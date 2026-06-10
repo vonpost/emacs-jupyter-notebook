@@ -119,6 +119,37 @@ Poll until the file is present and parseable or attempts are exhausted."
        (when (memq (process-status process) '(exit signal))
          (message "Jupyter tunnel %s: %s" process (string-trim event)))))))
 
+(defun emacs-jupyter-notebook--local-port-open-p (port)
+  "Return non-nil when PORT accepts a TCP connection on localhost."
+  (condition-case nil
+      (let ((proc (open-network-stream
+                   (format "emacs-jupyter-notebook-port-%s" port)
+                   nil "127.0.0.1" port)))
+        (delete-process proc)
+        t)
+    (error nil)))
+
+(defun emacs-jupyter-notebook--wait-for-tunnel (process local-ports)
+  "Wait until PROCESS has opened all LOCAL-PORTS.
+Signal an error when the tunnel exits or the timeout expires."
+  (let ((deadline (+ (float-time) emacs-jupyter-notebook-tunnel-wait-timeout))
+        pending)
+    (while (progn
+             (setq pending
+                   (cl-remove-if
+                    (lambda (key)
+                      (emacs-jupyter-notebook--local-port-open-p
+                       (plist-get local-ports key)))
+                    emacs-jupyter-notebook-connection-port-keys))
+             (and pending (< (float-time) deadline)))
+      (unless (process-live-p process)
+        (error "Jupyter SSH tunnel exited before ports were ready"))
+      (sleep-for emacs-jupyter-notebook-tunnel-wait-delay))
+    (when pending
+      (error "Timed out waiting for Jupyter SSH tunnel ports: %s"
+             (mapconcat #'symbol-name pending ", ")))
+    t))
+
 (defun emacs-jupyter-notebook--connect-entry (entry profile)
   "Connect current buffer to remote kernel ENTRY using PROFILE."
   (let* ((session-id (plist-get entry :session-id))
@@ -135,6 +166,7 @@ Poll until the file is present and parseable or attempts are exhausted."
                   profile remote-ports local-ports session-id)))
     (emacs-jupyter-notebook-connection-write-file rewritten local-file)
     (setq emacs-jupyter-notebook--tunnel-process tunnel)
+    (emacs-jupyter-notebook--wait-for-tunnel tunnel local-ports)
     (setq emacs-jupyter-notebook--client
           (emacs-jupyter-notebook-jupyter-connect local-file))
     (setq entry (plist-put (copy-sequence entry) :tunnel-ports local-ports))

@@ -100,6 +100,16 @@ The durable reconnect source remains the registry regardless of this value."
   :type 'number
   :group 'emacs-jupyter-notebook)
 
+(defcustom emacs-jupyter-notebook-tunnel-wait-timeout 10
+  "Seconds to wait for local SSH tunnel ports before connecting Jupyter."
+  :type 'number
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-tunnel-wait-delay 0.05
+  "Seconds between checks while waiting for SSH tunnel ports."
+  :type 'number
+  :group 'emacs-jupyter-notebook)
+
 (defcustom emacs-jupyter-notebook-language-cell-markers
   '((python-mode . "^\\s-*# %%\\(?:\\s-+.*\\)?$")
     (python-ts-mode . "^\\s-*# %%\\(?:\\s-+.*\\)?$"))

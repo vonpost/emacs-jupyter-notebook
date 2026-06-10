@@ -147,6 +147,70 @@
         (should (= attempts 2))
         (should (= sleeps 1))))))
 
+(ert-deftest ejn-wait-for-tunnel-retries-until-all-ports-open ()
+  (let ((attempts 0)
+        (sleeps 0)
+        (emacs-jupyter-notebook-tunnel-wait-timeout 1)
+        (emacs-jupyter-notebook-tunnel-wait-delay 0))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--local-port-open-p)
+               (lambda (_port)
+                 (>= (cl-incf attempts) 6)))
+              ((symbol-function 'process-live-p)
+               (lambda (_process) t))
+              ((symbol-function 'sleep-for)
+               (lambda (&rest _)
+                 (setq sleeps (1+ sleeps)))))
+      (should (emacs-jupyter-notebook--wait-for-tunnel
+               'mock-process
+               '(:shell_port 1001
+                 :iopub_port 1002
+                 :stdin_port 1003
+                 :hb_port 1004
+                 :control_port 1005)))
+      (should (= sleeps 1)))))
+
+(ert-deftest ejn-connect-entry-waits-for-tunnel-before-jupyter-connect ()
+  (let ((entry '(:profile "p"
+                 :remote-host "example.com"
+                 :remote-connection-file "/tmp/kernel.json"
+                 :session-id "session"))
+        (profile '(:profile "p" :host "example.com"))
+        (connection '(:ip "127.0.0.1"
+                      :transport "tcp"
+                      :shell_port 1
+                      :iopub_port 2
+                      :stdin_port 3
+                      :hb_port 4
+                      :control_port 5
+                      :key "secret"))
+        (local-ports '(:shell_port 1001
+                       :iopub_port 1002
+                       :stdin_port 1003
+                       :hb_port 1004
+                       :control_port 1005))
+        waited)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--retrieve-connection-file)
+               (lambda (&rest _) connection))
+              ((symbol-function 'emacs-jupyter-notebook-connection-allocate-local-ports)
+               (lambda () local-ports))
+              ((symbol-function 'emacs-jupyter-notebook--start-tunnel)
+               (lambda (&rest _) 'mock-process))
+              ((symbol-function 'emacs-jupyter-notebook--wait-for-tunnel)
+               (lambda (_process ports)
+                 (should (equal ports local-ports))
+                 (setq waited t)))
+              ((symbol-function 'emacs-jupyter-notebook-jupyter-connect)
+               (lambda (_connection-file)
+                 (should waited)
+                 'mock-client))
+              ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
+               #'ignore))
+      (with-temp-buffer
+        (should (equal (plist-get (emacs-jupyter-notebook--connect-entry entry profile)
+                                  :tunnel-ports)
+                       local-ports))
+        (should (eq emacs-jupyter-notebook--client 'mock-client))))))
+
 (ert-deftest ejn-ssh-basic-command-with-user-port-and-options ()
   (let ((emacs-jupyter-notebook-ssh-command "ssh")
         (emacs-jupyter-notebook-ssh-options '("-o" "BatchMode=yes")))
