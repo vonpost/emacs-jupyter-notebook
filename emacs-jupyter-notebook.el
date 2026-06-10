@@ -4,7 +4,7 @@
 
 ;; Author: emacs-jupyter-notebook contributors
 ;; Version: 0.1
-;; Package-Requires: ((emacs "27.1") (jupyter "1.0"))
+;; Package-Requires: ((emacs "27.1") (jupyter "1.0") (code-cells "0.5"))
 ;; Keywords: tools, languages, processes
 
 ;; This file is not part of GNU Emacs.
@@ -47,6 +47,8 @@
     (define-key map (kbd "C-c C-n") #'emacs-jupyter-notebook-reconnect-remote-kernel)
     (define-key map (kbd "C-c C-l") #'emacs-jupyter-notebook-clear-results)
     (define-key map (kbd "C-c C-x") #'emacs-jupyter-notebook-cancel-operation)
+    (define-key map (kbd "C-c C-f") #'code-cells-forward-cell)
+    (define-key map (kbd "C-c C-p") #'code-cells-backward-cell)
     map)
   "Keymap for `emacs-jupyter-notebook-mode'.")
 
@@ -54,7 +56,13 @@
 (define-minor-mode emacs-jupyter-notebook-mode
   "Minor mode for evaluating local source cells in remote Jupyter kernels."
   :lighter " EJN"
-  :keymap emacs-jupyter-notebook-mode-map)
+  :keymap emacs-jupyter-notebook-mode-map
+  (if emacs-jupyter-notebook-mode
+      (code-cells-mode 1)
+    (code-cells-mode -1)))
+
+(add-to-list 'code-cells-eval-region-commands
+             '(emacs-jupyter-notebook-mode . emacs-jupyter-notebook-evaluate-region))
 
 (defun emacs-jupyter-notebook--new-session-id ()
   "Return a locally unique session id string."

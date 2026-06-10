@@ -115,20 +115,6 @@ The durable reconnect source remains the registry regardless of this value."
   :type 'number
   :group 'emacs-jupyter-notebook)
 
-(defcustom emacs-jupyter-notebook-language-cell-markers
-  '((python-mode . "^\\s-*# %%\\(?:\\s-+.*\\)?$")
-    (python-ts-mode . "^\\s-*# %%\\(?:\\s-+.*\\)?$"))
-  "Alist mapping major modes to code-cell marker regexps."
-  :type '(alist :key-type symbol :value-type regexp)
-  :group 'emacs-jupyter-notebook)
-
-(defcustom emacs-jupyter-notebook-default-cell-marker-regexp
-  "^\\s-*# %%\\(?:\\s-+.*\\)?$"
-  "Fallback code-cell marker regexp.
-The default supports Python v1 # %% cells."
-  :type 'regexp
-  :group 'emacs-jupyter-notebook)
-
 (defconst emacs-jupyter-notebook-connection-port-keys
   '(:shell_port :iopub_port :stdin_port :hb_port :control_port)
   "Jupyter connection plist keys that contain channel ports.")
