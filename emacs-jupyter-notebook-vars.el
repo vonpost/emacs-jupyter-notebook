@@ -115,6 +115,13 @@ The durable reconnect source remains the registry regardless of this value."
   :type 'number
   :group 'emacs-jupyter-notebook)
 
+(defcustom emacs-jupyter-notebook-use-inline-overlays nil
+  "Whether to show evaluation results as inline overlays.
+When nil, results appear in pop-up buffers.
+When non-nil, results appear as inline overlays (may be truncated)."
+  :type 'boolean
+  :group 'emacs-jupyter-notebook)
+
 (defconst emacs-jupyter-notebook-connection-port-keys
   '(:shell_port :iopub_port :stdin_port :hb_port :control_port)
   "Jupyter connection plist keys that contain channel ports.")

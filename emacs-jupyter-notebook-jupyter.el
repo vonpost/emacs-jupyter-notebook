@@ -71,7 +71,7 @@
   (emacs-jupyter-notebook-jupyter--ensure)
   (require 'jupyter-client)
   (let ((jupyter-current-client client)
-        (jupyter-eval-use-overlays t))
+        (jupyter-eval-use-overlays emacs-jupyter-notebook-use-inline-overlays))
     (jupyter-eval-string code nil beg end)))
 
 (defun emacs-jupyter-notebook-jupyter--interrupt (client)
