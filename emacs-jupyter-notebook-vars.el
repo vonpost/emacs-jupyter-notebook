@@ -115,11 +115,16 @@ The durable reconnect source remains the registry regardless of this value."
   :type 'number
   :group 'emacs-jupyter-notebook)
 
-(defcustom emacs-jupyter-notebook-use-inline-overlays nil
+(defcustom emacs-jupyter-notebook-use-inline-overlays t
   "Whether to show evaluation results as inline overlays.
-When nil, results appear in pop-up buffers.
-When non-nil, results appear as inline overlays (may be truncated)."
+When non-nil (default), results appear inline below the cell.
+When nil, results appear in pop-up buffers."
   :type 'boolean
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-inline-result-max-lines 1000
+  "Maximum lines for inline result display before truncation."
+  :type 'integer
   :group 'emacs-jupyter-notebook)
 
 (defconst emacs-jupyter-notebook-connection-port-keys

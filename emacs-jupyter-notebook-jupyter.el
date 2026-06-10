@@ -25,9 +25,22 @@
 (declare-function jupyter-shutdown-kernel "jupyter-client" (client))
 (declare-function jupyter-insert "jupyter-mime" (mime-or-plist &optional metadata))
 (declare-function jupyter-eval-remove-overlays "jupyter-client" ())
+(declare-function jupyter-eval-ov--fold-string "jupyter-client" (text))
 (defvar jupyter-current-client)
 (defvar jupyter-default-timeout)
 (defvar jupyter-eval-use-overlays)
+(defvar jupyter-eval-short-result-max-lines)
+
+(defun emacs-jupyter-notebook-jupyter--maybe-fold-overlay (orig-fn text)
+  "Prevent overlay folding in `emacs-jupyter-notebook-mode' buffers.
+In other buffers, call ORIG-FN normally."
+  (if (bound-and-true-p emacs-jupyter-notebook-mode)
+      text
+    (funcall orig-fn text)))
+
+(with-eval-after-load 'jupyter-client
+  (advice-add 'jupyter-eval-ov--fold-string :around
+              #'emacs-jupyter-notebook-jupyter--maybe-fold-overlay))
 
 (defvar emacs-jupyter-notebook-jupyter-connect-function
   #'emacs-jupyter-notebook-jupyter--connect
@@ -71,7 +84,8 @@
   (emacs-jupyter-notebook-jupyter--ensure)
   (require 'jupyter-client)
   (let ((jupyter-current-client client)
-        (jupyter-eval-use-overlays emacs-jupyter-notebook-use-inline-overlays))
+        (jupyter-eval-use-overlays emacs-jupyter-notebook-use-inline-overlays)
+        (jupyter-eval-short-result-max-lines emacs-jupyter-notebook-inline-result-max-lines))
     (jupyter-eval-string code nil beg end)))
 
 (defun emacs-jupyter-notebook-jupyter--interrupt (client)
