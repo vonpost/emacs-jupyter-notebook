@@ -304,6 +304,23 @@
       (should (equal (buffer-modified-p) modified))
       (should (equal (nreverse calls) '("x = 1" "x = 1\ny = 2\n"))))))
 
+(ert-deftest ejn-mode-enable-does-not-start-remote-work ()
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-ssh-run-command)
+               (lambda (&rest _)
+                 (ert-fail "mode enable ran synchronous SSH command")))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
+               (lambda (&rest _)
+                 (ert-fail "mode enable started SSH process")))
+              ((symbol-function 'emacs-jupyter-notebook--wait-for-tunnel)
+               (lambda (&rest _)
+                 (ert-fail "mode enable waited for tunnel")))
+              ((symbol-function 'emacs-jupyter-notebook-jupyter-connect)
+               (lambda (&rest _)
+                 (ert-fail "mode enable connected to Jupyter"))))
+      (emacs-jupyter-notebook-mode 1)
+      (should emacs-jupyter-notebook-mode))))
+
 (provide 'emacs-jupyter-notebook-tests)
 
 ;;; emacs-jupyter-notebook-tests.el ends here
