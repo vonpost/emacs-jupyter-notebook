@@ -211,6 +211,50 @@
                        local-ports))
         (should (eq emacs-jupyter-notebook--client 'mock-client))))))
 
+(ert-deftest ejn-start-remote-kernel-uses-async-launch ()
+  (let ((emacs-jupyter-notebook-remote-profiles
+         '(("p" . (:host "example.com" :remote-cwd "~" :kernelspec "python3"))))
+        started)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+               #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook-ssh-run-command)
+               (lambda (&rest _)
+                 (ert-fail "start command used synchronous SSH")))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
+               (lambda (_name _argv _sentinel)
+                 (setq started t)
+                 'mock-launch-process)))
+      (with-temp-buffer
+        (let ((context (emacs-jupyter-notebook-start-remote-kernel "p")))
+          (should started)
+          (should (eq context emacs-jupyter-notebook--async-context))
+          (should (eq (plist-get context :phase) 'launch))
+          (should (eq (plist-get context :launch-process) 'mock-launch-process)))))))
+
+(ert-deftest ejn-reconnect-remote-kernel-uses-async-retrieve ()
+  (let ((entry '(:profile "p"
+                 :remote-host "example.com"
+                 :remote-cwd "~"
+                 :kernelspec "python3"
+                 :remote-connection-file "~/.cache/ejn/kernel.json"
+                 :session-id "session"))
+        retrieved)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+               #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook-ssh-run-command)
+               (lambda (&rest _)
+                 (ert-fail "reconnect command used synchronous SSH")))
+              ((symbol-function 'emacs-jupyter-notebook--async-retrieve)
+               (lambda (context)
+                 (setq retrieved t)
+                 context)))
+      (with-temp-buffer
+        (let ((context (emacs-jupyter-notebook-reconnect-remote-kernel entry)))
+          (should retrieved)
+          (should (eq context emacs-jupyter-notebook--async-context))
+          (should (eq (plist-get context :phase) 'retrieve))
+          (should-not (plist-get context :owns-kernel)))))))
+
 (ert-deftest ejn-ssh-basic-command-with-user-port-and-options ()
   (let ((emacs-jupyter-notebook-ssh-command "ssh")
         (emacs-jupyter-notebook-ssh-options '("-o" "BatchMode=yes")))
@@ -235,6 +279,18 @@
                  (list emacs-jupyter-notebook-scp-command
                        "example.com:~/.cache/ejn/kernel.json"
                        "/tmp/kernel.json"))))
+
+(ert-deftest ejn-ssh-remote-cleanup-targets-connection-file ()
+  (let* ((cmd (emacs-jupyter-notebook-ssh-build-remote-cleanup
+               '(:profile "p" :host "example.com")
+               "~/.cache/ejn/kernel-session.json"))
+         (remote-command (car (last cmd))))
+    (should (string-match-p "pkill -f \\\$HOME/.cache/ejn/kernel-session.json"
+                            remote-command))
+    (should (string-match-p "rm -f \\\$HOME/.cache/ejn/kernel-session.json"
+                            remote-command))
+    (should (string-match-p "\\$HOME/.cache/ejn/kernel-session.log"
+                            remote-command))))
 
 (ert-deftest ejn-ssh-remote-launch-command-is-detached ()
   (let* ((launch (emacs-jupyter-notebook-ssh-build-remote-launch

@@ -110,6 +110,11 @@ The durable reconnect source remains the registry regardless of this value."
   :type 'number
   :group 'emacs-jupyter-notebook)
 
+(defcustom emacs-jupyter-notebook-jupyter-connect-timeout 15
+  "Seconds emacs-jupyter may spend during initial client connection."
+  :type 'number
+  :group 'emacs-jupyter-notebook)
+
 (defcustom emacs-jupyter-notebook-language-cell-markers
   '((python-mode . "^\\s-*# %%\\(?:\\s-+.*\\)?$")
     (python-ts-mode . "^\\s-*# %%\\(?:\\s-+.*\\)?$"))

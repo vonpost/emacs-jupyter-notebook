@@ -16,6 +16,7 @@
 
 (declare-function jupyter-eval "jupyter-client" (code &optional mime))
 (defvar jupyter-current-client)
+(defvar jupyter-default-timeout)
 
 (defun ejn-remote-tests--host ()
   "Return the configured remote test host, or nil."
@@ -81,6 +82,20 @@
             (delete-process proc))
         (error (sleep-for 0.1))))
     connected))
+
+(defun ejn-remote-tests--wait-for-phase (buffer phase timeout)
+  "Wait until BUFFER's async context reaches PHASE within TIMEOUT seconds."
+  (let ((deadline (+ (float-time) timeout))
+        current error)
+    (while (and (< (float-time) deadline)
+                (not (memq current (list phase 'error))))
+      (accept-process-output nil 0.1)
+      (with-current-buffer buffer
+        (setq current (plist-get emacs-jupyter-notebook--async-context :phase))
+        (setq error (plist-get emacs-jupyter-notebook--async-context :error))))
+    (when (eq current 'error)
+      (ert-fail (format "Async operation failed: %s" error)))
+    (eq current phase)))
 
 (ert-deftest ejn-remote-start-retrieve-and-tunnel-smoke ()
   "Start a remote kernel, retrieve its connection file, and open tunnels."
@@ -171,7 +186,8 @@
                         (plist-get launch :argv))))
             (setq entry (plist-put entry :remote-pid pid))
             (emacs-jupyter-notebook--connect-entry entry profile)
-            (let ((jupyter-current-client emacs-jupyter-notebook--client))
+            (let ((jupyter-current-client emacs-jupyter-notebook--client)
+                  (jupyter-default-timeout 30))
               (should (equal (string-trim (jupyter-eval "6 * 7")) "42")))))
       (ignore-errors
         (when (buffer-live-p buffer)
@@ -190,6 +206,41 @@
           (format "rm -f %s %s"
                   (emacs-jupyter-notebook-ssh--quote-remote-path remote-file)
                   (emacs-jupyter-notebook-ssh--quote-remote-path remote-log)))))
+      (when (file-exists-p registry-file)
+        (delete-file registry-file)))))
+
+(ert-deftest ejn-remote-async-start-connect-and-evaluate ()
+  "Start, connect, and evaluate through the interactive async command path."
+  :tags '(:remote :emacs-jupyter :async)
+  (unless (require 'jupyter nil t)
+    (ert-skip "emacs-jupyter is not on load-path"))
+  (require 'jupyter-client)
+  (let* ((profile (ejn-remote-tests--profile))
+         (registry-file (let ((file (make-temp-file "ejn-registry-")))
+                          (delete-file file)
+                          file))
+         (buffer (generate-new-buffer " *ejn-remote-async*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (let ((emacs-jupyter-notebook-default-profile (plist-get profile :profile))
+                (emacs-jupyter-notebook-remote-profiles
+                 `((,(plist-get profile :profile) . ,profile)))
+                (emacs-jupyter-notebook-registry-file registry-file)
+                (emacs-jupyter-notebook-connection-retrieve-attempts 80)
+                (emacs-jupyter-notebook-connection-retrieve-delay 0.25))
+            (emacs-jupyter-notebook-start-remote-kernel (plist-get profile :profile))
+            (should (eq (plist-get emacs-jupyter-notebook--async-context :phase)
+                        'launch))
+            (should (ejn-remote-tests--wait-for-phase buffer 'done 60))
+            (let ((jupyter-current-client emacs-jupyter-notebook--client)
+                  (jupyter-default-timeout 30))
+              (should (equal (string-trim (jupyter-eval "6 * 7")) "42")))))
+      (ignore-errors
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (emacs-jupyter-notebook-shutdown-kernel))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer))
       (when (file-exists-p registry-file)
         (delete-file registry-file)))))
 

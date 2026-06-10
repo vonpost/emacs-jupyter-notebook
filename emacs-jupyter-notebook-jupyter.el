@@ -15,6 +15,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'emacs-jupyter-notebook-vars)
 
 (declare-function jupyter-kernel "jupyter-kernel" (&rest args))
 (declare-function jupyter-client "jupyter-client" (kernel &optional client-class))
@@ -25,6 +26,7 @@
 (declare-function jupyter-insert "jupyter-mime" (mime-or-plist &optional metadata))
 (declare-function jupyter-eval-remove-overlays "jupyter-client" ())
 (defvar jupyter-current-client)
+(defvar jupyter-default-timeout)
 (defvar jupyter-eval-use-overlays)
 
 (defvar emacs-jupyter-notebook-jupyter-connect-function
@@ -61,7 +63,8 @@
   (emacs-jupyter-notebook-jupyter--ensure)
   (require 'jupyter-kernel)
   (require 'jupyter-client)
-  (jupyter-client (jupyter-kernel :conn-info connection-file :connect-p t)))
+  (let ((jupyter-default-timeout emacs-jupyter-notebook-jupyter-connect-timeout))
+    (jupyter-client (jupyter-kernel :conn-info connection-file :connect-p t))))
 
 (defun emacs-jupyter-notebook-jupyter--evaluate (client code beg end)
   "Evaluate CODE using CLIENT with source bounds BEG and END."

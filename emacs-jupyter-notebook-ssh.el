@@ -167,6 +167,16 @@ The return value is a plist containing :argv, :remote-command,
    profile
    (format "kill %s" (shell-quote-argument (format "%s" pid)))))
 
+(defun emacs-jupyter-notebook-ssh-build-remote-cleanup (profile connection-file)
+  "Return an SSH argv list that cleans remote processes for CONNECTION-FILE."
+  (let ((remote-file (emacs-jupyter-notebook-ssh--quote-remote-path connection-file))
+        (remote-log (emacs-jupyter-notebook-ssh--quote-remote-path
+                     (replace-regexp-in-string "\\.json\\'" ".log" connection-file))))
+    (emacs-jupyter-notebook-ssh-command
+     profile
+     (format "{ pkill -f %s 2>/dev/null || true; rm -f %s %s; }"
+             remote-file remote-file remote-log))))
+
 (defun emacs-jupyter-notebook-ssh-run-command (argv)
   "Run ARGV synchronously and return stdout.
 Signal an error if the command exits non-zero."
