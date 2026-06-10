@@ -19,12 +19,15 @@
 
 (declare-function jupyter-kernel "jupyter-kernel" (&rest args))
 (declare-function jupyter-client "jupyter-client" (kernel &optional client-class))
-(declare-function jupyter-eval-string "jupyter-client" (str &optional insert beg end))
+(declare-function jupyter-send "jupyter-client" (client msg-type &rest args))
+(declare-function jupyter-execute-request "jupyter-messages" (&rest args))
 (declare-function jupyter-interrupt-kernel "jupyter-client" (client))
 (declare-function jupyter-restart-kernel "jupyter-client" (client))
 (declare-function jupyter-shutdown-kernel "jupyter-client" (client))
 (declare-function jupyter-insert "jupyter-mime" (mime-or-plist &optional metadata))
 (declare-function jupyter-eval-remove-overlays "jupyter-client" ())
+(declare-function jupyter-message-content "jupyter-messages" (msg))
+(declare-function jupyter-message-type "jupyter-messages" (msg))
 (declare-function jupyter-eval-ov--fold-string "jupyter-client" (text))
 (defvar jupyter-current-client)
 (defvar jupyter-default-timeout)
@@ -83,10 +86,52 @@ In other buffers, call ORIG-FN normally."
   "Evaluate CODE using CLIENT with source bounds BEG and END."
   (emacs-jupyter-notebook-jupyter--ensure)
   (require 'jupyter-client)
+  (require 'jupyter-messages)
   (let ((jupyter-current-client client)
-        (jupyter-eval-use-overlays emacs-jupyter-notebook-use-inline-overlays)
-        (jupyter-eval-short-result-max-lines emacs-jupyter-notebook-inline-result-max-lines))
-    (jupyter-eval-string code nil beg end)))
+        (buffer (current-buffer)))
+    ;; Send async execute request with callbacks
+    (jupyter-send client 'execute_request
+                  :code code
+                  :silent nil
+                  :store_history t
+                  :user_expressions nil
+                  :allow_stdin nil
+                  :stop_on_error t
+                  :callbacks
+                  `((execute_result
+                     . ,(lambda (msg)
+                          (when (buffer-live-p buffer)
+                            (with-current-buffer buffer
+                              (let* ((content (jupyter-message-content msg))
+                                     (data (plist-get content :data))
+                                     (text (or (plist-get data :text/plain) "")))
+                                (emacs-jupyter-notebook-result-create beg end text))))))
+                    (display_data
+                     . ,(lambda (msg)
+                          (when (buffer-live-p buffer)
+                            (with-current-buffer buffer
+                              (let* ((content (jupyter-message-content msg))
+                                     (data (plist-get content :data))
+                                     (text (or (plist-get data :text/plain) "")))
+                                (emacs-jupyter-notebook-result-create beg end text))))))
+                    (stream
+                     . ,(lambda (msg)
+                          (when (buffer-live-p buffer)
+                            (with-current-buffer buffer
+                              (let* ((content (jupyter-message-content msg))
+                                     (text (plist-get content :text)))
+                                (emacs-jupyter-notebook-result-create beg end text))))))
+                    (error
+                     . ,(lambda (msg)
+                          (when (buffer-live-p buffer)
+                            (with-current-buffer buffer
+                              (let* ((content (jupyter-message-content msg))
+                                     (ename (plist-get content :ename))
+                                     (evalue (plist-get content :evalue))
+                                     (error-text (format "%s: %s" ename evalue)))
+                                (emacs-jupyter-notebook-result-create beg end error-text))))))))
+    ;; Return immediately - results will appear via callbacks
+    nil))
 
 (defun emacs-jupyter-notebook-jupyter--interrupt (client)
   "Interrupt CLIENT's kernel."
