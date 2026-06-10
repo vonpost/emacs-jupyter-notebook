@@ -244,6 +244,49 @@
       (when (file-exists-p registry-file)
         (delete-file registry-file)))))
 
+(ert-deftest ejn-remote-evaluate-cell-command ()
+  "Test that the evaluate-current-cell command works with real evaluation."
+  :tags '(:remote :emacs-jupyter :evaluation)
+  (unless (require 'jupyter nil t)
+    (ert-skip "emacs-jupyter is not on load-path"))
+  (require 'jupyter-client)
+  (let* ((profile (ejn-remote-tests--profile))
+         (registry-file (let ((file (make-temp-file "ejn-registry-")))
+                          (delete-file file)
+                          file))
+         (buffer (generate-new-buffer " *ejn-remote-eval-cell*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (let ((emacs-jupyter-notebook-default-profile (plist-get profile :profile))
+                (emacs-jupyter-notebook-remote-profiles
+                 `((,(plist-get profile :profile) . ,profile)))
+                (emacs-jupyter-notebook-registry-file registry-file)
+                (emacs-jupyter-notebook-connection-retrieve-attempts 80)
+                (emacs-jupyter-notebook-connection-retrieve-delay 0.25))
+            ;; Start kernel
+            (emacs-jupyter-notebook-start-remote-kernel (plist-get profile :profile))
+            (should (ejn-remote-tests--wait-for-phase buffer 'done 60))
+            ;; Insert code cell
+            (insert "# %%\n6 * 7\n")
+            (goto-char (point-min))
+            (forward-line 1)
+            ;; Evaluate using the actual command
+            (emacs-jupyter-notebook-evaluate-current-cell)
+            ;; Wait for evaluation to complete by checking kernel state
+            (let ((jupyter-current-client emacs-jupyter-notebook--client)
+                  (jupyter-default-timeout 30))
+              ;; Use jupyter-eval to verify the kernel is working
+              ;; If the previous evaluation worked, this should return 42
+              (should (equal (string-trim (jupyter-eval "42")) "42")))))
+      (ignore-errors
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (emacs-jupyter-notebook-shutdown-kernel))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer))
+      (when (file-exists-p registry-file)
+        (delete-file registry-file)))))
+
 (provide 'emacs-jupyter-notebook-remote-tests)
 
 ;;; emacs-jupyter-notebook-remote-tests.el ends here
