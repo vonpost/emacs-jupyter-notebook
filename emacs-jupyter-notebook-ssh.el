@@ -105,12 +105,23 @@ port keys."
           (emacs-jupyter-notebook-ssh--option-args profile t)
           (list (format "%s:%s"
                         (emacs-jupyter-notebook-ssh-destination profile)
-                        (shell-quote-argument remote-file))
+                        remote-file)
                 local-file)))
 
 (defun emacs-jupyter-notebook-ssh--remote-join (directory file)
   "Join remote DIRECTORY and FILE without invoking file handlers."
   (concat (string-remove-suffix "/" directory) "/" file))
+
+(defun emacs-jupyter-notebook-ssh--quote-remote-path (path)
+  "Quote remote shell PATH while preserving leading home expansion."
+  (cond
+   ((equal path "~") "$HOME")
+   ((string-prefix-p "~/" path)
+    (let ((rest (substring path 2)))
+      (if (string-empty-p rest)
+          "$HOME/"
+        (concat "$HOME/" (shell-quote-argument rest)))))
+   (t (shell-quote-argument path))))
 
 (defun emacs-jupyter-notebook-ssh-remote-connection-file (profile session-id)
   "Return the remote connection file path for PROFILE and SESSION-ID."
@@ -134,14 +145,16 @@ The return value is a plist containing :argv, :remote-command,
           (mapconcat
            #'identity
            (list
-            (format "mkdir -p %s" (shell-quote-argument cache-dir))
-            (format "cd %s" (shell-quote-argument remote-cwd))
-            (format (concat "nohup jupyter kernel --kernel=%s "
+            (format "mkdir -p %s"
+                    (emacs-jupyter-notebook-ssh--quote-remote-path cache-dir))
+            (format "cd %s"
+                    (emacs-jupyter-notebook-ssh--quote-remote-path remote-cwd))
+            (format (concat "{ nohup jupyter kernel --kernel=%s "
                             "--KernelManager.connection_file=%s "
-                            "> %s 2>&1 < /dev/null & printf '%%s\\n' \"$!\"")
+                            "> %s 2>&1 < /dev/null & printf '%%s\\n' \"$!\"; }")
                     (shell-quote-argument kernelspec)
-                    (shell-quote-argument connection-file)
-                    (shell-quote-argument log-file)))
+                    (emacs-jupyter-notebook-ssh--quote-remote-path connection-file)
+                    (emacs-jupyter-notebook-ssh--quote-remote-path log-file)))
            " && ")))
     (list :argv (emacs-jupyter-notebook-ssh-command profile remote-command)
           :remote-command remote-command

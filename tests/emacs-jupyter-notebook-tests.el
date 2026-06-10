@@ -164,15 +164,33 @@
     (should (member "1005:127.0.0.1:5" cmd))
     (should (equal (car (last cmd)) "example.com"))))
 
+(ert-deftest ejn-ssh-scp-preserves-home-expansion ()
+  (should (equal (emacs-jupyter-notebook-ssh-scp-from-command
+                  '(:profile "p" :host "example.com")
+                  "~/.cache/ejn/kernel.json" "/tmp/kernel.json")
+                 (list emacs-jupyter-notebook-scp-command
+                       "example.com:~/.cache/ejn/kernel.json"
+                       "/tmp/kernel.json"))))
+
 (ert-deftest ejn-ssh-remote-launch-command-is-detached ()
   (let* ((launch (emacs-jupyter-notebook-ssh-build-remote-launch
                   '(:profile "p" :host "mother" :remote-cwd "/work" :remote-cache-dir "/tmp/ejn" :kernelspec "python3")
                   "session"))
          (remote-command (plist-get launch :remote-command)))
     (should (equal (plist-get launch :connection-file) "/tmp/ejn/kernel-session.json"))
-    (should (string-match-p "nohup jupyter kernel" remote-command))
+    (should (string-match-p "&& { nohup jupyter kernel" remote-command))
     (should (string-match-p "--kernel=python3" remote-command))
-    (should (string-match-p "printf" remote-command))))
+    (should (string-match-p "& printf '%s\\\\n' \"\\$!\"; }" remote-command))))
+
+(ert-deftest ejn-ssh-remote-launch-preserves-home-expansion ()
+  (let* ((launch (emacs-jupyter-notebook-ssh-build-remote-launch
+                  '(:profile "p" :host "mother" :remote-cwd "~" :remote-cache-dir "~/.cache/ejn" :kernelspec "python3")
+                  "session"))
+         (remote-command (plist-get launch :remote-command)))
+    (should (string-match-p "mkdir -p \\\$HOME/.cache/ejn" remote-command))
+    (should (string-match-p "cd \\\$HOME" remote-command))
+    (should-not (string-match-p "\\\\~" remote-command))
+    (should-not (string-match-p "'~" remote-command))))
 
 (ert-deftest ejn-result-overlay-create-and-clear-without-text-mutation ()
   (ejn-test-with-temp-buffer "# %%\n1 + 1\n"
