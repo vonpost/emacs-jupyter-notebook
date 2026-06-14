@@ -102,9 +102,19 @@ For remote behavior, structure code so SSH/process execution can be mocked.
 - Prefer delegating bounded research, test design, failure fixing, and review tasks to subagents.
 - Tell subagents whether they may edit files or only inspect the tree.
 - Keep subagent prompts focused on one concern, such as registry behavior, SSH command construction, or emacs-jupyter adapter integration.
+- Avoid assigning parallel editing tasks to the same file. If unavoidable, inspect the combined result carefully before running tests.
 - Ask subagents to report verification commands run, files changed, and remaining risks.
+- Treat subagent results as input for manager review, not as automatically final. Re-read the changed code and check for syntax, style, and integration issues.
+- Prefer manager/critic behavior for broad changes: delegate bounded implementation or review, then integrate, verify, and decide.
 - Do not ask subagents to use or require a real remote host for normal unit tests.
 - Keep deterministic ERT tests independent of `emacs-jupyter`, Jupyter itself, SSH connectivity, and remote hosts.
 - Use `mother` or `mother.lan` only for optional remote smoke tests when explicitly useful.
+- After byte-compilation checks, remove generated `.elc` files before status/diff review.
+- Re-run the canonical source-based local ERT command after deleting stale byte-code artifacts, because stale `.elc` files can hide source changes.
 - Do not commit generated artifacts such as `.elc` files, transient connection JSON files, local registry files, or `.opencode/` tooling data.
 - Before committing, inspect status, diff, and recent log; stage only intended project files.
+
+## Roadmap
+
+- [x] Solidify remote kernel handling: async start, reconnect, SSH tunnels, SCP retrieval, registry persistence, connection-file rewriting, file-associated sessions, and cell evaluation.
+- [ ] Add Jupyter runtime niceties after remote kernel handling is solid: runtime completion, inspect-at-point, code-completeness checks, kernel busy/idle status, rich MIME rendering, live `update_display_data`, `clear_output`, stdin prompts, and optional watch values via `user_expressions`.
