@@ -27,10 +27,12 @@
   (list :profile "remote-smoke"
         :host (or (ejn-remote-tests--host)
                   (ert-skip "Set EJN_REMOTE_TEST_HOST to run remote smoke tests"))
-        :remote-cwd (or (getenv "EJN_REMOTE_TEST_CWD") "~")
-        :remote-cache-dir (or (getenv "EJN_REMOTE_TEST_CACHE")
-                              "~/.cache/emacs-jupyter-notebook-smoke")
-        :kernelspec (or (getenv "EJN_REMOTE_TEST_KERNELSPEC") "python3")))
+         :remote-cwd (or (getenv "EJN_REMOTE_TEST_CWD") "~")
+         :remote-cache-dir (or (getenv "EJN_REMOTE_TEST_CACHE")
+                               "~/.cache/emacs-jupyter-notebook-smoke")
+         :kernelspec (or (getenv "EJN_REMOTE_TEST_KERNELSPEC") "python3")
+         :jupyter-command (or (getenv "EJN_REMOTE_TEST_JUPYTER_COMMAND")
+                              emacs-jupyter-notebook-jupyter-command)))
 
 (defun ejn-remote-tests--session-id ()
   "Return a unique session id for a remote smoke test."
@@ -38,9 +40,10 @@
 
 (defun ejn-remote-tests--remote-python-exec-command (connection-file)
   "Return a remote shell command that executes code via CONNECTION-FILE."
-  (let ((python-code
-         (string-join
-          '("import sys, time"
+  (let ((python-command (or (getenv "EJN_REMOTE_TEST_PYTHON_COMMAND") "python3"))
+        (python-code
+          (string-join
+           '("import sys, time"
             "from queue import Empty"
             "from jupyter_client import BlockingKernelClient"
             "kc = BlockingKernelClient(connection_file=sys.argv[1])"
@@ -66,7 +69,8 @@
             "kc.stop_channels()"
             "raise SystemExit(0 if seen else 1)")
           "\n")))
-    (format "python3 -c %s %s"
+    (format "%s -c %s %s"
+            python-command
             (shell-quote-argument python-code)
             (emacs-jupyter-notebook-ssh--quote-remote-path connection-file))))
 
@@ -96,6 +100,23 @@
     (when (eq current 'error)
       (ert-fail (format "Async operation failed: %s" error)))
     (eq current phase)))
+
+(defun ejn-remote-tests--wait-for-result-text (buffer text timeout)
+  "Return non-nil when BUFFER has an inline result containing TEXT."
+  (let ((deadline (+ (float-time) timeout))
+        found)
+    (while (and (not found) (< (float-time) deadline))
+      (accept-process-output nil 0.1)
+      (with-current-buffer buffer
+        (setq found
+              (cl-some
+               (lambda (ov)
+                 (let ((content (overlay-get ov 'emacs-jupyter-notebook-content))
+                       (display (overlay-get ov 'after-string)))
+                   (or (and content (string-match-p (regexp-quote text) content))
+                       (and display (string-match-p (regexp-quote text) display)))))
+               (emacs-jupyter-notebook-result--all-overlays)))))
+    found))
 
 (ert-deftest ejn-remote-start-retrieve-and-tunnel-smoke ()
   "Start a remote kernel, retrieve its connection file, and open tunnels."
@@ -174,13 +195,13 @@
                                             (emacs-jupyter-notebook-ssh-destination profile)
                                             (plist-get profile :kernelspec))
                       :session-id session-id))
-         (buffer (generate-new-buffer " *ejn-remote-emacs-jupyter*"))
-         pid)
-    (unwind-protect
-        (with-current-buffer buffer
-          (let ((emacs-jupyter-notebook-registry-file registry-file)
-                (emacs-jupyter-notebook-connection-retrieve-attempts 80)
-                (emacs-jupyter-notebook-connection-retrieve-delay 0.25))
+          (buffer (generate-new-buffer " *ejn-remote-emacs-jupyter*"))
+          (emacs-jupyter-notebook-registry-file registry-file)
+          pid)
+     (unwind-protect
+         (with-current-buffer buffer
+           (let ((emacs-jupyter-notebook-connection-retrieve-attempts 80)
+                 (emacs-jupyter-notebook-connection-retrieve-delay 0.25))
             (setq pid (emacs-jupyter-notebook--parse-pid
                        (emacs-jupyter-notebook-ssh-run-command
                         (plist-get launch :argv))))
@@ -219,15 +240,16 @@
          (registry-file (let ((file (make-temp-file "ejn-registry-")))
                           (delete-file file)
                           file))
-         (buffer (generate-new-buffer " *ejn-remote-async*")))
-    (unwind-protect
-        (with-current-buffer buffer
-          (let ((emacs-jupyter-notebook-default-profile (plist-get profile :profile))
-                (emacs-jupyter-notebook-remote-profiles
-                 `((,(plist-get profile :profile) . ,profile)))
-                (emacs-jupyter-notebook-registry-file registry-file)
-                (emacs-jupyter-notebook-connection-retrieve-attempts 80)
-                (emacs-jupyter-notebook-connection-retrieve-delay 0.25))
+          (buffer (generate-new-buffer " *ejn-remote-async*"))
+          (emacs-jupyter-notebook-registry-file registry-file))
+     (unwind-protect
+         (with-current-buffer buffer
+           (let ((emacs-jupyter-notebook-default-profile (plist-get profile :profile))
+                 (emacs-jupyter-notebook-remote-profiles
+                  `((,(plist-get profile :profile) . ,profile)))
+                 (emacs-jupyter-notebook-connection-retrieve-attempts 80)
+                 (emacs-jupyter-notebook-connection-retrieve-delay 0.25))
+            (setq buffer-file-name "/tmp/ejn-remote-async.py")
             (emacs-jupyter-notebook-start-remote-kernel (plist-get profile :profile))
             (should (eq (plist-get emacs-jupyter-notebook--async-context :phase)
                         'launch))
@@ -254,30 +276,23 @@
          (registry-file (let ((file (make-temp-file "ejn-registry-")))
                           (delete-file file)
                           file))
-         (buffer (generate-new-buffer " *ejn-remote-eval-cell*")))
-    (unwind-protect
-        (with-current-buffer buffer
-          (let ((emacs-jupyter-notebook-default-profile (plist-get profile :profile))
-                (emacs-jupyter-notebook-remote-profiles
-                 `((,(plist-get profile :profile) . ,profile)))
-                (emacs-jupyter-notebook-registry-file registry-file)
-                (emacs-jupyter-notebook-connection-retrieve-attempts 80)
-                (emacs-jupyter-notebook-connection-retrieve-delay 0.25))
-            ;; Start kernel
-            (emacs-jupyter-notebook-start-remote-kernel (plist-get profile :profile))
-            (should (ejn-remote-tests--wait-for-phase buffer 'done 60))
+          (buffer (generate-new-buffer " *ejn-remote-eval-cell*"))
+          (emacs-jupyter-notebook-registry-file registry-file))
+     (unwind-protect
+         (with-current-buffer buffer
+           (let ((emacs-jupyter-notebook-default-profile (plist-get profile :profile))
+                 (emacs-jupyter-notebook-remote-profiles
+                  `((,(plist-get profile :profile) . ,profile)))
+                 (emacs-jupyter-notebook-connection-retrieve-attempts 80)
+                 (emacs-jupyter-notebook-connection-retrieve-delay 0.25))
+            (setq buffer-file-name "/tmp/ejn-remote-eval-cell.py")
             ;; Insert code cell
             (insert "# %%\n6 * 7\n")
             (goto-char (point-min))
             (forward-line 1)
-            ;; Evaluate using the actual command
+            ;; Evaluate using the actual command; it should start the kernel.
             (emacs-jupyter-notebook-evaluate-current-cell)
-            ;; Wait for evaluation to complete by checking kernel state
-            (let ((jupyter-current-client emacs-jupyter-notebook--client)
-                  (jupyter-default-timeout 30))
-              ;; Use jupyter-eval to verify the kernel is working
-              ;; If the previous evaluation worked, this should return 42
-              (should (equal (string-trim (jupyter-eval "42")) "42")))))
+            (should (ejn-remote-tests--wait-for-result-text buffer "42" 80))))
       (ignore-errors
         (when (buffer-live-p buffer)
           (with-current-buffer buffer
@@ -286,6 +301,59 @@
         (kill-buffer buffer))
       (when (file-exists-p registry-file)
         (delete-file registry-file)))))
+
+(ert-deftest ejn-remote-reconnect-prefers-current-file-kernel ()
+  "Start a kernel, then reconnect from another buffer visiting the same file."
+  :tags '(:remote :emacs-jupyter :reconnect)
+  (unless (require 'jupyter nil t)
+    (ert-skip "emacs-jupyter is not on load-path"))
+  (require 'jupyter-client)
+  (let* ((profile (ejn-remote-tests--profile))
+         (registry-file (let ((file (make-temp-file "ejn-registry-")))
+                          (delete-file file)
+                          file))
+         (source-file (make-temp-file "ejn-source-" nil ".py"))
+         (first-buffer (generate-new-buffer " *ejn-remote-reconnect-a*"))
+          (second-buffer (generate-new-buffer " *ejn-remote-reconnect-b*"))
+          (emacs-jupyter-notebook-registry-file registry-file))
+     (unwind-protect
+         (progn
+           (with-current-buffer first-buffer
+             (setq buffer-file-name source-file)
+             (let ((emacs-jupyter-notebook-default-profile (plist-get profile :profile))
+                   (emacs-jupyter-notebook-remote-profiles
+                    `((,(plist-get profile :profile) . ,profile)))
+                   (emacs-jupyter-notebook-connection-retrieve-attempts 80)
+                   (emacs-jupyter-notebook-connection-retrieve-delay 0.25))
+              (emacs-jupyter-notebook-start-remote-kernel (plist-get profile :profile))
+              (should (ejn-remote-tests--wait-for-phase first-buffer 'done 60))
+              (when (process-live-p emacs-jupyter-notebook--tunnel-process)
+                (delete-process emacs-jupyter-notebook--tunnel-process))
+              (setq emacs-jupyter-notebook--tunnel-process nil)))
+          (with-current-buffer second-buffer
+            (setq buffer-file-name source-file)
+            (insert "# %%\n6 * 7\n")
+            (goto-char (point-min))
+            (forward-line 1)
+            (let ((emacs-jupyter-notebook-default-profile (plist-get profile :profile))
+                  (emacs-jupyter-notebook-remote-profiles
+                   `((,(plist-get profile :profile) . ,profile)))
+                  (emacs-jupyter-notebook-connection-retrieve-attempts 80)
+                  (emacs-jupyter-notebook-connection-retrieve-delay 0.25))
+              (emacs-jupyter-notebook-evaluate-current-cell)
+              (should (ejn-remote-tests--wait-for-result-text second-buffer "42" 80)))))
+      (ignore-errors
+        (when (buffer-live-p second-buffer)
+          (with-current-buffer second-buffer
+            (emacs-jupyter-notebook-shutdown-kernel))))
+      (when (buffer-live-p first-buffer)
+        (kill-buffer first-buffer))
+      (when (buffer-live-p second-buffer)
+        (kill-buffer second-buffer))
+      (when (file-exists-p registry-file)
+        (delete-file registry-file))
+      (when (file-exists-p source-file)
+        (delete-file source-file)))))
 
 (provide 'emacs-jupyter-notebook-remote-tests)
 
