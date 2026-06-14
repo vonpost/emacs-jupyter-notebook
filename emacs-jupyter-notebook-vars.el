@@ -23,8 +23,8 @@
   "Remote profile definitions.
 Each element is (NAME . PLIST).  Supported PLIST keys include
 :host, :user, :port, :identity-file, :ssh-options, :remote-cwd,
-:remote-cache-dir, and :kernelspec.  :host may include a user as
-in user@example.com."
+:remote-cache-dir, :kernelspec, and :jupyter-command.
+:host may include a user as in user@example.com."
   :type '(alist :key-type string :value-type plist)
   :group 'emacs-jupyter-notebook)
 
@@ -58,6 +58,12 @@ in user@example.com."
   :type 'string
   :group 'emacs-jupyter-notebook)
 
+(defcustom emacs-jupyter-notebook-jupyter-command "jupyter"
+  "Default Jupyter command on the remote host.
+Can be overridden per-profile with :jupyter-command in the profile plist."
+  :type 'string
+  :group 'emacs-jupyter-notebook)
+
 (defcustom emacs-jupyter-notebook-default-kernelspec "python3"
   "Default remote Jupyter kernelspec name."
   :type 'string
@@ -77,6 +83,21 @@ The durable reconnect source remains the registry regardless of this value."
 
 (defcustom emacs-jupyter-notebook-result-max-lines 200
   "Maximum number of result lines shown inline by package-owned overlays."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-result-max-bytes 10485760
+  "Maximum byte size of result content stored in overlays."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-result-inline-max-bytes 102400
+  "Maximum byte size of result content rendered inline in after-string."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-result-inline-lines 10
+  "Number of lines shown inline in result overlays before truncation."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
@@ -110,9 +131,44 @@ The durable reconnect source remains the registry regardless of this value."
   :type 'number
   :group 'emacs-jupyter-notebook)
 
-(defcustom emacs-jupyter-notebook-jupyter-connect-timeout 15
-  "Seconds emacs-jupyter may spend during initial client connection."
+(defcustom emacs-jupyter-notebook-jupyter-connect-timeout 45
+  "Seconds emacs-jupyter may spend during initial client connection.
+This needs to be generous for high-latency remote kernels, especially
+when the remote side uses Nix or other environment initialization."
   :type 'number
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-jupyter-request-timeout 2
+  "Seconds to wait for runtime completion, inspect, and completeness replies."
+  :type 'number
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-jupyter-completion-timeout 0.35
+  "Seconds to wait for runtime completion replies.
+Completion runs from `completion-at-point-functions', so this should stay
+short to avoid making normal editing feel blocked."
+  :type 'number
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-check-code-completeness nil
+  "Whether to ask the kernel if a cell is complete before evaluation.
+This uses Jupyter's `is_complete_request' and may block up to
+`emacs-jupyter-notebook-jupyter-request-timeout' seconds."
+  :type 'boolean
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-evaluation-timeout 120
+  "Seconds to wait before warning about a possibly unresponsive evaluation."
+  :type 'number
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-watch-expressions nil
+  "Named expressions to evaluate with each Jupyter execute request.
+Each element is (NAME . EXPRESSION), where NAME labels the displayed
+watch value and EXPRESSION is code evaluated by the kernel through
+Jupyter's `user_expressions' field.  Watch values are displayed in the
+result overlay when package-owned inline overlays are enabled."
+  :type '(alist :key-type string :value-type string)
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-use-inline-overlays t

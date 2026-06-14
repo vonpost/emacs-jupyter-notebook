@@ -50,6 +50,9 @@
     (unless (plist-member plist :kernelspec)
       (setq plist (plist-put plist :kernelspec
                              emacs-jupyter-notebook-default-kernelspec)))
+    (unless (plist-member plist :jupyter-command)
+      (setq plist (plist-put plist :jupyter-command
+                             emacs-jupyter-notebook-jupyter-command)))
     plist))
 
 (defun emacs-jupyter-notebook-ssh-destination (profile)
@@ -137,6 +140,7 @@ The return value is a plist containing :argv, :remote-command,
          (cache-dir (plist-get profile :remote-cache-dir))
          (remote-cwd (plist-get profile :remote-cwd))
          (kernelspec (plist-get profile :kernelspec))
+         (jupyter-cmd (plist-get profile :jupyter-command))
          (connection-file (emacs-jupyter-notebook-ssh-remote-connection-file
                            profile session-id))
          (log-file (emacs-jupyter-notebook-ssh--remote-join
@@ -149,9 +153,10 @@ The return value is a plist containing :argv, :remote-command,
                     (emacs-jupyter-notebook-ssh--quote-remote-path cache-dir))
             (format "cd %s"
                     (emacs-jupyter-notebook-ssh--quote-remote-path remote-cwd))
-            (format (concat "{ nohup jupyter kernel --kernel=%s "
+            (format (concat "{ nohup %s kernel --kernel=%s "
                             "--KernelManager.connection_file=%s "
                             "> %s 2>&1 < /dev/null & printf '%%s\\n' \"$!\"; }")
+                    jupyter-cmd
                     (shell-quote-argument kernelspec)
                     (emacs-jupyter-notebook-ssh--quote-remote-path connection-file)
                     (emacs-jupyter-notebook-ssh--quote-remote-path log-file)))
@@ -189,13 +194,16 @@ Signal an error if the command exits non-zero."
 
 (defun emacs-jupyter-notebook-ssh-start-process (name argv &optional sentinel)
   "Start ARGV asynchronously as process NAME and return the process."
-  (make-process :name name
-                :buffer (generate-new-buffer (format " *%s*" name))
-                :command argv
-                :connection-type 'pipe
-                :noquery t
-                :sentinel sentinel
-                :stderr (generate-new-buffer (format " *%s stderr*" name))))
+  (let* ((stderr-buffer (generate-new-buffer (format " *%s stderr*" name)))
+         (process (make-process :name name
+                                :buffer (generate-new-buffer (format " *%s*" name))
+                                :command argv
+                                :connection-type 'pipe
+                                :noquery t
+                                :sentinel sentinel
+                                :stderr stderr-buffer)))
+    (process-put process 'emacs-jupyter-notebook-stderr-buffer stderr-buffer)
+    process))
 
 (provide 'emacs-jupyter-notebook-ssh)
 

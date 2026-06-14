@@ -111,9 +111,20 @@ When FILE is nil, use `emacs-jupyter-notebook-registry-file'."
               (lambda (entry)
                 (equal profile (plist-get entry :profile)))
               (copy-sequence entries))
-             (lambda (a b)
-               (string> (or (plist-get a :created-at) "")
-                        (or (plist-get b :created-at) ""))))))
+              (lambda (a b)
+                (string> (or (plist-get a :created-at) "")
+                         (or (plist-get b :created-at) ""))))))
+
+(defun emacs-jupyter-notebook-registry-latest-for-file (file &optional entries)
+  "Return the newest registry entry associated with local FILE."
+  (let ((file (and file (file-truename file))))
+    (car (sort (cl-remove-if-not
+                (lambda (entry)
+                  (equal file (plist-get entry :local-file)))
+                (copy-sequence entries))
+               (lambda (a b)
+                 (string> (or (plist-get a :created-at) "")
+                          (or (plist-get b :created-at) "")))))))
 
 (provide 'emacs-jupyter-notebook-registry)
 
