@@ -25,6 +25,62 @@
 (require 'emacs-jupyter-notebook-result)
 (require 'emacs-jupyter-notebook-jupyter)
 
+(defvar-local emacs-jupyter-notebook--before-change-text nil)
+
+(defvar-local emacs-jupyter-notebook--saved-imenu-create-index-function nil
+  "Previous buffer-local value of `imenu-create-index-function'.")
+
+(defvar-local emacs-jupyter-notebook--saved-imenu-create-index-function-local-p nil
+  "Whether `imenu-create-index-function' was buffer-local before enabling.")
+
+(defun emacs-jupyter-notebook--before-change (beg end)
+  (setq emacs-jupyter-notebook--before-change-text
+        (when (and beg end (> end beg))
+          (buffer-substring-no-properties beg end))))
+
+(defun emacs-jupyter-notebook--after-change-cleanup (_beg _end old-len)
+  (when (and (> old-len 0)
+             emacs-jupyter-notebook--before-change-text
+             (string-match-p "\\(?:^\\|\n\\)# %%" emacs-jupyter-notebook--before-change-text))
+    (emacs-jupyter-notebook-result-clear-all)
+    (emacs-jupyter-notebook-jupyter-clear-overlays)))
+
+(defun emacs-jupyter-notebook--imenu-index ()
+  "Return an imenu index of code-cell markers in the current buffer."
+  (let ((entries nil)
+        (count 0))
+    (save-excursion
+      (goto-char (point-min))
+      (while (re-search-forward code-cells-boundary-regexp nil t)
+        (setq count (1+ count))
+        (let* ((title (string-trim
+                       (buffer-substring-no-properties
+                        (match-end 0) (line-end-position))))
+               (name (if (string-empty-p title)
+                         (format "Cell %d" count)
+                       title)))
+          (push (cons name (copy-marker (match-beginning 0) t)) entries))))
+    (nreverse entries)))
+
+(defun emacs-jupyter-notebook--enable-imenu ()
+  "Use cell markers as the imenu index for the current buffer."
+  (setq emacs-jupyter-notebook--saved-imenu-create-index-function
+        imenu-create-index-function
+        emacs-jupyter-notebook--saved-imenu-create-index-function-local-p
+        (local-variable-p 'imenu-create-index-function))
+  (setq-local imenu-create-index-function
+              #'emacs-jupyter-notebook--imenu-index))
+
+(defun emacs-jupyter-notebook--disable-imenu ()
+  "Restore the imenu index function that was active before mode enable."
+  (let ((saved-function emacs-jupyter-notebook--saved-imenu-create-index-function)
+        (saved-local-p emacs-jupyter-notebook--saved-imenu-create-index-function-local-p))
+    (if saved-local-p
+        (setq-local imenu-create-index-function saved-function)
+      (kill-local-variable 'imenu-create-index-function))
+    (kill-local-variable 'emacs-jupyter-notebook--saved-imenu-create-index-function)
+    (kill-local-variable 'emacs-jupyter-notebook--saved-imenu-create-index-function-local-p)))
+
 (defvar-local emacs-jupyter-notebook--client nil
   "Current buffer's emacs-jupyter client object.")
 
@@ -37,37 +93,204 @@
 (defvar-local emacs-jupyter-notebook--async-context nil
   "Current buffer's in-progress async start or reconnect context.")
 
+(defvar-local emacs-jupyter-notebook--tunnel-dead nil
+  "Non-nil when the current buffer's SSH tunnel has disconnected.")
+
+(defvar-local emacs-jupyter-notebook--kernel-status nil
+  "Current kernel status: `busy', `idle', or nil.")
+
+(defvar-local emacs-jupyter-notebook--completion-cache nil
+  "Last completion result plist with :key and :reply.")
+
+(defvar-local emacs-jupyter-notebook--completion-pending-key nil
+  "In-flight completion request key.")
+
+(defvar-local emacs-jupyter-notebook--completion-idle-timer nil
+  "Idle timer for populating completion cache.")
+
+(defvar-local emacs-jupyter-notebook--inspect-request-id 0
+  "Monotonic inspect request id.")
+
+(defvar-local emacs-jupyter-notebook--is-complete-request-id 0
+  "Monotonic is-complete request id.")
+
+(defvar-local emacs-jupyter-notebook--evaluation-timer nil
+  "Timeout timer for current evaluation.")
+
+(defun emacs-jupyter-notebook--mode-line-string ()
+  "Return the mode line lighter string based on kernel state."
+  (cond
+   (emacs-jupyter-notebook--tunnel-dead " EJN!")
+   ((eq emacs-jupyter-notebook--kernel-status 'busy) " EJN*")
+   (t " EJN")))
+
+(defvar emacs-jupyter-notebook-cell-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "n") #'emacs-jupyter-notebook-forward-cell)
+    (define-key map (kbd "p") #'emacs-jupyter-notebook-backward-cell)
+    (define-key map (kbd "a") #'emacs-jupyter-notebook-beginning-of-cell)
+    (define-key map (kbd "e") #'emacs-jupyter-notebook-end-of-cell)
+    (define-key map (kbd "s") #'emacs-jupyter-notebook-evaluate-current-cell-and-advance)
+    (define-key map (kbd "RET") #'emacs-jupyter-notebook-evaluate-current-cell-and-advance)
+    (define-key map (kbd "i") #'emacs-jupyter-notebook-insert-cell-below)
+    (define-key map (kbd "I") #'emacs-jupyter-notebook-insert-cell-above)
+    (define-key map (kbd "d") #'emacs-jupyter-notebook-delete-cell)
+    (define-key map (kbd "k") #'emacs-jupyter-notebook-kill-cell)
+    (define-key map (kbd "K") #'emacs-jupyter-notebook-clear-cell)
+    (define-key map (kbd "y") #'emacs-jupyter-notebook-duplicate-cell)
+    (define-key map (kbd "P") #'emacs-jupyter-notebook-move-cell-up)
+    (define-key map (kbd "N") #'emacs-jupyter-notebook-move-cell-down)
+    (define-key map (kbd "@") #'code-cells-mark-cell)
+    map)
+  "Cell editing keymap for `emacs-jupyter-notebook-mode'.")
+
 (defvar emacs-jupyter-notebook-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c C-c") #'emacs-jupyter-notebook-evaluate-current-cell)
     (define-key map (kbd "C-c C-r") #'emacs-jupyter-notebook-evaluate-region)
     (define-key map (kbd "C-c C-b") #'emacs-jupyter-notebook-evaluate-buffer)
+    (define-key map (kbd "C-c TAB") #'emacs-jupyter-notebook-complete-at-point)
+    (define-key map (kbd "C-c C-d") #'emacs-jupyter-notebook-inspect-at-point)
     (define-key map (kbd "C-c C-k") #'emacs-jupyter-notebook-interrupt-kernel)
     (define-key map (kbd "C-c C-s") #'emacs-jupyter-notebook-start-remote-kernel)
     (define-key map (kbd "C-c C-n") #'emacs-jupyter-notebook-reconnect-remote-kernel)
     (define-key map (kbd "C-c C-l") #'emacs-jupyter-notebook-clear-results)
     (define-key map (kbd "C-c C-x") #'emacs-jupyter-notebook-cancel-operation)
-    (define-key map (kbd "C-c C-f") #'code-cells-forward-cell)
-    (define-key map (kbd "C-c C-p") #'code-cells-backward-cell)
+    (define-key map (kbd "C-c C-t") #'emacs-jupyter-notebook-toggle-output)
+    (define-key map (kbd "C-c C-o") #'emacs-jupyter-notebook-show-output)
+    (define-key map (kbd "C-c C-f") #'emacs-jupyter-notebook-forward-cell)
+    (define-key map (kbd "C-c C-p") #'emacs-jupyter-notebook-backward-cell)
+    (define-key map (kbd "C-c C-j") #'emacs-jupyter-notebook-evaluate-current-cell-and-advance)
+    (define-key map (kbd "C-c %") emacs-jupyter-notebook-cell-map)
     map)
   "Keymap for `emacs-jupyter-notebook-mode'.")
 
 ;;;###autoload
 (define-minor-mode emacs-jupyter-notebook-mode
   "Minor mode for evaluating local source cells in remote Jupyter kernels."
-  :lighter " EJN"
+  :lighter (:eval (emacs-jupyter-notebook--mode-line-string))
   :keymap emacs-jupyter-notebook-mode-map
   (if emacs-jupyter-notebook-mode
-      (code-cells-mode 1)
-    (code-cells-mode -1)))
+      (progn
+        (code-cells-mode 1)
+        (add-hook 'completion-at-point-functions
+                  #'emacs-jupyter-notebook-completion-at-point nil t)
+        (add-hook 'before-change-functions
+                  #'emacs-jupyter-notebook--before-change nil t)
+        (add-hook 'after-change-functions
+                  #'emacs-jupyter-notebook--after-change-cleanup nil t)
+        (emacs-jupyter-notebook--enable-imenu)
+        (emacs-jupyter-notebook--completion-start-idle-timer))
+    (code-cells-mode -1)
+    (remove-hook 'completion-at-point-functions
+                 #'emacs-jupyter-notebook-completion-at-point t)
+    (remove-hook 'before-change-functions
+                 #'emacs-jupyter-notebook--before-change t)
+    (remove-hook 'after-change-functions
+                 #'emacs-jupyter-notebook--after-change-cleanup t)
+    (emacs-jupyter-notebook--disable-imenu)
+    (emacs-jupyter-notebook--completion-cancel-idle-timer)))
 
 (add-to-list 'code-cells-eval-region-commands
-             '(emacs-jupyter-notebook-mode . emacs-jupyter-notebook-evaluate-region))
+              '(emacs-jupyter-notebook-mode . emacs-jupyter-notebook-evaluate-region))
 
-(defun emacs-jupyter-notebook--new-session-id ()
-  "Return a locally unique session id string."
-  (md5 (format "%s:%s:%s:%s"
-               (current-time-string) (float-time) (random) (emacs-pid))))
+(defun emacs-jupyter-notebook--clear-cell-region-artifacts (beg end)
+  "Clear result artifacts attached to source positions between BEG and END."
+  (emacs-jupyter-notebook-result-clear-region beg end)
+  (emacs-jupyter-notebook-jupyter-clear-overlays))
+
+(defun emacs-jupyter-notebook--clear-all-cell-artifacts ()
+  "Clear all result artifacts before structural cell edits."
+  (emacs-jupyter-notebook-result-clear-all)
+  (emacs-jupyter-notebook-jupyter-clear-overlays))
+
+(defun emacs-jupyter-notebook--goto-live-cell-start ()
+  "Move point to the current cell body when the buffer is nonempty."
+  (unless (= (point-min) (point-max))
+    (emacs-jupyter-notebook-cell-goto-code-start)))
+
+(defun emacs-jupyter-notebook-beginning-of-cell ()
+  "Move to the first editable line of the current cell."
+  (interactive)
+  (emacs-jupyter-notebook-cell-goto-code-start))
+
+(defun emacs-jupyter-notebook-end-of-cell ()
+  "Move to the end of the current cell body."
+  (interactive)
+  (emacs-jupyter-notebook-cell-goto-code-end))
+
+(defun emacs-jupyter-notebook-insert-cell-below ()
+  "Insert an empty cell below the current cell."
+  (interactive)
+  (emacs-jupyter-notebook-cell-insert-below))
+
+(defun emacs-jupyter-notebook-insert-cell-above ()
+  "Insert an empty cell above the current cell."
+  (interactive)
+  (emacs-jupyter-notebook-cell-insert-above))
+
+(defun emacs-jupyter-notebook-delete-cell ()
+  "Delete the current cell without touching the kill ring."
+  (interactive)
+  (pcase-let ((`(,beg . ,end) (emacs-jupyter-notebook-cell-full-bounds)))
+    (emacs-jupyter-notebook--clear-cell-region-artifacts beg end)
+    (delete-region beg end)
+    (emacs-jupyter-notebook--goto-live-cell-start)))
+
+(defun emacs-jupyter-notebook-kill-cell ()
+  "Kill the current cell, saving it in the kill ring."
+  (interactive)
+  (pcase-let ((`(,beg . ,end) (emacs-jupyter-notebook-cell-full-bounds)))
+    (emacs-jupyter-notebook--clear-cell-region-artifacts beg end)
+    (kill-region beg end)
+    (emacs-jupyter-notebook--goto-live-cell-start)))
+
+(defun emacs-jupyter-notebook-clear-cell ()
+  "Delete the current cell body while keeping the cell marker."
+  (interactive)
+  (pcase-let ((`(,beg . ,end) (emacs-jupyter-notebook-cell-bounds)))
+    (emacs-jupyter-notebook--clear-cell-region-artifacts beg end)
+    (delete-region beg end)
+    (goto-char beg)))
+
+(defun emacs-jupyter-notebook-duplicate-cell ()
+  "Duplicate the current cell below itself and move to the duplicate."
+  (interactive)
+  (pcase-let* ((`(,beg . ,end) (emacs-jupyter-notebook-cell-full-bounds))
+               (text (buffer-substring beg end)))
+    (goto-char end)
+    (let ((start (point)))
+      (insert text)
+      (emacs-jupyter-notebook-cell-goto-code-start start))))
+
+(defun emacs-jupyter-notebook-move-cell-up (&optional arg)
+  "Move the current cell up ARG cells and clear stale output overlays."
+  (interactive "p")
+  (emacs-jupyter-notebook--clear-all-cell-artifacts)
+  (code-cells-move-cell-up (or arg 1))
+  (emacs-jupyter-notebook-cell-goto-code-start))
+
+(defun emacs-jupyter-notebook-move-cell-down (&optional arg)
+  "Move the current cell down ARG cells and clear stale output overlays."
+  (interactive "p")
+  (emacs-jupyter-notebook--clear-all-cell-artifacts)
+  (code-cells-move-cell-down (or arg 1))
+  (emacs-jupyter-notebook-cell-goto-code-start))
+
+(defun emacs-jupyter-notebook-evaluate-current-cell-and-advance ()
+  "Evaluate the current cell, then move to the next cell when one exists."
+  (interactive)
+  (emacs-jupyter-notebook-evaluate-current-cell)
+  (condition-case nil
+      (emacs-jupyter-notebook-forward-cell 1)
+    (user-error nil)))
+
+(defun emacs-jupyter-notebook--new-session-id (&optional hint)
+  "Return a locally unique session id string, optionally containing HINT."
+  (let ((base (or hint (format "%s" (emacs-pid)))))
+    (format "%s-%s" base
+            (md5 (format "%s:%s:%s:%s"
+                         (current-time-string) (float-time) (random) (emacs-pid))))))
 
 (defun emacs-jupyter-notebook--timestamp ()
   "Return an ISO-like timestamp string."
@@ -93,6 +316,48 @@
   "Parse a remote background PID from OUTPUT."
   (when (string-match "[0-9]+" output)
     (string-to-number (match-string 0 output))))
+
+(defun emacs-jupyter-notebook--entry-profile (entry)
+  "Return a profile plist reconstructed from registry ENTRY."
+  (emacs-jupyter-notebook-ssh-profile
+   (list :profile (plist-get entry :profile)
+         :host (plist-get entry :remote-host)
+         :remote-cwd (plist-get entry :remote-cwd)
+          :remote-cache-dir (file-name-directory
+                             (plist-get entry :remote-connection-file))
+          :kernelspec (plist-get entry :kernelspec)
+          :jupyter-command (plist-get entry :jupyter-command))))
+
+(defun emacs-jupyter-notebook--current-file-registry-entry ()
+  "Return the latest registry entry for the current buffer's file, or nil."
+  (when buffer-file-name
+    (emacs-jupyter-notebook-registry-latest-for-file
+     buffer-file-name
+     (emacs-jupyter-notebook-registry-load))))
+
+(defun emacs-jupyter-notebook--remove-registry-entry (entry)
+  "Remove ENTRY from the durable registry when it has an identity key."
+  (when-let* ((key (or (plist-get entry :session-id)
+                       (plist-get entry :profile))))
+    (emacs-jupyter-notebook-registry-remove-entry key)))
+
+(defun emacs-jupyter-notebook--read-registry-entry ()
+  "Read and return a registry entry for reconnect."
+  (if-let ((entry (emacs-jupyter-notebook--current-file-registry-entry)))
+      entry
+    (let ((entries (emacs-jupyter-notebook-registry-load)))
+      (unless entries
+        (user-error "No kernel sessions found in registry"))
+      (let* ((choices (mapcar (lambda (entry)
+                                (cons (format "%s  %s  %s"
+                                              (or (plist-get entry :display-name) "kernel")
+                                              (or (plist-get entry :profile) "")
+                                              (or (plist-get entry :session-id) ""))
+                                      entry))
+                              entries))
+             (choice (completing-read "Reconnect kernel: " choices nil t)))
+        (or (cdr (assoc choice choices))
+            (error "No registry entry selected"))))))
 
 (defun emacs-jupyter-notebook--retrieve-connection-file (profile remote-file local-file)
   "Retrieve REMOTE-FILE for PROFILE into LOCAL-FILE using scp.
@@ -164,11 +429,37 @@ Signal an error when the tunnel exits or the timeout expires."
 
 (defun emacs-jupyter-notebook--process-output (process)
   "Return PROCESS output buffer contents."
-  (if-let ((buffer (process-buffer process)))
+  (string-join
+   (delq nil
+         (mapcar (lambda (buffer)
+                   (when (and buffer (buffer-live-p buffer))
+                     (with-current-buffer buffer
+                       (let ((text (string-trim (buffer-string))))
+                         (unless (string-empty-p text)
+                           text)))))
+                 (list (process-buffer process)
+                       (process-get process 'emacs-jupyter-notebook-stderr-buffer))))
+   "\n"))
+
+(defun emacs-jupyter-notebook--install-tunnel-sentinel (process buffer)
+  "Install a sentinel on PROCESS that marks the tunnel dead in BUFFER."
+  (if (not (process-live-p process))
       (when (buffer-live-p buffer)
         (with-current-buffer buffer
-          (buffer-string)))
-    ""))
+          (setq emacs-jupyter-notebook--tunnel-dead t)
+          (setq emacs-jupyter-notebook--kernel-status nil)
+          (force-mode-line-update t)))
+    (set-process-sentinel
+     process
+     (lambda (proc _event)
+       (when (memq (process-status proc) '(exit signal))
+         (when (buffer-live-p buffer)
+           (with-current-buffer buffer
+             (setq emacs-jupyter-notebook--tunnel-dead t)
+             (setq emacs-jupyter-notebook--kernel-status nil)
+             (force-mode-line-update t))))))))
+
+;;; Async machinery
 
 (defun emacs-jupyter-notebook--async-new-context (&rest properties)
   "Return a new async operation context initialized with PROPERTIES."
@@ -205,6 +496,44 @@ Signal an error when the tunnel exits or the timeout expires."
       (with-current-buffer buffer
         (setq emacs-jupyter-notebook--async-context context))))
   context)
+
+(defun emacs-jupyter-notebook--async-get (context property)
+  "Return PROPERTY from async CONTEXT."
+  (plist-get context property))
+
+(defun emacs-jupyter-notebook--async-in-progress-p ()
+  "Return non-nil when an async operation is in progress."
+  (and emacs-jupyter-notebook--async-context
+       (not (memq (plist-get emacs-jupyter-notebook--async-context :phase)
+                  '(done error nil)))))
+
+(defun emacs-jupyter-notebook--ensure-no-async-operation ()
+  "Signal when the current buffer already has an async operation running."
+  (when (emacs-jupyter-notebook--async-in-progress-p)
+    (user-error
+     "A Jupyter operation is already in progress; use M-x emacs-jupyter-notebook-cancel-operation to cancel it")))
+
+(defun emacs-jupyter-notebook--async-add-callback (context callback)
+  "Add CALLBACK to CONTEXT's callback chain."
+  (let ((existing (plist-get context :callback)))
+    (emacs-jupyter-notebook--async-put
+     context :callback
+     (if existing
+         (lambda (ctx)
+           (funcall existing ctx)
+           (funcall callback ctx))
+       callback))))
+
+(defun emacs-jupyter-notebook--async-add-error-callback (context callback)
+  "Add error CALLBACK to CONTEXT's error-callback chain."
+  (let ((existing (plist-get context :error-callback)))
+    (emacs-jupyter-notebook--async-put
+     context :error-callback
+     (if existing
+         (lambda (ctx err)
+           (funcall existing ctx err)
+           (funcall callback ctx err))
+       callback))))
 
 (defun emacs-jupyter-notebook--async-buffer-live-p (context)
   "Return non-nil when CONTEXT's origin buffer is live."
@@ -399,11 +728,13 @@ Signal an error when the tunnel exits or the timeout expires."
                   (plist-get context :profile)
                   remote-ports local-ports
                   (plist-get context :session-id))))
-    (emacs-jupyter-notebook-connection-write-file
-     rewritten (plist-get context :local-file))
+    (emacs-jupyter-notebook-connection-write-file rewritten (plist-get context :local-file))
     (setq context (emacs-jupyter-notebook--async-put context :phase 'tunnel))
     (setq context (emacs-jupyter-notebook--async-put context :local-ports local-ports))
     (setq context (emacs-jupyter-notebook--async-put context :tunnel-process tunnel))
+    (when (emacs-jupyter-notebook--async-buffer-live-p context)
+      (with-current-buffer (plist-get context :origin-buffer)
+        (emacs-jupyter-notebook--install-tunnel-sentinel tunnel (current-buffer))))
     (setq context (emacs-jupyter-notebook--async-put
                    context :deadline
                    (+ (float-time) emacs-jupyter-notebook-tunnel-wait-timeout)))
@@ -438,6 +769,42 @@ Signal an error when the tunnel exits or the timeout expires."
                       #'emacs-jupyter-notebook--async-wait-tunnel-tick context)))
           (emacs-jupyter-notebook--async-put context :timer timer)))))))
 
+(defun emacs-jupyter-notebook--async-connect-finalize (buffer entry local-ports local-file client)
+  "Finalize the async connect for BUFFER with CLIENT."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (eq (plist-get emacs-jupyter-notebook--async-context :phase) 'connect)
+        (emacs-jupyter-notebook--async-cancel-timer
+         emacs-jupyter-notebook--async-context)
+        (if (not client)
+            (emacs-jupyter-notebook--async-fail
+             emacs-jupyter-notebook--async-context
+             "Kernel did not respond to kernel_info_request")
+          (setq emacs-jupyter-notebook--client client)
+          (setq emacs-jupyter-notebook--tunnel-dead nil)
+          (setq entry (plist-put entry :tunnel-ports local-ports))
+          (setq entry (plist-put entry :local-connection-file local-file))
+          (setq emacs-jupyter-notebook--session-entry entry)
+          (let ((ctx emacs-jupyter-notebook--async-context))
+            (setq ctx (emacs-jupyter-notebook--async-put ctx :entry entry))
+            (setq ctx (emacs-jupyter-notebook--async-put ctx :phase 'done))
+            (emacs-jupyter-notebook-registry-save-entry entry)
+            (emacs-jupyter-notebook--async-message
+             ctx "connected to remote Jupyter kernel %s"
+             (plist-get ctx :session-id))
+            (let ((cb (plist-get ctx :callback)))
+              (when cb
+                (funcall cb ctx)))))))))
+
+(defun emacs-jupyter-notebook--async-connect-timeout (buffer)
+  "Check if async connect for BUFFER has timed out."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (eq (plist-get emacs-jupyter-notebook--async-context :phase) 'connect)
+        (emacs-jupyter-notebook--async-fail
+         emacs-jupyter-notebook--async-context
+         "Timed out waiting for kernel_info_reply")))))
+
 (defun emacs-jupyter-notebook--async-connect (context)
   "Connect emacs-jupyter to the ready tunnel described by CONTEXT."
   (setq context (emacs-jupyter-notebook--async-put context :phase 'connect))
@@ -448,31 +815,34 @@ Signal an error when the tunnel exits or the timeout expires."
       (condition-case err
           (let* ((entry (copy-sequence (plist-get context :entry)))
                  (local-ports (plist-get context :local-ports))
-                 (local-file (plist-get context :local-file)))
+                 (local-file (plist-get context :local-file))
+                 (buffer (current-buffer)))
             (emacs-jupyter-notebook--async-message
              context "connecting emacs-jupyter client")
             (setq emacs-jupyter-notebook--tunnel-process
                   (plist-get context :tunnel-process))
-            (setq emacs-jupyter-notebook--client
-                  (emacs-jupyter-notebook-jupyter-connect local-file))
-            (setq entry (plist-put entry :tunnel-ports local-ports))
-            (setq entry (plist-put entry :local-connection-file local-file))
-            (setq emacs-jupyter-notebook--session-entry entry)
-            (setq context (emacs-jupyter-notebook--async-put context :entry entry))
-            (setq context (emacs-jupyter-notebook--async-put context :phase 'done))
-            (emacs-jupyter-notebook-registry-save-entry entry)
-            (emacs-jupyter-notebook--async-message
-             context "connected to remote Jupyter kernel %s"
-             (plist-get context :session-id))
-            (when-let ((callback (plist-get context :callback)))
-              (funcall callback context))
+            (emacs-jupyter-notebook--install-tunnel-sentinel
+              emacs-jupyter-notebook--tunnel-process buffer)
+            (let ((timer (run-at-time
+                          emacs-jupyter-notebook-jupyter-connect-timeout nil
+                          #'emacs-jupyter-notebook--async-connect-timeout
+                          buffer)))
+              (setq context (emacs-jupyter-notebook--async-put context :timer timer)))
+            (emacs-jupyter-notebook-jupyter-connect-async
+             local-file
+             (lambda (client)
+               (emacs-jupyter-notebook--async-connect-finalize
+                buffer entry local-ports local-file client)))
             context)
         (error
          (emacs-jupyter-notebook--async-fail
           context (error-message-string err)))))))
 
-(defun emacs-jupyter-notebook--async-start-context (profile entry session-id launch)
-  "Create and store an async start context for PROFILE, ENTRY and LAUNCH."
+(defun emacs-jupyter-notebook--async-start-context (profile entry session-id launch
+                                                     &optional callback error-callback)
+  "Create and store an async start context.
+PROFILE, ENTRY, SESSION-ID, and LAUNCH describe the kernel.
+CALLBACK and ERROR-CALLBACK are optional completion hooks."
   (let ((context (emacs-jupyter-notebook--async-new-context
                   :phase 'launch
                   :profile profile
@@ -480,31 +850,40 @@ Signal an error when the tunnel exits or the timeout expires."
                   :session-id session-id
                   :launch launch
                   :origin-buffer (current-buffer)
-                  :owns-kernel t)))
+                  :owns-kernel t
+                  :callback callback
+                  :error-callback error-callback)))
     (setq emacs-jupyter-notebook--async-context context)
     context))
 
-(defun emacs-jupyter-notebook--async-reconnect-context (profile entry)
-  "Create and store an async reconnect context for PROFILE and ENTRY."
+(defun emacs-jupyter-notebook--async-reconnect-context (profile entry
+                                                        &optional callback error-callback)
+  "Create and store an async reconnect context for PROFILE and ENTRY.
+CALLBACK and ERROR-CALLBACK are optional completion hooks."
   (let ((context (emacs-jupyter-notebook--async-new-context
                   :phase 'retrieve
                   :profile profile
                   :entry entry
                   :session-id (plist-get entry :session-id)
                   :origin-buffer (current-buffer)
-                  :owns-kernel nil)))
+                  :owns-kernel nil
+                  :callback callback
+                  :error-callback error-callback)))
     (setq emacs-jupyter-notebook--async-context context)
     context))
 
-(defun emacs-jupyter-notebook-cancel-operation ()
-  "Cancel the current buffer's in-progress async Jupyter operation."
-  (interactive)
-  (if emacs-jupyter-notebook--async-context
-      (progn
-        (emacs-jupyter-notebook--async-fail
-         emacs-jupyter-notebook--async-context "Operation cancelled")
-        (setq emacs-jupyter-notebook--async-context nil))
-    (user-error "No emacs-jupyter-notebook operation is in progress")))
+(defun emacs-jupyter-notebook--tunnel-reconnect (buffer &optional callback error-callback)
+  "Reconnect the tunnel for BUFFER asynchronously.
+CALLBACK is called on success, ERROR-CALLBACK on failure."
+  (when-let* ((entry emacs-jupyter-notebook--session-entry))
+    (let* ((profile (emacs-jupyter-notebook--entry-profile entry))
+           (context (emacs-jupyter-notebook--async-reconnect-context
+                     profile entry callback error-callback)))
+      (with-current-buffer buffer
+        (setq emacs-jupyter-notebook--async-context context))
+      (emacs-jupyter-notebook--async-retrieve context))))
+
+;;; Synchronous connect path
 
 (defun emacs-jupyter-notebook--connect-entry (entry profile)
   "Connect current buffer to remote kernel ENTRY using PROFILE."
@@ -522,6 +901,8 @@ Signal an error when the tunnel exits or the timeout expires."
                   profile remote-ports local-ports session-id)))
     (emacs-jupyter-notebook-connection-write-file rewritten local-file)
     (setq emacs-jupyter-notebook--tunnel-process tunnel)
+    (setq emacs-jupyter-notebook--tunnel-dead nil)
+    (emacs-jupyter-notebook--install-tunnel-sentinel tunnel (current-buffer))
     (emacs-jupyter-notebook--wait-for-tunnel tunnel local-ports)
     (setq emacs-jupyter-notebook--client
           (emacs-jupyter-notebook-jupyter-connect local-file))
@@ -531,75 +912,234 @@ Signal an error when the tunnel exits or the timeout expires."
     (emacs-jupyter-notebook-registry-save-entry entry)
     entry))
 
+;;; Ensure client (async)
+
+(defun emacs-jupyter-notebook--ensure-client-async (callback error-callback)
+  "Ensure a kernel client is connected, then call CALLBACK.
+On failure, call ERROR-CALLBACK with (context error-data)."
+  (cond
+   (emacs-jupyter-notebook--tunnel-dead
+    (emacs-jupyter-notebook--tunnel-reconnect
+     (current-buffer) callback error-callback))
+   (emacs-jupyter-notebook--client
+    (funcall callback nil))
+   ((emacs-jupyter-notebook--async-in-progress-p)
+     (emacs-jupyter-notebook--async-add-callback
+      emacs-jupyter-notebook--async-context callback)
+     (when error-callback
+       (emacs-jupyter-notebook--async-add-error-callback
+        emacs-jupyter-notebook--async-context error-callback)))
+   (t
+     (if-let ((entry (emacs-jupyter-notebook--current-file-registry-entry)))
+         (emacs-jupyter-notebook-reconnect-remote-kernel
+          entry callback
+          (lambda (_context error-data)
+            (emacs-jupyter-notebook--remove-registry-entry entry)
+            (message "emacs-jupyter-notebook: reconnect failed (%s); starting a new kernel"
+                     error-data)
+            (emacs-jupyter-notebook-start-remote-kernel
+             emacs-jupyter-notebook-default-profile callback error-callback)))
+       (emacs-jupyter-notebook-start-remote-kernel
+        emacs-jupyter-notebook-default-profile callback error-callback)))))
+
+;;; Completion
+
+(defun emacs-jupyter-notebook--completion-context ()
+  "Build a completion context from the current cell."
+  (let* ((code (emacs-jupyter-notebook-cell-code))
+         (bounds (emacs-jupyter-notebook-cell-bounds))
+         (beg (car bounds))
+         (cursor-pos (- (point) beg)))
+    (list :key (format "%s:%d" code cursor-pos)
+          :code code
+          :cursor-pos cursor-pos)))
+
+(defun emacs-jupyter-notebook--completion-result ()
+  "Return cached CAPF result or nil."
+  (when (and emacs-jupyter-notebook--completion-cache
+             emacs-jupyter-notebook--client
+             (not (eq emacs-jupyter-notebook--kernel-status 'busy)))
+    (let* ((context (emacs-jupyter-notebook--completion-context))
+           (cache emacs-jupyter-notebook--completion-cache)
+           (key (plist-get context :key)))
+      (when (equal (plist-get cache :key) key)
+        (let* ((reply (plist-get cache :reply))
+               (matches (plist-get reply :matches))
+               (cursor-start (plist-get reply :cursor_start))
+               (cursor-end (plist-get reply :cursor_end)))
+          (when matches
+            (list (- (point) (- cursor-end cursor-start))
+                  (point)
+                  (append matches nil))))))))
+
+(defun emacs-jupyter-notebook--request-completion (&optional show-results)
+  "Fire an async completion request and update cache on reply."
+  (when emacs-jupyter-notebook--client
+    (let* ((context (emacs-jupyter-notebook--completion-context))
+           (key (plist-get context :key))
+           (code (plist-get context :code))
+           (cursor-pos (plist-get context :cursor-pos))
+           (buffer (current-buffer)))
+      (unless (equal emacs-jupyter-notebook--completion-pending-key key)
+        (setq emacs-jupyter-notebook--completion-pending-key key)
+        (emacs-jupyter-notebook-jupyter-complete
+          emacs-jupyter-notebook--client code cursor-pos
+          (lambda (reply _error)
+            (when (buffer-live-p buffer)
+              (with-current-buffer buffer
+                (when (equal emacs-jupyter-notebook--completion-pending-key key)
+                  (setq emacs-jupyter-notebook--completion-pending-key nil)
+                  (when reply
+                    (setq emacs-jupyter-notebook--completion-cache
+                          (list :key key :reply reply))
+                    (when (and show-results
+                               (equal (emacs-jupyter-notebook--completion-context)
+                                      context))
+                      (let ((result (emacs-jupyter-notebook--completion-result)))
+                        (when result
+                          (apply #'completion-in-region result))))))))))))))
+
+(defun emacs-jupyter-notebook-completion-at-point ()
+  "CAPF function: return cached completions or fire async request."
+  (when (and emacs-jupyter-notebook--client
+             (not (eq emacs-jupyter-notebook--kernel-status 'busy)))
+    (let ((result (emacs-jupyter-notebook--completion-result)))
+      (if result
+          result
+        (when (memq this-command
+                    '(self-insert-command
+                      delete-backward-char
+                      backward-delete-char-untabify
+                      yank))
+          (emacs-jupyter-notebook--request-completion t))
+        nil))))
+
+(defun emacs-jupyter-notebook-complete-at-point ()
+  "Explicit completion command."
+  (interactive)
+  (unless emacs-jupyter-notebook--client
+    (user-error "No Jupyter kernel connected"))
+  (emacs-jupyter-notebook--request-completion t))
+
+(defun emacs-jupyter-notebook--completion-start-idle-timer ()
+  "Start the completion cache idle timer."
+  (emacs-jupyter-notebook--completion-cancel-idle-timer)
+  (setq emacs-jupyter-notebook--completion-idle-timer
+        (run-with-idle-timer 0.5 nil #'emacs-jupyter-notebook--completion-idle-populate)))
+
+(defun emacs-jupyter-notebook--completion-cancel-idle-timer ()
+  "Cancel the completion cache idle timer."
+  (when (timerp emacs-jupyter-notebook--completion-idle-timer)
+    (cancel-timer emacs-jupyter-notebook--completion-idle-timer))
+  (setq emacs-jupyter-notebook--completion-idle-timer nil))
+
+(defun emacs-jupyter-notebook--completion-idle-populate ()
+  "Populate completion cache on idle."
+  (when (and emacs-jupyter-notebook-mode
+             emacs-jupyter-notebook--client
+             (not (eq emacs-jupyter-notebook--kernel-status 'busy))
+             (not (emacs-jupyter-notebook--async-in-progress-p)))
+    (let* ((context (emacs-jupyter-notebook--completion-context))
+           (key (plist-get context :key)))
+      (unless (or (equal key emacs-jupyter-notebook--completion-pending-key)
+                  (equal key (plist-get emacs-jupyter-notebook--completion-cache :key)))
+        (emacs-jupyter-notebook--request-completion)))))
+
+;;; Inspect
+
+(defun emacs-jupyter-notebook-inspect-at-point ()
+  "Inspect the symbol at point using the Jupyter kernel."
+  (interactive)
+  (unless emacs-jupyter-notebook--client
+    (user-error "No Jupyter kernel connected"))
+  (let* ((code (emacs-jupyter-notebook-cell-code))
+         (bounds (emacs-jupyter-notebook-cell-bounds))
+         (beg (car bounds))
+         (cursor-pos (- (point) beg)))
+    (emacs-jupyter-notebook-jupyter-inspect
+     emacs-jupyter-notebook--client code cursor-pos 0
+     (lambda (reply _error)
+       (when reply
+         (let* ((data (plist-get reply :data))
+                (text (plist-get data :text/plain)))
+           (when text
+             (display-message-or-buffer text))))))))
+
+;;; Completeness check
+
+(defun emacs-jupyter-notebook--evaluate-after-completeness (code beg end)
+  "Check CODE completeness and evaluate if complete.
+BEG and END are source bounds."
+  (if (not emacs-jupyter-notebook-check-code-completeness)
+      (emacs-jupyter-notebook--evaluate-code-now code beg end)
+    (emacs-jupyter-notebook-jupyter-is-complete
+     emacs-jupyter-notebook--client code
+     (lambda (reply _error)
+       (when (and reply (equal (plist-get reply :status) "complete"))
+         (emacs-jupyter-notebook--evaluate-code-now code beg end))))))
+
+;;; Evaluation
+
+(defun emacs-jupyter-notebook--evaluate-code-now (code beg end)
+  "Evaluate CODE immediately for source range BEG to END."
+  (let ((modified (buffer-modified-p)))
+    (prog1
+        (emacs-jupyter-notebook-jupyter-evaluate
+         emacs-jupyter-notebook--client code beg end)
+      (set-buffer-modified-p modified))))
+
+(defun emacs-jupyter-notebook--evaluate-code (code beg end)
+  "Ensure client then evaluate CODE for source range BEG to END."
+  (let ((eval-cb (lambda (_ctx)
+                   (emacs-jupyter-notebook--evaluate-after-completeness code beg end)))
+        (error-cb (lambda (_ctx err)
+                    (message "emacs-jupyter-notebook: evaluation failed: %s" err))))
+    (emacs-jupyter-notebook--ensure-client-async eval-cb error-cb)))
+
+;;; Commands
+
 ;;;###autoload
-(defun emacs-jupyter-notebook-start-remote-kernel (profile-name)
-  "Start a detached remote kernel for PROFILE-NAME asynchronously."
+(defun emacs-jupyter-notebook-start-remote-kernel (profile-name &optional callback error-callback)
+  "Start a detached remote kernel for PROFILE-NAME asynchronously.
+  CALLBACK and ERROR-CALLBACK are optional completion hooks."
   (interactive (list (emacs-jupyter-notebook--read-profile-name)))
+  (unless buffer-file-name
+    (user-error "Buffer has no associated file"))
+  (emacs-jupyter-notebook--ensure-no-async-operation)
   (emacs-jupyter-notebook-jupyter--ensure)
   (let* ((profile (emacs-jupyter-notebook--read-host-profile profile-name))
-         (session-id (emacs-jupyter-notebook--new-session-id))
+         (session-id (emacs-jupyter-notebook--new-session-id
+                      (file-name-base buffer-file-name)))
          (launch (emacs-jupyter-notebook-ssh-build-remote-launch profile session-id))
          (entry (list :profile (plist-get profile :profile)
-                      :remote-host (emacs-jupyter-notebook-ssh-destination profile)
-                      :remote-cwd (plist-get profile :remote-cwd)
-                      :kernelspec (plist-get profile :kernelspec)
-                      :remote-connection-file (plist-get launch :connection-file)
+                       :remote-host (emacs-jupyter-notebook-ssh-destination profile)
+                       :remote-cwd (plist-get profile :remote-cwd)
+                       :kernelspec (plist-get profile :kernelspec)
+                       :jupyter-command (plist-get profile :jupyter-command)
+                       :remote-connection-file (plist-get launch :connection-file)
                       :remote-pid nil
                       :created-at (emacs-jupyter-notebook--timestamp)
                       :tunnel-ports nil
                       :display-name (format "%s:%s"
                                             (emacs-jupyter-notebook-ssh-destination profile)
                                             (plist-get profile :kernelspec))
-                      :session-id session-id)))
-    (emacs-jupyter-notebook--async-launch
-     (emacs-jupyter-notebook--async-start-context
-      profile entry session-id launch))))
-
-(defun emacs-jupyter-notebook--entry-profile (entry)
-  "Return a profile plist reconstructed from registry ENTRY."
-  (emacs-jupyter-notebook-ssh-profile
-   (list :profile (plist-get entry :profile)
-         :host (plist-get entry :remote-host)
-         :remote-cwd (plist-get entry :remote-cwd)
-         :remote-cache-dir (file-name-directory
-                            (plist-get entry :remote-connection-file))
-         :kernelspec (plist-get entry :kernelspec))))
-
-(defun emacs-jupyter-notebook--read-registry-entry ()
-  "Read and return a registry entry for reconnect."
-  (let* ((entries (emacs-jupyter-notebook-registry-load))
-         (choices (mapcar (lambda (entry)
-                            (cons (format "%s  %s  %s"
-                                          (or (plist-get entry :display-name) "kernel")
-                                          (or (plist-get entry :profile) "")
-                                          (or (plist-get entry :session-id) ""))
-                                  entry))
-                          entries))
-         (choice (completing-read "Reconnect kernel: " choices nil t)))
-    (or (cdr (assoc choice choices))
-        (error "No registry entry selected"))))
+                      :session-id session-id
+                      :local-file buffer-file-name))
+         (context (emacs-jupyter-notebook--async-start-context
+                   profile entry session-id launch callback error-callback)))
+    (setq context (emacs-jupyter-notebook--async-launch context))
+    context))
 
 ;;;###autoload
-(defun emacs-jupyter-notebook-reconnect-remote-kernel (entry)
-  "Reconnect current buffer to an existing remote kernel ENTRY asynchronously."
+(defun emacs-jupyter-notebook-reconnect-remote-kernel (entry &optional callback error-callback)
+  "Reconnect current buffer to an existing remote kernel ENTRY asynchronously.
+  CALLBACK and ERROR-CALLBACK are optional completion hooks."
   (interactive (list (emacs-jupyter-notebook--read-registry-entry)))
+  (emacs-jupyter-notebook--ensure-no-async-operation)
   (emacs-jupyter-notebook-jupyter--ensure)
   (let ((profile (emacs-jupyter-notebook--entry-profile entry)))
     (emacs-jupyter-notebook--async-retrieve
-     (emacs-jupyter-notebook--async-reconnect-context profile entry))))
-
-(defun emacs-jupyter-notebook--ensure-client ()
-  "Return the current buffer's kernel client or signal an error."
-  (or emacs-jupyter-notebook--client
-      (error "No Jupyter kernel connected; run `emacs-jupyter-notebook-start-remote-kernel'")))
-
-(defun emacs-jupyter-notebook--evaluate-code (code beg end)
-  "Evaluate CODE for source range BEG to END without changing source text."
-  (let ((modified (buffer-modified-p)))
-    (prog1
-        (emacs-jupyter-notebook-jupyter-evaluate
-         (emacs-jupyter-notebook--ensure-client) code beg end)
-      (set-buffer-modified-p modified))))
+     (emacs-jupyter-notebook--async-reconnect-context profile entry callback error-callback))))
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-evaluate-current-cell ()
@@ -640,7 +1180,7 @@ Signal an error when the tunnel exits or the timeout expires."
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-shutdown-kernel ()
-  "Shut down the current kernel and close the local tunnel."
+  "Shut down the current kernel, close tunnel, and reset state."
   (interactive)
   (when emacs-jupyter-notebook--client
     (emacs-jupyter-notebook-jupyter-shutdown emacs-jupyter-notebook--client))
@@ -654,9 +1194,17 @@ Signal an error when the tunnel exits or the timeout expires."
               (key (or (plist-get entry :session-id)
                        (plist-get entry :profile))))
     (emacs-jupyter-notebook-registry-remove-entry key))
+  (when-let* ((entry emacs-jupyter-notebook--session-entry)
+              (local-file (plist-get entry :local-connection-file)))
+    (emacs-jupyter-notebook--async-delete-file local-file))
   (setq emacs-jupyter-notebook--client nil
         emacs-jupyter-notebook--session-entry nil
-        emacs-jupyter-notebook--tunnel-process nil))
+        emacs-jupyter-notebook--tunnel-process nil
+        emacs-jupyter-notebook--tunnel-dead nil
+        emacs-jupyter-notebook--kernel-status nil
+        emacs-jupyter-notebook--async-context nil
+        emacs-jupyter-notebook--evaluation-timer nil)
+  (force-mode-line-update t))
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-clear-results ()
@@ -664,6 +1212,39 @@ Signal an error when the tunnel exits or the timeout expires."
   (interactive)
   (emacs-jupyter-notebook-result-clear-all)
   (emacs-jupyter-notebook-jupyter-clear-overlays))
+
+(defun emacs-jupyter-notebook-cancel-operation ()
+  "Cancel the current buffer's in-progress async Jupyter operation."
+  (interactive)
+  (if emacs-jupyter-notebook--async-context
+      (progn
+        (emacs-jupyter-notebook--async-fail
+         emacs-jupyter-notebook--async-context "Operation cancelled")
+        (setq emacs-jupyter-notebook--async-context nil))
+    (user-error "No emacs-jupyter-notebook operation is in progress")))
+
+(defun emacs-jupyter-notebook-show-output ()
+  "Open the full output of the nearest result overlay in a dedicated buffer."
+  (interactive)
+  (let ((ov (emacs-jupyter-notebook-result--nearest-overlay)))
+    (unless ov
+      (user-error "No result overlay at or near point"))
+    (let* ((content (or (overlay-get ov 'emacs-jupyter-notebook-result-full-content)
+                        (overlay-get ov 'emacs-jupyter-notebook-content)
+                        ""))
+           (buf (get-buffer-create "*ejn-output*")))
+      (with-current-buffer buf
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert content)
+          (goto-char (point-min)))
+        (setq buffer-read-only t))
+      (display-buffer buf))))
+
+(defun emacs-jupyter-notebook--ensure-client ()
+  "Return the current buffer's kernel client or signal an error."
+  (or emacs-jupyter-notebook--client
+      (error "No Jupyter kernel connected; run `emacs-jupyter-notebook-start-remote-kernel'")))
 
 (provide 'emacs-jupyter-notebook)
 
