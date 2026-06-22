@@ -1384,6 +1384,7 @@
 (ert-deftest ejn-result-overlay-stays-before-inserted-text-at-anchor ()
   (with-temp-buffer
     (insert "# %%\nplt.show()")
+    (emacs-jupyter-notebook-mode 1)
     (let* ((end (point-max))
            (ov (emacs-jupyter-notebook-result-start (point-min) end)))
       (emacs-jupyter-notebook-result-set-image ov '(image :type png :data "fake"))
@@ -1393,6 +1394,22 @@
       (should (= (overlay-end ov) end))
       (should (equal (buffer-substring-no-properties end (point-max))
                      "\n# %%\n")))))
+
+(ert-deftest ejn-result-overlay-moves-after-source-edit-at-anchor ()
+  (with-temp-buffer
+    (insert "# %%\nplt.show()")
+    (emacs-jupyter-notebook-mode 1)
+    (let* ((anchor (point-max))
+           (ov (emacs-jupyter-notebook-result-start (point-min) anchor)))
+      (emacs-jupyter-notebook-result-set-image ov '(image :type png :data "fake"))
+      (goto-char anchor)
+      (insert "  # edited")
+      (should (= (overlay-start ov) (point-max)))
+      (should (= (overlay-end ov) (point-max)))
+      (should (= (overlay-get ov 'emacs-jupyter-notebook-source-end)
+                 (point-max)))
+      (should (equal (buffer-substring-no-properties anchor (point-max))
+                     "  # edited")))))
 
 (ert-deftest ejn-result-append-clears-image ()
   (with-temp-buffer

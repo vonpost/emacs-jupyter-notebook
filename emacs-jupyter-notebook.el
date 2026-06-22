@@ -38,7 +38,29 @@
         (when (and beg end (> end beg))
           (buffer-substring-no-properties beg end))))
 
-(defun emacs-jupyter-notebook--after-change-cleanup (_beg _end old-len)
+(defun emacs-jupyter-notebook--insert-belongs-after-output-p (text)
+  "Return non-nil when inserted TEXT should stay below result output."
+  (or (equal text "\n")
+      (string-match-p "\\`\\(?:\n\\)?# %%" text)))
+
+(defun emacs-jupyter-notebook--after-change-adjust-result-anchors (beg end old-len)
+  "Keep result overlays usable after insertions at their anchor.
+Non-newline text inserted at a result anchor is a source edit, so move the
+result after it.  Newlines and cell markers inserted at the anchor are treated
+as new text below the output, so the result stays in place."
+  (when (and (zerop old-len) (< beg end))
+    (let ((inserted (buffer-substring-no-properties beg end)))
+      (unless (emacs-jupyter-notebook--insert-belongs-after-output-p inserted)
+        (dolist (ov (emacs-jupyter-notebook-result--all-overlays))
+          (when (and (= (overlay-start ov) beg)
+                     (= (overlay-end ov) beg)
+                     (= (or (overlay-get ov 'emacs-jupyter-notebook-source-end) beg)
+                        beg))
+            (move-overlay ov end end)
+            (overlay-put ov 'emacs-jupyter-notebook-source-end end)))))))
+
+(defun emacs-jupyter-notebook--after-change-cleanup (beg end old-len)
+  (emacs-jupyter-notebook--after-change-adjust-result-anchors beg end old-len)
   (when (and (> old-len 0)
              emacs-jupyter-notebook--before-change-text
              (string-match-p "\\(?:^\\|\n\\)# %%" emacs-jupyter-notebook--before-change-text))
