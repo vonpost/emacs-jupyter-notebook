@@ -77,12 +77,10 @@ With ARG, repeat that many times.  Negative ARG moves forward."
 
 (defun emacs-jupyter-notebook-cell-goto-code-end ()
   "Move to the end of the current cell code."
-  (interactive)
   (goto-char (emacs-jupyter-notebook-cell-end-position)))
 
 (defun emacs-jupyter-notebook-cell-insert-below ()
   "Insert an empty cell below the current cell and move into it."
-  (interactive)
   (pcase-let ((`(,_beg . ,end) (emacs-jupyter-notebook-cell-full-bounds)))
     (goto-char end)
     (unless (or (bolp) (= (point) (point-min)))
@@ -93,7 +91,6 @@ With ARG, repeat that many times.  Negative ARG moves forward."
 
 (defun emacs-jupyter-notebook-cell-insert-above ()
   "Insert an empty cell above the current cell and move into it."
-  (interactive)
   (pcase-let ((`(,beg . ,_end) (emacs-jupyter-notebook-cell-full-bounds)))
     (goto-char beg)
     (let ((start (point)))

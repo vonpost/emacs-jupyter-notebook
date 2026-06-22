@@ -1282,7 +1282,6 @@ non-nil, do not send a Jupyter shutdown request to the current client."
   (emacs-jupyter-notebook--evaluate-code
    (buffer-substring-no-properties beg end) beg end))
 
-;;;###autoload
 (defun emacs-jupyter-notebook-evaluate-buffer ()
   "Evaluate the current buffer."
   (interactive)
@@ -1310,7 +1309,6 @@ non-nil, do not send a Jupyter shutdown request to the current client."
   (interactive)
   (emacs-jupyter-notebook--cleanup-current-state "Kernel shut down"))
 
-;;;###autoload
 (defun emacs-jupyter-notebook-retry-fresh-kernel (&optional profile-name)
   "Cancel/cleanup current state and start a fresh kernel.
 With PROFILE-NAME, start that profile.  Otherwise reuse the current session's
@@ -1335,7 +1333,6 @@ profile, then fall back to `emacs-jupyter-notebook-default-profile'."
         (emacs-jupyter-notebook--display-command-output "*ejn-status*" text)
       text)))
 
-;;;###autoload
 (defun emacs-jupyter-notebook-fetch-remote-log ()
   "Fetch and display the current session's remote kernel log."
   (interactive)
@@ -1351,7 +1348,6 @@ profile, then fall back to `emacs-jupyter-notebook-default-profile'."
       (emacs-jupyter-notebook-ssh-build-remote-cat-log
        (emacs-jupyter-notebook--entry-profile entry) connection-file)))))
 
-;;;###autoload
 (defun emacs-jupyter-notebook-list-remote-processes (&optional profile-name)
   "List likely remote EJN kernel processes for PROFILE-NAME."
   (interactive (list (emacs-jupyter-notebook--read-profile-name)))
@@ -1362,7 +1358,6 @@ profile, then fall back to `emacs-jupyter-notebook-default-profile'."
      (emacs-jupyter-notebook-ssh-run-command
       (emacs-jupyter-notebook-ssh-build-remote-ps-command profile)))))
 
-;;;###autoload
 (defun emacs-jupyter-notebook-clean-orphaned-kernels (&optional profile-name)
   "Clean all EJN kernel files and processes in PROFILE-NAME's remote cache."
   (interactive (list (emacs-jupyter-notebook--read-profile-name)))

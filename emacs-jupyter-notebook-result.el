@@ -260,7 +260,6 @@ for images.  Return nil if no suitable MIME type is found."
 
 (defun emacs-jupyter-notebook-result-clear-all ()
   "Clear all package-owned result overlays in the current buffer."
-  (interactive)
   (mapc #'delete-overlay (emacs-jupyter-notebook-result--all-overlays))
   (setq emacs-jupyter-notebook-result--overlays nil)
   (emacs-jupyter-notebook-result--clear-all-execution-counts))

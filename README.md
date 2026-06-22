@@ -52,23 +52,22 @@ If no kernel is connected, evaluation starts or reconnects to one using the defa
 
 If `jupyter` is not directly on the remote `PATH`, set `:jupyter-command` in the profile.
 
-## Useful Commands
+## Core Commands
 
 | Key | Command |
 | --- | --- |
 | `C-c C-c` | evaluate current cell |
 | `C-c C-r` | evaluate region |
-| `C-c C-b` | evaluate buffer |
-| `C-c C-o` | open full output as real text |
-| `C-c C-t` | collapse/expand inline output |
 | `C-c C-j` | evaluate cell and advance |
-| `C-c %` | cell commands: next/previous, insert, delete, duplicate, move |
-| `C-c TAB` | complete at point |
-| `C-c C-d` | inspect at point |
 | `C-c C-k` | interrupt kernel |
 | `C-c C-s` | start remote kernel |
 | `C-c C-n` | reconnect remote kernel |
+| `C-c C-/` | show engine/session status |
 | `C-c C-l` | clear results |
+
+Less common but useful commands remain keybound: `C-c C-b` evaluates the full buffer, `C-c C-o` opens full output as text, `C-c C-t` toggles output, `C-c TAB` completes, `C-c C-d` inspects, and `C-c %` opens the cell command prefix.
+
+Recovery and diagnostics are intentionally secondary: `C-c C-y` retries with a fresh kernel, `C-c C-v` fetches the remote log, `C-c C-q` lists remote processes, and `C-c C-w` cleans orphaned remote kernels.
 
 ## Notes
 
