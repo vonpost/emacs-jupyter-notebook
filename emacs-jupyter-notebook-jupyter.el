@@ -136,7 +136,7 @@
                 lines)))
       (concat "\n[watch]\n" (string-join (nreverse lines) "\n") "\n"))))
 
-(defun emacs-jupyter-notebook-jupyter--callbacks (buffer ov cell-beg &optional client)
+(defun emacs-jupyter-notebook-jupyter--callbacks (buffer ov &optional client)
   "Return execution callbacks that render into OV in BUFFER."
   (let ((had-result nil))
     `(("input_request"
@@ -256,7 +256,7 @@
                        'emacs-jupyter-notebook-result-error-face)))
                   (when (and count (buffer-live-p buffer))
                     (with-current-buffer buffer
-                      (emacs-jupyter-notebook-result--set-execution-count cell-beg count)))
+                       (emacs-jupyter-notebook-result--set-execution-count ov count)))
                   (emacs-jupyter-notebook-jupyter--finish-result buffer ov)))
             (error nil))))
       ("status"
@@ -384,10 +384,10 @@ the synchronous emacs-jupyter connect blocks the event loop."
         (jupyter-eval-string code nil beg end))
     (let* ((buffer (current-buffer))
            (ov (emacs-jupyter-notebook-result-start beg end))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer ov beg))
+            (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer ov))
            (watch-expressions
             (emacs-jupyter-notebook-jupyter--watch-expressions-plist)))
-      (emacs-jupyter-notebook-result--set-busy-indicator beg)
+       (emacs-jupyter-notebook-result--set-busy-indicator ov)
       (when (timerp emacs-jupyter-notebook--evaluation-timer)
         (cancel-timer emacs-jupyter-notebook--evaluation-timer))
       (setq emacs-jupyter-notebook--evaluation-timer

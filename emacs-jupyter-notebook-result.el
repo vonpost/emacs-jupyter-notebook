@@ -40,9 +40,6 @@
 (defvar-local emacs-jupyter-notebook-result--overlays nil
   "Package-owned result overlays in the current buffer.")
 
-(defvar-local emacs-jupyter-notebook-result--execution-count-overlays nil
-  "Execution count overlays in the current buffer.")
-
 (defun emacs-jupyter-notebook--select-mime-type (data)
   "Select the best MIME type from DATA plist.
 Return (cons mime-type content) or nil."
@@ -153,14 +150,15 @@ for images.  Return nil if no suitable MIME type is found."
   (let* ((image (overlay-get ov 'emacs-jupyter-notebook-image))
          (content (or (overlay-get ov 'emacs-jupyter-notebook-content) ""))
          (running (overlay-get ov 'emacs-jupyter-notebook-running))
-         (collapsed (overlay-get ov 'emacs-jupyter-notebook-collapsed)))
+         (collapsed (overlay-get ov 'emacs-jupyter-notebook-collapsed))
+         (count (or (overlay-get ov 'emacs-jupyter-notebook-execution-count) "")))
     (overlay-put ov 'emacs-jupyter-notebook-result-full-content content)
     (if image
-        (let ((header (format "\n[%s]\n" (if running "running" "output"))))
+        (let ((header (format "\n[%s] [%s]\n" count (if running "running" "output"))))
           (overlay-put ov 'after-string
                        (if collapsed
                            (concat (emacs-jupyter-notebook-result--cursor-spacer)
-                                   (propertize (format "\n[output: image, hidden]\n")
+                                   (propertize (format "\n[%s] [output: image, hidden]\n" count)
                                                'face 'emacs-jupyter-notebook-result-header-face))
                          (concat (emacs-jupyter-notebook-result--cursor-spacer)
                                  (propertize header 'face 'emacs-jupyter-notebook-result-header-face)
@@ -177,32 +175,35 @@ for images.  Return nil if no suitable MIME type is found."
                        (byte-truncated "")
                        (t (emacs-jupyter-notebook-result--slice-lines
                            content 0 inline-lines))))
-             (header (format "\n[%s]\n"
-                             (if running "running" "output")))
+             (header (format "\n[%s] [%s]\n"
+                             count (if running "running" "output")))
              (visible (copy-sequence visible))
-             (_ (unless (string-empty-p visible)
-                  (add-face-text-property
-                   0 (length visible) 'emacs-jupyter-notebook-result-face 'append visible)))
-             (display (if collapsed
-                          (propertize (format "\n[output: %d lines, hidden]\n" line-count)
-                                      'face 'emacs-jupyter-notebook-result-header-face)
-                        (concat
-                         (propertize header 'face 'emacs-jupyter-notebook-result-header-face)
-                         visible
-                         (unless (or (string-empty-p visible)
-                                     (string-suffix-p "\n" visible))
-                           "\n")
-                         (cond
-                          (byte-truncated
-                           (propertize
-                            (format "[output: %d bytes, C-c C-o to view]\n"
-                                    (string-bytes content))
-                            'face 'emacs-jupyter-notebook-result-header-face))
-                          ((> line-count inline-lines)
-                           (propertize
-                            (format "... (%d more lines, C-c C-o to view)\n"
-                                    (- line-count inline-lines))
-                            'face 'emacs-jupyter-notebook-result-header-face)))))))
+              (_ (unless (string-empty-p visible)
+                   (add-face-text-property
+                    0 (length visible) 'emacs-jupyter-notebook-result-face 'append visible)))
+              (display (if collapsed
+                           (concat
+                            (emacs-jupyter-notebook-result--cursor-spacer)
+                            (propertize (format "\n[%s] [output: %d lines, hidden]\n" count line-count)
+                                        'face 'emacs-jupyter-notebook-result-header-face))
+                         (concat
+                          (emacs-jupyter-notebook-result--cursor-spacer)
+                          (propertize header 'face 'emacs-jupyter-notebook-result-header-face)
+                          visible
+                          (unless (or (string-empty-p visible)
+                                      (string-suffix-p "\n" visible))
+                            "\n")
+                          (cond
+                           (byte-truncated
+                            (propertize
+                             (format "[output: %d bytes, C-c C-o to view]\n"
+                                     (string-bytes content))
+                             'face 'emacs-jupyter-notebook-result-header-face))
+                           ((> line-count inline-lines)
+                            (propertize
+                             (format "... (%d more lines, C-c C-o to view)\n"
+                                     (- line-count inline-lines))
+                             'face 'emacs-jupyter-notebook-result-header-face)))))))
         (overlay-put ov 'after-string display)))))
 
 (defun emacs-jupyter-notebook-result--all-overlays ()
@@ -215,45 +216,15 @@ for images.  Return nil if no suitable MIME type is found."
                 (overlay-get ov 'emacs-jupyter-notebook-result)))
          emacs-jupyter-notebook-result--overlays)))
 
-(defun emacs-jupyter-notebook-result--clear-all-execution-counts ()
-  "Clear all execution count overlays in the current buffer."
-  (mapc (lambda (ov)
-          (when (and (overlayp ov)
-                     (eq (overlay-buffer ov) (current-buffer)))
-            (delete-overlay ov)))
-        emacs-jupyter-notebook-result--execution-count-overlays)
-  (setq emacs-jupyter-notebook-result--execution-count-overlays nil))
+(defun emacs-jupyter-notebook-result--set-execution-count (ov count)
+  "Set execution count on result overlay OV to COUNT."
+  (when (overlayp ov)
+    (overlay-put ov 'emacs-jupyter-notebook-execution-count count)
+    (emacs-jupyter-notebook-result--render ov)))
 
-(defun emacs-jupyter-notebook-result--clear-execution-counts-in-region (beg end)
-  "Clear execution count overlays whose position falls within BEG and END."
-  (setq emacs-jupyter-notebook-result--execution-count-overlays
-        (cl-delete-if
-         (lambda (ov)
-           (when (and (overlayp ov)
-                      (eq (overlay-buffer ov) (current-buffer))
-                      (overlay-get ov 'emacs-jupyter-notebook-execution-count)
-                      (<= beg (overlay-get ov 'emacs-jupyter-notebook-execution-count-pos))
-                      (<= (overlay-get ov 'emacs-jupyter-notebook-execution-count-pos) end))
-             (delete-overlay ov)
-             t))
-         emacs-jupyter-notebook-result--execution-count-overlays)))
-
-(defun emacs-jupyter-notebook-result--set-execution-count (pos count)
-  "Set execution count overlay at POS to COUNT."
-  (emacs-jupyter-notebook-result--clear-execution-counts-in-region pos pos)
-  (let ((ov (make-overlay pos pos (current-buffer) t t)))
-    (overlay-put ov 'before-string
-                 (concat (propertize (format "[%s]" count)
-                                     'face 'emacs-jupyter-notebook-execution-count-face)
-                         " "))
-    (overlay-put ov 'emacs-jupyter-notebook-execution-count t)
-    (overlay-put ov 'emacs-jupyter-notebook-execution-count-pos pos)
-    (push ov emacs-jupyter-notebook-result--execution-count-overlays)
-    ov))
-
-(defun emacs-jupyter-notebook-result--set-busy-indicator (pos)
-  "Set busy indicator overlay at POS."
-  (emacs-jupyter-notebook-result--set-execution-count pos "*"))
+(defun emacs-jupyter-notebook-result--set-busy-indicator (ov)
+  "Set busy indicator on result overlay OV."
+  (emacs-jupyter-notebook-result--set-execution-count ov "*"))
 
 (defun emacs-jupyter-notebook-result-clear-region (beg end)
   "Clear result overlays whose source range intersects BEG and END."
@@ -263,14 +234,12 @@ for images.  Return nil if no suitable MIME type is found."
       (when (and source-beg source-end
                  (<= beg source-end)
                  (<= source-beg end))
-        (delete-overlay ov))))
-  (emacs-jupyter-notebook-result--clear-execution-counts-in-region beg end))
+        (delete-overlay ov)))))
 
 (defun emacs-jupyter-notebook-result-clear-all ()
   "Clear all package-owned result overlays in the current buffer."
   (mapc #'delete-overlay (emacs-jupyter-notebook-result--all-overlays))
-  (setq emacs-jupyter-notebook-result--overlays nil)
-  (emacs-jupyter-notebook-result--clear-all-execution-counts))
+  (setq emacs-jupyter-notebook-result--overlays nil))
 
 (defun emacs-jupyter-notebook-result-start (beg end)
   "Create an empty running result overlay attached to BEG and END."
