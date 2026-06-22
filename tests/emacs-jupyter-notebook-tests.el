@@ -1742,6 +1742,15 @@
         (should after-string)
         (should (string-match-p "\\[output\\]" after-string))))))
 
+(ert-deftest ejn-result-image-render-adds-cursor-spacer ()
+  (with-temp-buffer
+    (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
+      (emacs-jupyter-notebook-result-set-image ov '(image :type png :data "fake"))
+      (let ((after-string (overlay-get ov 'after-string)))
+        (should after-string)
+        (should (equal (substring-no-properties after-string 0 1) " "))
+        (should (get-text-property 0 'cursor after-string))))))
+
 (ert-deftest ejn-mime-render-image-jpeg-decodes-base64 ()
   (let* ((raw "jpeg-data")
          (encoded (base64-encode-string raw t))
@@ -1919,7 +1928,8 @@
       (overlay-put ov 'emacs-jupyter-notebook-collapsed t)
       (emacs-jupyter-notebook-result--render ov)
       (let ((after (overlay-get ov 'after-string)))
-        (should (string-match-p "output: image, hidden" after))))))
+        (should (string-match-p "output: image, hidden" after))
+        (should (get-text-property 0 'cursor after))))))
 
 (ert-deftest ejn-clear-results-works-with-collapsed-overlays ()
   (with-temp-buffer

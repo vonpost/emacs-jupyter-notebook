@@ -139,8 +139,14 @@ for images.  Return nil if no suitable MIME type is found."
         (let ((mid (/ (+ lo hi) 2)))
           (if (<= (string-bytes (substring text mid)) max-bytes)
               (setq hi mid)
-            (setq lo mid))))
+              (setq lo mid))))
       (substring text hi))))
+
+(defun emacs-jupyter-notebook-result--cursor-spacer ()
+  "Return a spacer that keeps point visually on the source line."
+  (propertize " "
+              'cursor t
+              'face 'emacs-jupyter-notebook-result-header-face))
 
 (defun emacs-jupyter-notebook-result--render (ov)
   "Render result overlay OV from its stored content."
@@ -153,9 +159,11 @@ for images.  Return nil if no suitable MIME type is found."
         (let ((header (format "\n[%s]\n" (if running "running" "output"))))
           (overlay-put ov 'after-string
                        (if collapsed
-                           (propertize (format "\n[output: image, hidden]\n")
-                                       'face 'emacs-jupyter-notebook-result-header-face)
-                         (concat (propertize header 'face 'emacs-jupyter-notebook-result-header-face)
+                           (concat (emacs-jupyter-notebook-result--cursor-spacer)
+                                   (propertize (format "\n[output: image, hidden]\n")
+                                               'face 'emacs-jupyter-notebook-result-header-face))
+                         (concat (emacs-jupyter-notebook-result--cursor-spacer)
+                                 (propertize header 'face 'emacs-jupyter-notebook-result-header-face)
                                  (propertize " " 'display image)
                                  "\n"))))
       (let* ((inline-lines (max 1 emacs-jupyter-notebook-result-inline-lines))
