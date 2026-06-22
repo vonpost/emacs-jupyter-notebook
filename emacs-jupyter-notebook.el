@@ -143,8 +143,61 @@ as new text below the output, so the result stays in place."
   "Return the mode line lighter string based on kernel state."
   (cond
    (emacs-jupyter-notebook--tunnel-dead " EJN!")
-   ((eq emacs-jupyter-notebook--kernel-status 'busy) " EJN*")
-   (t " EJN")))
+    ((eq emacs-jupyter-notebook--kernel-status 'busy) " EJN*")
+    (t " EJN")))
+
+(defun emacs-jupyter-notebook--tunnel-state ()
+  "Return the current tunnel state as a symbol."
+  (cond
+   (emacs-jupyter-notebook--tunnel-dead 'dead)
+   ((and (processp emacs-jupyter-notebook--tunnel-process)
+         (process-live-p emacs-jupyter-notebook--tunnel-process))
+    'alive)
+   (emacs-jupyter-notebook--tunnel-process 'exited)
+   (t 'none)))
+
+(defun emacs-jupyter-notebook-status-snapshot ()
+  "Return a plist describing the current buffer's notebook engine state."
+  (let ((entry emacs-jupyter-notebook--session-entry)
+        (context emacs-jupyter-notebook--async-context))
+    (list :buffer (buffer-name)
+          :file buffer-file-name
+          :client (and emacs-jupyter-notebook--client t)
+          :kernel-status emacs-jupyter-notebook--kernel-status
+          :tunnel-state (emacs-jupyter-notebook--tunnel-state)
+          :async-phase (plist-get context :phase)
+          :async-error (plist-get context :error)
+          :profile (or (plist-get entry :profile)
+                       (plist-get (plist-get context :entry) :profile))
+          :session-id (or (plist-get entry :session-id)
+                          (plist-get context :session-id))
+          :remote-host (plist-get entry :remote-host)
+          :remote-pid (plist-get entry :remote-pid)
+          :remote-connection-file (plist-get entry :remote-connection-file)
+          :local-connection-file (plist-get entry :local-connection-file)
+          :tunnel-ports (plist-get entry :tunnel-ports))))
+
+(defun emacs-jupyter-notebook--format-status (snapshot)
+  "Format status SNAPSHOT for display."
+  (string-join
+   (list
+    (format "Buffer: %s" (plist-get snapshot :buffer))
+    (format "File: %s" (or (plist-get snapshot :file) "none"))
+    (format "Profile: %s" (or (plist-get snapshot :profile) "none"))
+    (format "Session: %s" (or (plist-get snapshot :session-id) "none"))
+    (format "Client: %s" (if (plist-get snapshot :client) "connected" "none"))
+    (format "Kernel status: %s" (or (plist-get snapshot :kernel-status) "unknown"))
+    (format "Tunnel: %s" (plist-get snapshot :tunnel-state))
+    (format "Async phase: %s" (or (plist-get snapshot :async-phase) "none"))
+    (format "Async error: %s" (or (plist-get snapshot :async-error) "none"))
+    (format "Remote host: %s" (or (plist-get snapshot :remote-host) "unknown"))
+    (format "Remote PID: %s" (or (plist-get snapshot :remote-pid) "unknown"))
+    (format "Remote connection: %s"
+            (or (plist-get snapshot :remote-connection-file) "none"))
+    (format "Local connection: %s"
+            (or (plist-get snapshot :local-connection-file) "none"))
+    (format "Tunnel ports: %S" (plist-get snapshot :tunnel-ports)))
+   "\n"))
 
 (defvar emacs-jupyter-notebook-cell-map
   (let ((map (make-sparse-keymap)))
@@ -176,6 +229,11 @@ as new text below the output, so the result stays in place."
     (define-key map (kbd "C-c C-k") #'emacs-jupyter-notebook-interrupt-kernel)
     (define-key map (kbd "C-c C-s") #'emacs-jupyter-notebook-start-remote-kernel)
     (define-key map (kbd "C-c C-n") #'emacs-jupyter-notebook-reconnect-remote-kernel)
+    (define-key map (kbd "C-c C-y") #'emacs-jupyter-notebook-retry-fresh-kernel)
+    (define-key map (kbd "C-c C-/") #'emacs-jupyter-notebook-status)
+    (define-key map (kbd "C-c C-v") #'emacs-jupyter-notebook-fetch-remote-log)
+    (define-key map (kbd "C-c C-q") #'emacs-jupyter-notebook-list-remote-processes)
+    (define-key map (kbd "C-c C-w") #'emacs-jupyter-notebook-clean-orphaned-kernels)
     (define-key map (kbd "C-c C-l") #'emacs-jupyter-notebook-clear-results)
     (define-key map (kbd "C-c C-x") #'emacs-jupyter-notebook-cancel-operation)
     (define-key map (kbd "C-c C-t") #'emacs-jupyter-notebook-toggle-output)
@@ -1120,6 +1178,52 @@ BEG and END are source bounds."
 
 ;;; Commands
 
+(defun emacs-jupyter-notebook--registry-entry-key (entry)
+  "Return the registry key for ENTRY, or nil."
+  (or (plist-get entry :session-id)
+      (plist-get entry :profile)))
+
+(defun emacs-jupyter-notebook--cleanup-current-state (&optional reason skip-jupyter-shutdown)
+  "Clean current buffer's client, tunnel, async context, and registry state.
+REASON is used when cancelling an async context.  When SKIP-JUPYTER-SHUTDOWN is
+non-nil, do not send a Jupyter shutdown request to the current client."
+  (let ((entry emacs-jupyter-notebook--session-entry)
+        (context emacs-jupyter-notebook--async-context))
+    (when (and context (emacs-jupyter-notebook--async-in-progress-p))
+      (emacs-jupyter-notebook--async-fail context (or reason "Operation cancelled")))
+    (when (and emacs-jupyter-notebook--client (not skip-jupyter-shutdown))
+      (ignore-errors
+        (emacs-jupyter-notebook-jupyter-shutdown emacs-jupyter-notebook--client)))
+    (when (and (processp emacs-jupyter-notebook--tunnel-process)
+               (process-live-p emacs-jupyter-notebook--tunnel-process))
+      (delete-process emacs-jupyter-notebook--tunnel-process))
+    (when entry
+      (emacs-jupyter-notebook--cleanup-remote-entry entry))
+    (when-let* ((key (and entry (emacs-jupyter-notebook--registry-entry-key entry))))
+      (emacs-jupyter-notebook-registry-remove-entry key))
+    (when-let* ((local-file (plist-get entry :local-connection-file)))
+      (emacs-jupyter-notebook--async-delete-file local-file))
+    (setq emacs-jupyter-notebook--client nil
+          emacs-jupyter-notebook--session-entry nil
+          emacs-jupyter-notebook--tunnel-process nil
+          emacs-jupyter-notebook--tunnel-dead nil
+          emacs-jupyter-notebook--kernel-status nil
+          emacs-jupyter-notebook--async-context nil
+          emacs-jupyter-notebook--evaluation-timer nil)
+    (force-mode-line-update t)
+    entry))
+
+(defun emacs-jupyter-notebook--display-command-output (buffer-name output)
+  "Display OUTPUT in read-only BUFFER-NAME."
+  (let ((buf (get-buffer-create buffer-name)))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert output)
+        (goto-char (point-min)))
+      (setq buffer-read-only t))
+    (display-buffer buf)))
+
 ;;;###autoload
 (defun emacs-jupyter-notebook-start-remote-kernel (profile-name &optional callback error-callback)
   "Start a detached remote kernel for PROFILE-NAME asynchronously.
@@ -1204,29 +1308,73 @@ BEG and END are source bounds."
 (defun emacs-jupyter-notebook-shutdown-kernel ()
   "Shut down the current kernel, close tunnel, and reset state."
   (interactive)
-  (when emacs-jupyter-notebook--client
-    (emacs-jupyter-notebook-jupyter-shutdown emacs-jupyter-notebook--client))
-  (when (and (processp emacs-jupyter-notebook--tunnel-process)
-             (process-live-p emacs-jupyter-notebook--tunnel-process))
-    (delete-process emacs-jupyter-notebook--tunnel-process))
-  (when emacs-jupyter-notebook--session-entry
-    (emacs-jupyter-notebook--cleanup-remote-entry
-     emacs-jupyter-notebook--session-entry))
-  (when-let* ((entry emacs-jupyter-notebook--session-entry)
-              (key (or (plist-get entry :session-id)
-                       (plist-get entry :profile))))
-    (emacs-jupyter-notebook-registry-remove-entry key))
-  (when-let* ((entry emacs-jupyter-notebook--session-entry)
-              (local-file (plist-get entry :local-connection-file)))
-    (emacs-jupyter-notebook--async-delete-file local-file))
-  (setq emacs-jupyter-notebook--client nil
-        emacs-jupyter-notebook--session-entry nil
-        emacs-jupyter-notebook--tunnel-process nil
-        emacs-jupyter-notebook--tunnel-dead nil
-        emacs-jupyter-notebook--kernel-status nil
-        emacs-jupyter-notebook--async-context nil
-        emacs-jupyter-notebook--evaluation-timer nil)
-  (force-mode-line-update t))
+  (emacs-jupyter-notebook--cleanup-current-state "Kernel shut down"))
+
+;;;###autoload
+(defun emacs-jupyter-notebook-retry-fresh-kernel (&optional profile-name)
+  "Cancel/cleanup current state and start a fresh kernel.
+With PROFILE-NAME, start that profile.  Otherwise reuse the current session's
+profile, then fall back to `emacs-jupyter-notebook-default-profile'."
+  (interactive)
+  (let* ((entry emacs-jupyter-notebook--session-entry)
+         (context emacs-jupyter-notebook--async-context)
+         (profile (or profile-name
+                      (plist-get entry :profile)
+                      (plist-get (plist-get context :profile) :profile)
+                      emacs-jupyter-notebook-default-profile)))
+    (emacs-jupyter-notebook--cleanup-current-state "Retrying with fresh kernel" t)
+    (emacs-jupyter-notebook-start-remote-kernel profile)))
+
+;;;###autoload
+(defun emacs-jupyter-notebook-status ()
+  "Display the current buffer's EJN engine state."
+  (interactive)
+  (let ((text (emacs-jupyter-notebook--format-status
+               (emacs-jupyter-notebook-status-snapshot))))
+    (if (called-interactively-p 'interactive)
+        (emacs-jupyter-notebook--display-command-output "*ejn-status*" text)
+      text)))
+
+;;;###autoload
+(defun emacs-jupyter-notebook-fetch-remote-log ()
+  "Fetch and display the current session's remote kernel log."
+  (interactive)
+  (unless emacs-jupyter-notebook--session-entry
+    (user-error "No active EJN session"))
+  (let* ((entry emacs-jupyter-notebook--session-entry)
+         (connection-file (plist-get entry :remote-connection-file)))
+    (unless connection-file
+      (user-error "Current EJN session has no remote connection file"))
+    (emacs-jupyter-notebook--display-command-output
+     "*ejn-log*"
+     (emacs-jupyter-notebook-ssh-run-command
+      (emacs-jupyter-notebook-ssh-build-remote-cat-log
+       (emacs-jupyter-notebook--entry-profile entry) connection-file)))))
+
+;;;###autoload
+(defun emacs-jupyter-notebook-list-remote-processes (&optional profile-name)
+  "List likely remote EJN kernel processes for PROFILE-NAME."
+  (interactive (list (emacs-jupyter-notebook--read-profile-name)))
+  (let ((profile (emacs-jupyter-notebook--read-host-profile
+                  (or profile-name emacs-jupyter-notebook-default-profile))))
+    (emacs-jupyter-notebook--display-command-output
+     "*ejn-remote-processes*"
+     (emacs-jupyter-notebook-ssh-run-command
+      (emacs-jupyter-notebook-ssh-build-remote-ps-command profile)))))
+
+;;;###autoload
+(defun emacs-jupyter-notebook-clean-orphaned-kernels (&optional profile-name)
+  "Clean all EJN kernel files and processes in PROFILE-NAME's remote cache."
+  (interactive (list (emacs-jupyter-notebook--read-profile-name)))
+  (let ((profile (emacs-jupyter-notebook--read-host-profile
+                  (or profile-name emacs-jupyter-notebook-default-profile))))
+    (when (or (not (called-interactively-p 'interactive))
+              (yes-or-no-p (format "Clean EJN kernels in %s on %s? "
+                                   (plist-get profile :remote-cache-dir)
+                                   (emacs-jupyter-notebook-ssh-destination profile))))
+      (emacs-jupyter-notebook-ssh-run-command
+       (emacs-jupyter-notebook-ssh-build-remote-cleanup-all profile))
+      (message "emacs-jupyter-notebook: requested remote orphan cleanup"))))
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-clear-results ()

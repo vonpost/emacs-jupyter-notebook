@@ -179,8 +179,38 @@ The return value is a plist containing :argv, :remote-command,
                      (replace-regexp-in-string "\\.json\\'" ".log" connection-file))))
     (emacs-jupyter-notebook-ssh-command
      profile
-     (format "{ pkill -f %s 2>/dev/null || true; rm -f %s %s; }"
-             remote-file remote-file remote-log))))
+      (format "{ pkill -f %s 2>/dev/null || true; rm -f %s %s; }"
+              remote-file remote-file remote-log))))
+
+(defun emacs-jupyter-notebook-ssh-build-remote-cat-log (profile connection-file)
+  "Return an SSH argv list that prints the log for CONNECTION-FILE."
+  (let ((remote-log (emacs-jupyter-notebook-ssh--quote-remote-path
+                     (replace-regexp-in-string "\\.json\\'" ".log" connection-file))))
+    (emacs-jupyter-notebook-ssh-command profile (format "cat %s" remote-log))))
+
+(defun emacs-jupyter-notebook-ssh-build-remote-ps-command (profile)
+  "Return an SSH argv list that lists likely remote EJN kernel processes."
+  (let* ((profile (emacs-jupyter-notebook-ssh-profile profile))
+         (cache-dir (emacs-jupyter-notebook-ssh--quote-remote-path
+                     (plist-get profile :remote-cache-dir))))
+    (emacs-jupyter-notebook-ssh-command
+     profile
+     (format "ps -eo pid,ppid,stat,etime,args | grep %s | grep -v grep || true"
+             (shell-quote-argument (format "KernelManager.connection_file=%s/kernel-"
+                                           cache-dir))))))
+
+(defun emacs-jupyter-notebook-ssh-build-remote-cleanup-all (profile)
+  "Return an SSH argv list that cleans all EJN cache-dir kernels for PROFILE."
+  (let* ((profile (emacs-jupyter-notebook-ssh-profile profile))
+         (cache-dir (emacs-jupyter-notebook-ssh--quote-remote-path
+                     (plist-get profile :remote-cache-dir))))
+    (emacs-jupyter-notebook-ssh-command
+     profile
+     (format (concat "{ pkill -f %s 2>/dev/null || true; "
+                     "rm -f %s/kernel-*.json %s/kernel-*.log; }")
+             (shell-quote-argument (format "KernelManager.connection_file=%s/kernel-"
+                                           cache-dir))
+             cache-dir cache-dir))))
 
 (defun emacs-jupyter-notebook-ssh-run-command (argv)
   "Run ARGV synchronously and return stdout.

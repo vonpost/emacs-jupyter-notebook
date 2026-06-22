@@ -471,14 +471,40 @@
 
 (ert-deftest ejn-ssh-remote-cleanup-targets-connection-file ()
   (let* ((cmd (emacs-jupyter-notebook-ssh-build-remote-cleanup
-               '(:profile "p" :host "example.com")
-               "~/.cache/ejn/kernel-session.json"))
+                '(:profile "p" :host "example.com")
+                "~/.cache/ejn/kernel-session.json"))
          (remote-command (car (last cmd))))
     (should (string-match-p "pkill -f \\\$HOME/.cache/ejn/kernel-session.json"
                             remote-command))
     (should (string-match-p "rm -f \\\$HOME/.cache/ejn/kernel-session.json"
                             remote-command))
     (should (string-match-p "\\$HOME/.cache/ejn/kernel-session.log"
+                            remote-command))))
+
+(ert-deftest ejn-ssh-remote-cat-log-targets-connection-log ()
+  (let* ((cmd (emacs-jupyter-notebook-ssh-build-remote-cat-log
+               '(:profile "p" :host "example.com")
+               "~/.cache/ejn/kernel-session.json"))
+         (remote-command (car (last cmd))))
+    (should (string-match-p "cat \\$HOME/.cache/ejn/kernel-session.log"
+                            remote-command))))
+
+(ert-deftest ejn-ssh-remote-ps-command-targets-cache-dir ()
+  (let* ((cmd (emacs-jupyter-notebook-ssh-build-remote-ps-command
+               '(:profile "p" :host "example.com" :remote-cache-dir "/tmp/ejn")))
+         (remote-command (car (last cmd))))
+    (should (string-match-p "ps -eo pid,ppid,stat,etime,args" remote-command))
+    (should (string-match-p "KernelManager.connection_file\\\\=/tmp/ejn/kernel-"
+                            remote-command))))
+
+(ert-deftest ejn-ssh-remote-cleanup-all-targets-cache-dir ()
+  (let* ((cmd (emacs-jupyter-notebook-ssh-build-remote-cleanup-all
+               '(:profile "p" :host "example.com" :remote-cache-dir "/tmp/ejn")))
+         (remote-command (car (last cmd))))
+    (should (string-match-p "pkill -f" remote-command))
+    (should (string-match-p "KernelManager.connection_file\\\\=/tmp/ejn/kernel-"
+                            remote-command))
+    (should (string-match-p "rm -f /tmp/ejn/kernel-\\*.json /tmp/ejn/kernel-\\*.log"
                             remote-command))))
 
 (ert-deftest ejn-ssh-remote-launch-command-is-detached ()
@@ -734,6 +760,170 @@
                 (should (= (length remaining) 1))
                 (should (equal (plist-get (car remaining) :session-id) "other-session"))))))
       (delete-directory dir t))))
+
+(ert-deftest ejn-status-snapshot-reports-engine-state ()
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook--kernel-status 'idle)
+          (emacs-jupyter-notebook--tunnel-dead t)
+          (emacs-jupyter-notebook--session-entry
+           '(:profile "p"
+             :session-id "session"
+             :remote-host "example.com"
+             :remote-pid 123
+             :remote-connection-file "/tmp/kernel.json"
+             :local-connection-file "/tmp/local.json"
+             :tunnel-ports (:shell_port 1001)))
+          (emacs-jupyter-notebook--async-context
+           (emacs-jupyter-notebook--async-new-context
+            :phase 'error
+            :error "boom"
+            :origin-buffer (current-buffer))))
+      (let ((snapshot (emacs-jupyter-notebook-status-snapshot)))
+        (should (plist-get snapshot :client))
+        (should (eq (plist-get snapshot :kernel-status) 'idle))
+        (should (eq (plist-get snapshot :tunnel-state) 'dead))
+        (should (eq (plist-get snapshot :async-phase) 'error))
+        (should (equal (plist-get snapshot :async-error) "boom"))
+        (should (equal (plist-get snapshot :profile) "p"))
+        (should (equal (plist-get snapshot :session-id) "session"))
+        (should (string-match-p "Session: session"
+                                (emacs-jupyter-notebook-status)))))))
+
+(ert-deftest ejn-cleanup-current-state-resets-buffer-state ()
+  (let* ((dir (make-temp-file "ejn-cleanup-" t))
+         (local-file (expand-file-name "kernel.json" dir))
+         (entry `(:profile "p"
+                  :session-id "session"
+                  :remote-connection-file "/tmp/kernel.json"
+                  :local-connection-file ,local-file))
+         shutdown-called cleanup-entry removed-key)
+    (unwind-protect
+        (progn
+          (with-temp-file local-file (insert "{}"))
+          (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
+                     (lambda (client)
+                       (setq shutdown-called client)))
+                    ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
+                     (lambda (captured-entry)
+                       (setq cleanup-entry captured-entry)))
+                    ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
+                     (lambda (key &optional _file)
+                       (setq removed-key key))))
+            (with-temp-buffer
+              (setq emacs-jupyter-notebook--client 'mock-client)
+              (setq emacs-jupyter-notebook--session-entry entry)
+              (setq emacs-jupyter-notebook--tunnel-dead t)
+              (emacs-jupyter-notebook--cleanup-current-state "cleanup")
+              (should (eq shutdown-called 'mock-client))
+              (should (equal cleanup-entry entry))
+              (should (equal removed-key "session"))
+              (should-not (file-exists-p local-file))
+              (should-not emacs-jupyter-notebook--client)
+              (should-not emacs-jupyter-notebook--session-entry)
+              (should-not emacs-jupyter-notebook--tunnel-dead))))
+      (delete-directory dir t))))
+
+(ert-deftest ejn-cancel-operation-does-not-tear-down-session-entry ()
+  (let ((entry '(:profile "p" :session-id "existing"))
+        cleanup-called)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
+               (lambda (&rest _)
+                 (setq cleanup-called t))))
+      (with-temp-buffer
+        (setq emacs-jupyter-notebook--session-entry entry)
+        (setq emacs-jupyter-notebook--async-context
+              (emacs-jupyter-notebook--async-new-context
+               :phase 'retrieve
+               :origin-buffer (current-buffer)
+               :error-callback (lambda (_ctx _err) nil)))
+        (emacs-jupyter-notebook-cancel-operation)
+        (should-not emacs-jupyter-notebook--async-context)
+        (should (equal emacs-jupyter-notebook--session-entry entry))
+        (should-not cleanup-called)))))
+
+(ert-deftest ejn-retry-fresh-kernel-cleans-state-and-starts-profile ()
+  (let ((entry '(:profile "p" :session-id "old"))
+        cleanup-called started-profile)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
+               (lambda (reason skip-shutdown)
+                 (setq cleanup-called (list reason skip-shutdown))))
+              ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
+               (lambda (profile &optional _callback _error-callback)
+                 (setq started-profile profile))))
+      (with-temp-buffer
+        (setq emacs-jupyter-notebook--session-entry entry)
+        (emacs-jupyter-notebook-retry-fresh-kernel)
+        (should (equal cleanup-called '("Retrying with fresh kernel" t)))
+        (should (equal started-profile "p"))))))
+
+(ert-deftest ejn-retry-fresh-kernel-uses-async-context-profile ()
+  (let (started-profile)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
+               #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
+               (lambda (profile &optional _callback _error-callback)
+                 (setq started-profile profile))))
+      (with-temp-buffer
+        (setq emacs-jupyter-notebook--async-context
+              (emacs-jupyter-notebook--async-new-context
+               :phase 'launch
+               :profile '(:profile "context-profile")
+               :origin-buffer (current-buffer)))
+        (emacs-jupyter-notebook-retry-fresh-kernel)
+        (should (equal started-profile "context-profile"))))))
+
+(ert-deftest ejn-fetch-remote-log-displays-command-output ()
+  (let (argv displayed)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-ssh-run-command)
+               (lambda (captured-argv)
+                 (setq argv captured-argv)
+                 "log text"))
+              ((symbol-function 'emacs-jupyter-notebook--display-command-output)
+               (lambda (buffer-name output)
+                 (setq displayed (list buffer-name output)))))
+      (with-temp-buffer
+        (setq emacs-jupyter-notebook--session-entry
+              '(:profile "p"
+                :remote-host "example.com"
+                :remote-cwd "~"
+                :kernelspec "python3"
+                :remote-connection-file "~/.cache/ejn/kernel-session.json"))
+        (emacs-jupyter-notebook-fetch-remote-log)
+        (should (equal displayed '("*ejn-log*" "log text")))
+        (should (string-match-p "kernel-session.log" (car (last argv))))))))
+
+(ert-deftest ejn-list-remote-processes-runs-ps-command ()
+  (let (argv displayed)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--read-host-profile)
+               (lambda (_profile)
+                 '(:profile "p" :host "example.com" :remote-cache-dir "/tmp/ejn")))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-run-command)
+               (lambda (captured-argv)
+                 (setq argv captured-argv)
+                 "ps output"))
+              ((symbol-function 'emacs-jupyter-notebook--display-command-output)
+               (lambda (buffer-name output)
+                 (setq displayed (list buffer-name output)))))
+      (emacs-jupyter-notebook-list-remote-processes "p")
+      (should (equal displayed '("*ejn-remote-processes*" "ps output")))
+      (should (string-match-p "ps -eo" (car (last argv)))))))
+
+(ert-deftest ejn-clean-orphaned-kernels-runs-cleanup-all-command ()
+  (let (argv message-text)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--read-host-profile)
+               (lambda (_profile)
+                 '(:profile "p" :host "example.com" :remote-cache-dir "/tmp/ejn")))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-run-command)
+               (lambda (captured-argv)
+                 (setq argv captured-argv)
+                 ""))
+              ((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (setq message-text (apply #'format format-string args)))))
+      (emacs-jupyter-notebook-clean-orphaned-kernels "p")
+      (should (string-match-p "pkill -f" (car (last argv))))
+      (should (string-match-p "requested remote orphan cleanup" message-text)))))
 
 (ert-deftest ejn-registry-latest-for-file-normalizes-with-file-truename ()
   (let* ((dir (make-temp-file "ejn-truename-" t))
