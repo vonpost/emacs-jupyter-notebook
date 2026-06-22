@@ -382,6 +382,23 @@
                       :type 'user-error)
         (should-not started)))))
 
+(ert-deftest ejn-start-remote-kernel-refuses-existing-client-noninteractive ()
+  (let ((emacs-jupyter-notebook-remote-profiles
+          '(("p" . (:host "example.com" :remote-cwd "~" :kernelspec "python3"))))
+        started)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+               #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
+               (lambda (&rest _)
+                 (setq started t)
+                 'mock-process)))
+      (with-temp-buffer
+        (setq buffer-file-name "/tmp/example-notebook.py")
+        (setq emacs-jupyter-notebook--client 'mock-client)
+        (should-error (emacs-jupyter-notebook-start-remote-kernel "p")
+                      :type 'user-error)
+        (should-not started)))))
+
 (ert-deftest ejn-reconnect-remote-kernel-uses-async-retrieve ()
   (let ((entry '(:profile "p"
                  :remote-host "example.com"
@@ -424,6 +441,25 @@
               (emacs-jupyter-notebook--async-new-context
                :phase 'connect
                :origin-buffer (current-buffer)))
+        (should-error (emacs-jupyter-notebook-reconnect-remote-kernel entry)
+                      :type 'user-error)
+        (should-not retrieved)))))
+
+(ert-deftest ejn-reconnect-remote-kernel-refuses-existing-session-noninteractive ()
+  (let ((entry '(:profile "p"
+                 :remote-host "example.com"
+                 :remote-cwd "~"
+                 :kernelspec "python3"
+                 :remote-connection-file "~/.cache/ejn/kernel.json"
+                 :session-id "session"))
+        retrieved)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+               #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook--async-retrieve)
+               (lambda (&rest _)
+                 (setq retrieved t))))
+      (with-temp-buffer
+        (setq emacs-jupyter-notebook--session-entry '(:profile "p" :session-id "old"))
         (should-error (emacs-jupyter-notebook-reconnect-remote-kernel entry)
                       :type 'user-error)
         (should-not retrieved)))))
@@ -591,6 +627,19 @@
       (should (equal captured-code "a = 1\n"))
       (should (equal (buffer-string) before))
       (should (= (length (emacs-jupyter-notebook-result--all-overlays)) 1)))))
+
+(ert-deftest ejn-evaluate-code-error-creates-result-overlay ()
+  (ejn-test-with-temp-buffer "x = 1\n"
+    (let ((before (buffer-string)))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-client-async)
+                 (lambda (_callback error-callback)
+                   (funcall error-callback nil "connect failed"))))
+        (emacs-jupyter-notebook--evaluate-code "x = 1\n" (point-min) (point-max)))
+      (should (equal (buffer-string) before))
+      (let ((overlays (emacs-jupyter-notebook-result--all-overlays)))
+        (should (= (length overlays) 1))
+        (should (string-match-p "Evaluation failed: connect failed"
+                                (overlay-get (car overlays) 'after-string)))))))
 
 (ert-deftest ejn-evaluate-region-and-buffer-do-not-mutate-source ()
   (ejn-test-with-temp-buffer "x = 1\ny = 2\n"
@@ -789,6 +838,26 @@
         (should (equal (plist-get snapshot :session-id) "session"))
         (should (string-match-p "Session: session"
                                 (emacs-jupyter-notebook-status)))))))
+
+(ert-deftest ejn-status-suggestions-report-no-client ()
+  (let ((text (emacs-jupyter-notebook--status-suggestions
+               '(:client nil :tunnel-state none))))
+    (should (string-match-p "No client connected" text))
+    (should (string-match-p "start-remote-kernel" text))
+    (should (string-match-p "reconnect-remote-kernel" text))))
+
+(ert-deftest ejn-status-suggestions-report-dead-tunnel-and-async-error ()
+  (let ((text (emacs-jupyter-notebook--status-suggestions
+               '(:client t :tunnel-state dead :async-error "boom"))))
+    (should (string-match-p "Tunnel is not alive" text))
+    (should (string-match-p "retry-fresh-kernel" text))
+    (should (string-match-p "Last async failure: boom" text))))
+
+(ert-deftest ejn-status-suggestions-report-healthy-state ()
+  (let ((text (emacs-jupyter-notebook--status-suggestions
+               '(:client t :tunnel-state alive))))
+    (should (string-match-p "Engine looks healthy" text))
+    (should (string-match-p "C-c C-c" text))))
 
 (ert-deftest ejn-cleanup-current-state-resets-buffer-state ()
   (let* ((dir (make-temp-file "ejn-cleanup-" t))

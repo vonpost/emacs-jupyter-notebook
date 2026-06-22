@@ -196,8 +196,25 @@ as new text below the output, so the result stays in place."
             (or (plist-get snapshot :remote-connection-file) "none"))
     (format "Local connection: %s"
             (or (plist-get snapshot :local-connection-file) "none"))
-    (format "Tunnel ports: %S" (plist-get snapshot :tunnel-ports)))
+    (format "Tunnel ports: %S" (plist-get snapshot :tunnel-ports))
+    (emacs-jupyter-notebook--status-suggestions snapshot))
    "\n"))
+
+(defun emacs-jupyter-notebook--status-suggestions (snapshot)
+  "Return actionable next steps for engine state SNAPSHOT."
+  (let (suggestions)
+    (unless (plist-get snapshot :client)
+      (push (concat "No client connected: start with `M-x emacs-jupyter-notebook-start-remote-kernel' "
+                    "or reconnect with `M-x emacs-jupyter-notebook-reconnect-remote-kernel'.")
+            suggestions))
+    (when (memq (plist-get snapshot :tunnel-state) '(dead exited))
+      (push "Tunnel is not alive: retry with `M-x emacs-jupyter-notebook-retry-fresh-kernel'."
+            suggestions))
+    (when-let* ((error (plist-get snapshot :async-error)))
+      (push (format "Last async failure: %s" error) suggestions))
+    (if suggestions
+        (concat "Suggested actions:\n- " (string-join (nreverse suggestions) "\n- "))
+      "Suggested actions:\n- Engine looks healthy; evaluate with `C-c C-c'.")))
 
 (defvar emacs-jupyter-notebook-cell-map
   (let ((map (make-sparse-keymap)))
@@ -592,6 +609,18 @@ Signal an error when the tunnel exits or the timeout expires."
   (when (emacs-jupyter-notebook--async-in-progress-p)
     (user-error
      "A Jupyter operation is already in progress; use M-x emacs-jupyter-notebook-cancel-operation to cancel it")))
+
+(defun emacs-jupyter-notebook--active-session-p ()
+  "Return non-nil when the current buffer already owns connection state."
+  (or emacs-jupyter-notebook--client
+      emacs-jupyter-notebook--session-entry
+      (and (processp emacs-jupyter-notebook--tunnel-process)
+           (process-live-p emacs-jupyter-notebook--tunnel-process))))
+
+(defun emacs-jupyter-notebook--ensure-clean-before-start ()
+  "Ensure the current buffer can start or reconnect a kernel without leaking one."
+  (when (emacs-jupyter-notebook--active-session-p)
+    (user-error "A kernel is already active; shut it down or retry fresh first")))
 
 (defun emacs-jupyter-notebook--async-add-callback (context callback)
   "Add CALLBACK to CONTEXT's callback chain."
@@ -1170,10 +1199,15 @@ BEG and END are source bounds."
 
 (defun emacs-jupyter-notebook--evaluate-code (code beg end)
   "Ensure client then evaluate CODE for source range BEG to END."
-  (let ((eval-cb (lambda (_ctx)
-                   (emacs-jupyter-notebook--evaluate-after-completeness code beg end)))
-        (error-cb (lambda (_ctx err)
-                    (message "emacs-jupyter-notebook: evaluation failed: %s" err))))
+  (let* ((buffer (current-buffer))
+         (eval-cb (lambda (_ctx)
+                    (emacs-jupyter-notebook--evaluate-after-completeness code beg end)))
+         (error-cb (lambda (_ctx err)
+                     (when (buffer-live-p buffer)
+                       (with-current-buffer buffer
+                         (emacs-jupyter-notebook-result-create
+                          beg end (format "Evaluation failed: %s" err))))
+                     (message "emacs-jupyter-notebook: evaluation failed: %s" err))))
     (emacs-jupyter-notebook--ensure-client-async eval-cb error-cb)))
 
 ;;; Commands
@@ -1232,6 +1266,7 @@ non-nil, do not send a Jupyter shutdown request to the current client."
   (unless buffer-file-name
     (user-error "Buffer has no associated file"))
   (emacs-jupyter-notebook--ensure-no-async-operation)
+  (emacs-jupyter-notebook--ensure-clean-before-start)
   (emacs-jupyter-notebook-jupyter--ensure)
   (let* ((profile (emacs-jupyter-notebook--read-host-profile profile-name))
          (session-id (emacs-jupyter-notebook--new-session-id
@@ -1262,6 +1297,7 @@ non-nil, do not send a Jupyter shutdown request to the current client."
   CALLBACK and ERROR-CALLBACK are optional completion hooks."
   (interactive (list (emacs-jupyter-notebook--read-registry-entry)))
   (emacs-jupyter-notebook--ensure-no-async-operation)
+  (emacs-jupyter-notebook--ensure-clean-before-start)
   (emacs-jupyter-notebook-jupyter--ensure)
   (let ((profile (emacs-jupyter-notebook--entry-profile entry)))
     (emacs-jupyter-notebook--async-retrieve
