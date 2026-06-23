@@ -139,11 +139,14 @@ for images.  Return nil if no suitable MIME type is found."
               (setq lo mid))))
       (substring text hi))))
 
-(defun emacs-jupyter-notebook-result--cursor-spacer ()
-  "Return a spacer that keeps point visually on the source line."
-  (propertize " "
-              'cursor t
-              'face 'emacs-jupyter-notebook-result-header-face))
+(defun emacs-jupyter-notebook-result--header-string (text)
+  "Return propertized result header TEXT with an explicit cursor target."
+  (let ((string (propertize text 'face 'emacs-jupyter-notebook-result-header-face)))
+    ;; The cursor property does not work on newlines, so mark the first
+    ;; visible header character instead of adding a visible spacer.
+    (when-let* ((pos (string-match-p "[^\n]" string)))
+      (put-text-property pos (1+ pos) 'cursor t string))
+    string))
 
 (defun emacs-jupyter-notebook-result--render (ov)
   "Render result overlay OV from its stored content."
@@ -157,11 +160,9 @@ for images.  Return nil if no suitable MIME type is found."
         (let ((header (format "\n[%s] [%s]\n" count (if running "running" "output"))))
           (overlay-put ov 'after-string
                        (if collapsed
-                           (concat (emacs-jupyter-notebook-result--cursor-spacer)
-                                   (propertize (format "\n[%s] [output: image, hidden]\n" count)
-                                               'face 'emacs-jupyter-notebook-result-header-face))
-                         (concat (emacs-jupyter-notebook-result--cursor-spacer)
-                                 (propertize header 'face 'emacs-jupyter-notebook-result-header-face)
+                           (emacs-jupyter-notebook-result--header-string
+                            (format "\n[%s] [output: image, hidden]\n" count))
+                         (concat (emacs-jupyter-notebook-result--header-string header)
                                  (propertize " " 'display image)
                                  "\n"))))
       (let* ((inline-lines (max 1 emacs-jupyter-notebook-result-inline-lines))
@@ -182,13 +183,10 @@ for images.  Return nil if no suitable MIME type is found."
                    (add-face-text-property
                     0 (length visible) 'emacs-jupyter-notebook-result-face 'append visible)))
               (display (if collapsed
-                           (concat
-                            (emacs-jupyter-notebook-result--cursor-spacer)
-                            (propertize (format "\n[%s] [output: %d lines, hidden]\n" count line-count)
-                                        'face 'emacs-jupyter-notebook-result-header-face))
+                           (emacs-jupyter-notebook-result--header-string
+                            (format "\n[%s] [output: %d lines, hidden]\n" count line-count))
                          (concat
-                          (emacs-jupyter-notebook-result--cursor-spacer)
-                          (propertize header 'face 'emacs-jupyter-notebook-result-header-face)
+                          (emacs-jupyter-notebook-result--header-string header)
                           visible
                           (unless (or (string-empty-p visible)
                                       (string-suffix-p "\n" visible))
