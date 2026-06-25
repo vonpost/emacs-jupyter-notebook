@@ -1643,6 +1643,21 @@
       (should (equal (buffer-substring-no-properties end (point-max))
                      "\n# %%\n")))))
 
+(ert-deftest ejn-result-overlay-stays-before-text-inserted-after-source-newline ()
+  (with-temp-buffer
+    (insert "# %%\nplt.show()\n")
+    (emacs-jupyter-notebook-mode 1)
+    (let* ((end (point-max))
+           (ov (emacs-jupyter-notebook-result-start (point-min) end)))
+      (emacs-jupyter-notebook-result-set-image ov '(image :type png :data "fake"))
+      (goto-char end)
+      (insert "typed below output")
+      (should (= (overlay-start ov) end))
+      (should (= (overlay-end ov) end))
+      (should (= (overlay-get ov 'emacs-jupyter-notebook-source-end) end))
+      (should (equal (buffer-substring-no-properties end (point-max))
+                     "typed below output")))))
+
 (ert-deftest ejn-result-overlay-moves-after-source-edit-at-anchor ()
   (with-temp-buffer
     (insert "# %%\nplt.show()")

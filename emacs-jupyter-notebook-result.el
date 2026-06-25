@@ -237,7 +237,7 @@ for images.  Return nil if no suitable MIME type is found."
 (defun emacs-jupyter-notebook-result-start (beg end)
   "Create an empty running result overlay attached to BEG and END."
   (emacs-jupyter-notebook-result-clear-region beg end)
-  (let ((ov (make-overlay end end (current-buffer) t nil)))
+  (let ((ov (make-overlay end end (current-buffer) nil nil)))
     (overlay-put ov 'emacs-jupyter-notebook-result t)
     (overlay-put ov 'emacs-jupyter-notebook-source-begin beg)
     (overlay-put ov 'emacs-jupyter-notebook-source-end end)
