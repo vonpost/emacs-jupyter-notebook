@@ -26,8 +26,13 @@
   `(let ((,var (make-temp-file "ejn-test-")))
      (unwind-protect
          (progn ,@body)
-       (when (file-exists-p ,var)
-         (delete-file ,var)))))
+        (when (file-exists-p ,var)
+          (delete-file ,var)))))
+
+(defun ejn-test-overlay-display-string (ov)
+  "Return the rendered display string for result overlay OV."
+  (or (overlay-get ov 'after-string)
+      (overlay-get ov 'before-string)))
 
 (ert-deftest ejn-cell-no-marker-is-whole-buffer ()
   (ejn-test-with-temp-buffer "x = 1\ny = 2\n"
@@ -611,7 +616,7 @@
     (emacs-jupyter-notebook-result-create (point-min) (point-max) "two")
     (let ((overlays (emacs-jupyter-notebook-result--all-overlays)))
       (should (= (length overlays) 1))
-      (should (string-match-p "two" (overlay-get (car overlays) 'after-string))))))
+      (should (string-match-p "two" (ejn-test-overlay-display-string (car overlays)))))))
 
 (ert-deftest ejn-evaluate-cell-does-not-mutate-source ()
   (ejn-test-with-temp-buffer "# %%\na = 1\n# %%\nb = 2\n"
@@ -639,7 +644,7 @@
       (let ((overlays (emacs-jupyter-notebook-result--all-overlays)))
         (should (= (length overlays) 1))
         (should (string-match-p "Evaluation failed: connect failed"
-                                (overlay-get (car overlays) 'after-string)))))))
+                                (ejn-test-overlay-display-string (car overlays))))))))
 
 (ert-deftest ejn-evaluate-region-and-buffer-do-not-mutate-source ()
   (ejn-test-with-temp-buffer "x = 1\ny = 2\n"
@@ -714,7 +719,7 @@
     (with-temp-buffer
       (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
         (emacs-jupyter-notebook-result-append ov "aaaaaaaaaa bbbbbbbbbb cc")
-        (let ((after (overlay-get ov 'after-string)))
+        (let ((after (ejn-test-overlay-display-string ov)))
           (should (string-match-p "bytes" after))
           (should (string-match-p "C-c C-o" after))
           (should-not (string-match-p "aaaa" after)))))))
@@ -726,7 +731,7 @@
     (with-temp-buffer
       (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
         (emacs-jupyter-notebook-result-append ov "small")
-        (let ((after (overlay-get ov 'after-string)))
+        (let ((after (ejn-test-overlay-display-string ov)))
           (should (string-match-p "small" after))
           (should-not (string-match-p "bytes" after)))))))
 
@@ -747,7 +752,7 @@
     (with-temp-buffer
       (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
         (emacs-jupyter-notebook-result-append ov "a\nb\nc\nd\ne\nf\ng")
-        (let ((after (overlay-get ov 'after-string)))
+        (let ((after (ejn-test-overlay-display-string ov)))
           (should (string-match-p "a" after))
           (should (string-match-p "c" after))
           (should-not (string-match-p "d" after))
@@ -760,7 +765,7 @@
     (with-temp-buffer
       (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
         (emacs-jupyter-notebook-result-append ov "a\nb\nc")
-        (let ((after (overlay-get ov 'after-string)))
+        (let ((after (ejn-test-overlay-display-string ov)))
           (should (string-match-p "a" after))
           (should (string-match-p "c" after))
           (should-not (string-match-p "more lines" after)))))))
@@ -1495,14 +1500,14 @@
     (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
       (emacs-jupyter-notebook-result--set-execution-count ov 42)
       (should (equal (overlay-get ov 'emacs-jupyter-notebook-execution-count) 42))
-      (should (string-match-p "\\[42\\]" (overlay-get ov 'after-string))))))
+      (should (string-match-p "\\[42\\]" (ejn-test-overlay-display-string ov))))))
 
 (ert-deftest ejn-busy-indicator-shows-star ()
   (with-temp-buffer
     (insert "# %%\nx = 1\n")
     (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
       (emacs-jupyter-notebook-result--set-busy-indicator ov)
-      (should (string-match-p "\\[\\*\\]" (overlay-get ov 'after-string))))))
+      (should (string-match-p "\\[\\*\\]" (ejn-test-overlay-display-string ov))))))
 
 (ert-deftest ejn-clear-results-removes-execution-count-overlays ()
   (with-temp-buffer
@@ -1520,10 +1525,10 @@
     (insert "# %%\nx = 1\n")
     (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
       (emacs-jupyter-notebook-result--set-busy-indicator ov)
-      (should (string-match-p "\\[\\*\\]" (overlay-get ov 'after-string)))
+      (should (string-match-p "\\[\\*\\]" (ejn-test-overlay-display-string ov)))
       (emacs-jupyter-notebook-result--set-execution-count ov 5)
       (should (equal (overlay-get ov 'emacs-jupyter-notebook-execution-count) 5))
-      (should (string-match-p "\\[5\\]" (overlay-get ov 'after-string))))))
+      (should (string-match-p "\\[5\\]" (ejn-test-overlay-display-string ov))))))
 
 (ert-deftest ejn-callback-execute-reply-sets-execution-count ()
   (with-temp-buffer
@@ -1533,12 +1538,12 @@
            (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer ov))
            (reply-fn (cadr (assoc "execute_reply" callbacks))))
       (emacs-jupyter-notebook-result--set-busy-indicator ov)
-      (should (string-match-p "\\[\\*\\]" (overlay-get ov 'after-string)))
+      (should (string-match-p "\\[\\*\\]" (ejn-test-overlay-display-string ov)))
       (cl-letf (((symbol-function 'jupyter-message-content)
                  (lambda (_msg) '(:status "ok" :execution_count 7))))
         (funcall reply-fn 'mock-reply-msg))
       (should (equal (overlay-get ov 'emacs-jupyter-notebook-execution-count) 7))
-      (should (string-match-p "\\[7\\]" (overlay-get ov 'after-string))))))
+      (should (string-match-p "\\[7\\]" (ejn-test-overlay-display-string ov))))))
 
 (ert-deftest ejn-clear-region-removes-execution-count-overlays ()
   (with-temp-buffer
@@ -1652,11 +1657,29 @@
       (emacs-jupyter-notebook-result-set-image ov '(image :type png :data "fake"))
       (goto-char end)
       (insert "typed below output")
-      (should (= (overlay-start ov) end))
+      (should (= (overlay-start ov) (1- end)))
       (should (= (overlay-end ov) end))
       (should (= (overlay-get ov 'emacs-jupyter-notebook-source-end) end))
+      (goto-char end)
+      (should (= (line-beginning-position) end))
       (should (equal (buffer-substring-no-properties end (point-max))
                      "typed below output")))))
+
+(ert-deftest ejn-line-delete-below-output-does-not-delete-source-line ()
+  (with-temp-buffer
+    (insert "# %%\nplt.show()\n")
+    (emacs-jupyter-notebook-mode 1)
+    (let* ((end (point-max))
+           (ov (emacs-jupyter-notebook-result-start (point-min) end)))
+      (emacs-jupyter-notebook-result-set-image ov '(image :type png :data "fake"))
+      (goto-char end)
+      (insert "typed below output\n")
+      (goto-char end)
+      (kill-whole-line)
+      (should (equal (buffer-string) "# %%\nplt.show()\n"))
+      (should (overlayp ov))
+      (should (= (overlay-start ov) (1- end)))
+      (should (= (overlay-end ov) end)))))
 
 (ert-deftest ejn-result-overlay-moves-after-source-edit-at-anchor ()
   (with-temp-buffer
@@ -1742,7 +1765,7 @@
   (with-temp-buffer
     (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
       (emacs-jupyter-notebook-result-set-image ov '(image :type png :data "fake"))
-      (let ((after-string (overlay-get ov 'after-string)))
+      (let ((after-string (ejn-test-overlay-display-string ov)))
         (should after-string)
         (should (string-match-p "\\[output\\]" after-string))))))
 
@@ -1750,7 +1773,7 @@
   (with-temp-buffer
     (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
       (emacs-jupyter-notebook-result-set-image ov '(image :type png :data "fake"))
-      (let ((after-string (overlay-get ov 'after-string)))
+      (let ((after-string (ejn-test-overlay-display-string ov)))
         (should after-string)
         (should (equal (substring-no-properties after-string 0 1) "\n"))
         (should-not (text-property-any 0 (length after-string) 'cursor t after-string))))))
@@ -1884,7 +1907,7 @@
                                                    "line1\nline2\nline3")))
       (overlay-put ov 'emacs-jupyter-notebook-collapsed t)
       (emacs-jupyter-notebook-result--render ov)
-      (let ((after (overlay-get ov 'after-string)))
+      (let ((after (ejn-test-overlay-display-string ov)))
         (should (string-match-p "output: 3 lines, hidden" after))
         (should-not (string-match-p "line1" after))
         (should-not (text-property-any 0 (length after) 'cursor t after))))))
@@ -1895,7 +1918,7 @@
     (let ((ov (emacs-jupyter-notebook-result-create (point-min) (point-max)
                                                    "line1\nline2")))
       (should-not (overlay-get ov 'emacs-jupyter-notebook-collapsed))
-      (let ((after (overlay-get ov 'after-string)))
+      (let ((after (ejn-test-overlay-display-string ov)))
         (should (string-match-p "line1" after))
         (should (string-match-p "line2" after))
         (should (equal (substring-no-properties after 0 1) "\n"))
@@ -1934,7 +1957,7 @@
       (emacs-jupyter-notebook-result-set-image ov '(image :type png :data "fake"))
       (overlay-put ov 'emacs-jupyter-notebook-collapsed t)
       (emacs-jupyter-notebook-result--render ov)
-      (let ((after (overlay-get ov 'after-string)))
+      (let ((after (ejn-test-overlay-display-string ov)))
         (should (string-match-p "output: image, hidden" after))
         (should-not (text-property-any 0 (length after) 'cursor t after))))))
 

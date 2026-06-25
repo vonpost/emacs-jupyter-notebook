@@ -143,6 +143,17 @@ for images.  Return nil if no suitable MIME type is found."
   "Return propertized result header TEXT."
   (propertize text 'face 'emacs-jupyter-notebook-result-header-face))
 
+(defun emacs-jupyter-notebook-result--put-display (ov display)
+  "Set OV display string to DISPLAY according to its anchor placement."
+  (overlay-put ov 'before-string nil)
+  (overlay-put ov 'after-string nil)
+  (if (eq (overlay-get ov 'emacs-jupyter-notebook-display-placement)
+          'before-newline)
+      ;; The real buffer newline covered by OV terminates the output display and
+      ;; gives text below the output its own logical line.
+      (overlay-put ov 'before-string (string-remove-suffix "\n" display))
+    (overlay-put ov 'after-string display)))
+
 (defun emacs-jupyter-notebook-result--render (ov)
   "Render result overlay OV from its stored content."
   (let* ((image (overlay-get ov 'emacs-jupyter-notebook-image))
@@ -153,13 +164,14 @@ for images.  Return nil if no suitable MIME type is found."
     (overlay-put ov 'emacs-jupyter-notebook-result-full-content content)
     (if image
         (let ((header (format "\n[%s] [%s]\n" count (if running "running" "output"))))
-          (overlay-put ov 'after-string
-                       (if collapsed
-                           (emacs-jupyter-notebook-result--header-string
-                            (format "\n[%s] [output: image, hidden]\n" count))
-                         (concat (emacs-jupyter-notebook-result--header-string header)
-                                 (propertize " " 'display image)
-                                 "\n"))))
+          (emacs-jupyter-notebook-result--put-display
+           ov
+           (if collapsed
+               (emacs-jupyter-notebook-result--header-string
+                (format "\n[%s] [output: image, hidden]\n" count))
+             (concat (emacs-jupyter-notebook-result--header-string header)
+                     (propertize " " 'display image)
+                     "\n"))))
       (let* ((inline-lines (max 1 emacs-jupyter-notebook-result-inline-lines))
              (inline-max-bytes emacs-jupyter-notebook-result-inline-max-bytes)
              (line-count (emacs-jupyter-notebook-result--line-count content))
@@ -197,7 +209,7 @@ for images.  Return nil if no suitable MIME type is found."
                              (format "... (%d more lines, C-c C-o to view)\n"
                                      (- line-count inline-lines))
                              'face 'emacs-jupyter-notebook-result-header-face)))))))
-        (overlay-put ov 'after-string display)))))
+        (emacs-jupyter-notebook-result--put-display ov display)))))
 
 (defun emacs-jupyter-notebook-result--all-overlays ()
   "Return all package-owned result overlays in the current buffer."
@@ -237,8 +249,14 @@ for images.  Return nil if no suitable MIME type is found."
 (defun emacs-jupyter-notebook-result-start (beg end)
   "Create an empty running result overlay attached to BEG and END."
   (emacs-jupyter-notebook-result-clear-region beg end)
-  (let ((ov (make-overlay end end (current-buffer) nil nil)))
+  (let* ((before-newline (and (> end beg)
+                              (eq (char-before end) ?\n)))
+         (ov (if before-newline
+                 (make-overlay (1- end) end (current-buffer) nil nil)
+               (make-overlay end end (current-buffer) nil nil))))
     (overlay-put ov 'emacs-jupyter-notebook-result t)
+    (overlay-put ov 'emacs-jupyter-notebook-display-placement
+                 (if before-newline 'before-newline 'after-anchor))
     (overlay-put ov 'emacs-jupyter-notebook-source-begin beg)
     (overlay-put ov 'emacs-jupyter-notebook-source-end end)
     (overlay-put ov 'emacs-jupyter-notebook-content "")
