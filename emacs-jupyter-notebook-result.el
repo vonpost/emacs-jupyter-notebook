@@ -140,13 +140,8 @@ for images.  Return nil if no suitable MIME type is found."
       (substring text hi))))
 
 (defun emacs-jupyter-notebook-result--header-string (text)
-  "Return propertized result header TEXT with an explicit cursor target."
-  (let ((string (propertize text 'face 'emacs-jupyter-notebook-result-header-face)))
-    ;; The cursor property does not work on newlines, so mark the first
-    ;; visible header character instead of adding a visible spacer.
-    (when-let* ((pos (string-match-p "[^\n]" string)))
-      (put-text-property pos (1+ pos) 'cursor t string))
-    string))
+  "Return propertized result header TEXT."
+  (propertize text 'face 'emacs-jupyter-notebook-result-header-face))
 
 (defun emacs-jupyter-notebook-result--render (ov)
   "Render result overlay OV from its stored content."

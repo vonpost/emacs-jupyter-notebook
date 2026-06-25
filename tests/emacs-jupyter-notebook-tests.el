@@ -1731,14 +1731,14 @@
         (should after-string)
         (should (string-match-p "\\[output\\]" after-string))))))
 
-(ert-deftest ejn-result-image-render-adds-cursor-target ()
+(ert-deftest ejn-result-image-render-does-not-add-cursor-spacer ()
   (with-temp-buffer
     (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
       (emacs-jupyter-notebook-result-set-image ov '(image :type png :data "fake"))
       (let ((after-string (overlay-get ov 'after-string)))
         (should after-string)
         (should (equal (substring-no-properties after-string 0 1) "\n"))
-        (should (text-property-any 0 (length after-string) 'cursor t after-string))))))
+        (should-not (text-property-any 0 (length after-string) 'cursor t after-string))))))
 
 (ert-deftest ejn-mime-render-image-jpeg-decodes-base64 ()
   (let* ((raw "jpeg-data")
@@ -1872,7 +1872,7 @@
       (let ((after (overlay-get ov 'after-string)))
         (should (string-match-p "output: 3 lines, hidden" after))
         (should-not (string-match-p "line1" after))
-        (should (text-property-any 0 (length after) 'cursor t after))))))
+        (should-not (text-property-any 0 (length after) 'cursor t after))))))
 
 (ert-deftest ejn-toggle-output-expanded-render-shows-content ()
   (with-temp-buffer
@@ -1884,7 +1884,7 @@
         (should (string-match-p "line1" after))
         (should (string-match-p "line2" after))
         (should (equal (substring-no-properties after 0 1) "\n"))
-        (should (text-property-any 0 (length after) 'cursor t after)))))
+        (should-not (text-property-any 0 (length after) 'cursor t after)))))
   )
 
 (ert-deftest ejn-nearest-overlay-finds-overlay-at-point ()
@@ -1921,7 +1921,7 @@
       (emacs-jupyter-notebook-result--render ov)
       (let ((after (overlay-get ov 'after-string)))
         (should (string-match-p "output: image, hidden" after))
-        (should (text-property-any 0 (length after) 'cursor t after))))))
+        (should-not (text-property-any 0 (length after) 'cursor t after))))))
 
 (ert-deftest ejn-clear-results-works-with-collapsed-overlays ()
   (with-temp-buffer
