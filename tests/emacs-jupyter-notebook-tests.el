@@ -2583,6 +2583,73 @@
         (when (file-exists-p local-file)
           (delete-file local-file))))))
 
+(ert-deftest ejn-mode-disable-cancels-async-context-locally ()
+  "W1.2: disabling the mode cancels any in-flight async context locally."
+  (with-temp-buffer
+    (emacs-jupyter-notebook-mode 1)
+    (let* ((launch (start-process "ejn-test-disable-launch" nil "sleep" "60"))
+           (scp (start-process "ejn-test-disable-scp" nil "sleep" "60"))
+           (tunnel (start-process "ejn-test-disable-tunnel" nil "sleep" "60"))
+           (remote-copy (make-temp-file "ejn-disable-remote-" nil ".json"))
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'tunnel
+                     :launch-process launch
+                     :scp-process scp
+                     :tunnel-process tunnel
+                     :remote-copy remote-copy
+                     :origin-buffer (current-buffer))))
+      (setq emacs-jupyter-notebook--async-context context)
+      (emacs-jupyter-notebook-mode -1)
+      (should-not (process-live-p launch))
+      (should-not (process-live-p scp))
+      (should-not (process-live-p tunnel))
+      (should-not (file-exists-p remote-copy))
+      (should-not emacs-jupyter-notebook--async-context))))
+
+(ert-deftest ejn-mode-disable-cancels-buffer-local-timers ()
+  "W1.2: disabling the mode cancels evaluation and completion idle timers."
+  (with-temp-buffer
+    (emacs-jupyter-notebook-mode 1)
+    (let ((eval-timer (run-at-time 600 nil #'ignore)))
+      (setq emacs-jupyter-notebook--evaluation-timer eval-timer)
+      (emacs-jupyter-notebook-mode -1)
+      (should-not emacs-jupyter-notebook--evaluation-timer)
+      (should-not (memq eval-timer timer-list))
+      (should-not emacs-jupyter-notebook--completion-idle-timer))))
+
+(ert-deftest ejn-mode-disable-preserves-session-entry-and-client ()
+  "W1.2: mode disable does not call jupyter-shutdown or touch the registry."
+  (let (shutdown-called cleanup-called registry-removed
+        (entry '(:profile "p" :session-id "session")))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
+               (lambda (&rest _)
+                 (setq shutdown-called t)))
+              ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
+               (lambda (&rest _)
+                 (setq cleanup-called t)))
+              ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
+               (lambda (&rest _)
+                 (setq registry-removed t))))
+      (with-temp-buffer
+        (emacs-jupyter-notebook-mode 1)
+        (setq emacs-jupyter-notebook--client 'mock-client)
+        (setq emacs-jupyter-notebook--session-entry entry)
+        (emacs-jupyter-notebook-mode -1)
+        (should-not shutdown-called)
+        (should-not cleanup-called)
+        (should-not registry-removed)
+        (should (equal emacs-jupyter-notebook--session-entry entry))))))
+
+(ert-deftest ejn-mode-disable-cleanup-swallows-errors ()
+  "W1.2: mode-disable cleanup swallows disposer errors without raising."
+  (cl-letf (((symbol-function 'emacs-jupyter-notebook--cancel-async-context-locally)
+             (lambda (&rest _) (error "boom"))))
+    (with-temp-buffer
+      (should
+       (progn
+         (emacs-jupyter-notebook--mode-disable-cleanup)
+         t)))))
+
 (provide 'emacs-jupyter-notebook-tests)
 
 ;;; emacs-jupyter-notebook-tests.el ends here
