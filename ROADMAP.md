@@ -326,7 +326,7 @@ Design contract:
 
 Rows:
 
-- [~] owner=W3-agent claimed=2026-06-28 W3.1 Cache with bounded LRU and context-key generation. ERT for cache
+- [x] sha=eb4360a W3.1 Cache with bounded LRU and context-key generation. ERT for cache
       hit/miss/eviction.
 - [ ] W3.2 Idle-delayed async request that can be cancelled when the
       buffer's context changes (point moves, character typed). ERT.
