@@ -128,7 +128,7 @@ the registry or the remote kernel.
       `ejn-mode-disable-preserves-session-entry-and-client` to assert only the
       session entry is preserved; add an ERT proving the client and tunnel
       process are gone after disable.
-- [~] owner=W1-fixup claimed=2026-06-28 W1.10 Per-disposer error tolerance in buffer-local cleanup: the
+- [x] sha=ecd9564 W1.10 Per-disposer error tolerance in buffer-local cleanup: the
       kill-buffer-hook and mode-disable wrappers wrap a chain of disposers in
       one `condition-case`. Refactor so each disposer is independently
       best-effort (`ignore-errors` per call or an `unwind-protect` chain),
