@@ -219,7 +219,7 @@ Rows:
 - [x] sha=031436e W2.3 Implement the history-log view. Toggle via `H` in the panel.
       Region/paragraph/defun evals appear only here. ERT: toggle round-trip
       preserves data; region eval shows in history but not in latest-per-cell.
-- [ ] W2.4 Streaming throttle. Stream events buffer at the panel level and
+- [~] owner=W2-agent claimed=2026-06-28 W2.4 Streaming throttle. Stream events buffer at the panel level and
       flush at most every 50 ms. ERT: 1000 small stream events produce ≤ 20
       redisplays in batch (mock by counting `ejn-panel--render` calls).
 - [ ] W2.5 Image rendering. PNG/JPEG inline; large images downscaled with
