@@ -335,7 +335,7 @@ Rows:
 - [x] sha=788ada8 W3.4 capf integration that never blocks. ERT proves capf returns in
       ≤ 5 ms regardless of kernel state (mock the adapter to delay 10 s and
       assert capf still returns within budget).
-- [~] owner=W3-agent claimed=2026-06-28 W3.5 Frontend refresh trigger: on reply arrival, if the buffer's
+- [x] sha=5ea4339 W3.5 Frontend refresh trigger: on reply arrival, if the buffer's
       context still matches the request's context, push results to the
       active completion UI. ERT for corfu and company variants (mock the
       UI).
