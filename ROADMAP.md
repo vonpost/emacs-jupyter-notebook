@@ -249,6 +249,44 @@ Rows:
       `emacs-jupyter-notebook-panel-default-view` (default `latest`),
       `emacs-jupyter-notebook-panel-stream-throttle-ms` (default 50),
       `emacs-jupyter-notebook-fringe-side` (default `left-fringe`).
+- [~] owner=W2-fixup claimed=2026-06-28 W2.11 Stable cell key across edits.
+      `--cell-key-for` currently returns a numeric marker-position snapshot:
+      inserts above a cell shift the marker but the cons changes, so
+      latest-per-cell replacement and fringe lookup stop recognizing the cell.
+      Fix: allocate a stable per-cell integer ID kept in a buffer-local hash
+      that maps id → marker; the cell-key becomes `(file . id)` for the
+      lifetime of the buffer.  Add an ERT that inserts text above a cell and
+      proves the returned cell key is identical to the pre-edit key.
+- [ ] W2.12 Indicator display spec correctness.  The previous spec
+      `'((<side> "<glyph>"))' is invalid in both fringe and margin slots
+      (fringe needs a bitmap symbol, margin needs `((margin <side>) STRING)`).
+      Fix: use the proper margin syntax and default to `left-margin` so the
+      ✓N digit actually renders.  Document that true fringe support would
+      require define-fringe-bitmap variants per state/digit and is out of
+      scope here.  Add an ERT that introspects the indicator overlay's
+      `before-string` `display` property and asserts it matches the documented
+      Emacs margin-display form.
+- [ ] W2.13 History view accumulates all evaluations.  The panel currently
+      deletes the prior same-cell entry from `--entries` on re-eval, so the
+      history-log view loses past runs.  Fix: stop deleting on re-eval; let
+      the latest-view renderer (which already groups by cell-key) filter the
+      duplicates for the latest view only.  Update the W2.3
+      `ejn-w2.3-history-view-keeps-all-evals` test to assert all four entries
+      remain in history view.
+- [ ] W2.14 Panel buffer name disambiguation.  `--name-for` uses
+      `file-name-nondirectory`, so two source buffers visiting different files
+      with the same basename collide on one `*ejn: foo.py*` buffer.  Fix: use
+      `(buffer-name SOURCE)` (which Emacs already disambiguates as `foo.py<2>`)
+      as the suffix.  Add an ERT that creates two source buffers visiting
+      different paths with the same basename and asserts their panels are
+      distinct objects.
+
+Known follow-on (not in this remediation pass):
+- Panel state currently lives in panel-buffer-local vars, so killing the
+  panel discards entries (the W2.5 "image survives panel kill/reopen"
+  contract is not honored). Honoring it requires relocating
+  `--entries`/`--next-id`/`--source-buffer` to defvar-local on the SOURCE
+  buffer; the panel buffer becomes pure presentation. Future workstream.
 
 Acceptance: every W2 row [x] with sha; the source buffer carries no result
 text; all inline-overlay code is gone; manual smoke: edit code while a long
