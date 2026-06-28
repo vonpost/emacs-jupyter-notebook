@@ -116,6 +116,24 @@ the registry or the remote kernel.
 - [x] sha=ed5d15c W1.7 ERT: killing the buffer that owns a live client does **not** call
       the configured `…-jupyter-shutdown-function` and does **not** remove
       the registry entry.
+- [~] owner=W1-fixup claimed=2026-06-28 W1.8 Remove `--async-kill-remote-kernel`
+      call and `:local-file` deletion from `--async-fail` (binding-rule
+      compliance: async failure paths must not terminate the remote kernel,
+      and `:local-file` is the future `:local-connection-file` reconnect key
+      after `--async-connect-finalize` promotion). Update or drop the
+      `--async-kill-remote-kernel` stubs in the W1.3/W1.6 tests; add a
+      positive ERT asserting `--async-fail` does NOT call the kill helper.
+- [ ] W1.9 Mode-disable also releases `--client` and `--tunnel-process` (the
+      W1 GOAL lists both as local resources released on mode disable). Update
+      `ejn-mode-disable-preserves-session-entry-and-client` to assert only the
+      session entry is preserved; add an ERT proving the client and tunnel
+      process are gone after disable.
+- [ ] W1.10 Per-disposer error tolerance in buffer-local cleanup: the
+      kill-buffer-hook and mode-disable wrappers wrap a chain of disposers in
+      one `condition-case`. Refactor so each disposer is independently
+      best-effort (`ignore-errors` per call or an `unwind-protect` chain),
+      and add an ERT proving that one disposer raising still lets the
+      remaining disposers run.
 
 Acceptance: all new ERTs pass; canonical test command is green; manual
 smoke: open a buffer, start a kernel, kill the buffer, reopen the file,
