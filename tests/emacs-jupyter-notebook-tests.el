@@ -600,66 +600,59 @@
                "nohup uv run --project ~/myproject jupyter kernel"
                remote-command)))))
 
-(ert-deftest ejn-result-overlay-create-and-clear-without-text-mutation ()
-  (ejn-test-with-temp-buffer "# %%\n1 + 1\n"
-    (let ((before (buffer-string)))
-      (emacs-jupyter-notebook-result-create (point-min) (point-max) "2")
-      (should (equal (buffer-string) before))
-      (should (= (length (emacs-jupyter-notebook-result--all-overlays)) 1))
-      (emacs-jupyter-notebook-result-clear-all)
-      (should (equal (buffer-string) before))
-      (should (= (length (emacs-jupyter-notebook-result--all-overlays)) 0)))))
-
-(ert-deftest ejn-result-overlay-replaces-existing-for-region ()
-  (ejn-test-with-temp-buffer "x = 1\n"
-    (emacs-jupyter-notebook-result-create (point-min) (point-max) "one")
-    (emacs-jupyter-notebook-result-create (point-min) (point-max) "two")
-    (let ((overlays (emacs-jupyter-notebook-result--all-overlays)))
-      (should (= (length overlays) 1))
-      (should (string-match-p "two" (ejn-test-overlay-display-string (car overlays)))))))
-
 (ert-deftest ejn-evaluate-cell-does-not-mutate-source ()
+  "W2: evaluating a cell does not mutate source-buffer text.
+Output goes to the panel; the source buffer is untouched."
   (ejn-test-with-temp-buffer "# %%\na = 1\n# %%\nb = 2\n"
     (search-forward "a = 1")
     (let ((before (buffer-string))
           (emacs-jupyter-notebook--client 'mock-client)
           captured-code)
       (let ((emacs-jupyter-notebook-jupyter-evaluate-function
-             (lambda (_client code beg end)
-               (setq captured-code code)
-               (emacs-jupyter-notebook-result-create beg end "ok"))))
+             (lambda (_client code _entry)
+               (setq captured-code code))))
         (emacs-jupyter-notebook-evaluate-current-cell))
       (should (equal captured-code "a = 1\n"))
-      (should (equal (buffer-string) before))
-      (should (= (length (emacs-jupyter-notebook-result--all-overlays)) 1)))))
+      (should (equal (buffer-string) before)))))
 
-(ert-deftest ejn-evaluate-code-error-creates-result-overlay ()
+(ert-deftest ejn-evaluate-code-error-routes-to-panel ()
+  "W2: an evaluate failure creates a panel entry annotated with the error and
+leaves source-buffer text untouched."
   (ejn-test-with-temp-buffer "x = 1\n"
     (let ((before (buffer-string)))
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-client-async)
                  (lambda (_callback error-callback)
                    (funcall error-callback nil "connect failed"))))
-        (emacs-jupyter-notebook--evaluate-code "x = 1\n" (point-min) (point-max)))
+        (emacs-jupyter-notebook--evaluate-code "x = 1\n" nil))
       (should (equal (buffer-string) before))
-      (let ((overlays (emacs-jupyter-notebook-result--all-overlays)))
-        (should (= (length overlays) 1))
-        (should (string-match-p "Evaluation failed: connect failed"
-                                (ejn-test-overlay-display-string (car overlays))))))))
+      (let ((panel (emacs-jupyter-notebook-panel-buffer (current-buffer))))
+        (should (buffer-live-p panel))
+        (with-current-buffer panel
+          (should (cl-find-if
+                   (lambda (cell)
+                     (let* ((e (cdr cell))
+                            (c (or (plist-get e :content) "")))
+                       (string-match-p "Evaluation failed: connect failed" c)))
+                   emacs-jupyter-notebook-panel--entries)))))))
 
 (ert-deftest ejn-evaluate-region-and-buffer-do-not-mutate-source ()
+  "W2: region/buffer eval does not mutate source-buffer text and has cell-key nil."
   (ejn-test-with-temp-buffer "x = 1\ny = 2\n"
     (let ((before (buffer-string))
           (modified (buffer-modified-p))
           (emacs-jupyter-notebook--client 'mock-client)
           calls)
       (let ((emacs-jupyter-notebook-jupyter-evaluate-function
-             (lambda (_client code _beg _end)
-               (push code calls))))
+             (lambda (_client code entry-handle)
+               (push (list code (plist-get entry-handle :cell-key)) calls))))
         (emacs-jupyter-notebook-evaluate-region (point-min) (line-end-position))
         (emacs-jupyter-notebook-evaluate-buffer))
       (should (equal (buffer-string) before))
       (should (equal (buffer-modified-p) modified))
-      (should (equal (nreverse calls) '("x = 1" "x = 1\ny = 2\n"))))))
+      (let ((codes (mapcar #'car (nreverse calls)))
+            (keys (mapcar #'cadr (nreverse calls))))
+        (should (equal codes '("x = 1" "x = 1\ny = 2\n")))
+        (should (cl-every #'null keys))))))
 
 (ert-deftest ejn-mode-enable-does-not-start-remote-work ()
   (with-temp-buffer
@@ -678,97 +671,13 @@
       (emacs-jupyter-notebook-mode 1)
       (should emacs-jupyter-notebook-mode))))
 
-(ert-deftest ejn-result-line-count-without-splitting ()
-  (should (= (emacs-jupyter-notebook-result--line-count "") 0))
-  (should (= (emacs-jupyter-notebook-result--line-count "a") 1))
-  (should (= (emacs-jupyter-notebook-result--line-count "a\nb") 2))
-  (should (= (emacs-jupyter-notebook-result--line-count "a\nb\nc") 3))
-  (should (= (emacs-jupyter-notebook-result--line-count "a\n") 2)))
-
 (ert-deftest ejn-result-last-bytes-truncates-to-tail ()
+  "W2: byte truncation helper trims to the trailing window."
   (let ((text "abcdefghij"))
-    (should (equal (emacs-jupyter-notebook-result--last-bytes text 100) text))
-    (should (equal (emacs-jupyter-notebook-result--last-bytes text 5) "fghij"))
-    (should (equal (emacs-jupyter-notebook-result--last-bytes text 1) "j"))
-    (should (equal (emacs-jupyter-notebook-result--last-bytes text 10) text))))
-
-(ert-deftest ejn-result-append-caps-by-bytes ()
-  (let ((emacs-jupyter-notebook-result-max-bytes 20)
-        (emacs-jupyter-notebook-result-max-lines 10000))
-    (with-temp-buffer
-      (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
-        (emacs-jupyter-notebook-result-append ov "aaaaaaaaaa bbbbbbbbbb ccccc")
-        (let ((content (overlay-get ov 'emacs-jupyter-notebook-content)))
-          (should (<= (string-bytes content) 20))
-          (should (string-suffix-p "ccccc" content)))))))
-
-(ert-deftest ejn-result-replace-caps-by-bytes ()
-  (let ((emacs-jupyter-notebook-result-max-bytes 15)
-        (emacs-jupyter-notebook-result-max-lines 10000))
-    (with-temp-buffer
-      (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
-        (emacs-jupyter-notebook-result-replace ov "aaaaaaaaaa bbbbbbbbbb")
-        (let ((content (overlay-get ov 'emacs-jupyter-notebook-content)))
-          (should (<= (string-bytes content) 15)))))))
-
-(ert-deftest ejn-result-render-byte-truncated-shows-summary ()
-  (let ((emacs-jupyter-notebook-result-inline-max-bytes 10)
-        (emacs-jupyter-notebook-result-inline-lines 100)
-        (emacs-jupyter-notebook-result-max-lines 10000)
-        (emacs-jupyter-notebook-result-max-bytes 100000))
-    (with-temp-buffer
-      (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
-        (emacs-jupyter-notebook-result-append ov "aaaaaaaaaa bbbbbbbbbb cc")
-        (let ((after (ejn-test-overlay-display-string ov)))
-          (should (string-match-p "bytes" after))
-          (should (string-match-p "C-c C-o" after))
-          (should-not (string-match-p "aaaa" after)))))))
-
-(ert-deftest ejn-result-render-no-byte-summary-when-under-limit ()
-  (let ((emacs-jupyter-notebook-result-inline-max-bytes 100000)
-        (emacs-jupyter-notebook-result-inline-lines 100)
-        (emacs-jupyter-notebook-result-max-lines 10000))
-    (with-temp-buffer
-      (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
-        (emacs-jupyter-notebook-result-append ov "small")
-        (let ((after (ejn-test-overlay-display-string ov)))
-          (should (string-match-p "small" after))
-          (should-not (string-match-p "bytes" after)))))))
-
-(ert-deftest ejn-result-append-caps-to-max-lines-retaining-newest ()
-  (let ((emacs-jupyter-notebook-result-max-lines 5))
-    (with-temp-buffer
-      (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
-        (emacs-jupyter-notebook-result-append
-         ov (mapconcat #'number-to-string (number-sequence 1 10) "\n"))
-        (let ((content (overlay-get ov 'emacs-jupyter-notebook-content)))
-          (should (= (emacs-jupyter-notebook-result--line-count content) 5))
-          (should (string-prefix-p "6" content))
-          (should (string-suffix-p "10" content)))))))
-
-(ert-deftest ejn-result-render-truncates-to-inline-lines ()
-  (let ((emacs-jupyter-notebook-result-inline-lines 3)
-        (emacs-jupyter-notebook-result-max-lines 200))
-    (with-temp-buffer
-      (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
-        (emacs-jupyter-notebook-result-append ov "a\nb\nc\nd\ne\nf\ng")
-        (let ((after (ejn-test-overlay-display-string ov)))
-          (should (string-match-p "a" after))
-          (should (string-match-p "c" after))
-          (should-not (string-match-p "d" after))
-          (should (string-match-p "4 more lines" after))
-          (should (string-match-p "C-c C-o" after)))))))
-
-(ert-deftest ejn-result-render-no-truncation-summary-when-fits ()
-  (let ((emacs-jupyter-notebook-result-inline-lines 10)
-        (emacs-jupyter-notebook-result-max-lines 200))
-    (with-temp-buffer
-      (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
-        (emacs-jupyter-notebook-result-append ov "a\nb\nc")
-        (let ((after (ejn-test-overlay-display-string ov)))
-          (should (string-match-p "a" after))
-          (should (string-match-p "c" after))
-          (should-not (string-match-p "more lines" after)))))))
+    (should (equal (emacs-jupyter-notebook--last-bytes text 100) text))
+    (should (equal (emacs-jupyter-notebook--last-bytes text 5) "fghij"))
+    (should (equal (emacs-jupyter-notebook--last-bytes text 1) "j"))
+    (should (equal (emacs-jupyter-notebook--last-bytes text 10) text))))
 
 (ert-deftest ejn-read-registry-entry-empty-registry-raises-user-error ()
   (let ((completing-read-called nil))
@@ -1020,7 +929,7 @@
     (let ((emacs-jupyter-notebook--client 'mock-client)
           captured)
       (let ((emacs-jupyter-notebook-jupyter-evaluate-function
-             (lambda (_client code _beg _end)
+             (lambda (_client code _entry-handle)
                (push code captured))))
         (emacs-jupyter-notebook-evaluate-current-cell))
       (should (equal captured '("a = 1\n"))))))
@@ -1033,7 +942,7 @@
            (reconnect-captured nil)
            (eval-called nil)
            (emacs-jupyter-notebook-jupyter-evaluate-function
-            (lambda (_client _code _beg _end)
+            (lambda (_client _code _entry-handle)
               (setq eval-called t))))
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
                  (lambda () entry))
@@ -1055,7 +964,7 @@
            (start-captured nil)
            (eval-called nil)
            (emacs-jupyter-notebook-jupyter-evaluate-function
-            (lambda (_client _code _beg _end)
+            (lambda (_client _code _entry-handle)
               (setq eval-called t))))
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
                  (lambda () nil))
@@ -1079,7 +988,7 @@
            removed-key
            eval-called
            (emacs-jupyter-notebook-jupyter-evaluate-function
-            (lambda (_client _code _beg _end)
+            (lambda (_client _code _entry-handle)
               (setq eval-called t))))
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
                  (lambda () entry))
@@ -1105,7 +1014,7 @@
     (let* ((emacs-jupyter-notebook--client nil)
            (eval-called nil)
            (emacs-jupyter-notebook-jupyter-evaluate-function
-            (lambda (_client code _beg _end)
+            (lambda (_client code _entry-handle)
               (setq eval-called t)))
            (emacs-jupyter-notebook--async-context
             (emacs-jupyter-notebook--async-new-context
@@ -1315,65 +1224,72 @@
       (funcall callback '(:status "incomplete" :indent "    ") nil)
       (should-not eval-called))))
 
-(ert-deftest ejn-result-overlay-clear-resets-content ()
+(ert-deftest ejn-panel-append-replace-clear-pending ()
+  "W2.1: panel API supports append, replace, clear and pending-clear semantics."
   (with-temp-buffer
-    (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
-      (emacs-jupyter-notebook-result-append ov "hello\nworld")
-      (should (equal (overlay-get ov 'emacs-jupyter-notebook-content) "hello\nworld"))
-      (emacs-jupyter-notebook-result-clear ov)
-      (should (equal (overlay-get ov 'emacs-jupyter-notebook-content) ""))
-      (should-not (overlay-get ov 'emacs-jupyter-notebook-pending-clear)))))
-
-(ert-deftest ejn-result-overlay-replace-swaps-content ()
-  (with-temp-buffer
-    (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
-      (emacs-jupyter-notebook-result-append ov "old-content")
-      (emacs-jupyter-notebook-result-replace ov "new-content")
-      (should (equal (overlay-get ov 'emacs-jupyter-notebook-content) "new-content")))))
-
-(ert-deftest ejn-result-overlay-append-after-pending-clear-replaces ()
-  (with-temp-buffer
-    (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
-      (emacs-jupyter-notebook-result-append ov "existing")
-      (overlay-put ov 'emacs-jupyter-notebook-pending-clear t)
-      (emacs-jupyter-notebook-result-append ov "fresh")
-      (should (equal (overlay-get ov 'emacs-jupyter-notebook-content) "fresh"))
-      (should-not (overlay-get ov 'emacs-jupyter-notebook-pending-clear)))))
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1")))
+      (ejn-panel-append-text handle "hello\n")
+      (ejn-panel-append-text handle "world")
+      (let ((e (ejn-panel-entry-snapshot handle)))
+        (should (equal (plist-get e :content) "hello\nworld")))
+      (ejn-panel-clear-entry handle)
+      (should (equal (plist-get (ejn-panel-entry-snapshot handle) :content) ""))
+      (ejn-panel-append-text handle "existing")
+      (ejn-panel-clear-entry handle t)
+      (let ((e (ejn-panel-entry-snapshot handle)))
+        (should (equal (plist-get e :content) "existing"))
+        (should (plist-get e :pending-clear)))
+      (ejn-panel-append-text handle "fresh")
+      (let ((e (ejn-panel-entry-snapshot handle)))
+        (should (equal (plist-get e :content) "fresh"))
+        (should-not (plist-get e :pending-clear)))
+      (ejn-panel-replace-text handle "swapped")
+      (should (equal (plist-get (ejn-panel-entry-snapshot handle) :content)
+                     "swapped")))))
 
 (ert-deftest ejn-callback-clear-output-immediate ()
+  "W2.7: clear_output without :wait clears the panel entry immediately."
   (with-temp-buffer
     (let* ((buffer (current-buffer))
-           (ov (emacs-jupyter-notebook-result-start (point-min) (point-max)))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer ov))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
            (clear-fn (cadr (assoc "clear_output" callbacks))))
-      (emacs-jupyter-notebook-result-append ov "some output")
-      (should (equal (overlay-get ov 'emacs-jupyter-notebook-content) "some output"))
+      (ejn-panel-append-text handle "some output")
       (cl-letf (((symbol-function 'jupyter-message-content)
                  (lambda (_msg) '(:wait nil))))
         (funcall clear-fn 'mock-msg))
-      (should (equal (overlay-get ov 'emacs-jupyter-notebook-content) ""))
-      (should-not (overlay-get ov 'emacs-jupyter-notebook-pending-clear)))))
+      (let ((e (ejn-panel-entry-snapshot handle)))
+        (should (equal (plist-get e :content) ""))
+        (should-not (plist-get e :pending-clear))))))
 
 (ert-deftest ejn-callback-clear-output-wait-defers-clear ()
+  "W2.7: clear_output with :wait defers the clear until next text arrives."
   (with-temp-buffer
     (let* ((buffer (current-buffer))
-           (ov (emacs-jupyter-notebook-result-start (point-min) (point-max)))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer ov))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
            (clear-fn (cadr (assoc "clear_output" callbacks))))
-      (emacs-jupyter-notebook-result-append ov "some output")
+      (ejn-panel-append-text handle "some output")
       (cl-letf (((symbol-function 'jupyter-message-content)
                  (lambda (_msg) '(:wait t))))
         (funcall clear-fn 'mock-msg))
-      (should (equal (overlay-get ov 'emacs-jupyter-notebook-content) "some output"))
-      (should (overlay-get ov 'emacs-jupyter-notebook-pending-clear)))))
+      (let ((e (ejn-panel-entry-snapshot handle)))
+        (should (equal (plist-get e :content) "some output"))
+        (should (plist-get e :pending-clear))))))
 
 (ert-deftest ejn-callback-update-display-data-replaces-content ()
+  "W2.7: update_display_data replaces the panel entry's content."
   (with-temp-buffer
     (let* ((buffer (current-buffer))
-           (ov (emacs-jupyter-notebook-result-start (point-min) (point-max)))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer ov))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
            (update-fn (cadr (assoc "update_display_data" callbacks))))
-      (emacs-jupyter-notebook-result-append ov "old display")
+      (ejn-panel-append-text handle "old display")
       (cl-letf (((symbol-function 'jupyter-message-content)
                  (lambda (_msg) '(:data (:text/plain "updated output")
                                         :transient (:display_id "abc"))))
@@ -1381,7 +1297,8 @@
                  (lambda (_msg mimetype)
                    (when (eq mimetype :text/plain) "updated output"))))
         (funcall update-fn 'mock-update-msg))
-      (should (equal (overlay-get ov 'emacs-jupyter-notebook-content) "updated output")))))
+      (should (equal (plist-get (ejn-panel-entry-snapshot handle) :content)
+                     "updated output")))))
 
 (ert-deftest ejn-evaluate-cell-completeness-check-allows-complete-code-async ()
   (ejn-test-with-temp-buffer "# %%\nx = 1\n"
@@ -1404,9 +1321,10 @@
 (ert-deftest ejn-status-message-sets-kernel-status ()
   (with-temp-buffer
     (emacs-jupyter-notebook-mode 1)
-    (let ((buffer (current-buffer))
-          (ov (make-overlay (point-min) (point-max))))
-      (let* ((callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer ov))
+    (let* ((buffer (current-buffer))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "")))
+      (let* ((callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
              (status-handler (cadr (assoc "status" callbacks)))
              (mock-msg 'mock-status-msg))
         (should status-handler)
@@ -1494,73 +1412,6 @@
         (should-not emacs-jupyter-notebook--tunnel-dead)
         (should sentinel-installed)))))
 
-(ert-deftest ejn-execution-count-overlay-created-with-correct-text ()
-  (with-temp-buffer
-    (insert "# %%\nx = 1\n")
-    (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
-      (emacs-jupyter-notebook-result--set-execution-count ov 42)
-      (should (equal (overlay-get ov 'emacs-jupyter-notebook-execution-count) 42))
-      (should (string-match-p "\\[42\\]" (ejn-test-overlay-display-string ov))))))
-
-(ert-deftest ejn-busy-indicator-shows-star ()
-  (with-temp-buffer
-    (insert "# %%\nx = 1\n")
-    (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
-      (emacs-jupyter-notebook-result--set-busy-indicator ov)
-      (should (string-match-p "\\[\\*\\]" (ejn-test-overlay-display-string ov))))))
-
-(ert-deftest ejn-clear-results-removes-execution-count-overlays ()
-  (with-temp-buffer
-    (insert "# %%\nx = 1\n# %%\ny = 2\n")
-    (let ((ov1 (emacs-jupyter-notebook-result-start (point-min) 7))
-          (ov2 (emacs-jupyter-notebook-result-start 8 (point-max))))
-      (emacs-jupyter-notebook-result--set-execution-count ov1 1)
-      (emacs-jupyter-notebook-result--set-execution-count ov2 2)
-      (should (= (length (emacs-jupyter-notebook-result--all-overlays)) 2))
-      (emacs-jupyter-notebook-result-clear-all)
-      (should (= (length (emacs-jupyter-notebook-result--all-overlays)) 0)))))
-
-(ert-deftest ejn-execution-count-replaced-on-reevaluation ()
-  (with-temp-buffer
-    (insert "# %%\nx = 1\n")
-    (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
-      (emacs-jupyter-notebook-result--set-busy-indicator ov)
-      (should (string-match-p "\\[\\*\\]" (ejn-test-overlay-display-string ov)))
-      (emacs-jupyter-notebook-result--set-execution-count ov 5)
-      (should (equal (overlay-get ov 'emacs-jupyter-notebook-execution-count) 5))
-      (should (string-match-p "\\[5\\]" (ejn-test-overlay-display-string ov))))))
-
-(ert-deftest ejn-callback-execute-reply-sets-execution-count ()
-  (with-temp-buffer
-    (insert "# %%\nx = 1\n")
-    (let* ((buffer (current-buffer))
-           (ov (emacs-jupyter-notebook-result-start (point-min) (point-max)))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer ov))
-           (reply-fn (cadr (assoc "execute_reply" callbacks))))
-      (emacs-jupyter-notebook-result--set-busy-indicator ov)
-      (should (string-match-p "\\[\\*\\]" (ejn-test-overlay-display-string ov)))
-      (cl-letf (((symbol-function 'jupyter-message-content)
-                 (lambda (_msg) '(:status "ok" :execution_count 7))))
-        (funcall reply-fn 'mock-reply-msg))
-      (should (equal (overlay-get ov 'emacs-jupyter-notebook-execution-count) 7))
-      (should (string-match-p "\\[7\\]" (ejn-test-overlay-display-string ov))))))
-
-(ert-deftest ejn-clear-region-removes-execution-count-overlays ()
-  (with-temp-buffer
-    (insert "# %%\nx = 1\n# %%\ny = 2\n")
-    (let ((pos1 (point-min))
-          pos2)
-      (goto-char (point-min))
-      (search-forward "# %%" nil t 2)
-      (setq pos2 (match-beginning 0))
-      (let ((ov1 (emacs-jupyter-notebook-result-start pos1 7))
-            (ov2 (emacs-jupyter-notebook-result-start pos2 (point-max))))
-        (emacs-jupyter-notebook-result--set-execution-count ov1 1)
-        (emacs-jupyter-notebook-result--set-execution-count ov2 2)
-        (should (= (length (emacs-jupyter-notebook-result--all-overlays)) 2))
-        (emacs-jupyter-notebook-result-clear-region (point-min) (point-max))
-        (should (= (length (emacs-jupyter-notebook-result--all-overlays)) 0))))))
-
 (ert-deftest ejn-mime-select-png-over-jpeg-and-text ()
   (let ((data '(:text/plain "hello" :image/png "pngdata" :image/jpeg "jpgdata")))
     (should (equal (car (emacs-jupyter-notebook--select-mime-type data)) :image/png))
@@ -1623,115 +1474,69 @@
       (let ((result (emacs-jupyter-notebook--render-mime-result data)))
         (should (equal result "fallback"))))))
 
-(ert-deftest ejn-result-set-image-clears-text-content ()
+(ert-deftest ejn-panel-set-image-clears-text-content ()
+  "W2.5: setting an image clears the panel entry's text content."
   (with-temp-buffer
-    (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
-      (emacs-jupyter-notebook-result-append ov "some text")
-      (should (equal (overlay-get ov 'emacs-jupyter-notebook-content) "some text"))
-      (emacs-jupyter-notebook-result-set-image ov '(image :type png :data "fake"))
-      (should (equal (overlay-get ov 'emacs-jupyter-notebook-content) ""))
-      (should (equal (overlay-get ov 'emacs-jupyter-notebook-image)
-                     '(image :type png :data "fake")))
-      (should-not (overlay-get ov 'emacs-jupyter-notebook-running)))))
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "")))
+      (ejn-panel-append-text handle "some text")
+      (should (equal (plist-get (ejn-panel-entry-snapshot handle) :content)
+                     "some text"))
+      (ejn-panel-set-image handle '(image :type png :data "fake"))
+      (let ((e (ejn-panel-entry-snapshot handle)))
+        (should (equal (plist-get e :content) ""))
+        (should (equal (plist-get e :image)
+                       '(image :type png :data "fake")))))))
 
-(ert-deftest ejn-result-overlay-stays-before-inserted-text-at-anchor ()
+(ert-deftest ejn-panel-append-clears-image ()
+  "W2.5: text appended after an image clears the image."
   (with-temp-buffer
-    (insert "# %%\nplt.show()")
-    (emacs-jupyter-notebook-mode 1)
-    (let* ((end (point-max))
-           (ov (emacs-jupyter-notebook-result-start (point-min) end)))
-      (emacs-jupyter-notebook-result-set-image ov '(image :type png :data "fake"))
-      (goto-char end)
-      (insert "\n# %%\n")
-      (should (= (overlay-start ov) end))
-      (should (= (overlay-end ov) end))
-      (should (equal (buffer-substring-no-properties end (point-max))
-                     "\n# %%\n")))))
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "")))
+      (ejn-panel-set-image handle '(image :type png :data "fake"))
+      (should (plist-get (ejn-panel-entry-snapshot handle) :image))
+      (ejn-panel-append-text handle "text after image")
+      (let ((e (ejn-panel-entry-snapshot handle)))
+        (should-not (plist-get e :image))
+        (should (equal (plist-get e :content) "text after image"))))))
 
-(ert-deftest ejn-result-overlay-stays-before-text-inserted-after-source-newline ()
+(ert-deftest ejn-panel-clear-removes-image ()
+  "W2.5: clearing an entry also removes its image."
   (with-temp-buffer
-    (insert "# %%\nplt.show()\n")
-    (emacs-jupyter-notebook-mode 1)
-    (let* ((end (point-max))
-           (ov (emacs-jupyter-notebook-result-start (point-min) end)))
-      (emacs-jupyter-notebook-result-set-image ov '(image :type png :data "fake"))
-      (goto-char end)
-      (insert "typed below output")
-      (should (= (overlay-start ov) (1- end)))
-      (should (= (overlay-end ov) end))
-      (should (= (overlay-get ov 'emacs-jupyter-notebook-source-end) end))
-      (goto-char end)
-      (should (= (line-beginning-position) end))
-      (should (equal (buffer-substring-no-properties end (point-max))
-                     "typed below output")))))
-
-(ert-deftest ejn-line-delete-below-output-does-not-delete-source-line ()
-  (with-temp-buffer
-    (insert "# %%\nplt.show()\n")
-    (emacs-jupyter-notebook-mode 1)
-    (let* ((end (point-max))
-           (ov (emacs-jupyter-notebook-result-start (point-min) end)))
-      (emacs-jupyter-notebook-result-set-image ov '(image :type png :data "fake"))
-      (goto-char end)
-      (insert "typed below output\n")
-      (goto-char end)
-      (kill-whole-line)
-      (should (equal (buffer-string) "# %%\nplt.show()\n"))
-      (should (overlayp ov))
-      (should (= (overlay-start ov) (1- end)))
-      (should (= (overlay-end ov) end)))))
-
-(ert-deftest ejn-result-overlay-moves-after-source-edit-at-anchor ()
-  (with-temp-buffer
-    (insert "# %%\nplt.show()")
-    (emacs-jupyter-notebook-mode 1)
-    (let* ((anchor (point-max))
-           (ov (emacs-jupyter-notebook-result-start (point-min) anchor)))
-      (emacs-jupyter-notebook-result-set-image ov '(image :type png :data "fake"))
-      (goto-char anchor)
-      (insert "  # edited")
-      (should (= (overlay-start ov) (point-max)))
-      (should (= (overlay-end ov) (point-max)))
-      (should (= (overlay-get ov 'emacs-jupyter-notebook-source-end)
-                 (point-max)))
-      (should (equal (buffer-substring-no-properties anchor (point-max))
-                     "  # edited")))))
-
-(ert-deftest ejn-result-append-clears-image ()
-  (with-temp-buffer
-    (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
-      (emacs-jupyter-notebook-result-set-image ov '(image :type png :data "fake"))
-      (should (overlay-get ov 'emacs-jupyter-notebook-image))
-      (emacs-jupyter-notebook-result-append ov "text after image")
-      (should-not (overlay-get ov 'emacs-jupyter-notebook-image))
-      (should (equal (overlay-get ov 'emacs-jupyter-notebook-content) "text after image")))))
-
-(ert-deftest ejn-result-clear-removes-image ()
-  (with-temp-buffer
-    (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
-      (emacs-jupyter-notebook-result-set-image ov '(image :type png :data "fake"))
-      (should (overlay-get ov 'emacs-jupyter-notebook-image))
-      (emacs-jupyter-notebook-result-clear ov)
-      (should-not (overlay-get ov 'emacs-jupyter-notebook-image))
-      (should (equal (overlay-get ov 'emacs-jupyter-notebook-content) "")))))
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "")))
+      (ejn-panel-set-image handle '(image :type png :data "fake"))
+      (should (plist-get (ejn-panel-entry-snapshot handle) :image))
+      (ejn-panel-clear-entry handle)
+      (let ((e (ejn-panel-entry-snapshot handle)))
+        (should-not (plist-get e :image))
+        (should (equal (plist-get e :content) ""))))))
 
 (ert-deftest ejn-callback-execute-result-renders-text-via-mime ()
+  "W2.7: execute_result with text MIME goes through replace-text."
   (with-temp-buffer
     (let* ((buffer (current-buffer))
-           (ov (emacs-jupyter-notebook-result-start (point-min) (point-max)))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer ov))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
            (exec-fn (cadr (assoc "execute_result" callbacks))))
       (cl-letf (((symbol-function 'jupyter-message-content)
                  (lambda (_msg) '(:data (:text/plain "42")))))
         (funcall exec-fn 'mock-msg))
-      (should (equal (overlay-get ov 'emacs-jupyter-notebook-content) "42"))
-      (should-not (overlay-get ov 'emacs-jupyter-notebook-image)))))
+      (let ((e (ejn-panel-entry-snapshot handle)))
+        (should (equal (plist-get e :content) "42"))
+        (should-not (plist-get e :image))))))
 
 (ert-deftest ejn-callback-execute-result-renders-image-via-mime ()
+  "W2.7: display_data with PNG MIME goes through set-image."
   (with-temp-buffer
     (let* ((buffer (current-buffer))
-           (ov (emacs-jupyter-notebook-result-start (point-min) (point-max)))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer ov))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
            (display-fn (cadr (assoc "display_data" callbacks)))
            (encoded (base64-encode-string "imgdata" t)))
       (cl-letf (((symbol-function 'jupyter-message-content)
@@ -1740,43 +1545,29 @@
                  (lambda (data &optional _type _data-p &rest _props)
                    (list 'image :type 'png :data data))))
         (funcall display-fn 'mock-msg))
-      (should (equal (overlay-get ov 'emacs-jupyter-notebook-image)
+      (should (equal (plist-get (ejn-panel-entry-snapshot handle) :image)
                      '(image :type png :data "imgdata"))))))
 
 (ert-deftest ejn-callback-update-display-data-replaces-image ()
+  "W2.7: update_display_data with image MIME swaps the entry's image."
   (with-temp-buffer
     (let* ((buffer (current-buffer))
-           (ov (emacs-jupyter-notebook-result-start (point-min) (point-max)))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer ov))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
            (update-fn (cadr (assoc "update_display_data" callbacks)))
            (encoded (base64-encode-string "newimg" t)))
-      (emacs-jupyter-notebook-result-append ov "old text")
+      (ejn-panel-append-text handle "old text")
       (cl-letf (((symbol-function 'jupyter-message-content)
                  (lambda (_msg) `(:data (:image/jpeg ,encoded))))
                 ((symbol-function 'create-image)
                  (lambda (data &optional _type _data-p &rest _props)
                    (list 'image :type 'jpeg :data data))))
         (funcall update-fn 'mock-msg))
-      (should (equal (overlay-get ov 'emacs-jupyter-notebook-image)
-                     '(image :type jpeg :data "newimg")))
-      (should (equal (overlay-get ov 'emacs-jupyter-notebook-content) "")))))
-
-(ert-deftest ejn-result-image-render-has-header-in-after-string ()
-  (with-temp-buffer
-    (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
-      (emacs-jupyter-notebook-result-set-image ov '(image :type png :data "fake"))
-      (let ((after-string (ejn-test-overlay-display-string ov)))
-        (should after-string)
-        (should (string-match-p "\\[output\\]" after-string))))))
-
-(ert-deftest ejn-result-image-render-does-not-add-cursor-spacer ()
-  (with-temp-buffer
-    (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
-      (emacs-jupyter-notebook-result-set-image ov '(image :type png :data "fake"))
-      (let ((after-string (ejn-test-overlay-display-string ov)))
-        (should after-string)
-        (should (equal (substring-no-properties after-string 0 1) "\n"))
-        (should-not (text-property-any 0 (length after-string) 'cursor t after-string))))))
+      (let ((e (ejn-panel-entry-snapshot handle)))
+        (should (equal (plist-get e :image)
+                       '(image :type jpeg :data "newimg")))
+        (should (equal (plist-get e :content) ""))))))
 
 (ert-deftest ejn-mime-render-image-jpeg-decodes-base64 ()
   (let* ((raw "jpeg-data")
@@ -1837,7 +1628,7 @@
            (reconnect-called nil)
            (eval-called nil)
            (emacs-jupyter-notebook-jupyter-evaluate-function
-            (lambda (_client _code _beg _end)
+            (lambda (_client _code _entry-handle)
               (setq eval-called t))))
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--tunnel-reconnect)
                  (lambda (buffer callback error-callback)
@@ -1882,100 +1673,38 @@
       (emacs-jupyter-notebook--install-tunnel-sentinel proc buffer)
       (should emacs-jupyter-notebook--tunnel-dead))))
 
-(ert-deftest ejn-source-text-not-mutated-by-image-result ()
+(ert-deftest ejn-panel-source-text-not-mutated-by-image-result ()
+  "W2: setting an image on a panel entry does not touch source-buffer text."
   (ejn-test-with-temp-buffer "# %%\nimport matplotlib\n"
-    (let ((before (buffer-string)))
-      (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
-        (emacs-jupyter-notebook-result-set-image ov '(image :type png :data "fake")))
+    (let* ((before (buffer-string))
+           (source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "")))
+      (ejn-panel-set-image handle '(image :type png :data "fake"))
       (should (equal (buffer-string) before)))))
 
-(ert-deftest ejn-toggle-output-sets-collapsed-property ()
+(ert-deftest ejn-clear-results-empties-panel ()
+  "W2: clear-results empties the output panel and clears fringe indicators."
   (with-temp-buffer
-    (insert "# %%\nx = 1\n")
-    (let ((ov (emacs-jupyter-notebook-result-create (point-min) (point-max) "result")))
-      (should-not (overlay-get ov 'emacs-jupyter-notebook-collapsed))
-      (goto-char (point-min))
-      (emacs-jupyter-notebook-toggle-output)
-      (should (overlay-get ov 'emacs-jupyter-notebook-collapsed))
-      (emacs-jupyter-notebook-toggle-output)
-      (should-not (overlay-get ov 'emacs-jupyter-notebook-collapsed)))))
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "")))
+      (ejn-panel-append-text handle "stuff")
+      (emacs-jupyter-notebook-fringe-set '("x.py" . 1) 'ok 3)
+      (should emacs-jupyter-notebook--fringe-overlays)
+      (emacs-jupyter-notebook-clear-results)
+      (with-current-buffer panel
+        (should-not emacs-jupyter-notebook-panel--entries))
+      (should-not emacs-jupyter-notebook--fringe-overlays))))
 
-(ert-deftest ejn-toggle-output-collapsed-render-shows-summary ()
-  (with-temp-buffer
-    (insert "# %%\nx = 1\n")
-    (let ((ov (emacs-jupyter-notebook-result-create (point-min) (point-max)
-                                                   "line1\nline2\nline3")))
-      (overlay-put ov 'emacs-jupyter-notebook-collapsed t)
-      (emacs-jupyter-notebook-result--render ov)
-      (let ((after (ejn-test-overlay-display-string ov)))
-        (should (string-match-p "output: 3 lines, hidden" after))
-        (should-not (string-match-p "line1" after))
-        (should-not (text-property-any 0 (length after) 'cursor t after))))))
-
-(ert-deftest ejn-toggle-output-expanded-render-shows-content ()
-  (with-temp-buffer
-    (insert "# %%\nx = 1\n")
-    (let ((ov (emacs-jupyter-notebook-result-create (point-min) (point-max)
-                                                   "line1\nline2")))
-      (should-not (overlay-get ov 'emacs-jupyter-notebook-collapsed))
-      (let ((after (ejn-test-overlay-display-string ov)))
-        (should (string-match-p "line1" after))
-        (should (string-match-p "line2" after))
-        (should (equal (substring-no-properties after 0 1) "\n"))
-        (should-not (text-property-any 0 (length after) 'cursor t after)))))
-  )
-
-(ert-deftest ejn-nearest-overlay-finds-overlay-at-point ()
-  (with-temp-buffer
-    (insert "# %%\nx = 1\n")
-    (let ((ov (emacs-jupyter-notebook-result-create (point-min) (point-max) "ok")))
-      (goto-char (point-min))
-      (should (eq (emacs-jupyter-notebook-result--nearest-overlay) ov)))))
-
-(ert-deftest ejn-nearest-overlay-finds-overlay-above-point ()
-  (with-temp-buffer
-    (insert "# %%\nx = 1\n\n\nsome text below\n")
-    (let ((ov (emacs-jupyter-notebook-result-create
-               (point-min) (save-excursion (goto-char (point-min)) (line-end-position))
-               "result")))
-      (goto-char (point-max))
-      (should (eq (emacs-jupyter-notebook-result--nearest-overlay) ov)))))
-
-(ert-deftest ejn-nearest-overlay-returns-nil-when-no-overlays ()
-  (with-temp-buffer
-    (insert "no overlays here\n")
-    (should-not (emacs-jupyter-notebook-result--nearest-overlay))))
-
-(ert-deftest ejn-toggle-output-errors-when-no-overlay ()
-  (with-temp-buffer
-    (insert "nothing here\n")
-    (should-error (emacs-jupyter-notebook-toggle-output) :type 'user-error)))
-
-(ert-deftest ejn-toggle-output-collapsed-image-overlay ()
-  (with-temp-buffer
-    (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
-      (emacs-jupyter-notebook-result-set-image ov '(image :type png :data "fake"))
-      (overlay-put ov 'emacs-jupyter-notebook-collapsed t)
-      (emacs-jupyter-notebook-result--render ov)
-      (let ((after (ejn-test-overlay-display-string ov)))
-        (should (string-match-p "output: image, hidden" after))
-        (should-not (text-property-any 0 (length after) 'cursor t after))))))
-
-(ert-deftest ejn-clear-results-works-with-collapsed-overlays ()
-  (with-temp-buffer
-    (insert "# %%\nx = 1\n")
-    (let ((ov (emacs-jupyter-notebook-result-create (point-min) (point-max) "data")))
-      (overlay-put ov 'emacs-jupyter-notebook-collapsed t)
-      (emacs-jupyter-notebook-result--render ov)
-      (emacs-jupyter-notebook-result-clear-all)
-      (should (= (length (emacs-jupyter-notebook-result--all-overlays)) 0)))))
-
-(ert-deftest ejn-callback-input-request-appends-prompt-to-overlay ()
+(ert-deftest ejn-callback-input-request-appends-prompt-to-panel ()
+  "W2.7: input_request appends the prompt to the panel entry."
   (with-temp-buffer
     (let* ((buffer (current-buffer))
-           (ov (emacs-jupyter-notebook-result-start (point-min) (point-max)))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
            (callbacks (emacs-jupyter-notebook-jupyter--callbacks
-                        buffer ov 'mock-client))
+                        buffer handle 'mock-client))
            (input-fn (cadr (assoc "input_request" callbacks))))
       (cl-letf (((symbol-function 'jupyter-message-content)
                  (lambda (_msg) '(:prompt "Enter value: " :password nil)))
@@ -1985,14 +1714,16 @@
                  (lambda (_client _value) nil)))
         (funcall input-fn 'mock-input-msg))
       (should (string-match-p "Enter value: "
-                              (overlay-get ov 'emacs-jupyter-notebook-content))))))
+                              (plist-get (ejn-panel-entry-snapshot handle) :content))))))
 
 (ert-deftest ejn-callback-input-request-sends-reply-with-user-input ()
+  "W2.7: input_request relays the user's response back to the kernel."
   (with-temp-buffer
     (let* ((buffer (current-buffer))
-           (ov (emacs-jupyter-notebook-result-start (point-min) (point-max)))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
            (callbacks (emacs-jupyter-notebook-jupyter--callbacks
-                        buffer ov 'mock-client))
+                        buffer handle 'mock-client))
            (input-fn (cadr (assoc "input_request" callbacks)))
            reply-sent)
       (cl-letf (((symbol-function 'jupyter-message-content)
@@ -2006,11 +1737,13 @@
       (should (equal reply-sent '(mock-client "alice"))))))
 
 (ert-deftest ejn-callback-input-request-uses-read-passwd-for-password ()
+  "W2.7: password prompts route through `read-passwd'."
   (with-temp-buffer
     (let* ((buffer (current-buffer))
-           (ov (emacs-jupyter-notebook-result-start (point-min) (point-max)))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
            (callbacks (emacs-jupyter-notebook-jupyter--callbacks
-                        buffer ov 'mock-client))
+                        buffer handle 'mock-client))
            (input-fn (cadr (assoc "input_request" callbacks)))
            passwd-called reply-value)
       (cl-letf (((symbol-function 'jupyter-message-content)
@@ -2028,11 +1761,13 @@
       (should (equal reply-value "secret")))))
 
 (ert-deftest ejn-callback-input-request-without-client-does-not-send-reply ()
+  "W2.7: without a client, the input_request callback still shows the prompt."
   (with-temp-buffer
     (let* ((buffer (current-buffer))
-           (ov (emacs-jupyter-notebook-result-start (point-min) (point-max)))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
            (callbacks (emacs-jupyter-notebook-jupyter--callbacks
-                        buffer ov))
+                        buffer handle))
            (input-fn (cadr (assoc "input_request" callbacks)))
            (reply-called nil))
       (cl-letf (((symbol-function 'jupyter-message-content)
@@ -2045,16 +1780,18 @@
         (funcall input-fn 'mock-input-msg))
       (should-not reply-called)
       (should (string-match-p "Input: "
-                              (overlay-get ov 'emacs-jupyter-notebook-content))))))
+                              (plist-get (ejn-panel-entry-snapshot handle) :content))))))
 
 (ert-deftest ejn-callback-input-request-extracts-prompt-and-password-fields ()
+  "W2.7: input_request reads :prompt and :password fields correctly."
   (with-temp-buffer
     (let* ((buffer (current-buffer))
-           (ov (emacs-jupyter-notebook-result-start (point-min) (point-max)))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
            (callbacks (emacs-jupyter-notebook-jupyter--callbacks
-                        buffer ov 'mock-client))
+                        buffer handle 'mock-client))
            (input-fn (cadr (assoc "input_request" callbacks)))
-           captured-prompt captured-password)
+           captured-prompt)
       (cl-letf (((symbol-function 'jupyter-message-content)
                  (lambda (_msg) '(:prompt "Your name: " :password nil)))
                 ((symbol-function 'read-string)
@@ -2089,9 +1826,9 @@
                          (intern ":mean value") "sum(xs) / len(xs)")))))
 
 (ert-deftest ejn-evaluate-sends-user-expressions ()
+  "W2.7: user_expressions are forwarded to jupyter-execute-request."
   (with-temp-buffer
     (let ((emacs-jupyter-notebook--evaluation-timer nil)
-          (emacs-jupyter-notebook-use-inline-overlays t)
           (emacs-jupyter-notebook-evaluation-timeout 120)
           (emacs-jupyter-notebook-watch-expressions
            '(("x" . "x") ("total" . "sum(xs)")))
@@ -2111,19 +1848,23 @@
                     (setq captured-args args)
                     'mock-request)))
         (insert "# %%\nx = 1\n")
-        (unwind-protect
-            (emacs-jupyter-notebook-jupyter--evaluate
-             'mock-client "x = 1" (point-min) (point-max))
-          (when (timerp emacs-jupyter-notebook--evaluation-timer)
-            (cancel-timer emacs-jupyter-notebook--evaluation-timer)))
+        (let* ((panel (ejn-panel-ensure (current-buffer)))
+               (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1")))
+          (unwind-protect
+              (emacs-jupyter-notebook-jupyter--evaluate
+               'mock-client "x = 1" handle)
+            (when (timerp emacs-jupyter-notebook--evaluation-timer)
+              (cancel-timer emacs-jupyter-notebook--evaluation-timer))))
         (should (equal (plist-get captured-args :user-expressions)
                        '(:x "x" :total "sum(xs)")))))))
 
 (ert-deftest ejn-execute-reply-appends-watch-results ()
+  "W2.7: execute_reply watch results are appended to the panel entry."
   (with-temp-buffer
     (let* ((buffer (current-buffer))
-           (ov (emacs-jupyter-notebook-result-start (point-min) (point-max)))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer ov))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
            (reply-fn (cadr (assoc "execute_reply" callbacks))))
       (cl-letf (((symbol-function 'jupyter-message-content)
                  (lambda (_msg)
@@ -2133,15 +1874,15 @@
                      (:x (:status "ok" :data (:text/plain "10"))
                       :bad (:status "error" :ename "NameError" :evalue "name 'bad' is not defined"))))))
         (funcall reply-fn 'mock-reply-msg))
-      (let ((content (overlay-get ov 'emacs-jupyter-notebook-content)))
+      (let ((content (plist-get (ejn-panel-entry-snapshot handle) :content)))
         (should (string-match-p "\\[watch\\]" content))
         (should (string-match-p "x: 10" content))
         (should (string-match-p "bad: NameError: name 'bad' is not defined" content))))))
 
 (ert-deftest ejn-evaluation-timer-started-on-evaluate ()
+  "W2.7: jupyter--evaluate arms the evaluation timer."
   (with-temp-buffer
     (let ((emacs-jupyter-notebook--evaluation-timer nil)
-          (emacs-jupyter-notebook-use-inline-overlays t)
           (emacs-jupyter-notebook-evaluation-timeout 120))
       (cl-letf* ((orig-require (symbol-function 'require))
                  ((symbol-function 'require)
@@ -2155,15 +1896,19 @@
                  ((symbol-function 'jupyter-message-subscribed) (lambda (req _cbs) req))
                  ((symbol-function 'jupyter-execute-request) (lambda (&rest _) 'mock-request)))
         (insert "# %%\nx = 1\n")
-        (emacs-jupyter-notebook-jupyter--evaluate 'mock-client "x = 1" (point-min) (point-max))
+        (let* ((panel (ejn-panel-ensure (current-buffer)))
+               (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1")))
+          (emacs-jupyter-notebook-jupyter--evaluate 'mock-client "x = 1" handle))
         (should (timerp emacs-jupyter-notebook--evaluation-timer))
         (cancel-timer emacs-jupyter-notebook--evaluation-timer)))))
 
 (ert-deftest ejn-evaluation-timer-cancelled-on-execute-reply ()
+  "W2.7: execute_reply cancels the buffer-local evaluation timer."
   (with-temp-buffer
     (let* ((buffer (current-buffer))
-           (ov (emacs-jupyter-notebook-result-start (point-min) (point-max)))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer ov))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
            (reply-fn (cadr (assoc "execute_reply" callbacks)))
            (dummy-timer (run-at-time 999 nil #'ignore)))
       (setq emacs-jupyter-notebook--evaluation-timer dummy-timer)
@@ -2174,11 +1919,13 @@
       (should (null emacs-jupyter-notebook--evaluation-timer)))))
 
 (ert-deftest ejn-evaluation-timer-cancelled-on-status-idle ()
+  "W2.7: status=idle cancels the buffer-local evaluation timer."
   (with-temp-buffer
     (emacs-jupyter-notebook-mode 1)
     (let* ((buffer (current-buffer))
-           (ov (make-overlay (point-min) (point-max)))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer ov))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
            (status-fn (cadr (assoc "status" callbacks)))
            (dummy-timer (run-at-time 999 nil #'ignore)))
       (setq emacs-jupyter-notebook--evaluation-timer dummy-timer)
@@ -2189,11 +1936,13 @@
       (should (null emacs-jupyter-notebook--evaluation-timer)))))
 
 (ert-deftest ejn-evaluation-timer-not-cancelled-on-status-busy ()
+  "W2.7: status=busy leaves the evaluation timer running."
   (with-temp-buffer
     (emacs-jupyter-notebook-mode 1)
     (let* ((buffer (current-buffer))
-           (ov (make-overlay (point-min) (point-max)))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer ov))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
            (status-fn (cadr (assoc "status" callbacks)))
            (dummy-timer (run-at-time 999 nil #'ignore)))
       (setq emacs-jupyter-notebook--evaluation-timer dummy-timer)
@@ -2204,9 +1953,9 @@
       (cancel-timer dummy-timer))))
 
 (ert-deftest ejn-evaluation-timer-fires-warning-message ()
+  "W2.7: evaluation timer expiry fires a non-blocking warning message."
   (with-temp-buffer
     (let ((emacs-jupyter-notebook--evaluation-timer nil)
-          (emacs-jupyter-notebook-use-inline-overlays t)
           (emacs-jupyter-notebook-evaluation-timeout 0.01)
           messages)
       (cl-letf* ((orig-require (symbol-function 'require))
@@ -2224,66 +1973,12 @@
                   (lambda (&rest args)
                     (push (apply #'format args) messages))))
         (insert "# %%\nx = 1\n")
-        (emacs-jupyter-notebook-jupyter--evaluate 'mock-client "x = 1" (point-min) (point-max))
+        (let* ((panel (ejn-panel-ensure (current-buffer)))
+               (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1")))
+          (emacs-jupyter-notebook-jupyter--evaluate 'mock-client "x = 1" handle))
         (should (timerp emacs-jupyter-notebook--evaluation-timer))
         (sit-for 2)
         (should (cl-some (lambda (m) (string-match-p "[Ee]valuation timed out" m)) messages))))))
-
-(ert-deftest ejn-show-output-opens-buffer-with-full-content ()
-  (with-temp-buffer
-    (insert "# %%\nx = 1\n")
-    (let* ((emacs-jupyter-notebook-result-inline-lines 2)
-           (emacs-jupyter-notebook-result-max-lines 200)
-           (ov (emacs-jupyter-notebook-result-create
-                (point-min) (point-max)
-                "line1\nline2\nline3\nline4\nline5")))
-      (goto-char (point-min))
-      (let ((buf (get-buffer "*ejn-output*")))
-        (when buf (kill-buffer buf)))
-      (emacs-jupyter-notebook-show-output)
-      (let ((buf (get-buffer "*ejn-output*")))
-        (should buf)
-        (with-current-buffer buf
-          (should (equal (buffer-string) "line1\nline2\nline3\nline4\nline5"))
-          (should buffer-read-only))
-        (kill-buffer buf)))))
-
-(ert-deftest ejn-show-output-buffer-contains-real-text ()
-  (with-temp-buffer
-    (insert "# %%\nx = 1\n")
-    (let ((emacs-jupyter-notebook-result-inline-lines 2)
-          (emacs-jupyter-notebook-result-max-lines 200))
-      (emacs-jupyter-notebook-result-create
-       (point-min) (point-max) "alpha\nbeta\ngamma")
-      (goto-char (point-min))
-      (let ((buf (get-buffer "*ejn-output*")))
-        (when buf (kill-buffer buf)))
-      (emacs-jupyter-notebook-show-output)
-      (let ((buf (get-buffer "*ejn-output*")))
-        (should buf)
-        (with-current-buffer buf
-          (should (equal (buffer-string) "alpha\nbeta\ngamma"))
-          (should (= (point-min) 1))
-          (goto-char (point-min))
-          (should (search-forward "beta" nil t))
-          (should (equal (buffer-substring-no-properties
-                          (match-beginning 0) (match-end 0))
-                         "beta")))
-        (kill-buffer buf)))))
-
-(ert-deftest ejn-show-output-errors-when-no-overlay ()
-  (with-temp-buffer
-    (insert "nothing here\n")
-    (should-error (emacs-jupyter-notebook-show-output) :type 'user-error)))
-
-(ert-deftest ejn-result-full-content-property-stores-uncapped-content ()
-  (with-temp-buffer
-    (let ((emacs-jupyter-notebook-result-inline-lines 2)
-          (emacs-jupyter-notebook-result-max-lines 200))
-      (let ((ov (emacs-jupyter-notebook-result-start (point-min) (point-max))))
-        (emacs-jupyter-notebook-result-append ov "a\nb\nc\nd\ne")
-        (should (equal (overlay-get ov 'emacs-jupyter-notebook-result-full-content)
-                       "a\nb\nc\nd\ne"))))))
 
 (ert-deftest ejn-async-connect-calls-connect-async-function ()
   (let ((entry '(:profile "p"
@@ -2396,63 +2091,11 @@
       (emacs-jupyter-notebook--async-connect-timeout buffer)
       (should (eq (plist-get emacs-jupyter-notebook--async-context :phase) 'done)))))
 
-(ert-deftest ejn-after-change-clears-overlays-when-cell-marker-removed ()
-  (with-temp-buffer
-    (insert "# %%\na = 1\n# %%\nb = 2\n")
-    (emacs-jupyter-notebook-mode 1)
-    (emacs-jupyter-notebook-result-create 6 11 "result1")
-    (emacs-jupyter-notebook-result-create 17 22 "result2")
-    (should (= (length (emacs-jupyter-notebook-result--all-overlays)) 2))
-    (goto-char (point-min))
-    (search-forward "# %%" nil t 2)
-    (delete-region (match-beginning 0) (1+ (match-end 0)))
-    (should (= (length (emacs-jupyter-notebook-result--all-overlays)) 0))))
-
-(ert-deftest ejn-after-change-does-not-clear-overlays-for-normal-deletion ()
-  (with-temp-buffer
-    (insert "# %%\na = 1\n# %%\nb = 2\n")
-    (emacs-jupyter-notebook-mode 1)
-    (emacs-jupyter-notebook-result-create 6 11 "result1")
-    (emacs-jupyter-notebook-result-create 17 22 "result2")
-    (should (= (length (emacs-jupyter-notebook-result--all-overlays)) 2))
-    (goto-char (point-min))
-    (search-forward "1")
-    (delete-region (match-beginning 0) (match-end 0))
-    (should (= (length (emacs-jupyter-notebook-result--all-overlays)) 2))))
-
-(ert-deftest ejn-after-change-does-not-clear-overlays-on-insertion ()
-  (with-temp-buffer
-    (insert "# %%\na = 1\n")
-    (emacs-jupyter-notebook-mode 1)
-    (emacs-jupyter-notebook-result-create 6 11 "result1")
-    (should (= (length (emacs-jupyter-notebook-result--all-overlays)) 1))
-    (goto-char (point-min))
-    (insert "x = 0\n")
-    (should (= (length (emacs-jupyter-notebook-result--all-overlays)) 1))))
-
-(ert-deftest ejn-after-change-clears-overlays-when-replacing-cell-marker ()
-  (with-temp-buffer
-    (insert "# %%\na = 1\n# %%\nb = 2\n")
-    (emacs-jupyter-notebook-mode 1)
-    (emacs-jupyter-notebook-result-create 6 11 "result1")
-    (emacs-jupyter-notebook-result-create 17 22 "result2")
-    (should (= (length (emacs-jupyter-notebook-result--all-overlays)) 2))
-    (goto-char (point-min))
-    (search-forward "# %%" nil t 2)
-    (let ((beg (match-beginning 0)))
-      (delete-region beg (1+ (match-end 0)))
-      (goto-char beg)
-      (insert "replaced"))
-    (should (= (length (emacs-jupyter-notebook-result--all-overlays)) 0))))
-
-(ert-deftest ejn-mode-disable-removes-change-hooks ()
+(ert-deftest ejn-mode-disable-does-not-install-source-change-hooks ()
+  "W2: with the panel design the source buffer needs no before/after-change
+hooks, so mode enable does not install them."
   (with-temp-buffer
     (emacs-jupyter-notebook-mode 1)
-    (should (memq 'emacs-jupyter-notebook--after-change-cleanup
-                  after-change-functions))
-    (should (memq 'emacs-jupyter-notebook--before-change
-                  before-change-functions))
-    (emacs-jupyter-notebook-mode -1)
     (should-not (memq 'emacs-jupyter-notebook--after-change-cleanup
                       after-change-functions))
     (should-not (memq 'emacs-jupyter-notebook--before-change
@@ -3029,6 +2672,471 @@ durable reconnect surface and must survive buffer kill."
               (should (equal (plist-get (car remaining) :session-id)
                              "w17-session")))))
       (delete-directory registry-dir t))))
+
+;;; W2 — Output panel & fringe indicator
+
+(defun ejn-test--make-source-buffer (&optional content)
+  "Create a buffer-file-visited source buffer for panel tests."
+  (let* ((file (make-temp-file "ejn-source-" nil ".py"))
+         (buf (find-file-noselect file)))
+    (with-current-buffer buf
+      (erase-buffer)
+      (insert (or content "# %%\nx = 1\n")))
+    buf))
+
+(defun ejn-test--kill-source-buffer (buf)
+  "Kill BUF (and its visited file)."
+  (let ((file (buffer-file-name buf)))
+    (kill-buffer buf)
+    (when (and file (file-exists-p file))
+      (delete-file file))))
+
+;; W2.1: panel mode + API in isolation
+(ert-deftest ejn-w2.1-panel-mode-is-special-mode-derived ()
+  "W2.1: panel mode is derived from `special-mode' and has buffer-read-only."
+  (let ((buf (ejn-test--make-source-buffer)))
+    (unwind-protect
+        (let ((panel (ejn-panel-ensure buf)))
+          (with-current-buffer panel
+            (should (derived-mode-p 'emacs-jupyter-notebook-panel-mode))
+            (should (derived-mode-p 'special-mode))
+            (should buffer-read-only)))
+      (ejn-test--kill-source-buffer buf))))
+
+(ert-deftest ejn-w2.1-panel-name-uses-source-basename ()
+  "W2.1: the panel buffer name is `*ejn: <basename>*'."
+  (let ((buf (ejn-test--make-source-buffer)))
+    (unwind-protect
+        (let ((panel (ejn-panel-ensure buf)))
+          (should (string-match-p (format "\\*ejn: %s\\*"
+                                          (regexp-quote
+                                           (file-name-nondirectory
+                                            (buffer-file-name buf))))
+                                  (buffer-name panel))))
+      (ejn-test--kill-source-buffer buf))))
+
+(ert-deftest ejn-w2.1-ensure-is-idempotent ()
+  "W2.1: ejn-panel-ensure returns the same buffer on repeated calls."
+  (let ((buf (ejn-test--make-source-buffer)))
+    (unwind-protect
+        (let ((p1 (ejn-panel-ensure buf))
+              (p2 (ejn-panel-ensure buf)))
+          (should (eq p1 p2)))
+      (ejn-test--kill-source-buffer buf))))
+
+(ert-deftest ejn-w2.1-api-start-append-finish-clear-image ()
+  "W2.1: the entire panel API works without a kernel."
+  (let ((buf (ejn-test--make-source-buffer)))
+    (unwind-protect
+        (let* ((panel (ejn-panel-ensure buf))
+               (handle (ejn-panel-start-entry panel '("a" . 1) "x = 1")))
+          (should handle)
+          (should (plist-get handle :id))
+          (should (plist-get handle :cell-key))
+          (ejn-panel-append-text handle "hello ")
+          (ejn-panel-append-text handle "world")
+          (let ((e (ejn-panel-entry-snapshot handle)))
+            (should (equal (plist-get e :content) "hello world"))
+            (should (eq (plist-get e :status) 'running))
+            (should (equal (plist-get e :exec-count) "*")))
+          (ejn-panel-replace-text handle "swapped")
+          (should (equal (plist-get (ejn-panel-entry-snapshot handle) :content)
+                         "swapped"))
+          (ejn-panel-set-image handle '(image :type png :data "fake"))
+          (let ((e (ejn-panel-entry-snapshot handle)))
+            (should (equal (plist-get e :image)
+                           '(image :type png :data "fake")))
+            (should (equal (plist-get e :content) "")))
+          (ejn-panel-clear-entry handle)
+          (let ((e (ejn-panel-entry-snapshot handle)))
+            (should (equal (plist-get e :content) ""))
+            (should-not (plist-get e :image)))
+          (ejn-panel-finish-entry handle 'ok 7)
+          (let ((e (ejn-panel-entry-snapshot handle)))
+            (should (eq (plist-get e :status) 'ok))
+            (should (equal (plist-get e :exec-count) 7))))
+      (ejn-test--kill-source-buffer buf))))
+
+;; W2.2: latest-per-cell view
+(ert-deftest ejn-w2.2-latest-per-cell-replaces-same-cell ()
+  "W2.2: re-evaluating the same cell leaves a single entry in the latest view."
+  (let ((buf (ejn-test--make-source-buffer)))
+    (unwind-protect
+        (let* ((panel (ejn-panel-ensure buf))
+               (key '("file" . 10)))
+          (ejn-panel-start-entry panel key "first")
+          (ejn-panel-start-entry panel key "second")
+          (with-current-buffer panel
+            (setq emacs-jupyter-notebook-panel--view 'latest)
+            (let ((vis (emacs-jupyter-notebook-panel--visible-entries)))
+              (should (= (length vis) 1))
+              (should (equal (plist-get (car vis) :code) "second")))))
+      (ejn-test--kill-source-buffer buf))))
+
+(ert-deftest ejn-w2.2-latest-per-cell-orders-by-cell-position ()
+  "W2.2: latest-per-cell entries render in cell-position order."
+  (let ((buf (ejn-test--make-source-buffer)))
+    (unwind-protect
+        (let* ((panel (ejn-panel-ensure buf))
+               (k1 '("file" . 5))
+               (k2 '("file" . 50))
+               (k3 '("file" . 100)))
+          ;; Start in non-position order:
+          (ejn-panel-start-entry panel k2 "second")
+          (ejn-panel-start-entry panel k3 "third")
+          (ejn-panel-start-entry panel k1 "first")
+          (with-current-buffer panel
+            (setq emacs-jupyter-notebook-panel--view 'latest)
+            (let ((vis (emacs-jupyter-notebook-panel--visible-entries)))
+              (should (= (length vis) 3))
+              (should (equal (plist-get (nth 0 vis) :code) "first"))
+              (should (equal (plist-get (nth 1 vis) :code) "second"))
+              (should (equal (plist-get (nth 2 vis) :code) "third")))))
+      (ejn-test--kill-source-buffer buf))))
+
+;; W2.3: history-log view + toggle
+(ert-deftest ejn-w2.3-history-view-keeps-all-evals ()
+  "W2.3: history view shows every evaluation, including keyless ones."
+  (let ((buf (ejn-test--make-source-buffer)))
+    (unwind-protect
+        (let* ((panel (ejn-panel-ensure buf)))
+          (ejn-panel-start-entry panel '("f" . 1) "cell1")
+          (ejn-panel-start-entry panel '("f" . 2) "cell2")
+          (ejn-panel-start-entry panel nil "region-eval")
+          (ejn-panel-start-entry panel '("f" . 1) "cell1-again")
+          (with-current-buffer panel
+            (setq emacs-jupyter-notebook-panel--view 'history)
+            (let ((vis (emacs-jupyter-notebook-panel--visible-entries)))
+              (should (= (length vis) 3))
+              ;; The re-eval of cell1 replaced the prior cell1 entry, so the
+              ;; history view sees: cell2, region-eval, cell1-again.
+              (should (equal (plist-get (nth 0 vis) :code) "cell2"))
+              (should (equal (plist-get (nth 1 vis) :code) "region-eval"))
+              (should (equal (plist-get (nth 2 vis) :code) "cell1-again")))))
+      (ejn-test--kill-source-buffer buf))))
+
+(ert-deftest ejn-w2.3-region-eval-absent-from-latest-view ()
+  "W2.3: keyless (region/paragraph/defun) evals do not appear in latest view."
+  (let ((buf (ejn-test--make-source-buffer)))
+    (unwind-protect
+        (let ((panel (ejn-panel-ensure buf)))
+          (ejn-panel-start-entry panel nil "region")
+          (with-current-buffer panel
+            (setq emacs-jupyter-notebook-panel--view 'latest)
+            (should-not (emacs-jupyter-notebook-panel--visible-entries))
+            (setq emacs-jupyter-notebook-panel--view 'history)
+            (should (= 1 (length (emacs-jupyter-notebook-panel--visible-entries))))))
+      (ejn-test--kill-source-buffer buf))))
+
+(ert-deftest ejn-w2.3-toggle-view-roundtrips ()
+  "W2.3: H toggle moves between latest and history views without data loss."
+  (let ((buf (ejn-test--make-source-buffer)))
+    (unwind-protect
+        (let ((panel (ejn-panel-ensure buf)))
+          (ejn-panel-start-entry panel '("f" . 1) "c1")
+          (ejn-panel-start-entry panel nil "region")
+          (with-current-buffer panel
+            (should (eq emacs-jupyter-notebook-panel--view 'latest))
+            (emacs-jupyter-notebook-panel-toggle-view)
+            (should (eq emacs-jupyter-notebook-panel--view 'history))
+            (emacs-jupyter-notebook-panel-toggle-view)
+            (should (eq emacs-jupyter-notebook-panel--view 'latest))
+            ;; Data preserved across toggles.
+            (should (= 2 (length emacs-jupyter-notebook-panel--entries)))))
+      (ejn-test--kill-source-buffer buf))))
+
+;; W2.4: streaming throttle
+(ert-deftest ejn-w2.4-streaming-throttle-coalesces-renders ()
+  "W2.4: 1000 small stream events produce far fewer than 1000 renders.
+
+The throttle keeps redisplay churn bounded; the exact upper bound depends on
+batch timing, but it must be a tiny fraction of the event count."
+  (let ((buf (ejn-test--make-source-buffer))
+        (emacs-jupyter-notebook-panel-stream-throttle-ms 50))
+    (unwind-protect
+        (let* ((panel (ejn-panel-ensure buf))
+               (handle (ejn-panel-start-entry panel '("f" . 1) "code")))
+          (with-current-buffer panel
+            (setq emacs-jupyter-notebook-panel--render-count 0))
+          (dotimes (_ 1000)
+            (ejn-panel-append-text handle "x"))
+          (emacs-jupyter-notebook-panel-flush-now panel)
+          (with-current-buffer panel
+            (should (<= emacs-jupyter-notebook-panel--render-count 20))))
+      (ejn-test--kill-source-buffer buf))))
+
+;; W2.5: image entry survives toggle (no kernel)
+(ert-deftest ejn-w2.5-image-survives-view-toggle ()
+  "W2.5: image-bearing entry remains intact across a view toggle round-trip."
+  (let ((buf (ejn-test--make-source-buffer)))
+    (unwind-protect
+        (let* ((panel (ejn-panel-ensure buf))
+               (handle (ejn-panel-start-entry panel '("f" . 1) "plot")))
+          (ejn-panel-set-image handle '(image :type png :data "data"))
+          (with-current-buffer panel
+            (emacs-jupyter-notebook-panel-toggle-view)
+            (emacs-jupyter-notebook-panel-toggle-view))
+          (should (equal (plist-get (ejn-panel-entry-snapshot handle) :image)
+                         '(image :type png :data "data"))))
+      (ejn-test--kill-source-buffer buf))))
+
+;; W2.6: navigation
+(ert-deftest ejn-w2.6-ret-visits-source-cell ()
+  "W2.6: RET on an entry header jumps to the originating cell in source."
+  (let ((buf (generate-new-buffer "ejn-w2.6-source")))
+    (unwind-protect
+        (let (cell-pos panel popped)
+          (with-current-buffer buf
+            (insert "# %% one\nfoo\n# %% two\nbar\n")
+            (goto-char (point-min))
+            (re-search-forward "# %% two")
+            (setq cell-pos (line-beginning-position))
+            (setq panel (ejn-panel-ensure buf))
+            (ejn-panel-start-entry panel (cons "test.py" cell-pos) "bar")
+            (emacs-jupyter-notebook-panel-flush-now panel))
+          (with-current-buffer panel
+            (goto-char (point-min))
+            (let (header-pos)
+              (while (and (not header-pos) (not (eobp)))
+                (if (get-text-property (point) 'emacs-jupyter-notebook-entry-id)
+                    (setq header-pos (point))
+                  (goto-char (or (next-single-property-change
+                                  (point) 'emacs-jupyter-notebook-entry-id)
+                                 (point-max)))))
+              (goto-char header-pos))
+            ;; Capture pop-to-buffer target+goto destination from inside the
+            ;; visit-source command (pop-to-buffer is hard to assert against
+            ;; in batch mode otherwise).
+            (cl-letf (((symbol-function 'pop-to-buffer)
+                       (lambda (target &rest _)
+                         (setq popped target)
+                         (set-buffer target))))
+              (emacs-jupyter-notebook-panel-visit-source)
+              (should (eq popped buf))
+              (should (= (point) cell-pos)))))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest ejn-w2.6-n-p-navigate-headers ()
+  "W2.6: n and p step between entry headers in the panel."
+  (let ((buf (ejn-test--make-source-buffer)))
+    (unwind-protect
+        (let ((panel (ejn-panel-ensure buf)))
+          (ejn-panel-start-entry panel '("f" . 1) "a")
+          (ejn-panel-start-entry panel '("f" . 50) "b")
+          (emacs-jupyter-notebook-panel-flush-now panel)
+          (with-current-buffer panel
+            (goto-char (point-min))
+            (emacs-jupyter-notebook-panel-next-entry)
+            (should (get-text-property (point) 'emacs-jupyter-notebook-entry-id))
+            (let ((first-id (get-text-property
+                             (point) 'emacs-jupyter-notebook-entry-id)))
+              (emacs-jupyter-notebook-panel-next-entry)
+              (let ((second-id (get-text-property
+                                (point) 'emacs-jupyter-notebook-entry-id)))
+                (should second-id)
+                (should-not (equal first-id second-id))
+                (emacs-jupyter-notebook-panel-previous-entry)
+                (should (equal (get-text-property
+                                (point) 'emacs-jupyter-notebook-entry-id)
+                               first-id))))))
+      (ejn-test--kill-source-buffer buf))))
+
+;; W2.7: callback rewrite (additional)
+(ert-deftest ejn-w2.7-stream-callback-routes-to-panel-append ()
+  "W2.7: a stream message appends to the panel entry, not the source buffer."
+  (let ((buf (ejn-test--make-source-buffer)))
+    (unwind-protect
+        (let* ((panel (ejn-panel-ensure buf))
+               (handle (ejn-panel-start-entry panel '("f" . 1) "code"))
+               (callbacks (emacs-jupyter-notebook-jupyter--callbacks
+                           buf handle))
+               (stream (cadr (assoc "stream" callbacks)))
+               (before (with-current-buffer buf (buffer-string))))
+          (cl-letf (((symbol-function 'jupyter-message-content)
+                     (lambda (_msg) '(:text "hello\n" :name "stdout"))))
+            (funcall stream 'mock))
+          (should (equal (plist-get (ejn-panel-entry-snapshot handle) :content)
+                         "hello\n"))
+          (with-current-buffer buf
+            (should (equal (buffer-string) before))))
+      (ejn-test--kill-source-buffer buf))))
+
+(ert-deftest ejn-w2.7-error-callback-uses-error-face ()
+  "W2.7: an error message lands in the panel content with the error face."
+  (let ((buf (ejn-test--make-source-buffer)))
+    (unwind-protect
+        (let* ((panel (ejn-panel-ensure buf))
+               (handle (ejn-panel-start-entry panel '("f" . 1) "code"))
+               (callbacks (emacs-jupyter-notebook-jupyter--callbacks
+                           buf handle))
+               (err-fn (cadr (assoc "error" callbacks))))
+          (cl-letf (((symbol-function 'jupyter-message-content)
+                     (lambda (_msg)
+                       '(:traceback ("a" "b") :ename "Boom" :evalue "x"))))
+            (funcall err-fn 'mock))
+          (let ((content (plist-get (ejn-panel-entry-snapshot handle) :content)))
+            (should (string-match-p "a\nb" content))))
+      (ejn-test--kill-source-buffer buf))))
+
+(ert-deftest ejn-w2.7-execute-reply-marks-status-and-count ()
+  "W2.7: execute_reply finishes the entry with status and exec-count."
+  (let ((buf (ejn-test--make-source-buffer)))
+    (unwind-protect
+        (let* ((panel (ejn-panel-ensure buf))
+               (handle (ejn-panel-start-entry panel '("f" . 1) "code"))
+               (callbacks (emacs-jupyter-notebook-jupyter--callbacks
+                           buf handle))
+               (reply-fn (cadr (assoc "execute_reply" callbacks))))
+          (cl-letf (((symbol-function 'jupyter-message-content)
+                     (lambda (_msg) '(:status "ok" :execution_count 5))))
+            (funcall reply-fn 'mock))
+          (let ((e (ejn-panel-entry-snapshot handle)))
+            (should (eq (plist-get e :status) 'ok))
+            (should (equal (plist-get e :exec-count) 5))))
+      (ejn-test--kill-source-buffer buf))))
+
+(ert-deftest ejn-w2.7-callbacks-do-not-mutate-source-buffer ()
+  "W2.7: an entire roundtrip of callbacks does not change source-buffer text."
+  (let ((buf (ejn-test--make-source-buffer "# %%\ncode\n")))
+    (unwind-protect
+        (let* ((before (with-current-buffer buf (buffer-string)))
+               (panel (ejn-panel-ensure buf))
+               (handle (ejn-panel-start-entry panel '("f" . 1) "code"))
+               (callbacks (emacs-jupyter-notebook-jupyter--callbacks
+                           buf handle)))
+          (cl-letf (((symbol-function 'jupyter-message-content)
+                     (lambda (_msg) '(:text "out" :name "stdout"))))
+            (funcall (cadr (assoc "stream" callbacks)) 'mock))
+          (cl-letf (((symbol-function 'jupyter-message-content)
+                     (lambda (_msg) '(:data (:text/plain "42")))))
+            (funcall (cadr (assoc "execute_result" callbacks)) 'mock))
+          (cl-letf (((symbol-function 'jupyter-message-content)
+                     (lambda (_msg) '(:wait nil))))
+            (funcall (cadr (assoc "clear_output" callbacks)) 'mock))
+          (cl-letf (((symbol-function 'jupyter-message-content)
+                     (lambda (_msg) '(:status "ok" :execution_count 1))))
+            (funcall (cadr (assoc "execute_reply" callbacks)) 'mock))
+          (should (equal (with-current-buffer buf (buffer-string)) before)))
+      (ejn-test--kill-source-buffer buf))))
+
+;; W2.8: fringe indicator
+(ert-deftest ejn-w2.8-fringe-state-transitions ()
+  "W2.8: queued→running→ok and queued→running→error transitions work."
+  (with-temp-buffer
+    (insert "# %%\nx = 1\n")
+    (goto-char (point-min))
+    (let ((key (emacs-jupyter-notebook--cell-key-for (point))))
+      (emacs-jupyter-notebook-fringe-set key 'queued)
+      (should (eq 'queued (emacs-jupyter-notebook-fringe-state key)))
+      (emacs-jupyter-notebook-fringe-set key 'running)
+      (should (eq 'running (emacs-jupyter-notebook-fringe-state key)))
+      (emacs-jupyter-notebook-fringe-set key 'ok 3)
+      (should (eq 'ok (emacs-jupyter-notebook-fringe-state key)))
+      (emacs-jupyter-notebook-fringe-set key 'error)
+      (should (eq 'error (emacs-jupyter-notebook-fringe-state key))))))
+
+(ert-deftest ejn-w2.8-fringe-indicator-does-not-mutate-source ()
+  "W2.8: setting/clearing fringe indicators does not change source text."
+  (with-temp-buffer
+    (insert "# %%\nx = 1\n")
+    (goto-char (point-min))
+    (let ((before (buffer-string))
+          (key (emacs-jupyter-notebook--cell-key-for (point))))
+      (emacs-jupyter-notebook-fringe-set key 'running)
+      (should (equal (buffer-string) before))
+      (emacs-jupyter-notebook-fringe-clear-all)
+      (should (equal (buffer-string) before)))))
+
+(ert-deftest ejn-w2.8-typing-on-cell-line-does-not-interfere ()
+  "W2.8: typing on the cell marker line does not delete or move the indicator."
+  (with-temp-buffer
+    (insert "# %%\nx = 1\n")
+    (goto-char (point-min))
+    (let* ((key (emacs-jupyter-notebook--cell-key-for (point)))
+           (ov (emacs-jupyter-notebook-fringe-set key 'running)))
+      (should (overlayp ov))
+      (goto-char (line-end-position))
+      (insert " extra")
+      ;; The overlay must still exist and still mark the cell line.
+      (should (overlayp ov))
+      (should (overlay-buffer ov))
+      (should (eq 'running (emacs-jupyter-notebook-fringe-state key))))))
+
+(ert-deftest ejn-w2.8-glyph-truncates-to-last-digit-when-large ()
+  "W2.8: the ok glyph shows only the last digit for exec-counts >= 10."
+  (should (equal (emacs-jupyter-notebook--fringe-glyph 'ok 12) "✓2"))
+  (should (equal (emacs-jupyter-notebook--fringe-glyph 'ok 30) "✓0"))
+  (should (equal (emacs-jupyter-notebook--fringe-glyph 'ok 5) "✓5"))
+  (should (equal (emacs-jupyter-notebook--fringe-glyph 'running 99) "►"))
+  (should (equal (emacs-jupyter-notebook--fringe-glyph 'error nil) "✗"))
+  (should (equal (emacs-jupyter-notebook--fringe-glyph 'queued nil) "…")))
+
+(ert-deftest ejn-w2.8-fringe-no-cursor-intangible-adjacency ()
+  "W2.8: the indicator carries no cursor-intangible or read-only properties."
+  (with-temp-buffer
+    (insert "# %%\nx = 1\n")
+    (goto-char (point-min))
+    (let* ((key (emacs-jupyter-notebook--cell-key-for (point)))
+           (ov (emacs-jupyter-notebook-fringe-set key 'running))
+           (before (overlay-get ov 'before-string)))
+      (should before)
+      (should-not (get-text-property 0 'cursor-intangible before))
+      (should-not (get-text-property 0 'read-only before)))))
+
+;; W2.9: panel cleanup
+(ert-deftest ejn-w2.9-killing-source-buffer-kills-panel ()
+  "W2.9: killing the source buffer kills its output panel."
+  (let* ((buf (ejn-test--make-source-buffer))
+         (panel nil))
+    (with-current-buffer buf
+      (emacs-jupyter-notebook-mode 1)
+      (setq panel (ejn-panel-ensure buf))
+      (should (buffer-live-p panel)))
+    (let ((file (buffer-file-name buf)))
+      (kill-buffer buf)
+      (when (and file (file-exists-p file))
+        (delete-file file)))
+    (should-not (buffer-live-p panel))))
+
+(ert-deftest ejn-w2.9-killing-panel-alone-does-not-affect-kernel-or-registry ()
+  "W2.9: killing only the panel buffer leaves --client and registry untouched."
+  (let* ((buf (ejn-test--make-source-buffer))
+         shutdown-called registry-removed)
+    (unwind-protect
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
+                   (lambda (&rest _) (setq shutdown-called t)))
+                  ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
+                   (lambda (&rest _) (setq registry-removed t))))
+          (with-current-buffer buf
+            (emacs-jupyter-notebook-mode 1)
+            (setq emacs-jupyter-notebook--client 'mock-client)
+            (setq emacs-jupyter-notebook--session-entry
+                  '(:profile "p" :session-id "s")))
+          (let ((panel (ejn-panel-ensure buf)))
+            (kill-buffer panel))
+          (with-current-buffer buf
+            (should (eq emacs-jupyter-notebook--client 'mock-client))
+            (should emacs-jupyter-notebook--session-entry))
+          (should-not shutdown-called)
+          (should-not registry-removed))
+      (ejn-test--kill-source-buffer buf))))
+
+;; W2.10: customization variables exist and have the documented defaults
+(ert-deftest ejn-w2.10-customization-defaults ()
+  "W2.10: the W2 customization variables have the documented defaults."
+  (should (eq emacs-jupyter-notebook-panel-side 'right))
+  (should (= emacs-jupyter-notebook-panel-width 80))
+  (should (eq emacs-jupyter-notebook-panel-default-view 'latest))
+  (should (= emacs-jupyter-notebook-panel-stream-throttle-ms 50))
+  (should (eq emacs-jupyter-notebook-fringe-side 'left-fringe)))
+
+(ert-deftest ejn-w2.10-inline-overlay-customizations-removed ()
+  "W2.10: legacy inline-overlay customizations are gone."
+  (should-not (boundp 'emacs-jupyter-notebook-use-inline-overlays))
+  (should-not (boundp 'emacs-jupyter-notebook-inline-result-max-lines))
+  (should-not (boundp 'emacs-jupyter-notebook-result-inline-lines))
+  (should-not (boundp 'emacs-jupyter-notebook-result-inline-max-bytes))
+  (should-not (boundp 'emacs-jupyter-notebook-result-max-lines)))
 
 (provide 'emacs-jupyter-notebook-tests)
 

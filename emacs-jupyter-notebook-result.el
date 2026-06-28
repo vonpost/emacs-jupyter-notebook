@@ -1,4 +1,4 @@
-;;; emacs-jupyter-notebook-result.el --- Inline result overlays  -*- lexical-binding: t; -*-
+;;; emacs-jupyter-notebook-result.el --- Output panel & fringe indicator  -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026
 
@@ -8,7 +8,27 @@
 ;; This file is not part of GNU Emacs.
 
 ;;; Commentary:
-;; Package-owned result overlays.  These never alter visited source text.
+;; W2: A dedicated side-panel buffer per source buffer that owns all
+;; evaluation output.  The source buffer carries no result text and only
+;; a fringe/margin indicator (W2.8) that cannot interfere with editing.
+;;
+;; Public API used by `emacs-jupyter-notebook-jupyter.el' callbacks:
+;;
+;;   (ejn-panel-ensure SOURCE-BUFFER)        => panel buffer
+;;   (ejn-panel-start-entry PANEL KEY CODE)  => handle (plist)
+;;   (ejn-panel-append-text HANDLE TEXT &optional FACE)
+;;   (ejn-panel-replace-text HANDLE TEXT)
+;;   (ejn-panel-set-image HANDLE IMAGE-SPEC)
+;;   (ejn-panel-finish-entry HANDLE STATUS EXECUTION-COUNT)
+;;   (ejn-panel-clear-entry HANDLE)
+;;
+;; An entry HANDLE is a plist:
+;;   (:panel PANEL :id N :cell-key KEY)
+;;
+;; A KEY for cell-bound evaluation is a cons of (file-name . line-start-pos)
+;; produced by the source buffer's cell tracking.  Region/paragraph/defun
+;; evaluation uses KEY = nil; those entries flow only to the history-log
+;; view.
 
 ;;; Code:
 
@@ -17,28 +37,49 @@
 (require 'subr-x)
 (require 'emacs-jupyter-notebook-vars)
 
+;;; Faces
+
 (defface emacs-jupyter-notebook-result-face
-  '((t :inherit font-lock-doc-face))
-  "Face used for inline text results."
+  '((t :inherit default))
+  "Face used for output text in the result panel."
   :group 'emacs-jupyter-notebook)
 
 (defface emacs-jupyter-notebook-result-header-face
   '((t :inherit shadow))
-  "Face used for inline result headers and scroll hints."
+  "Face used for entry headers in the result panel."
   :group 'emacs-jupyter-notebook)
 
 (defface emacs-jupyter-notebook-result-error-face
   '((t :inherit error))
-  "Face used for inline error results."
+  "Face used for error output in the result panel."
   :group 'emacs-jupyter-notebook)
 
 (defface emacs-jupyter-notebook-execution-count-face
   '((t :inherit font-lock-comment-face))
-  "Face used for execution count overlays."
+  "Face used for execution counts displayed in the panel."
   :group 'emacs-jupyter-notebook)
 
-(defvar-local emacs-jupyter-notebook-result--overlays nil
-  "Package-owned result overlays in the current buffer.")
+(defface emacs-jupyter-notebook-fringe-running-face
+  '((t :inherit warning))
+  "Face for the running indicator in the source buffer's fringe."
+  :group 'emacs-jupyter-notebook)
+
+(defface emacs-jupyter-notebook-fringe-ok-face
+  '((t :inherit success))
+  "Face for the success indicator in the source buffer's fringe."
+  :group 'emacs-jupyter-notebook)
+
+(defface emacs-jupyter-notebook-fringe-error-face
+  '((t :inherit error))
+  "Face for the error indicator in the source buffer's fringe."
+  :group 'emacs-jupyter-notebook)
+
+(defface emacs-jupyter-notebook-fringe-queued-face
+  '((t :inherit shadow))
+  "Face for the queued indicator in the source buffer's fringe."
+  :group 'emacs-jupyter-notebook)
+
+;;; MIME helpers (still used by callbacks)
 
 (defun emacs-jupyter-notebook--select-mime-type (data)
   "Select the best MIME type from DATA plist.
@@ -77,56 +118,7 @@ for images.  Return nil if no suitable MIME type is found."
               (error (plist-get data :text/plain)))
           content)))))
 
-(defun emacs-jupyter-notebook-result-set-image (ov image-spec)
-  "Display IMAGE-SPEC in result overlay OV."
-  (when (overlayp ov)
-    (overlay-put ov 'emacs-jupyter-notebook-image image-spec)
-    (overlay-put ov 'emacs-jupyter-notebook-content "")
-    (overlay-put ov 'emacs-jupyter-notebook-scroll-offset 0)
-    (overlay-put ov 'emacs-jupyter-notebook-running nil)
-    (overlay-put ov 'emacs-jupyter-notebook-pending-clear nil)
-    (emacs-jupyter-notebook-result--render ov)))
-
-(defun emacs-jupyter-notebook-result--text (result)
-  "Return a display string for RESULT."
-  (let ((text (cond
-               ((stringp result) result)
-               ((and (listp result) (plist-get result :text/plain))
-                (plist-get result :text/plain))
-               ((and (listp result)
-                     (plist-get result :data)
-                     (plist-get (plist-get result :data) :text/plain))
-                (plist-get (plist-get result :data) :text/plain))
-               ((and (listp result) (plist-get result :ename))
-                (format "%s: %s"
-                        (plist-get result :ename)
-                        (or (plist-get result :evalue) "")))
-               (t (format "%S" result)))))
-    text))
-
-(defun emacs-jupyter-notebook-result--line-count (text)
-  "Return the number of display lines in TEXT."
-  (if (string-empty-p text)
-      0
-    (let ((count 1)
-          (pos 0))
-      (while (setq pos (string-match "\n" text pos))
-        (setq count (1+ count)
-              pos (1+ pos)))
-      count)))
-
-(defun emacs-jupyter-notebook-result--slice-lines (text offset limit)
-  "Return TEXT lines from OFFSET up to LIMIT lines."
-  (let* ((lines (split-string text "\n"))
-         (slice (seq-take (nthcdr offset lines) limit)))
-    (string-join slice "\n")))
-
-(defun emacs-jupyter-notebook-result--last-lines (text limit)
-  "Return the last LIMIT lines of TEXT."
-  (let ((lines (split-string text "\n")))
-    (string-join (last lines (min limit (length lines))) "\n")))
-
-(defun emacs-jupyter-notebook-result--last-bytes (text max-bytes)
+(defun emacs-jupyter-notebook--last-bytes (text max-bytes)
   "Return the last MAX-BYTES bytes of TEXT."
   (if (<= (string-bytes text) max-bytes)
       text
@@ -136,241 +128,560 @@ for images.  Return nil if no suitable MIME type is found."
         (let ((mid (/ (+ lo hi) 2)))
           (if (<= (string-bytes (substring text mid)) max-bytes)
               (setq hi mid)
-              (setq lo mid))))
+            (setq lo mid))))
       (substring text hi))))
 
-(defun emacs-jupyter-notebook-result--header-string (text)
-  "Return propertized result header TEXT."
-  (propertize text 'face 'emacs-jupyter-notebook-result-header-face))
+;;; Panel buffer state
 
-(defun emacs-jupyter-notebook-result--put-display (ov display)
-  "Set OV display string to DISPLAY according to its anchor placement."
-  (overlay-put ov 'before-string nil)
-  (overlay-put ov 'after-string nil)
-  (if (eq (overlay-get ov 'emacs-jupyter-notebook-display-placement)
-          'before-newline)
-      ;; The real buffer newline covered by OV terminates the output display and
-      ;; gives text below the output its own logical line.
-      (overlay-put ov 'before-string (string-remove-suffix "\n" display))
-    (overlay-put ov 'after-string display)))
+(defvar-local emacs-jupyter-notebook-panel--source-buffer nil
+  "The source buffer this panel is attached to.")
 
-(defun emacs-jupyter-notebook-result--render (ov)
-  "Render result overlay OV from its stored content."
-  (let* ((image (overlay-get ov 'emacs-jupyter-notebook-image))
-         (content (or (overlay-get ov 'emacs-jupyter-notebook-content) ""))
-         (running (overlay-get ov 'emacs-jupyter-notebook-running))
-         (collapsed (overlay-get ov 'emacs-jupyter-notebook-collapsed))
-         (count (or (overlay-get ov 'emacs-jupyter-notebook-execution-count) "")))
-    (overlay-put ov 'emacs-jupyter-notebook-result-full-content content)
-    (if image
-        (let ((header (format "\n[%s] [%s]\n" count (if running "running" "output"))))
-          (emacs-jupyter-notebook-result--put-display
-           ov
-           (if collapsed
-               (emacs-jupyter-notebook-result--header-string
-                (format "\n[%s] [output: image, hidden]\n" count))
-             (concat (emacs-jupyter-notebook-result--header-string header)
-                     (propertize " " 'display image)
-                     "\n"))))
-      (let* ((inline-lines (max 1 emacs-jupyter-notebook-result-inline-lines))
-             (inline-max-bytes emacs-jupyter-notebook-result-inline-max-bytes)
-             (line-count (emacs-jupyter-notebook-result--line-count content))
-             (byte-truncated (and (not (string-empty-p content))
-                                  (> (string-bytes content) inline-max-bytes)))
-             (visible (cond
-                       ((string-empty-p content)
-                        (if running "Running..." "Done"))
-                       (byte-truncated "")
-                       (t (emacs-jupyter-notebook-result--slice-lines
-                           content 0 inline-lines))))
-             (header (format "\n[%s] [%s]\n"
-                             count (if running "running" "output")))
-             (visible (copy-sequence visible))
-              (_ (unless (string-empty-p visible)
-                   (add-face-text-property
-                    0 (length visible) 'emacs-jupyter-notebook-result-face 'append visible)))
-              (display (if collapsed
-                           (emacs-jupyter-notebook-result--header-string
-                            (format "\n[%s] [output: %d lines, hidden]\n" count line-count))
-                         (concat
-                          (emacs-jupyter-notebook-result--header-string header)
-                          visible
-                          (unless (or (string-empty-p visible)
-                                      (string-suffix-p "\n" visible))
-                            "\n")
-                          (cond
-                           (byte-truncated
-                            (propertize
-                             (format "[output: %d bytes, C-c C-o to view]\n"
-                                     (string-bytes content))
-                             'face 'emacs-jupyter-notebook-result-header-face))
-                           ((> line-count inline-lines)
-                            (propertize
-                             (format "... (%d more lines, C-c C-o to view)\n"
-                                     (- line-count inline-lines))
-                             'face 'emacs-jupyter-notebook-result-header-face)))))))
-        (emacs-jupyter-notebook-result--put-display ov display)))))
+(defvar-local emacs-jupyter-notebook-panel--entries nil
+  "Alist of (ID . ENTRY-PLIST), newest insertion at the tail.
+Each entry plist supports:
+  :id N
+  :cell-key KEY-or-nil
+  :code STRING
+  :status running|ok|error
+  :exec-count INTEGER-or-\"*\"
+  :timestamp ISO-string
+  :content STRING
+  :image IMAGE-SPEC-or-nil
+  :pending-clear BOOL")
 
-(defun emacs-jupyter-notebook-result--all-overlays ()
-  "Return all package-owned result overlays in the current buffer."
-  (setq emacs-jupyter-notebook-result--overlays
-        (cl-remove-if-not
-         (lambda (ov)
-           (and (overlayp ov)
-                (eq (overlay-buffer ov) (current-buffer))
-                (overlay-get ov 'emacs-jupyter-notebook-result)))
-         emacs-jupyter-notebook-result--overlays)))
+(defvar-local emacs-jupyter-notebook-panel--next-id 0
+  "Monotonic id counter for new entries.")
 
-(defun emacs-jupyter-notebook-result--set-execution-count (ov count)
-  "Set execution count on result overlay OV to COUNT."
-  (when (overlayp ov)
-    (overlay-put ov 'emacs-jupyter-notebook-execution-count count)
-    (emacs-jupyter-notebook-result--render ov)))
+(defvar-local emacs-jupyter-notebook-panel--view 'latest
+  "Current view: `latest' or `history'.")
 
-(defun emacs-jupyter-notebook-result--set-busy-indicator (ov)
-  "Set busy indicator on result overlay OV."
-  (emacs-jupyter-notebook-result--set-execution-count ov "*"))
+(defvar-local emacs-jupyter-notebook-panel--flush-timer nil
+  "Pending flush timer for streaming throttle.")
 
-(defun emacs-jupyter-notebook-result-clear-region (beg end)
-  "Clear result overlays whose source range intersects BEG and END."
-  (dolist (ov (emacs-jupyter-notebook-result--all-overlays))
-    (let ((source-beg (overlay-get ov 'emacs-jupyter-notebook-source-begin))
-          (source-end (overlay-get ov 'emacs-jupyter-notebook-source-end)))
-      (when (and source-beg source-end
-                 (<= beg source-end)
-                 (<= source-beg end))
-        (delete-overlay ov)))))
+(defvar-local emacs-jupyter-notebook-panel--dirty nil
+  "Non-nil when the panel needs a redisplay.")
 
-(defun emacs-jupyter-notebook-result-clear-all ()
-  "Clear all package-owned result overlays in the current buffer."
-  (mapc #'delete-overlay (emacs-jupyter-notebook-result--all-overlays))
-  (setq emacs-jupyter-notebook-result--overlays nil))
+(defvar-local emacs-jupyter-notebook-panel--render-count 0
+  "Counter incremented every time the panel re-renders.  Test instrument.")
 
-(defun emacs-jupyter-notebook-result-start (beg end)
-  "Create an empty running result overlay attached to BEG and END."
-  (emacs-jupyter-notebook-result-clear-region beg end)
-  (let* ((before-newline (and (> end beg)
-                              (eq (char-before end) ?\n)))
-         (ov (if before-newline
-                 (make-overlay (1- end) end (current-buffer) nil nil)
-               (make-overlay end end (current-buffer) nil nil))))
-    (overlay-put ov 'emacs-jupyter-notebook-result t)
-    (overlay-put ov 'emacs-jupyter-notebook-display-placement
-                 (if before-newline 'before-newline 'after-anchor))
-    (overlay-put ov 'emacs-jupyter-notebook-source-begin beg)
-    (overlay-put ov 'emacs-jupyter-notebook-source-end end)
-    (overlay-put ov 'emacs-jupyter-notebook-content "")
-    (overlay-put ov 'emacs-jupyter-notebook-running t)
-    (overlay-put ov 'priority 1000)
-    (push ov emacs-jupyter-notebook-result--overlays)
-    (emacs-jupyter-notebook-result--render ov)
-    ov))
+;;; Panel mode
 
-(defun emacs-jupyter-notebook-result-append (ov text &optional face)
-  "Append TEXT to result overlay OV.
-When FACE is non-nil, apply it to TEXT before storing it.
-If OV has a pending-clear flag, replace content instead of appending."
-  (when (overlayp ov)
-    (let* ((text (if face (propertize text 'face face) text))
-           (pending-clear (overlay-get ov 'emacs-jupyter-notebook-pending-clear))
-           (content (if pending-clear
-                        text
-                      (concat (or (overlay-get ov 'emacs-jupyter-notebook-content) "")
-                              text)))
-           (max-lines (max 1 emacs-jupyter-notebook-result-max-lines))
-           (max-bytes emacs-jupyter-notebook-result-max-bytes))
-      (when pending-clear
-        (overlay-put ov 'emacs-jupyter-notebook-pending-clear nil))
-      (overlay-put ov 'emacs-jupyter-notebook-image nil)
-      (when (> (emacs-jupyter-notebook-result--line-count content) max-lines)
-        (setq content (emacs-jupyter-notebook-result--last-lines content max-lines)))
-      (when (> (string-bytes content) max-bytes)
-        (setq content (emacs-jupyter-notebook-result--last-bytes content max-bytes)))
-      (overlay-put ov 'emacs-jupyter-notebook-content content)
-      (emacs-jupyter-notebook-result--render ov))))
+(defvar emacs-jupyter-notebook-panel-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "q") #'emacs-jupyter-notebook-panel-quit)
+    (define-key map (kbd "H") #'emacs-jupyter-notebook-panel-toggle-view)
+    (define-key map (kbd "RET") #'emacs-jupyter-notebook-panel-visit-source)
+    (define-key map (kbd "n") #'emacs-jupyter-notebook-panel-next-entry)
+    (define-key map (kbd "p") #'emacs-jupyter-notebook-panel-previous-entry)
+    map)
+  "Keymap for `emacs-jupyter-notebook-panel-mode'.")
 
-(defun emacs-jupyter-notebook-result-clear (ov)
-  "Reset result overlay OV content to empty."
-  (when (overlayp ov)
-    (overlay-put ov 'emacs-jupyter-notebook-image nil)
-    (overlay-put ov 'emacs-jupyter-notebook-content "")
-    (overlay-put ov 'emacs-jupyter-notebook-pending-clear nil)
-    (emacs-jupyter-notebook-result--render ov)))
+(define-derived-mode emacs-jupyter-notebook-panel-mode special-mode
+  "EJN-Panel"
+  "Side-panel buffer that displays Jupyter evaluation output.
+The latest-per-cell view shows the most recent output for each
+evaluated cell, keyed by the cell's `# %%' marker location.  The
+history-log view appends every evaluation in time order."
+  (setq buffer-read-only t)
+  (setq truncate-lines nil)
+  (add-hook 'kill-buffer-hook
+            #'emacs-jupyter-notebook-panel--on-kill nil t))
 
-(defun emacs-jupyter-notebook-result-replace (ov text &optional face)
-  "Replace result overlay OV content with TEXT.
-When FACE is non-nil, apply it to TEXT before storing it."
-  (when (overlayp ov)
-    (let* ((text (if face (propertize text 'face face) text))
-           (max-lines (max 1 emacs-jupyter-notebook-result-max-lines))
-           (max-bytes emacs-jupyter-notebook-result-max-bytes))
-      (overlay-put ov 'emacs-jupyter-notebook-image nil)
-      (when (> (emacs-jupyter-notebook-result--line-count text) max-lines)
-        (setq text (emacs-jupyter-notebook-result--last-lines text max-lines)))
-      (when (> (string-bytes text) max-bytes)
-        (setq text (emacs-jupyter-notebook-result--last-bytes text max-bytes)))
-      (overlay-put ov 'emacs-jupyter-notebook-content text)
-      (emacs-jupyter-notebook-result--render ov))))
+(defun emacs-jupyter-notebook-panel--on-kill ()
+  "Cancel any pending flush timer when the panel buffer is killed."
+  (when (timerp emacs-jupyter-notebook-panel--flush-timer)
+    (cancel-timer emacs-jupyter-notebook-panel--flush-timer))
+  (setq emacs-jupyter-notebook-panel--flush-timer nil))
 
-(defun emacs-jupyter-notebook-result-finish (ov)
-  "Mark result overlay OV as no longer running."
-  (when (overlayp ov)
-    (overlay-put ov 'emacs-jupyter-notebook-running nil)
-    (emacs-jupyter-notebook-result--render ov)))
+;;; Buffer naming & lookup
 
-(defun emacs-jupyter-notebook-result-create (beg end result)
-  "Display RESULT after END as an overlay attached to source BEG and END."
-  (let ((ov (emacs-jupyter-notebook-result-start beg end)))
-    (emacs-jupyter-notebook-result-append
-     ov (emacs-jupyter-notebook-result--text result))
-    (emacs-jupyter-notebook-result-finish ov)
-    ov))
+(defun emacs-jupyter-notebook-panel--name-for (source-buffer)
+  "Return the panel buffer name for SOURCE-BUFFER."
+  (let ((base (or (buffer-file-name source-buffer)
+                  (buffer-name source-buffer))))
+    (format "*ejn: %s*" (file-name-nondirectory base))))
 
-(defun emacs-jupyter-notebook-result--at-point ()
-  "Return the package-owned result overlay for source at point."
-  (cl-find-if
-   (lambda (ov)
-     (and (overlay-get ov 'emacs-jupyter-notebook-result)
-          (<= (or (overlay-get ov 'emacs-jupyter-notebook-source-begin) 0)
-              (point))
-          (<= (point)
-              (or (overlay-get ov 'emacs-jupyter-notebook-source-end) 0))))
-   (emacs-jupyter-notebook-result--all-overlays)))
+(defvar-local emacs-jupyter-notebook--panel-buffer nil
+  "Source-buffer-local: the panel buffer attached to this source.")
 
-(defun emacs-jupyter-notebook-result--nearest-overlay ()
-  "Return the result overlay at or nearest above point in the current buffer."
-  (catch 'found
-    (let ((overlays (emacs-jupyter-notebook-result--all-overlays))
-          (best nil)
-          (best-dist most-positive-fixnum))
-      (dolist (ov overlays)
-        (let ((src-beg (overlay-get ov 'emacs-jupyter-notebook-source-begin))
-              (src-end (overlay-get ov 'emacs-jupyter-notebook-source-end)))
-          (when (and src-beg src-end)
-            (cond
-             ((and (<= src-beg (point)) (<= (point) src-end))
-              (throw 'found ov))
-             ((< (point) src-beg)
-              (let ((dist (- src-beg (point))))
-                (when (< dist best-dist)
-                  (setq best ov)
-                  (setq best-dist dist))))
-             (t
-              (let ((dist (- (point) src-end)))
-                (when (< dist best-dist)
-                  (setq best ov)
-                  (setq best-dist dist))))))))
-      best)))
+(defun ejn-panel-ensure (source-buffer)
+  "Return (creating if needed) the panel buffer for SOURCE-BUFFER."
+  (with-current-buffer source-buffer
+    (or (and (buffer-live-p emacs-jupyter-notebook--panel-buffer)
+             emacs-jupyter-notebook--panel-buffer)
+        (let* ((name (emacs-jupyter-notebook-panel--name-for source-buffer))
+               (panel (get-buffer-create name)))
+          (with-current-buffer panel
+            (unless (derived-mode-p 'emacs-jupyter-notebook-panel-mode)
+              (emacs-jupyter-notebook-panel-mode))
+            (setq emacs-jupyter-notebook-panel--source-buffer source-buffer)
+            (setq emacs-jupyter-notebook-panel--view
+                  emacs-jupyter-notebook-panel-default-view))
+          (setq emacs-jupyter-notebook--panel-buffer panel)
+          panel))))
 
-(defun emacs-jupyter-notebook-toggle-output ()
-  "Toggle visibility of the result overlay at or nearest above point."
+(defun emacs-jupyter-notebook-panel-buffer (source-buffer)
+  "Return SOURCE-BUFFER's panel buffer, or nil if not yet created."
+  (when (buffer-live-p source-buffer)
+    (with-current-buffer source-buffer
+      (and (buffer-live-p emacs-jupyter-notebook--panel-buffer)
+           emacs-jupyter-notebook--panel-buffer))))
+
+(defun emacs-jupyter-notebook-panel--display (panel)
+  "Pop PANEL up in a side window honoring the user's customization."
+  (display-buffer
+   panel
+   `((display-buffer-in-side-window)
+     (side . ,emacs-jupyter-notebook-panel-side)
+     (window-width . ,emacs-jupyter-notebook-panel-width))))
+
+(defun emacs-jupyter-notebook-show-output-panel ()
+  "Open or pop up the current source buffer's output panel."
   (interactive)
-  (let ((ov (emacs-jupyter-notebook-result--nearest-overlay)))
-    (unless ov
-      (user-error "No result overlay at or near point"))
-    (overlay-put ov 'emacs-jupyter-notebook-collapsed
-                 (not (overlay-get ov 'emacs-jupyter-notebook-collapsed)))
-    (emacs-jupyter-notebook-result--render ov)))
+  (let ((panel (ejn-panel-ensure (current-buffer))))
+    (emacs-jupyter-notebook-panel--display panel)))
+
+;;; Entry handle helpers
+
+(defun emacs-jupyter-notebook-panel--entry (panel id)
+  "Return the entry plist with ID in PANEL, or nil."
+  (when (buffer-live-p panel)
+    (with-current-buffer panel
+      (cdr (assq id emacs-jupyter-notebook-panel--entries)))))
+
+(defun emacs-jupyter-notebook-panel--set-entry (panel id new-entry)
+  "Replace entry with ID in PANEL with NEW-ENTRY."
+  (when (buffer-live-p panel)
+    (with-current-buffer panel
+      (let ((cell (assq id emacs-jupyter-notebook-panel--entries)))
+        (if cell
+            (setcdr cell new-entry)
+          (setq emacs-jupyter-notebook-panel--entries
+                (append emacs-jupyter-notebook-panel--entries
+                        (list (cons id new-entry)))))))))
+
+(defun emacs-jupyter-notebook-panel--handle (panel id key)
+  "Return a public entry handle for ID in PANEL with cell KEY."
+  (list :panel panel :id id :cell-key key))
+
+(defun emacs-jupyter-notebook-panel--update-entry (handle updater)
+  "Apply UPDATER to the entry referenced by HANDLE and schedule a render.
+UPDATER is called with the current entry plist and must return a new plist."
+  (when handle
+    (let ((panel (plist-get handle :panel))
+          (id (plist-get handle :id)))
+      (when (buffer-live-p panel)
+        (let ((entry (emacs-jupyter-notebook-panel--entry panel id)))
+          (when entry
+            (let ((new (funcall updater entry)))
+              (emacs-jupyter-notebook-panel--set-entry panel id new)
+              (emacs-jupyter-notebook-panel--schedule-render panel))))))))
+
+;;; Render scheduling (W2.4 throttle)
+
+(defun emacs-jupyter-notebook-panel--schedule-render (panel)
+  "Mark PANEL dirty and schedule a flush within the throttle window."
+  (when (buffer-live-p panel)
+    (with-current-buffer panel
+      (setq emacs-jupyter-notebook-panel--dirty t)
+      (unless (timerp emacs-jupyter-notebook-panel--flush-timer)
+        (let ((delay (/ (max 0 emacs-jupyter-notebook-panel-stream-throttle-ms)
+                        1000.0)))
+          (setq emacs-jupyter-notebook-panel--flush-timer
+                (run-at-time
+                 delay nil
+                 #'emacs-jupyter-notebook-panel--flush panel)))))))
+
+(defun emacs-jupyter-notebook-panel--flush (panel)
+  "Flush pending changes for PANEL by re-rendering."
+  (when (buffer-live-p panel)
+    (with-current-buffer panel
+      (setq emacs-jupyter-notebook-panel--flush-timer nil)
+      (when emacs-jupyter-notebook-panel--dirty
+        (setq emacs-jupyter-notebook-panel--dirty nil)
+        (emacs-jupyter-notebook-panel--render panel)))))
+
+(defun emacs-jupyter-notebook-panel-flush-now (panel)
+  "Force PANEL to render immediately, cancelling any pending throttle timer."
+  (when (buffer-live-p panel)
+    (with-current-buffer panel
+      (when (timerp emacs-jupyter-notebook-panel--flush-timer)
+        (cancel-timer emacs-jupyter-notebook-panel--flush-timer))
+      (setq emacs-jupyter-notebook-panel--flush-timer nil)
+      (setq emacs-jupyter-notebook-panel--dirty nil)
+      (emacs-jupyter-notebook-panel--render panel))))
+
+;;; Rendering
+
+(defun emacs-jupyter-notebook-panel--visible-entries ()
+  "Return the entries visible under the current view, in display order."
+  (let ((all (mapcar #'cdr emacs-jupyter-notebook-panel--entries)))
+    (cond
+     ((eq emacs-jupyter-notebook-panel--view 'history)
+      all)
+     (t
+      ;; Latest-per-cell: only entries with a cell-key, deduped to the latest
+      ;; per key (subsequent start-entry already replaces the older entry, so
+      ;; here we just filter and order by the key's marker position).
+      (let ((entries (cl-remove-if-not
+                      (lambda (e) (plist-get e :cell-key))
+                      all)))
+        (sort (copy-sequence entries)
+              (lambda (a b)
+                (let ((pa (cdr (plist-get a :cell-key)))
+                      (pb (cdr (plist-get b :cell-key))))
+                  (cond
+                   ((and (numberp pa) (numberp pb)) (< pa pb))
+                   ((numberp pa) t)
+                   (t nil))))))))))
+
+(defun emacs-jupyter-notebook-panel--format-header (entry)
+  "Return the propertized header string for ENTRY."
+  (let* ((count (or (plist-get entry :exec-count) "*"))
+         (status (or (plist-get entry :status) 'running))
+         (ts (or (plist-get entry :timestamp) ""))
+         (code (or (plist-get entry :code) ""))
+         (first-line (car (split-string code "\n" t)))
+         (title (if first-line
+                    (substring first-line 0
+                               (min (length first-line) 60))
+                  ""))
+         (status-s (pcase status
+                     ('running "running")
+                     ('ok "ok")
+                     ('error "error")
+                     (_ (format "%s" status)))))
+    (propertize
+     (format "[%s] %s [%s] %s\n" count ts status-s title)
+     'face 'emacs-jupyter-notebook-result-header-face
+     'emacs-jupyter-notebook-entry-id (plist-get entry :id)
+     'emacs-jupyter-notebook-cell-key (plist-get entry :cell-key))))
+
+(defun emacs-jupyter-notebook-panel--render (panel)
+  "Render PANEL contents according to current view."
+  (with-current-buffer panel
+    (let ((inhibit-read-only t)
+          (entries (emacs-jupyter-notebook-panel--visible-entries)))
+      (erase-buffer)
+      (cl-incf emacs-jupyter-notebook-panel--render-count)
+      (insert (propertize
+               (format "Output panel — view: %s   (H toggle, RET visit, q bury)\n\n"
+                       emacs-jupyter-notebook-panel--view)
+               'face 'emacs-jupyter-notebook-result-header-face))
+      (dolist (e entries)
+        (insert (emacs-jupyter-notebook-panel--format-header e))
+        (let ((image (plist-get e :image))
+              (content (or (plist-get e :content) "")))
+          (cond
+           (image
+            (insert (propertize " " 'display image))
+            (insert "\n"))
+           ((not (string-empty-p content))
+            (let ((c (copy-sequence content)))
+              (add-face-text-property
+               0 (length c) 'emacs-jupyter-notebook-result-face 'append c)
+              (insert c)
+              (unless (string-suffix-p "\n" c)
+                (insert "\n"))))
+           (t nil)))
+        (insert "\n"))
+      (goto-char (point-min)))))
+
+;;; Public API
+
+(defun ejn-panel-start-entry (panel cell-key code)
+  "Begin a new output entry in PANEL associated with CELL-KEY for CODE.
+Return an entry handle.
+
+For latest-per-cell view, re-evaluating the same CELL-KEY replaces the
+prior entry's slot.  The new entry takes its position so the running
+state appears in place."
+  (unless (buffer-live-p panel)
+    (error "Panel buffer is not live"))
+  (with-current-buffer panel
+    ;; Replace the prior entry for this CELL-KEY (latest-per-cell behavior).
+    (when cell-key
+      (let ((existing (cl-find-if (lambda (cell)
+                                    (equal (plist-get (cdr cell) :cell-key)
+                                           cell-key))
+                                  emacs-jupyter-notebook-panel--entries)))
+        (when existing
+          (setq emacs-jupyter-notebook-panel--entries
+                (assq-delete-all (car existing)
+                                 emacs-jupyter-notebook-panel--entries)))))
+    (let* ((id (cl-incf emacs-jupyter-notebook-panel--next-id))
+           (entry (list :id id
+                        :cell-key cell-key
+                        :code (or code "")
+                        :status 'running
+                        :exec-count "*"
+                        :timestamp (format-time-string "%Y-%m-%dT%H:%M:%S")
+                        :content ""
+                        :image nil
+                        :pending-clear nil)))
+      (setq emacs-jupyter-notebook-panel--entries
+            (append emacs-jupyter-notebook-panel--entries
+                    (list (cons id entry))))
+      (emacs-jupyter-notebook-panel--schedule-render panel)
+      (emacs-jupyter-notebook-panel--handle panel id cell-key))))
+
+(defun ejn-panel-append-text (handle text &optional face)
+  "Append TEXT (optionally propertized with FACE) to HANDLE's entry."
+  (when (and handle text)
+    (let ((display-text (if face (propertize text 'face face) text)))
+      (emacs-jupyter-notebook-panel--update-entry
+       handle
+       (lambda (entry)
+         (let* ((pending (plist-get entry :pending-clear))
+                (current (or (plist-get entry :content) ""))
+                (new (if pending display-text (concat current display-text)))
+                (max-bytes emacs-jupyter-notebook-result-max-bytes))
+           (when (> (string-bytes new) max-bytes)
+             (setq new (emacs-jupyter-notebook--last-bytes new max-bytes)))
+           (setq entry (plist-put entry :content new))
+           (setq entry (plist-put entry :image nil))
+           (setq entry (plist-put entry :pending-clear nil))
+           entry))))))
+
+(defun ejn-panel-replace-text (handle text)
+  "Replace HANDLE's entry content with TEXT."
+  (when handle
+    (emacs-jupyter-notebook-panel--update-entry
+     handle
+     (lambda (entry)
+       (setq entry (plist-put entry :content (or text "")))
+       (setq entry (plist-put entry :image nil))
+       (setq entry (plist-put entry :pending-clear nil))
+       entry))))
+
+(defun ejn-panel-set-image (handle image-spec)
+  "Set HANDLE's entry to display IMAGE-SPEC and clear text content."
+  (when handle
+    (emacs-jupyter-notebook-panel--update-entry
+     handle
+     (lambda (entry)
+       (setq entry (plist-put entry :image image-spec))
+       (setq entry (plist-put entry :content ""))
+       (setq entry (plist-put entry :pending-clear nil))
+       entry))))
+
+(defun ejn-panel-finish-entry (handle status execution-count)
+  "Mark HANDLE's entry as completed with STATUS and EXECUTION-COUNT."
+  (when handle
+    (emacs-jupyter-notebook-panel--update-entry
+     handle
+     (lambda (entry)
+       (setq entry (plist-put entry :status (or status 'ok)))
+       (when execution-count
+         (setq entry (plist-put entry :exec-count execution-count)))
+       entry))
+    (emacs-jupyter-notebook-panel-flush-now (plist-get handle :panel))))
+
+(defun ejn-panel-clear-entry (handle &optional wait)
+  "Clear HANDLE's entry content.
+If WAIT is non-nil, defer the clear until the next text arrives
+(matches Jupyter's clear_output :wait semantics)."
+  (when handle
+    (emacs-jupyter-notebook-panel--update-entry
+     handle
+     (lambda (entry)
+       (if wait
+           (plist-put entry :pending-clear t)
+         (setq entry (plist-put entry :content ""))
+         (setq entry (plist-put entry :image nil))
+         (setq entry (plist-put entry :pending-clear nil))
+         entry)))))
+
+(defun ejn-panel-entry-snapshot (handle)
+  "Return the entry plist for HANDLE (debug/test introspection)."
+  (and handle
+       (emacs-jupyter-notebook-panel--entry
+        (plist-get handle :panel) (plist-get handle :id))))
+
+;;; Cell key (W2.2)
+
+;; Cell key is (FILE-NAME . LINE-START-POS).  A buffer-local hash maps cell
+;; positions to permanent-local markers so that edits above the cell shift
+;; the position naturally while the entry identity stays stable across edits.
+
+(defvar-local emacs-jupyter-notebook--cell-key-markers nil
+  "Hash table mapping cell-marker position to a permanent marker on that line.")
+
+(defun emacs-jupyter-notebook--cell-key-for (position)
+  "Return a cell key for the cell whose marker line begins at POSITION."
+  (unless emacs-jupyter-notebook--cell-key-markers
+    (setq emacs-jupyter-notebook--cell-key-markers
+          (make-hash-table :test 'equal)))
+  (let* ((file (or (buffer-file-name) (buffer-name)))
+         (line-start (save-excursion
+                       (goto-char (max (point-min)
+                                       (min (point-max) position)))
+                       (line-beginning-position)))
+         (existing (gethash line-start
+                            emacs-jupyter-notebook--cell-key-markers))
+         (marker (or (and (markerp existing) (marker-position existing) existing)
+                     (let ((m (copy-marker line-start t)))
+                       (set-marker-insertion-type m t)
+                       (puthash line-start m
+                                emacs-jupyter-notebook--cell-key-markers)
+                       m))))
+    (cons file (marker-position marker))))
+
+;;; View toggle / navigation (W2.3, W2.6)
+
+(defun emacs-jupyter-notebook-panel-toggle-view ()
+  "Toggle the panel between latest-per-cell and history-log views."
+  (interactive)
+  (unless (derived-mode-p 'emacs-jupyter-notebook-panel-mode)
+    (user-error "Not in an EJN output panel"))
+  (setq emacs-jupyter-notebook-panel--view
+        (if (eq emacs-jupyter-notebook-panel--view 'history) 'latest 'history))
+  (emacs-jupyter-notebook-panel-flush-now (current-buffer))
+  (message "EJN panel view: %s" emacs-jupyter-notebook-panel--view))
+
+(defun emacs-jupyter-notebook-panel-quit ()
+  "Bury the panel window."
+  (interactive)
+  (quit-window))
+
+(defun emacs-jupyter-notebook-panel--header-positions ()
+  "Return a list of buffer positions where entry headers begin."
+  (let (positions
+        (pos (point-min)))
+    (save-excursion
+      (while pos
+        (when (get-text-property pos 'emacs-jupyter-notebook-entry-id)
+          (push pos positions))
+        (setq pos (next-single-property-change
+                   pos 'emacs-jupyter-notebook-entry-id))))
+    (nreverse positions)))
+
+(defun emacs-jupyter-notebook-panel-next-entry ()
+  "Move point to the next entry header in the panel."
+  (interactive)
+  (let* ((positions (emacs-jupyter-notebook-panel--header-positions))
+         (after (cl-find-if (lambda (p) (> p (point))) positions)))
+    (when after
+      (goto-char after))))
+
+(defun emacs-jupyter-notebook-panel-previous-entry ()
+  "Move point to the previous entry header in the panel."
+  (interactive)
+  (let* ((positions (emacs-jupyter-notebook-panel--header-positions))
+         (before (cl-find-if (lambda (p) (< p (point))) (reverse positions))))
+    (when before
+      (goto-char before))))
+
+(defun emacs-jupyter-notebook-panel-visit-source ()
+  "Visit the source cell associated with the entry at point."
+  (interactive)
+  (let* ((id (get-text-property (point) 'emacs-jupyter-notebook-entry-id))
+         (key (get-text-property (point) 'emacs-jupyter-notebook-cell-key))
+         (source emacs-jupyter-notebook-panel--source-buffer))
+    (unless id
+      (user-error "Point is not on an entry header"))
+    (unless (and key (buffer-live-p source))
+      (user-error "Entry has no source cell"))
+    (let ((pos (cdr key)))
+      (pop-to-buffer source)
+      (when (numberp pos)
+        (goto-char (min (point-max) pos))))))
+
+;;; Fringe indicator (W2.8)
+
+;; The indicator is a zero-width overlay anchored at the cell marker's line
+;; beginning, carrying a `before-string' whose display property places the
+;; glyph in the configured fringe.  Because the overlay is zero-width and the
+;; glyph lives in a display property (not the buffer text), nothing the user
+;; types on or near the cell line can interfere with it.
+
+(defvar-local emacs-jupyter-notebook--fringe-overlays nil
+  "Alist of (CELL-KEY . OVERLAY) for source-buffer fringe indicators.")
+
+(defun emacs-jupyter-notebook--fringe-glyph (state exec-count)
+  "Return the indicator glyph string for STATE and EXEC-COUNT."
+  (let* ((digit (cond
+                 ((and (numberp exec-count) (>= exec-count 10))
+                  (number-to-string (mod exec-count 10)))
+                 ((numberp exec-count) (number-to-string exec-count))
+                 (t ""))))
+    (pcase state
+      ('running "►")
+      ('ok (concat "✓" digit))
+      ('error "✗")
+      ('queued "…")
+      (_ ""))))
+
+(defun emacs-jupyter-notebook--fringe-face (state)
+  "Return the face symbol for indicator STATE."
+  (pcase state
+    ('running 'emacs-jupyter-notebook-fringe-running-face)
+    ('ok 'emacs-jupyter-notebook-fringe-ok-face)
+    ('error 'emacs-jupyter-notebook-fringe-error-face)
+    ('queued 'emacs-jupyter-notebook-fringe-queued-face)
+    (_ 'default)))
+
+(defun emacs-jupyter-notebook-fringe-set (cell-key state &optional exec-count)
+  "Set the source-buffer fringe indicator for CELL-KEY to STATE.
+EXEC-COUNT is the execution count (used by the `ok' state)."
+  (when (and cell-key (buffer-live-p (current-buffer)))
+    (let* ((pos (cdr cell-key))
+           (existing (cdr (assoc cell-key
+                                 emacs-jupyter-notebook--fringe-overlays)))
+           (line-pos (when (numberp pos)
+                       (save-excursion
+                         (goto-char (max (point-min)
+                                         (min (point-max) pos)))
+                         (line-beginning-position))))
+           (ov (or (and (overlayp existing) (overlay-buffer existing) existing)
+                   (and line-pos
+                        (make-overlay line-pos line-pos
+                                      (current-buffer) t nil))))
+           (glyph (emacs-jupyter-notebook--fringe-glyph state exec-count))
+           (face (emacs-jupyter-notebook--fringe-face state)))
+      (when ov
+        (overlay-put ov 'emacs-jupyter-notebook-fringe t)
+        (overlay-put ov 'emacs-jupyter-notebook-cell-key cell-key)
+        (overlay-put ov 'emacs-jupyter-notebook-state state)
+        (overlay-put ov 'emacs-jupyter-notebook-exec-count exec-count)
+        (overlay-put
+         ov 'before-string
+         (propertize
+          " "
+          'display `((,emacs-jupyter-notebook-fringe-side
+                      ,(propertize glyph 'face face)))))
+        (setf (alist-get cell-key emacs-jupyter-notebook--fringe-overlays
+                         nil nil #'equal)
+              ov)
+        ov))))
+
+(defun emacs-jupyter-notebook-fringe-clear-all ()
+  "Remove all fringe indicator overlays from the current buffer."
+  (dolist (cell emacs-jupyter-notebook--fringe-overlays)
+    (when (overlayp (cdr cell))
+      (delete-overlay (cdr cell))))
+  (setq emacs-jupyter-notebook--fringe-overlays nil))
+
+(defun emacs-jupyter-notebook-fringe-state (cell-key)
+  "Return the recorded state symbol for CELL-KEY, or nil."
+  (let ((ov (cdr (assoc cell-key
+                        emacs-jupyter-notebook--fringe-overlays))))
+    (and (overlayp ov) (overlay-get ov 'emacs-jupyter-notebook-state))))
+
+(defun emacs-jupyter-notebook-fringe-overlay (cell-key)
+  "Return the fringe overlay for CELL-KEY, or nil."
+  (cdr (assoc cell-key emacs-jupyter-notebook--fringe-overlays)))
+
+;;; Panel cleanup (W2.9)
+
+(defun emacs-jupyter-notebook--kill-panel ()
+  "Kill the current buffer's output panel, if any."
+  (let ((panel (and (boundp 'emacs-jupyter-notebook--panel-buffer)
+                    emacs-jupyter-notebook--panel-buffer)))
+    (when (buffer-live-p panel)
+      (let ((kill-buffer-query-functions nil))
+        (kill-buffer panel)))
+    (setq emacs-jupyter-notebook--panel-buffer nil)))
 
 (provide 'emacs-jupyter-notebook-result)
 

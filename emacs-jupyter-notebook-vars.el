@@ -81,23 +81,8 @@ The durable reconnect source remains the registry regardless of this value."
   :type 'file
   :group 'emacs-jupyter-notebook)
 
-(defcustom emacs-jupyter-notebook-result-max-lines 200
-  "Maximum number of result lines shown inline by package-owned overlays."
-  :type 'integer
-  :group 'emacs-jupyter-notebook)
-
 (defcustom emacs-jupyter-notebook-result-max-bytes 10485760
-  "Maximum byte size of result content stored in overlays."
-  :type 'integer
-  :group 'emacs-jupyter-notebook)
-
-(defcustom emacs-jupyter-notebook-result-inline-max-bytes 102400
-  "Maximum byte size of result content rendered inline in after-string."
-  :type 'integer
-  :group 'emacs-jupyter-notebook)
-
-(defcustom emacs-jupyter-notebook-result-inline-lines 10
-  "Number of lines shown inline in result overlays before truncation."
+  "Maximum byte size of result content stored per panel entry."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
@@ -167,20 +152,44 @@ This uses Jupyter's `is_complete_request' and may block up to
 Each element is (NAME . EXPRESSION), where NAME labels the displayed
 watch value and EXPRESSION is code evaluated by the kernel through
 Jupyter's `user_expressions' field.  Watch values are displayed in the
-result overlay when package-owned inline overlays are enabled."
+panel under the entry header."
   :type '(alist :key-type string :value-type string)
   :group 'emacs-jupyter-notebook)
 
-(defcustom emacs-jupyter-notebook-use-inline-overlays t
-  "Whether to show evaluation results as inline overlays.
-When non-nil (default), results appear inline below the cell.
-When nil, results appear in pop-up buffers."
-  :type 'boolean
+;;; W2 panel customization
+
+(defcustom emacs-jupyter-notebook-panel-side 'right
+  "Side of the frame where the output panel side window opens."
+  :type '(choice (const :tag "Right" right)
+                 (const :tag "Left" left)
+                 (const :tag "Top" top)
+                 (const :tag "Bottom" bottom))
   :group 'emacs-jupyter-notebook)
 
-(defcustom emacs-jupyter-notebook-inline-result-max-lines 1000
-  "Maximum lines for inline result display before truncation."
+(defcustom emacs-jupyter-notebook-panel-width 80
+  "Width of the panel side window in columns."
   :type 'integer
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-panel-default-view 'latest
+  "Default view for newly-opened output panels."
+  :type '(choice (const :tag "Latest per cell" latest)
+                 (const :tag "History log" history))
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-panel-stream-throttle-ms 50
+  "Maximum time in milliseconds between panel renders during streaming.
+A value of 50 caps redisplay churn at roughly 20 Hz.  Higher values
+reduce churn further."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-fringe-side 'left-fringe
+  "Where to draw the per-cell status indicator in the source buffer."
+  :type '(choice (const :tag "Left fringe" left-fringe)
+                 (const :tag "Right fringe" right-fringe)
+                 (const :tag "Left margin" left-margin)
+                 (const :tag "Right margin" right-margin))
   :group 'emacs-jupyter-notebook)
 
 (defconst emacs-jupyter-notebook-connection-port-keys

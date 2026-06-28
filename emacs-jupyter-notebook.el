@@ -25,50 +25,11 @@
 (require 'emacs-jupyter-notebook-result)
 (require 'emacs-jupyter-notebook-jupyter)
 
-(defvar-local emacs-jupyter-notebook--before-change-text nil)
-
 (defvar-local emacs-jupyter-notebook--saved-imenu-create-index-function nil
   "Previous buffer-local value of `imenu-create-index-function'.")
 
 (defvar-local emacs-jupyter-notebook--saved-imenu-create-index-function-local-p nil
   "Whether `imenu-create-index-function' was buffer-local before enabling.")
-
-(defun emacs-jupyter-notebook--before-change (beg end)
-  (setq emacs-jupyter-notebook--before-change-text
-        (when (and beg end (> end beg))
-          (buffer-substring-no-properties beg end))))
-
-(defun emacs-jupyter-notebook--insert-belongs-after-output-p (text anchor)
-  "Return non-nil when inserted TEXT at ANCHOR should stay below result output."
-  (or (equal text "\n")
-      (string-match-p "\\`\\(?:\n\\)?# %%" text)
-      (and (> anchor (point-min))
-           (eq (char-before anchor) ?\n))))
-
-(defun emacs-jupyter-notebook--after-change-adjust-result-anchors (beg end old-len)
-  "Keep result overlays usable after insertions at their anchor.
-Non-newline text inserted at a result anchor extends the source line when the
-anchor is immediately after source text, so move the result after it.  Newlines,
-cell markers, and text inserted at an anchor that is already after a real source
-newline are treated as text below the output, so the result stays in place."
-  (when (and (zerop old-len) (< beg end))
-    (let ((inserted (buffer-substring-no-properties beg end)))
-      (unless (emacs-jupyter-notebook--insert-belongs-after-output-p inserted beg)
-        (dolist (ov (emacs-jupyter-notebook-result--all-overlays))
-          (when (and (= (overlay-start ov) beg)
-                     (= (overlay-end ov) beg)
-                     (= (or (overlay-get ov 'emacs-jupyter-notebook-source-end) beg)
-                        beg))
-            (move-overlay ov end end)
-            (overlay-put ov 'emacs-jupyter-notebook-source-end end)))))))
-
-(defun emacs-jupyter-notebook--after-change-cleanup (beg end old-len)
-  (emacs-jupyter-notebook--after-change-adjust-result-anchors beg end old-len)
-  (when (and (> old-len 0)
-             emacs-jupyter-notebook--before-change-text
-             (string-match-p "\\(?:^\\|\n\\)# %%" emacs-jupyter-notebook--before-change-text))
-    (emacs-jupyter-notebook-result-clear-all)
-    (emacs-jupyter-notebook-jupyter-clear-overlays)))
 
 (defun emacs-jupyter-notebook--imenu-index ()
   "Return an imenu index of code-cell markers in the current buffer."
@@ -256,8 +217,8 @@ newline are treated as text below the output, so the result stays in place."
     (define-key map (kbd "C-c C-w") #'emacs-jupyter-notebook-clean-orphaned-kernels)
     (define-key map (kbd "C-c C-l") #'emacs-jupyter-notebook-clear-results)
     (define-key map (kbd "C-c C-x") #'emacs-jupyter-notebook-cancel-operation)
-    (define-key map (kbd "C-c C-t") #'emacs-jupyter-notebook-toggle-output)
-    (define-key map (kbd "C-c C-o") #'emacs-jupyter-notebook-show-output)
+    (define-key map (kbd "C-c C-o") #'emacs-jupyter-notebook-show-output-panel)
+    (define-key map (kbd "C-c C-t") #'emacs-jupyter-notebook-toggle-panel-view)
     (define-key map (kbd "C-c C-f") #'emacs-jupyter-notebook-forward-cell)
     (define-key map (kbd "C-c C-p") #'emacs-jupyter-notebook-backward-cell)
     (define-key map (kbd "C-c C-j") #'emacs-jupyter-notebook-evaluate-current-cell-and-advance)
@@ -343,11 +304,17 @@ and survive mode disable.  Errors are swallowed so disable cannot raise."
 (defun emacs-jupyter-notebook--kill-buffer-hook ()
   "Buffer-local `kill-buffer-hook' that releases local kernel resources.
 Errors are swallowed so a failure here cannot prevent the buffer from being
-killed."
+killed.  W2.9: also kills the source buffer's output panel; killing the
+panel alone does not touch the kernel or registry."
   (condition-case err
       (emacs-jupyter-notebook--release-local-resources)
     (error
      (message "emacs-jupyter-notebook: kill-buffer cleanup failed: %s"
+              (error-message-string err))))
+  (condition-case err
+      (emacs-jupyter-notebook--kill-panel)
+    (error
+     (message "emacs-jupyter-notebook: panel kill failed: %s"
               (error-message-string err)))))
 
 ;;;###autoload
@@ -360,10 +327,6 @@ killed."
         (code-cells-mode 1)
         (add-hook 'completion-at-point-functions
                   #'emacs-jupyter-notebook-completion-at-point nil t)
-        (add-hook 'before-change-functions
-                  #'emacs-jupyter-notebook--before-change nil t)
-        (add-hook 'after-change-functions
-                  #'emacs-jupyter-notebook--after-change-cleanup nil t)
         (add-hook 'kill-buffer-hook
                   #'emacs-jupyter-notebook--kill-buffer-hook nil t)
         (emacs-jupyter-notebook--enable-imenu)
@@ -371,27 +334,24 @@ killed."
     (code-cells-mode -1)
     (remove-hook 'completion-at-point-functions
                  #'emacs-jupyter-notebook-completion-at-point t)
-    (remove-hook 'before-change-functions
-                 #'emacs-jupyter-notebook--before-change t)
-    (remove-hook 'after-change-functions
-                 #'emacs-jupyter-notebook--after-change-cleanup t)
     (remove-hook 'kill-buffer-hook
                  #'emacs-jupyter-notebook--kill-buffer-hook t)
+    (emacs-jupyter-notebook-fringe-clear-all)
     (emacs-jupyter-notebook--disable-imenu)
     (emacs-jupyter-notebook--mode-disable-cleanup)))
 
 (add-to-list 'code-cells-eval-region-commands
               '(emacs-jupyter-notebook-mode . emacs-jupyter-notebook-evaluate-region))
 
-(defun emacs-jupyter-notebook--clear-cell-region-artifacts (beg end)
-  "Clear result artifacts attached to source positions between BEG and END."
-  (emacs-jupyter-notebook-result-clear-region beg end)
-  (emacs-jupyter-notebook-jupyter-clear-overlays))
+(defun emacs-jupyter-notebook--clear-cell-region-artifacts (_beg _end)
+  "Clear source-side fringe indicators in the BEG..END region.
+With the W2 panel design the source buffer carries no result text, so
+only the fringe indicators need clearing on a structural cell edit."
+  (emacs-jupyter-notebook-fringe-clear-all))
 
 (defun emacs-jupyter-notebook--clear-all-cell-artifacts ()
-  "Clear all result artifacts before structural cell edits."
-  (emacs-jupyter-notebook-result-clear-all)
-  (emacs-jupyter-notebook-jupyter-clear-overlays))
+  "Clear all source-side fringe indicators before structural cell edits."
+  (emacs-jupyter-notebook-fringe-clear-all))
 
 (defun emacs-jupyter-notebook--goto-live-cell-start ()
   "Move point to the current cell body when the buffer is nonempty."
@@ -1283,39 +1243,76 @@ On failure, call ERROR-CALLBACK with (context error-data)."
            (when text
              (display-message-or-buffer text))))))))
 
-;;; Completeness check
+;;; Evaluation
 
-(defun emacs-jupyter-notebook--evaluate-after-completeness (code beg end)
-  "Check CODE completeness and evaluate if complete.
-BEG and END are source bounds."
+(defun emacs-jupyter-notebook--current-cell-key ()
+  "Return the cell key for the current cell, or nil if no marker exists.
+Cells without a `# %%' marker (i.e., whole-buffer evaluation in marker-less
+files) return nil so they flow only to the history-log view."
+  (save-excursion
+    (let* ((bounds (emacs-jupyter-notebook-cell-bounds))
+           (beg (car bounds)))
+      ;; Bounds start at the cell body; the marker line begins just before.
+      ;; Walk back to the marker line, if any.
+      (goto-char beg)
+      (cond
+       ((and (> beg (point-min))
+             (save-excursion
+               (goto-char beg)
+               (forward-line -1)
+               (looking-at code-cells-boundary-regexp)))
+        (forward-line -1)
+        (emacs-jupyter-notebook--cell-key-for (line-beginning-position)))
+       ((save-excursion
+          (goto-char (point-min))
+          (looking-at code-cells-boundary-regexp))
+        (emacs-jupyter-notebook--cell-key-for (point-min)))
+       (t nil)))))
+
+(defun emacs-jupyter-notebook--evaluate-code-now (code cell-key)
+  "Evaluate CODE immediately, sending output to CELL-KEY's panel entry.
+CELL-KEY may be nil for region/paragraph/defun evaluation."
+  (let* ((buffer (current-buffer))
+         (panel (ejn-panel-ensure buffer))
+         (handle (ejn-panel-start-entry panel cell-key code))
+         (modified (buffer-modified-p)))
+    (emacs-jupyter-notebook-panel--display panel)
+    (when cell-key
+      (emacs-jupyter-notebook-fringe-set cell-key 'running))
+    (prog1
+        (emacs-jupyter-notebook-jupyter-evaluate
+         emacs-jupyter-notebook--client code handle)
+      (set-buffer-modified-p modified))))
+
+(defun emacs-jupyter-notebook--evaluate-after-completeness-cell (code cell-key)
+  "Check CODE completeness and evaluate if complete, posting to CELL-KEY."
   (if (not emacs-jupyter-notebook-check-code-completeness)
-      (emacs-jupyter-notebook--evaluate-code-now code beg end)
+      (emacs-jupyter-notebook--evaluate-code-now code cell-key)
     (emacs-jupyter-notebook-jupyter-is-complete
      emacs-jupyter-notebook--client code
      (lambda (reply _error)
        (when (and reply (equal (plist-get reply :status) "complete"))
-         (emacs-jupyter-notebook--evaluate-code-now code beg end))))))
+         (emacs-jupyter-notebook--evaluate-code-now code cell-key))))))
 
-;;; Evaluation
-
-(defun emacs-jupyter-notebook--evaluate-code-now (code beg end)
-  "Evaluate CODE immediately for source range BEG to END."
-  (let ((modified (buffer-modified-p)))
-    (prog1
-        (emacs-jupyter-notebook-jupyter-evaluate
-         emacs-jupyter-notebook--client code beg end)
-      (set-buffer-modified-p modified))))
-
-(defun emacs-jupyter-notebook--evaluate-code (code beg end)
-  "Ensure client then evaluate CODE for source range BEG to END."
+(defun emacs-jupyter-notebook--evaluate-code (code cell-key)
+  "Ensure client then evaluate CODE, posting output to CELL-KEY's entry.
+CELL-KEY may be nil (region/paragraph/defun evaluation)."
   (let* ((buffer (current-buffer))
          (eval-cb (lambda (_ctx)
-                    (emacs-jupyter-notebook--evaluate-after-completeness code beg end)))
+                    (when (buffer-live-p buffer)
+                      (with-current-buffer buffer
+                        (emacs-jupyter-notebook--evaluate-after-completeness-cell
+                         code cell-key)))))
          (error-cb (lambda (_ctx err)
                      (when (buffer-live-p buffer)
                        (with-current-buffer buffer
-                         (emacs-jupyter-notebook-result-create
-                          beg end (format "Evaluation failed: %s" err))))
+                         (let* ((panel (ejn-panel-ensure buffer))
+                                (handle (ejn-panel-start-entry
+                                         panel cell-key code)))
+                           (ejn-panel-append-text
+                            handle (format "Evaluation failed: %s" err)
+                            'emacs-jupyter-notebook-result-error-face)
+                           (ejn-panel-finish-entry handle 'error nil))))
                      (message "emacs-jupyter-notebook: evaluation failed: %s" err))))
     (emacs-jupyter-notebook--ensure-client-async eval-cb error-cb)))
 
@@ -1414,25 +1411,29 @@ non-nil, do not send a Jupyter shutdown request to the current client."
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-evaluate-current-cell ()
-  "Evaluate the current # %% cell."
+  "Evaluate the current # %% cell, sending output to the cell's panel entry."
   (interactive)
   (pcase-let ((`(,beg . ,end) (emacs-jupyter-notebook-cell-bounds)))
-    (emacs-jupyter-notebook--evaluate-code
-     (buffer-substring-no-properties beg end) beg end)))
+    (let ((code (buffer-substring-no-properties beg end))
+          (key (emacs-jupyter-notebook--current-cell-key)))
+      (emacs-jupyter-notebook--evaluate-code code key))))
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-evaluate-region (beg end)
-  "Evaluate the active region from BEG to END."
+  "Evaluate the active region from BEG to END.
+Region evaluations have no cell key and appear only in the history-log
+view of the panel."
   (interactive "r")
   (emacs-jupyter-notebook--evaluate-code
-   (buffer-substring-no-properties beg end) beg end))
+   (buffer-substring-no-properties beg end) nil))
 
 (defun emacs-jupyter-notebook-evaluate-buffer ()
-  "Evaluate the current buffer."
+  "Evaluate the current buffer.
+Buffer evaluations have no cell key and appear only in the history-log
+view of the panel."
   (interactive)
   (emacs-jupyter-notebook--evaluate-code
-   (buffer-substring-no-properties (point-min) (point-max))
-   (point-min) (point-max)))
+   (buffer-substring-no-properties (point-min) (point-max)) nil))
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-interrupt-kernel ()
@@ -1518,10 +1519,14 @@ profile, then fall back to `emacs-jupyter-notebook-default-profile'."
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-clear-results ()
-  "Clear inline result overlays from the current buffer."
+  "Clear the source-side fringe indicators and the output panel contents."
   (interactive)
-  (emacs-jupyter-notebook-result-clear-all)
-  (emacs-jupyter-notebook-jupyter-clear-overlays))
+  (emacs-jupyter-notebook-fringe-clear-all)
+  (let ((panel (emacs-jupyter-notebook-panel-buffer (current-buffer))))
+    (when (buffer-live-p panel)
+      (with-current-buffer panel
+        (setq emacs-jupyter-notebook-panel--entries nil)
+        (emacs-jupyter-notebook-panel-flush-now panel)))))
 
 (defun emacs-jupyter-notebook-cancel-operation ()
   "Cancel the current buffer's in-progress async Jupyter operation."
@@ -1533,23 +1538,13 @@ profile, then fall back to `emacs-jupyter-notebook-default-profile'."
         (setq emacs-jupyter-notebook--async-context nil))
     (user-error "No emacs-jupyter-notebook operation is in progress")))
 
-(defun emacs-jupyter-notebook-show-output ()
-  "Open the full output of the nearest result overlay in a dedicated buffer."
+(defun emacs-jupyter-notebook-toggle-panel-view ()
+  "Toggle the source buffer's output panel between latest and history views."
   (interactive)
-  (let ((ov (emacs-jupyter-notebook-result--nearest-overlay)))
-    (unless ov
-      (user-error "No result overlay at or near point"))
-    (let* ((content (or (overlay-get ov 'emacs-jupyter-notebook-result-full-content)
-                        (overlay-get ov 'emacs-jupyter-notebook-content)
-                        ""))
-           (buf (get-buffer-create "*ejn-output*")))
-      (with-current-buffer buf
-        (let ((inhibit-read-only t))
-          (erase-buffer)
-          (insert content)
-          (goto-char (point-min)))
-        (setq buffer-read-only t))
-      (display-buffer buf))))
+  (let ((panel (or (emacs-jupyter-notebook-panel-buffer (current-buffer))
+                   (ejn-panel-ensure (current-buffer)))))
+    (with-current-buffer panel
+      (emacs-jupyter-notebook-panel-toggle-view))))
 
 (defun emacs-jupyter-notebook--ensure-client ()
   "Return the current buffer's kernel client or signal an error."

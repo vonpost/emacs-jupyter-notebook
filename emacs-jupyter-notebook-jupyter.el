@@ -11,6 +11,9 @@
 ;; Thin, mockable adapter around emacs-jupyter.  This file intentionally
 ;; avoids requiring emacs-jupyter at top level so local ERT tests can run
 ;; without that package installed.
+;;
+;; W2: callbacks drive the panel API in `emacs-jupyter-notebook-result.el'
+;; rather than mutating source-buffer overlays.
 
 ;;; Code:
 
@@ -57,31 +60,6 @@
 (defun emacs-jupyter-notebook-jupyter--result-mime-data (msg)
   "Return the MIME data plist from result MSG, or nil."
   (plist-get (jupyter-message-content msg) :data))
-
-(defun emacs-jupyter-notebook-jupyter--set-image-result (buffer ov rendered)
-  "Set image from RENDERED propertized string in OV in BUFFER."
-  (when (and rendered (buffer-live-p buffer) (overlayp ov))
-    (with-current-buffer buffer
-      (when-let ((image-spec (get-text-property 0 'display rendered)))
-        (emacs-jupyter-notebook-result-set-image ov image-spec)))))
-
-(defun emacs-jupyter-notebook-jupyter--append-result (buffer ov text &optional face)
-  "Append TEXT to OV in BUFFER when both are still live."
-  (when (and text (buffer-live-p buffer) (overlayp ov))
-    (with-current-buffer buffer
-      (emacs-jupyter-notebook-result-append ov (ansi-color-apply text) face))))
-
-(defun emacs-jupyter-notebook-jupyter--replace-result (buffer ov text &optional face)
-  "Replace OV content with TEXT in BUFFER when both are still live."
-  (when (and text (buffer-live-p buffer) (overlayp ov))
-    (with-current-buffer buffer
-      (emacs-jupyter-notebook-result-replace ov (ansi-color-apply text) face))))
-
-(defun emacs-jupyter-notebook-jupyter--finish-result (buffer ov)
-  "Mark OV in BUFFER as finished when both are still live."
-  (when (and (buffer-live-p buffer) (overlayp ov))
-    (with-current-buffer buffer
-      (emacs-jupyter-notebook-result-finish ov))))
 
 (defun emacs-jupyter-notebook-jupyter--send-input-reply (client value)
   "Send an input_reply with VALUE through CLIENT."
@@ -136,8 +114,17 @@
                 lines)))
       (concat "\n[watch]\n" (string-join (nreverse lines) "\n") "\n"))))
 
-(defun emacs-jupyter-notebook-jupyter--callbacks (buffer ov &optional client)
-  "Return execution callbacks that render into OV in BUFFER."
+(defun emacs-jupyter-notebook-jupyter--ansi (text)
+  "Apply ANSI color escapes in TEXT for panel display."
+  (when text (ansi-color-apply text)))
+
+(defun emacs-jupyter-notebook-jupyter--callbacks (buffer entry-handle &optional client)
+  "Return execution callbacks that drive panel ENTRY-HANDLE in BUFFER.
+
+Stream/execute_result/display_data/update_display_data/error/clear_output/
+execute_reply/status all flow through the panel API; the source BUFFER
+is not mutated.  The optional CLIENT is used to reply to input_request
+prompts."
   (let ((had-result nil))
     `(("input_request"
        ,(lambda (msg)
@@ -145,7 +132,7 @@
               (let* ((content (jupyter-message-content msg))
                      (prompt (or (plist-get content :prompt) ""))
                      (password (plist-get content :password)))
-                (emacs-jupyter-notebook-jupyter--append-result buffer ov prompt)
+                (ejn-panel-append-text entry-handle prompt)
                 (let ((value (condition-case nil
                                  (if (eq password t)
                                      (read-passwd prompt)
@@ -156,15 +143,11 @@
                   (when (eq password t)
                     (clear-string value))))
             (error nil))))
-       ("clear_output"
+      ("clear_output"
        ,(lambda (msg)
           (condition-case nil
-              (when (and (buffer-live-p buffer) (overlayp ov))
-                (with-current-buffer buffer
-                  (let ((wait (plist-get (jupyter-message-content msg) :wait)))
-                    (if wait
-                        (overlay-put ov 'emacs-jupyter-notebook-pending-clear t)
-                      (emacs-jupyter-notebook-result-clear ov)))))
+              (let ((wait (plist-get (jupyter-message-content msg) :wait)))
+                (ejn-panel-clear-entry entry-handle wait))
             (error nil))))
       ("stream"
        ,(lambda (msg)
@@ -173,9 +156,11 @@
                     (name (emacs-jupyter-notebook-jupyter--message-content-value msg :name)))
                 (when (and text (not (string-empty-p text)))
                   (setq had-result t)
-                  (emacs-jupyter-notebook-jupyter--append-result
-                   buffer ov text
-                   (when (equal name "stderr") 'emacs-jupyter-notebook-result-error-face))))
+                  (ejn-panel-append-text
+                   entry-handle
+                   (emacs-jupyter-notebook-jupyter--ansi text)
+                   (when (equal name "stderr")
+                     'emacs-jupyter-notebook-result-error-face))))
             (error nil))))
       ("execute_result"
        ,(lambda (msg)
@@ -184,8 +169,11 @@
                          (rendered (emacs-jupyter-notebook--render-mime-result data)))
                 (setq had-result t)
                 (if (get-text-property 0 'display rendered)
-                    (emacs-jupyter-notebook-jupyter--set-image-result buffer ov rendered)
-                  (emacs-jupyter-notebook-jupyter--append-result buffer ov rendered)))
+                    (ejn-panel-set-image
+                     entry-handle (get-text-property 0 'display rendered))
+                  (ejn-panel-replace-text
+                   entry-handle
+                   (emacs-jupyter-notebook-jupyter--ansi rendered))))
             (error nil))))
       ("display_data"
        ,(lambda (msg)
@@ -194,12 +182,17 @@
                 (when data
                   (let ((rendered (emacs-jupyter-notebook--render-mime-result data)))
                     (setq had-result t)
-                    (if rendered
-                        (if (get-text-property 0 'display rendered)
-                            (emacs-jupyter-notebook-jupyter--set-image-result buffer ov rendered)
-                          (emacs-jupyter-notebook-jupyter--append-result buffer ov rendered))
-                      (emacs-jupyter-notebook-jupyter--append-result
-                       buffer ov "[unsupported output format]")))))
+                    (cond
+                     ((null rendered)
+                      (ejn-panel-append-text
+                       entry-handle "[unsupported output format]"))
+                     ((get-text-property 0 'display rendered)
+                      (ejn-panel-set-image
+                       entry-handle (get-text-property 0 'display rendered)))
+                     (t
+                      (ejn-panel-append-text
+                       entry-handle
+                       (emacs-jupyter-notebook-jupyter--ansi rendered)))))))
             (error nil))))
       ("update_display_data"
        ,(lambda (msg)
@@ -208,12 +201,17 @@
                 (when data
                   (let ((rendered (emacs-jupyter-notebook--render-mime-result data)))
                     (setq had-result t)
-                    (if rendered
-                        (if (get-text-property 0 'display rendered)
-                            (emacs-jupyter-notebook-jupyter--set-image-result buffer ov rendered)
-                          (emacs-jupyter-notebook-jupyter--replace-result buffer ov rendered))
-                      (emacs-jupyter-notebook-jupyter--replace-result
-                       buffer ov "[unsupported output format]")))))
+                    (cond
+                     ((null rendered)
+                      (ejn-panel-replace-text
+                       entry-handle "[unsupported output format]"))
+                     ((get-text-property 0 'display rendered)
+                      (ejn-panel-set-image
+                       entry-handle (get-text-property 0 'display rendered)))
+                     (t
+                      (ejn-panel-replace-text
+                       entry-handle
+                       (emacs-jupyter-notebook-jupyter--ansi rendered)))))))
             (error nil))))
       ("error"
        ,(lambda (msg)
@@ -226,8 +224,9 @@
                                (string-join traceback "\n")
                              (format "%s: %s" ename evalue))))
                 (setq had-result t)
-                (emacs-jupyter-notebook-jupyter--append-result
-                 buffer ov text 'emacs-jupyter-notebook-result-error-face))
+                (ejn-panel-append-text
+                 entry-handle text
+                 'emacs-jupyter-notebook-result-error-face))
             (error nil))))
       ("execute_reply"
        ,(lambda (msg)
@@ -238,26 +237,36 @@
                     (when (timerp emacs-jupyter-notebook--evaluation-timer)
                       (cancel-timer emacs-jupyter-notebook--evaluation-timer))
                     (setq emacs-jupyter-notebook--evaluation-timer nil)))
-                (let ((status (emacs-jupyter-notebook-jupyter--message-content-value msg :status))
-                      (count (emacs-jupyter-notebook-jupyter--message-content-value msg :execution_count))
-                      (watch-text (emacs-jupyter-notebook-jupyter--watch-results-text
-                                   (emacs-jupyter-notebook-jupyter--message-content-value
-                                    msg :user_expressions))))
+                (let* ((status-s (emacs-jupyter-notebook-jupyter--message-content-value
+                                  msg :status))
+                       (count (emacs-jupyter-notebook-jupyter--message-content-value
+                               msg :execution_count))
+                       (watch-text (emacs-jupyter-notebook-jupyter--watch-results-text
+                                    (emacs-jupyter-notebook-jupyter--message-content-value
+                                     msg :user_expressions)))
+                       (status-sym (cond ((equal status-s "ok") 'ok)
+                                         ((equal status-s "error") 'error)
+                                         (t 'ok))))
                   (when watch-text
                     (setq had-result t)
-                    (emacs-jupyter-notebook-jupyter--append-result buffer ov watch-text))
+                    (ejn-panel-append-text entry-handle watch-text))
                   (unless had-result
-                    (when (equal status "error")
-                      (emacs-jupyter-notebook-jupyter--append-result
-                       buffer ov
+                    (when (equal status-s "error")
+                      (ejn-panel-append-text
+                       entry-handle
                        (format "%s: %s"
-                               (or (emacs-jupyter-notebook-jupyter--message-content-value msg :ename) "Error")
-                               (or (emacs-jupyter-notebook-jupyter--message-content-value msg :evalue) ""))
+                               (or (emacs-jupyter-notebook-jupyter--message-content-value
+                                    msg :ename) "Error")
+                               (or (emacs-jupyter-notebook-jupyter--message-content-value
+                                    msg :evalue) ""))
                        'emacs-jupyter-notebook-result-error-face)))
-                  (when (and count (buffer-live-p buffer))
+                  (ejn-panel-finish-entry entry-handle status-sym count)
+                  (when (buffer-live-p buffer)
                     (with-current-buffer buffer
-                       (emacs-jupyter-notebook-result--set-execution-count ov count)))
-                  (emacs-jupyter-notebook-jupyter--finish-result buffer ov)))
+                      (let ((cell-key (plist-get entry-handle :cell-key)))
+                        (when cell-key
+                          (emacs-jupyter-notebook-fringe-set
+                           cell-key status-sym count)))))))
             (error nil))))
       ("status"
        ,(lambda (msg)
@@ -370,45 +379,43 @@ the synchronous emacs-jupyter connect blocks the event loop."
         (message "Failed to connect to Jupyter kernel: %s" (error-message-string err))
         (funcall callback nil))))))
 
-(defun emacs-jupyter-notebook-jupyter--evaluate (client code beg end)
-  "Evaluate CODE using CLIENT with source bounds BEG and END."
+(defun emacs-jupyter-notebook-jupyter--evaluate (client code entry-handle)
+  "Evaluate CODE through CLIENT, sending callbacks driving ENTRY-HANDLE.
+
+The caller (the eval entry-point) creates ENTRY-HANDLE on the source
+buffer's panel before calling this function.  This function is
+adapter-only: the buffer-local evaluation timer and panel wiring live
+in the caller's surface."
   (emacs-jupyter-notebook-jupyter--ensure)
   (require 'jupyter-client)
   (require 'jupyter-messages)
   (require 'jupyter-monads)
-  (if (not emacs-jupyter-notebook-use-inline-overlays)
-      (let ((jupyter-current-client client)
-            (jupyter-eval-use-overlays nil)
-            (jupyter-eval-short-result-max-lines
-             emacs-jupyter-notebook-inline-result-max-lines))
-        (jupyter-eval-string code nil beg end))
-    (let* ((buffer (current-buffer))
-           (ov (emacs-jupyter-notebook-result-start beg end))
-            (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer ov))
-           (watch-expressions
-            (emacs-jupyter-notebook-jupyter--watch-expressions-plist)))
-       (emacs-jupyter-notebook-result--set-busy-indicator ov)
-      (when (timerp emacs-jupyter-notebook--evaluation-timer)
-        (cancel-timer emacs-jupyter-notebook--evaluation-timer))
-      (setq emacs-jupyter-notebook--evaluation-timer
-            (run-at-time emacs-jupyter-notebook-evaluation-timeout nil
-                         (lambda ()
-                           (when (buffer-live-p buffer)
-                             (with-current-buffer buffer
-                               (message "Evaluation timed out after %ss. Kernel may be busy or unresponsive. Use C-c C-k to interrupt."
-                                        emacs-jupyter-notebook-evaluation-timeout)
-                               (setq emacs-jupyter-notebook--kernel-status 'busy)
-                               (force-mode-line-update t))))))
-      (jupyter-run-with-state
-       client
-       (jupyter-sent
-        (jupyter-message-subscribed
-          (jupyter-execute-request
-           :code code
-           :store-history nil
-           :user-expressions watch-expressions
-           :handlers '("input_request"))
-          callbacks))))))
+  (let* ((buffer (current-buffer))
+         (callbacks (emacs-jupyter-notebook-jupyter--callbacks
+                     buffer entry-handle client))
+         (watch-expressions
+          (emacs-jupyter-notebook-jupyter--watch-expressions-plist)))
+    (when (timerp emacs-jupyter-notebook--evaluation-timer)
+      (cancel-timer emacs-jupyter-notebook--evaluation-timer))
+    (setq emacs-jupyter-notebook--evaluation-timer
+          (run-at-time emacs-jupyter-notebook-evaluation-timeout nil
+                       (lambda ()
+                         (when (buffer-live-p buffer)
+                           (with-current-buffer buffer
+                             (message "Evaluation timed out after %ss. Kernel may be busy or unresponsive. Use C-c C-k to interrupt."
+                                      emacs-jupyter-notebook-evaluation-timeout)
+                             (setq emacs-jupyter-notebook--kernel-status 'busy)
+                             (force-mode-line-update t))))))
+    (jupyter-run-with-state
+     client
+     (jupyter-sent
+      (jupyter-message-subscribed
+       (jupyter-execute-request
+        :code code
+        :store-history nil
+        :user-expressions watch-expressions
+        :handlers '("input_request"))
+       callbacks)))))
 
 (defun emacs-jupyter-notebook-jupyter--interrupt (client)
   "Interrupt CLIENT's kernel."
@@ -486,9 +493,9 @@ Call CALLBACK with the client on success, or nil on failure."
   (funcall emacs-jupyter-notebook-jupyter-connect-async-function
            connection-file callback))
 
-(defun emacs-jupyter-notebook-jupyter-evaluate (client code beg end)
-  "Evaluate CODE through the configured adapter."
-  (funcall emacs-jupyter-notebook-jupyter-evaluate-function client code beg end))
+(defun emacs-jupyter-notebook-jupyter-evaluate (client code entry-handle)
+  "Evaluate CODE through the configured adapter driving ENTRY-HANDLE."
+  (funcall emacs-jupyter-notebook-jupyter-evaluate-function client code entry-handle))
 
 (defun emacs-jupyter-notebook-jupyter-interrupt (client)
   "Interrupt CLIENT through the configured adapter."
@@ -517,12 +524,7 @@ Call CALLBACK with the client on success, or nil on failure."
   (funcall emacs-jupyter-notebook-jupyter-is-complete-function
            client code callback))
 
-(defun emacs-jupyter-notebook-jupyter-clear-overlays ()
-  "Clear emacs-jupyter's own evaluation overlays when available."
-  (when (and (featurep 'jupyter-client)
-             (fboundp 'jupyter-eval-remove-overlays))
-    (jupyter-eval-remove-overlays)))
-
 (provide 'emacs-jupyter-notebook-jupyter)
 
 ;;; emacs-jupyter-notebook-jupyter.el ends here
+
