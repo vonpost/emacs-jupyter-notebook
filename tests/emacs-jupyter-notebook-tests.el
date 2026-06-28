@@ -1264,6 +1264,102 @@ leaves source-buffer text untouched."
       (should-not (gethash '(2 . "b") emacs-jupyter-notebook--completion-cache))
       (should (gethash '(3 . "c") emacs-jupyter-notebook--completion-cache)))))
 
+(ert-deftest ejn-w3.2-schedule-installs-idle-timer ()
+  ;; A schedule call installs exactly one idle timer.
+  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
+    (search-forward "my_obj.met")
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook--completion-cache nil)
+          (emacs-jupyter-notebook--completion-cache-order nil)
+          (emacs-jupyter-notebook--completion-idle-timer nil)
+          (emacs-jupyter-notebook-completion-idle 0.10))
+      (emacs-jupyter-notebook--completion-schedule-request)
+      (unwind-protect
+          (should (timerp emacs-jupyter-notebook--completion-idle-timer))
+        (emacs-jupyter-notebook--completion-cancel-idle-timer)))))
+
+(ert-deftest ejn-w3.2-schedule-cancels-prior-timer ()
+  ;; A second schedule cancels the first; the old timer object is dead.
+  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
+    (search-forward "my_obj.met")
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook--completion-cache nil)
+          (emacs-jupyter-notebook--completion-cache-order nil)
+          (emacs-jupyter-notebook--completion-idle-timer nil)
+          (emacs-jupyter-notebook-completion-idle 0.10))
+      (emacs-jupyter-notebook--completion-schedule-request)
+      (let ((first emacs-jupyter-notebook--completion-idle-timer))
+        (should (timerp first))
+        (emacs-jupyter-notebook--completion-schedule-request)
+        (let ((second emacs-jupyter-notebook--completion-idle-timer))
+          (should (timerp second))
+          (should-not (eq first second))
+          (should-not (memq first timer-list))
+          (emacs-jupyter-notebook--completion-cancel-idle-timer))))))
+
+(ert-deftest ejn-w3.2-cancel-idle-timer-clears-state ()
+  ;; Explicit cancel drops the timer and the pending key/id.
+  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
+    (search-forward "my_obj.met")
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook--completion-cache nil)
+          (emacs-jupyter-notebook--completion-cache-order nil)
+          (emacs-jupyter-notebook--completion-idle-timer nil))
+      (emacs-jupyter-notebook--completion-schedule-request)
+      (emacs-jupyter-notebook--completion-cancel-idle-timer)
+      (should-not (timerp emacs-jupyter-notebook--completion-idle-timer))
+      (should-not emacs-jupyter-notebook--completion-pending-key)
+      (should-not emacs-jupyter-notebook--completion-pending-id))))
+
+(ert-deftest ejn-w3.2-schedule-fires-adapter-after-delay ()
+  ;; When the scheduled timer fires, the adapter is called exactly once
+  ;; with the expected (code, cursor-pos).  The test invokes the timer's
+  ;; function directly rather than relying on the batch-mode scheduler.
+  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
+    (emacs-jupyter-notebook-mode 1)
+    (unwind-protect
+        (progn
+          (search-forward "my_obj.met")
+          (let ((emacs-jupyter-notebook--client 'mock-client)
+                (emacs-jupyter-notebook--completion-cache nil)
+                (emacs-jupyter-notebook--completion-cache-order nil)
+                (emacs-jupyter-notebook--completion-idle-timer nil)
+                (emacs-jupyter-notebook--completion-pending-key nil)
+                (emacs-jupyter-notebook--completion-pending-id nil)
+                (emacs-jupyter-notebook-completion-idle 0.01)
+                calls captured-code captured-pos)
+            (let ((emacs-jupyter-notebook-jupyter-complete-function
+                   (lambda (_client code pos _callback)
+                     (setq calls (1+ (or calls 0))
+                           captured-code code
+                           captured-pos pos))))
+              (emacs-jupyter-notebook--completion-schedule-request)
+              (let ((timer emacs-jupyter-notebook--completion-idle-timer))
+                (should (timerp timer))
+                (apply (timer--function timer) (timer--args timer)))
+              (should (equal calls 1))
+              (should (stringp captured-code))
+              (should (numberp captured-pos)))))
+      (emacs-jupyter-notebook-mode -1))))
+
+(ert-deftest ejn-w3.2-typing-after-schedule-invalidates-pending ()
+  ;; A schedule that follows another schedule (the user typed) clears any
+  ;; pending key/id so a stale reply will be dropped on arrival.
+  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
+    (search-forward "my_obj.met")
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook--completion-cache nil)
+          (emacs-jupyter-notebook--completion-cache-order nil)
+          (emacs-jupyter-notebook--completion-pending-key "stale-key")
+          (emacs-jupyter-notebook--completion-pending-id 42)
+          (emacs-jupyter-notebook--completion-idle-timer nil))
+      (emacs-jupyter-notebook--completion-schedule-request)
+      (unwind-protect
+          (progn
+            (should-not emacs-jupyter-notebook--completion-pending-key)
+            (should-not emacs-jupyter-notebook--completion-pending-id))
+        (emacs-jupyter-notebook--completion-cancel-idle-timer)))))
+
 (ert-deftest ejn-w3.1-completion-cache-reset-clears-everything ()
   (with-temp-buffer
     (let ((emacs-jupyter-notebook--completion-cache nil)
