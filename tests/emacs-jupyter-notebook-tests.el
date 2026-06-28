@@ -578,6 +578,79 @@ sentinel is present."
   (should-not (emacs-jupyter-notebook--parse-pid
                "noise EJN_PID=7\n")))
 
+(ert-deftest ejn-w4.3-classify-stderr-auth-failed ()
+  "W4.3: `Permission denied' / `Authentication failed' map to `auth-failed'."
+  (dolist (s '("Permission denied (publickey).\n"
+               "user@host: Permission denied (publickey,password).\n"
+               "Authentication failed.\n"
+               "Too many authentication failures for user\n"
+               "Could not open a connection to your authentication agent.\n"))
+    (let ((r (emacs-jupyter-notebook-ssh-classify-stderr s)))
+      (should (eq 'auth-failed (plist-get r :kind)))
+      (should (stringp (plist-get r :hint))))))
+
+(ert-deftest ejn-w4.3-classify-stderr-host-unreachable ()
+  "W4.3: DNS/route failures map to `host-unreachable'."
+  (dolist (s '("ssh: Could not resolve hostname mother: Name or service not known\n"
+               "ssh: connect to host mother port 22: No route to host\n"
+               "ssh: connect to host x port 22: Network is unreachable\n"))
+    (let ((r (emacs-jupyter-notebook-ssh-classify-stderr s)))
+      (should (eq 'host-unreachable (plist-get r :kind))))))
+
+(ert-deftest ejn-w4.3-classify-stderr-connection-refused ()
+  "W4.3: `Connection refused' maps to `connection-refused'."
+  (let ((r (emacs-jupyter-notebook-ssh-classify-stderr
+            "ssh: connect to host mother port 22: Connection refused\n")))
+    (should (eq 'connection-refused (plist-get r :kind)))))
+
+(ert-deftest ejn-w4.3-classify-stderr-forward-refused ()
+  "W4.3: forward refusal maps to `forward-refused'."
+  (dolist (s '("Could not request local forwarding.\n"
+               "remote port forwarding failed for listen port 9000\n"
+               "bind [127.0.0.1]:9000: Address already in use\n"))
+    (let ((r (emacs-jupyter-notebook-ssh-classify-stderr s)))
+      (should (eq 'forward-refused (plist-get r :kind))))))
+
+(ert-deftest ejn-w4.3-classify-stderr-host-key-changed ()
+  "W4.3: changed host key maps to `host-key-changed'."
+  (dolist (s '("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n"
+               "Host key verification failed.\n"))
+    (let ((r (emacs-jupyter-notebook-ssh-classify-stderr s)))
+      (should (eq 'host-key-changed (plist-get r :kind))))))
+
+(ert-deftest ejn-w4.3-classify-stderr-unknown-falls-back ()
+  "W4.3: unrecognized stderr maps to `unknown' with a non-empty hint."
+  (let ((r (emacs-jupyter-notebook-ssh-classify-stderr
+            "something completely unparseable\n")))
+    (should (eq 'unknown (plist-get r :kind)))
+    (should (stringp (plist-get r :hint)))
+    (should (> (length (plist-get r :hint)) 0))))
+
+(ert-deftest ejn-w4.3-async-fail-enriches-classified-errors ()
+  "W4.3: `--async-fail' surfaces classified SSH errors with a kind prefix and hint."
+  (with-temp-buffer
+    (let* ((captured nil)
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'launch
+                     :error-callback (lambda (_ctx err) (setq captured err)))))
+      (cl-letf (((symbol-function 'display-warning) #'ignore))
+        (emacs-jupyter-notebook--async-fail
+         context "ssh: Could not resolve hostname mother: Name or service not known\n"))
+      (should (stringp captured))
+      (should (string-prefix-p "HOST-UNREACHABLE:" captured))
+      (should (string-match-p "Hint: " captured)))))
+
+(ert-deftest ejn-w4.3-async-fail-passes-unknown-through ()
+  "W4.3: unrecognized errors pass through `--async-fail' verbatim."
+  (with-temp-buffer
+    (let* ((captured nil)
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'launch
+                     :error-callback (lambda (_ctx err) (setq captured err)))))
+      (cl-letf (((symbol-function 'display-warning) #'ignore))
+        (emacs-jupyter-notebook--async-fail context "unparseable noise\n"))
+      (should (equal captured "unparseable noise\n")))))
+
 (ert-deftest ejn-ssh-remote-launch-preserves-home-expansion ()
   (let* ((launch (emacs-jupyter-notebook-ssh-build-remote-launch
                   '(:profile "p" :host "mother" :remote-cwd "~" :remote-cache-dir "~/.cache/ejn" :kernelspec "python3")

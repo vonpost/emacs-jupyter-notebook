@@ -223,6 +223,79 @@ The return value is a plist containing :argv, :remote-command,
                                            cache-dir))
              cache-dir cache-dir))))
 
+(defun emacs-jupyter-notebook-ssh-classify-stderr (stderr)
+  "Classify SSH STDERR into a (:kind SYMBOL :hint STRING) plist.
+This is a pure function: input is a string (possibly multi-line), output is
+a plist describing the dominant failure mode and an actionable hint suitable
+for surfacing to the user.
+
+Kinds (in priority order; the first matching pattern wins):
+- `host-key-changed' — the remote host key changed; the user must accept the
+  new key explicitly (often by editing ~/.ssh/known_hosts).
+- `auth-failed' — permission denied / authentication failed; check identity
+  file, agent, or `:user' / `:identity-file' on the profile.
+- `host-unreachable' — name resolution or routing failure; check the host
+  name and connectivity.
+- `connection-refused' — TCP-level refusal; sshd may be down or behind a
+  firewall.
+- `forward-refused' — port forwarding refused by the remote; usually means
+  the requested remote port is already in use or AllowTcpForwarding is off.
+- `unknown' — fallback when no pattern matches."
+  (let ((s (or stderr "")))
+    (cond
+     ((string-match-p
+       (concat "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED"
+               "\\|Host key verification failed")
+       s)
+      (list :kind 'host-key-changed
+            :hint
+            (concat "Remote host key changed. Verify with the admin and "
+                    "either remove the stale line from ~/.ssh/known_hosts "
+                    "or `ssh-keygen -R <host>'.")))
+     ((string-match-p
+       (concat "Permission denied"
+               "\\|Authentication failed"
+               "\\|Too many authentication failures"
+               "\\|Could not open a connection to your authentication agent")
+       s)
+      (list :kind 'auth-failed
+            :hint
+            (concat "SSH authentication failed. Check the profile's "
+                    "`:identity-file', `:user', and that ssh-agent is "
+                    "running or the key is loaded.")))
+     ((string-match-p
+       (concat "Name or service not known"
+               "\\|Could not resolve hostname"
+               "\\|nodename nor servname provided"
+               "\\|No route to host"
+               "\\|Network is unreachable")
+       s)
+      (list :kind 'host-unreachable
+            :hint
+            (concat "Could not reach the remote host. Verify the profile's "
+                    "`:host', DNS, and network connectivity.")))
+     ((string-match-p "Connection refused" s)
+      (list :kind 'connection-refused
+            :hint
+            (concat "The remote SSH port refused the connection. Confirm "
+                    "sshd is running and the profile's `:port' is correct.")))
+     ((string-match-p
+       (concat "remote port forwarding failed"
+               "\\|Could not request local forwarding"
+               "\\|cannot listen to port"
+               "\\|bind \\[127\\.0\\.0\\.1\\]")
+       s)
+      (list :kind 'forward-refused
+            :hint
+            (concat "SSH port forwarding refused. The remote tunnel port may "
+                    "already be in use, or AllowTcpForwarding is disabled.")))
+     (t
+      (list :kind 'unknown
+            :hint
+            (concat "Unrecognized SSH failure. See *Messages* or run "
+                    "`M-x emacs-jupyter-notebook-fetch-remote-log' for "
+                    "details."))))))
+
 (defun emacs-jupyter-notebook-ssh-run-command (argv)
   "Run ARGV synchronously and return stdout.
 Signal an error if the command exits non-zero."

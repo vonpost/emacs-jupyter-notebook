@@ -775,6 +775,23 @@ buffer per session (see ssh.el)."
        (emacs-jupyter-notebook-ssh-build-remote-cleanup
         (emacs-jupyter-notebook--entry-profile entry) connection-file)))))
 
+(defun emacs-jupyter-notebook--enrich-ssh-error (error-data)
+  "Return ERROR-DATA prefixed with a W4.3 SSH-error classification when applicable.
+When ERROR-DATA is a string, the SSH-stderr classifier inspects it; any
+non-`unknown' kind is surfaced as `<KIND>: <text>\\nHint: <actionable hint>'.
+Non-string or unrecognized errors are returned verbatim."
+  (if (stringp error-data)
+      (let* ((classification (emacs-jupyter-notebook-ssh-classify-stderr error-data))
+             (kind (plist-get classification :kind))
+             (hint (plist-get classification :hint)))
+        (if (eq kind 'unknown)
+            error-data
+          (format "%s: %s\nHint: %s"
+                  (upcase (symbol-name kind))
+                  error-data
+                  hint)))
+    error-data))
+
 (defun emacs-jupyter-notebook--async-fail (context error-data)
   "Move CONTEXT to error state with ERROR-DATA and clean up.
 
@@ -787,19 +804,24 @@ once `--async-connect-finalize' runs that same path becomes the registry
 entry's `:local-connection-file' (the offline reconnect key), and this
 function is also called from failure paths that may race with that
 promotion.  A small temp-file leak is acceptable; loss of the reconnect
-key is not."
-  (setq context (emacs-jupyter-notebook--async-put context :phase 'error))
-  (setq context (emacs-jupyter-notebook--async-put context :error error-data))
-  (setq context (emacs-jupyter-notebook--async-cancel-timer context))
-  (emacs-jupyter-notebook--async-delete-process (plist-get context :launch-process))
-  (emacs-jupyter-notebook--async-delete-process (plist-get context :scp-process))
-  (emacs-jupyter-notebook--async-delete-process (plist-get context :tunnel-process))
-  (emacs-jupyter-notebook--async-delete-file (plist-get context :remote-copy))
-  (if-let ((callback (plist-get context :error-callback)))
-      (funcall callback context error-data)
-    (display-warning 'emacs-jupyter-notebook
-                     (format "%s" error-data)))
-  context)
+key is not.
+
+ERROR-DATA is passed through `--enrich-ssh-error' (W4.3) so the
+user-visible message carries a kind label and an actionable hint when the
+underlying stderr matches a known SSH failure pattern."
+  (let ((error-data (emacs-jupyter-notebook--enrich-ssh-error error-data)))
+    (setq context (emacs-jupyter-notebook--async-put context :phase 'error))
+    (setq context (emacs-jupyter-notebook--async-put context :error error-data))
+    (setq context (emacs-jupyter-notebook--async-cancel-timer context))
+    (emacs-jupyter-notebook--async-delete-process (plist-get context :launch-process))
+    (emacs-jupyter-notebook--async-delete-process (plist-get context :scp-process))
+    (emacs-jupyter-notebook--async-delete-process (plist-get context :tunnel-process))
+    (emacs-jupyter-notebook--async-delete-file (plist-get context :remote-copy))
+    (if-let ((callback (plist-get context :error-callback)))
+        (funcall callback context error-data)
+      (display-warning 'emacs-jupyter-notebook
+                       (format "%s" error-data)))
+    context))
 
 (defun emacs-jupyter-notebook--async-process-failed-p (process)
   "Return non-nil when PROCESS exited unsuccessfully."
