@@ -282,17 +282,6 @@ prompts."
                     (force-mode-line-update t))))
             (error nil)))))))
 
-(defun emacs-jupyter-notebook-jupyter--maybe-fold-overlay (orig-fn text)
-  "Prevent overlay folding in `emacs-jupyter-notebook-mode' buffers.
-In other buffers, call ORIG-FN normally."
-  (if (bound-and-true-p emacs-jupyter-notebook-mode)
-      text
-    (funcall orig-fn text)))
-
-(with-eval-after-load 'jupyter-client
-  (advice-add 'jupyter-eval-ov--fold-string :around
-              #'emacs-jupyter-notebook-jupyter--maybe-fold-overlay))
-
 (defvar emacs-jupyter-notebook-jupyter-connect-function
   #'emacs-jupyter-notebook-jupyter--connect
   "Function used by `emacs-jupyter-notebook-jupyter-connect'.")
