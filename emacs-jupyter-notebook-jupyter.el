@@ -324,6 +324,14 @@ CALLBACK receives two arguments: reply content and error data.")
 The function is called with CLIENT, CODE, and CALLBACK.  CALLBACK
 receives two arguments: reply content and error data.")
 
+(defvar emacs-jupyter-notebook-jupyter-kernel-info-function
+  #'emacs-jupyter-notebook-jupyter--kernel-info
+  "Function used by `emacs-jupyter-notebook-jupyter-kernel-info'.
+The function is called with CLIENT and CALLBACK.  CALLBACK receives two
+arguments: reply content (or nil) and error data (or nil).  The W4.5
+heartbeat uses this adapter so the kernel-info request can be mocked
+without requiring a real Jupyter kernel in tests.")
+
 (defun emacs-jupyter-notebook-jupyter-available-p ()
   "Return non-nil when emacs-jupyter can be loaded."
   (require 'jupyter nil t))
@@ -468,6 +476,17 @@ in the caller's surface."
    "is_complete_reply"
    callback))
 
+(defun emacs-jupyter-notebook-jupyter--kernel-info (client callback)
+  "Send a Jupyter kernel-info request through CLIENT.
+CALLBACK is invoked with the reply content and error data when the
+`kernel_info_reply' arrives; if the request errors out before sending,
+CALLBACK is called with nil reply and the error data."
+  (emacs-jupyter-notebook-jupyter--send-request
+   client
+   (jupyter-kernel-info-request :handlers nil)
+   "kernel_info_reply"
+   callback))
+
 (defun emacs-jupyter-notebook-jupyter-connect (connection-file)
   "Connect to CONNECTION-FILE through the configured adapter."
   (funcall emacs-jupyter-notebook-jupyter-connect-function connection-file))
@@ -481,6 +500,10 @@ Call CALLBACK with the client on success, or nil on failure."
 (defun emacs-jupyter-notebook-jupyter-evaluate (client code entry-handle)
   "Evaluate CODE through the configured adapter driving ENTRY-HANDLE."
   (funcall emacs-jupyter-notebook-jupyter-evaluate-function client code entry-handle))
+
+(defun emacs-jupyter-notebook-jupyter-kernel-info (client callback)
+  "Send a kernel-info request through the configured adapter."
+  (funcall emacs-jupyter-notebook-jupyter-kernel-info-function client callback))
 
 (defun emacs-jupyter-notebook-jupyter-interrupt (client)
   "Interrupt CLIENT through the configured adapter."

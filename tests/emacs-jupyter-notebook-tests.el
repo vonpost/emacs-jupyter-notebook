@@ -736,6 +736,68 @@ explanation, leaving the registry entry intact."
     (should (string-match-p "no longer alive" fail-reason))
     (should (string-match-p "start-remote-kernel" fail-reason))))
 
+(ert-deftest ejn-w4.5-heartbeat-success-keeps-tunnel-alive ()
+  "W4.5: a successful heartbeat reply keeps `--tunnel-dead' nil and resets
+the miss counter regardless of prior misses."
+  (with-temp-buffer
+    (setq emacs-jupyter-notebook--client 'mock-client)
+    (setq emacs-jupyter-notebook--heartbeat-misses 1)
+    (let ((emacs-jupyter-notebook-heartbeat-misses-allowed 2)
+          (emacs-jupyter-notebook-heartbeat-timeout 0.2))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-kernel-info)
+                 (lambda (_client cb)
+                   (funcall cb '(:status "ok") nil))))
+        (emacs-jupyter-notebook--heartbeat-tick)
+        (should (= 0 emacs-jupyter-notebook--heartbeat-misses))
+        (should-not emacs-jupyter-notebook--tunnel-dead)))))
+
+(ert-deftest ejn-w4.5-heartbeat-n-consecutive-misses-flip-tunnel-dead ()
+  "W4.5: after `--heartbeat-misses-allowed' consecutive misses the buffer
+flags --tunnel-dead, clears --kernel-status, and the timer is cancelled."
+  (with-temp-buffer
+    (setq emacs-jupyter-notebook--client 'mock-client)
+    (setq emacs-jupyter-notebook--heartbeat-timer (run-with-timer 1000 nil #'ignore))
+    (setq emacs-jupyter-notebook--kernel-status 'idle)
+    (let ((emacs-jupyter-notebook-heartbeat-misses-allowed 2))
+      (cl-letf (((symbol-function 'display-warning) #'ignore))
+        (emacs-jupyter-notebook--heartbeat-on-miss)
+        (should-not emacs-jupyter-notebook--tunnel-dead)
+        (emacs-jupyter-notebook--heartbeat-on-miss)
+        (should emacs-jupyter-notebook--tunnel-dead)
+        (should-not emacs-jupyter-notebook--kernel-status)
+        (should-not emacs-jupyter-notebook--heartbeat-timer)))))
+
+(ert-deftest ejn-w4.5-heartbeat-cancel-clears-state ()
+  "W4.5: cancelling the heartbeat zeros misses, drops inflight, removes timer."
+  (with-temp-buffer
+    (setq emacs-jupyter-notebook--heartbeat-timer (run-with-timer 1000 nil #'ignore))
+    (setq emacs-jupyter-notebook--heartbeat-misses 1)
+    (setq emacs-jupyter-notebook--heartbeat-inflight 'tok)
+    (emacs-jupyter-notebook--heartbeat-cancel)
+    (should-not emacs-jupyter-notebook--heartbeat-timer)
+    (should (= 0 emacs-jupyter-notebook--heartbeat-misses))
+    (should-not emacs-jupyter-notebook--heartbeat-inflight)))
+
+(ert-deftest ejn-w4.5-heartbeat-skipped-when-tunnel-already-dead ()
+  "W4.5: `--heartbeat-tick' does not fire a probe when --tunnel-dead is set."
+  (with-temp-buffer
+    (setq emacs-jupyter-notebook--client 'mock-client
+          emacs-jupyter-notebook--tunnel-dead t)
+    (let (probe-called)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-kernel-info)
+                 (lambda (_c _cb) (setq probe-called t))))
+        (emacs-jupyter-notebook--heartbeat-tick)
+        (should-not probe-called)))))
+
+(ert-deftest ejn-w4.5-heartbeat-cancelled-by-release-local-resources ()
+  "W4.5 + W1: `--release-local-resources' cancels the heartbeat timer
+as part of local cleanup (kill-buffer-hook + mode-disable both route here)."
+  (with-temp-buffer
+    (setq emacs-jupyter-notebook--client 'mock-client
+          emacs-jupyter-notebook--heartbeat-timer (run-with-timer 1000 nil #'ignore))
+    (emacs-jupyter-notebook--release-local-resources)
+    (should-not emacs-jupyter-notebook--heartbeat-timer)))
+
 (ert-deftest ejn-ssh-remote-launch-preserves-home-expansion ()
   (let* ((launch (emacs-jupyter-notebook-ssh-build-remote-launch
                   '(:profile "p" :host "mother" :remote-cwd "~" :remote-cache-dir "~/.cache/ejn" :kernelspec "python3")

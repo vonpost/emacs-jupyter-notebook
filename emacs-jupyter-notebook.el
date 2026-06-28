@@ -117,6 +117,104 @@ Bumped every time a request is sent; replies for stale ids are dropped.")
 (defvar-local emacs-jupyter-notebook--evaluation-timer nil
   "Timeout timer for current evaluation.")
 
+(defvar-local emacs-jupyter-notebook--heartbeat-timer nil
+  "Buffer-local repeating timer driving the W4.5 kernel-info heartbeat.")
+
+(defvar-local emacs-jupyter-notebook--heartbeat-misses 0
+  "Count of consecutive heartbeat misses on the current buffer.
+Reset to 0 on every successful `kernel_info_reply'.")
+
+(defvar-local emacs-jupyter-notebook--heartbeat-inflight nil
+  "Token identifying the most recently dispatched heartbeat probe.
+The reply callback only updates state when the token still matches; this
+prevents a late reply from a previous probe from masking a true miss.")
+
+(defun emacs-jupyter-notebook--heartbeat-start ()
+  "Start the per-buffer kernel-info heartbeat.
+The repeating timer fires every `emacs-jupyter-notebook-heartbeat-interval'
+seconds and sends a `kernel_info_request' through the configured adapter.
+After `emacs-jupyter-notebook-heartbeat-misses-allowed' consecutive misses
+the tunnel is flagged dead; the remote kernel is NOT shut down."
+  (emacs-jupyter-notebook--heartbeat-cancel)
+  (setq emacs-jupyter-notebook--heartbeat-misses 0)
+  (let* ((buffer (current-buffer))
+         (interval (max 1 (or emacs-jupyter-notebook-heartbeat-interval 20))))
+    (setq emacs-jupyter-notebook--heartbeat-timer
+          (run-with-timer
+           interval interval
+           (lambda ()
+             (when (buffer-live-p buffer)
+               (with-current-buffer buffer
+                 (emacs-jupyter-notebook--heartbeat-tick))))))))
+
+(defun emacs-jupyter-notebook--heartbeat-cancel ()
+  "Cancel the buffer-local heartbeat timer and reset its state."
+  (when (timerp emacs-jupyter-notebook--heartbeat-timer)
+    (cancel-timer emacs-jupyter-notebook--heartbeat-timer))
+  (setq emacs-jupyter-notebook--heartbeat-timer nil
+        emacs-jupyter-notebook--heartbeat-misses 0
+        emacs-jupyter-notebook--heartbeat-inflight nil))
+
+(defun emacs-jupyter-notebook--heartbeat-tick ()
+  "Fire one kernel-info heartbeat probe with a bounded miss window.
+The probe sends a `kernel_info_request' via the configured adapter and
+arms a one-shot timeout matching `emacs-jupyter-notebook-heartbeat-timeout'.
+The reply (or timeout) routes through `--heartbeat-on-reply' or
+`--heartbeat-on-miss', which run in the originating buffer only and only
+when the inflight token still matches (so late replies are ignored)."
+  (when (and emacs-jupyter-notebook--client
+             (not emacs-jupyter-notebook--tunnel-dead))
+    (let* ((buffer (current-buffer))
+           (token (gensym "ejn-heartbeat-")))
+      (setq emacs-jupyter-notebook--heartbeat-inflight token)
+      (run-with-timer
+       (max 0.1 (or emacs-jupyter-notebook-heartbeat-timeout 3))
+       nil
+       (lambda ()
+         (when (buffer-live-p buffer)
+           (with-current-buffer buffer
+             (when (eq emacs-jupyter-notebook--heartbeat-inflight token)
+               (emacs-jupyter-notebook--heartbeat-on-miss))))))
+      (condition-case _err
+          (emacs-jupyter-notebook-jupyter-kernel-info
+           emacs-jupyter-notebook--client
+           (lambda (reply _error)
+             (when (buffer-live-p buffer)
+               (with-current-buffer buffer
+                 (when (eq emacs-jupyter-notebook--heartbeat-inflight token)
+                   (if reply
+                       (emacs-jupyter-notebook--heartbeat-on-reply)
+                     (emacs-jupyter-notebook--heartbeat-on-miss)))))))
+        (error
+         (when (buffer-live-p buffer)
+           (with-current-buffer buffer
+             (when (eq emacs-jupyter-notebook--heartbeat-inflight token)
+               (emacs-jupyter-notebook--heartbeat-on-miss)))))))))
+
+(defun emacs-jupyter-notebook--heartbeat-on-reply ()
+  "Handle a successful heartbeat reply: clear inflight and reset misses."
+  (setq emacs-jupyter-notebook--heartbeat-inflight nil
+        emacs-jupyter-notebook--heartbeat-misses 0))
+
+(defun emacs-jupyter-notebook--heartbeat-on-miss ()
+  "Handle a heartbeat miss: increment the counter; on threshold flag dead.
+Per the binding rule the remote kernel is NOT shut down — heartbeat-driven
+death sets `--tunnel-dead' locally so `--ensure-client-async' routes the
+next evaluation through `--tunnel-reconnect'."
+  (setq emacs-jupyter-notebook--heartbeat-inflight nil)
+  (cl-incf emacs-jupyter-notebook--heartbeat-misses)
+  (when (>= emacs-jupyter-notebook--heartbeat-misses
+            (max 1 (or emacs-jupyter-notebook-heartbeat-misses-allowed 2)))
+    (setq emacs-jupyter-notebook--tunnel-dead t)
+    (setq emacs-jupyter-notebook--kernel-status nil)
+    (force-mode-line-update t)
+    (display-warning
+     'emacs-jupyter-notebook
+     (format
+      "Heartbeat: %d consecutive kernel-info misses in `%s'; tunnel flagged dead."
+      emacs-jupyter-notebook--heartbeat-misses (buffer-name)))
+    (emacs-jupyter-notebook--heartbeat-cancel)))
+
 (defun emacs-jupyter-notebook--mode-line-string ()
   "Return the mode line lighter string based on kernel state."
   (cond
@@ -289,6 +387,7 @@ executes."
     (emacs-jupyter-notebook--cancel-async-context-locally
      emacs-jupyter-notebook--async-context))
   (ignore-errors (emacs-jupyter-notebook--clear-buffer-timers))
+  (ignore-errors (emacs-jupyter-notebook--heartbeat-cancel))
   (ignore-errors
     (when (processp emacs-jupyter-notebook--tunnel-process)
       (emacs-jupyter-notebook--async-delete-process
@@ -1005,6 +1104,8 @@ underlying stderr matches a known SSH failure pattern."
           (setq entry (plist-put entry :tunnel-ports local-ports))
           (setq entry (plist-put entry :local-connection-file local-file))
           (setq emacs-jupyter-notebook--session-entry entry)
+          ;; W4.5: arm the kernel-info heartbeat now that the client is live.
+          (emacs-jupyter-notebook--heartbeat-start)
           (let ((ctx emacs-jupyter-notebook--async-context))
             (setq ctx (emacs-jupyter-notebook--async-put ctx :entry entry))
             (setq ctx (emacs-jupyter-notebook--async-put ctx :phase 'done))
