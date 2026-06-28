@@ -123,7 +123,7 @@ the registry or the remote kernel.
       after `--async-connect-finalize` promotion). Update or drop the
       `--async-kill-remote-kernel` stubs in the W1.3/W1.6 tests; add a
       positive ERT asserting `--async-fail` does NOT call the kill helper.
-- [~] owner=W1-fixup claimed=2026-06-28 W1.9 Mode-disable also releases `--client` and `--tunnel-process` (the
+- [x] sha=82e869a W1.9 Mode-disable also releases `--client` and `--tunnel-process` (the
       W1 GOAL lists both as local resources released on mode disable). Update
       `ejn-mode-disable-preserves-session-entry-and-client` to assert only the
       session entry is preserved; add an ERT proving the client and tunnel
