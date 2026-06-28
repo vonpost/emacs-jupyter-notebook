@@ -304,8 +304,9 @@ and survive mode disable.  Errors are swallowed so disable cannot raise."
 (defun emacs-jupyter-notebook--kill-buffer-hook ()
   "Buffer-local `kill-buffer-hook' that releases local kernel resources.
 Errors are swallowed so a failure here cannot prevent the buffer from being
-killed.  W2.9: also kills the source buffer's output panel; killing the
-panel alone does not touch the kernel or registry."
+killed.  W2.9 contract: also kills the source buffer's output panel;
+killing the panel alone does not touch the kernel or registry (the
+panel's own kill-buffer-hook only cancels its flush timer)."
   (condition-case err
       (emacs-jupyter-notebook--release-local-resources)
     (error
