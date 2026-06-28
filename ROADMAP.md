@@ -97,7 +97,7 @@ the registry or the remote kernel.
       and drops `--client`. Must not call `--cleanup-remote-entry`, must not
       call `jupyter-shutdown`, must not delete the registry entry, must not
       delete the local connection file (it is the offline reconnect key).
-- [ ] W1.2 On minor-mode disable, cancel any in-flight `--async-context`
+- [~] owner=W1-agent claimed=2026-06-28 W1.2 On minor-mode disable, cancel any in-flight `--async-context`
       (call the cancel path without raising), clear timers, and remove the
       kill-buffer-hook from the buffer.
 - [ ] W1.3 Fix stderr-buffer leak: `--async-delete-process` must also kill
