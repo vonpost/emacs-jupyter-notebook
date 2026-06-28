@@ -408,9 +408,9 @@ flow stays fully non-blocking.
       `--kernel-status`, force mode-line update, log via the W6 log buffer.
       Cancel in W1.1's kill-buffer-hook and on mode-disable. ERT with
       stubbed adapter.
-- [~] owner=W4-fixup claimed=2026-06-28 W4.6 ERT: heartbeat-driven death routes through `--tunnel-reconnect`
+- [x] sha=ff31aa1 W4.6 ERT: heartbeat-driven death routes through `--tunnel-reconnect`
       indistinguishably from sentinel-driven death.
-- [ ] W4.7 Audit and remove the sync `--retrieve-connection-file` code path.
+- [~] owner=W4-fixup claimed=2026-06-28 W4.7 Audit and remove the sync `--retrieve-connection-file` code path.
       All retrieval must go through the async retrieve. ERT: there is no
       `sleep-for` reachable from any user-facing command.
 
