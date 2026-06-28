@@ -100,7 +100,7 @@ the registry or the remote kernel.
 - [x] sha=b093303 W1.2 On minor-mode disable, cancel any in-flight `--async-context`
       (call the cancel path without raising), clear timers, and remove the
       kill-buffer-hook from the buffer.
-- [~] owner=W1-agent claimed=2026-06-28 W1.3 Fix stderr-buffer leak: `--async-delete-process` must also kill
+- [x] sha=bc37398 W1.3 Fix stderr-buffer leak: `--async-delete-process` must also kill
       the buffer stored under the process property
       `emacs-jupyter-notebook-stderr-buffer` (see ssh.el:235). Audit
       `--async-fail`, `--cleanup-current-state`, and W1.1's hook to use the
