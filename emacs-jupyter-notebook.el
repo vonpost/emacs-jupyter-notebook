@@ -480,9 +480,11 @@ only the fringe indicators need clearing on a structural cell edit."
     profile))
 
 (defun emacs-jupyter-notebook--parse-pid (output)
-  "Parse a remote background PID from OUTPUT."
-  (when (string-match "[0-9]+" output)
-    (string-to-number (match-string 0 output))))
+  "Parse a remote background PID from OUTPUT.
+Match the W4.2 sentinel `EJN_PID=<digits>' anchored on its own line so
+spurious numbers in an SSH banner or MOTD cannot poison the parse."
+  (when (string-match "^EJN_PID=\\([0-9]+\\)$" output)
+    (string-to-number (match-string 1 output))))
 
 (defun emacs-jupyter-notebook--entry-profile (entry)
   "Return a profile plist reconstructed from registry ENTRY."

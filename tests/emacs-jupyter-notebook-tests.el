@@ -557,7 +557,26 @@
     (should (equal (plist-get launch :connection-file) "/tmp/ejn/kernel-session.json"))
     (should (string-match-p "&& { nohup jupyter kernel" remote-command))
     (should (string-match-p "--kernel=python3" remote-command))
-    (should (string-match-p "& printf '%s\\\\n' \"\\$!\"; }" remote-command))))
+    ;; W4.2: PID sentinel `EJN_PID=<pid>' on its own line.
+    (should (string-match-p "& printf 'EJN_PID=%s\\\\n' \"\\$!\"; }" remote-command))))
+
+(ert-deftest ejn-w4.2-parse-pid-uses-anchored-sentinel ()
+  "W4.2: `--parse-pid' matches the anchored `EJN_PID=<digits>' sentinel,
+ignores spurious numbers in SSH banners / motd, and returns nil when no
+sentinel is present."
+  (should (= 12345
+             (emacs-jupyter-notebook--parse-pid
+              "Welcome to host 42\nLast login: ...\nEJN_PID=12345\n")))
+  (should (= 9
+             (emacs-jupyter-notebook--parse-pid "EJN_PID=9\n")))
+  (should-not (emacs-jupyter-notebook--parse-pid
+               "Welcome 42\nLast login: 99999 days ago\n"))
+  (should-not (emacs-jupyter-notebook--parse-pid
+               "EJN_PID=abc\n"))
+  ;; The sentinel must be anchored; an embedded `EJN_PID=...' inside another
+  ;; word should not match unless it starts the line.
+  (should-not (emacs-jupyter-notebook--parse-pid
+               "noise EJN_PID=7\n")))
 
 (ert-deftest ejn-ssh-remote-launch-preserves-home-expansion ()
   (let* ((launch (emacs-jupyter-notebook-ssh-build-remote-launch
