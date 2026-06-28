@@ -1490,6 +1490,141 @@ leaves source-buffer text untouched."
                        (emacs-jupyter-notebook-completion-at-point))))
         (should (< elapsed 0.005))))))
 
+;; Frontend variables introduced for W3.5 tests; the real packages define
+;; these but we mock them to keep tests independent of the packages.
+(defvar corfu-mode nil)
+(defvar completion-in-region-mode nil)
+(defvar company-mode nil)
+
+(ert-deftest ejn-w3.5-reply-refreshes-corfu-via-exhibit ()
+  ;; When corfu is active inside a completion-in-region session, the
+  ;; reply path calls `corfu--exhibit' so the popup picks up the new
+  ;; candidates immediately.
+  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
+    (search-forward "my_obj.met")
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook--completion-cache nil)
+          (emacs-jupyter-notebook--completion-cache-order nil)
+          (emacs-jupyter-notebook--completion-pending-key nil)
+          (emacs-jupyter-notebook--completion-pending-id nil)
+          (emacs-jupyter-notebook--completion-request-counter 0)
+          captured-cb refresh-called)
+      (let ((emacs-jupyter-notebook-jupyter-complete-function
+             (lambda (_client _code _pos cb) (setq captured-cb cb))))
+        (cl-letf* (((symbol-value 'corfu-mode) t)
+                   ((symbol-value 'completion-in-region-mode) t)
+                   ((symbol-function 'corfu--exhibit)
+                    (lambda (&rest _) (setq refresh-called 'corfu-exhibit))))
+          (emacs-jupyter-notebook--request-completion t)
+          (should captured-cb)
+          (funcall captured-cb
+                   '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10)
+                   nil)
+          (should (eq refresh-called 'corfu-exhibit)))))))
+
+(ert-deftest ejn-w3.5-reply-refreshes-corfu-via-auto-complete-deferred ()
+  ;; When corfu is active outside a completion-in-region session, the
+  ;; reply path calls `corfu--auto-complete-deferred' if available.
+  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
+    (search-forward "my_obj.met")
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook--completion-cache nil)
+          (emacs-jupyter-notebook--completion-cache-order nil)
+          (emacs-jupyter-notebook--completion-pending-key nil)
+          (emacs-jupyter-notebook--completion-pending-id nil)
+          (emacs-jupyter-notebook--completion-request-counter 0)
+          captured-cb refresh-called)
+      (let ((emacs-jupyter-notebook-jupyter-complete-function
+             (lambda (_client _code _pos cb) (setq captured-cb cb))))
+        (cl-letf* (((symbol-value 'corfu-mode) t)
+                   ((symbol-value 'completion-in-region-mode) nil)
+                   ((symbol-function 'corfu--auto-complete-deferred)
+                    (lambda (&rest _)
+                      (setq refresh-called 'auto-complete-deferred))))
+          (emacs-jupyter-notebook--request-completion t)
+          (should captured-cb)
+          (funcall captured-cb
+                   '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10)
+                   nil)
+          (should (eq refresh-called 'auto-complete-deferred)))))))
+
+(ert-deftest ejn-w3.5-reply-refreshes-company-via-manual-begin ()
+  ;; When company is active, the reply path calls `company-manual-begin'.
+  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
+    (search-forward "my_obj.met")
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook--completion-cache nil)
+          (emacs-jupyter-notebook--completion-cache-order nil)
+          (emacs-jupyter-notebook--completion-pending-key nil)
+          (emacs-jupyter-notebook--completion-pending-id nil)
+          (emacs-jupyter-notebook--completion-request-counter 0)
+          captured-cb refresh-called)
+      (let ((emacs-jupyter-notebook-jupyter-complete-function
+             (lambda (_client _code _pos cb) (setq captured-cb cb))))
+        (cl-letf* (((symbol-value 'corfu-mode) nil)
+                   ((symbol-value 'company-mode) t)
+                   ((symbol-function 'company-manual-begin)
+                    (lambda (&rest _) (setq refresh-called 'company-manual))))
+          (emacs-jupyter-notebook--request-completion t)
+          (should captured-cb)
+          (funcall captured-cb
+                   '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10)
+                   nil)
+          (should (eq refresh-called 'company-manual)))))))
+
+(ert-deftest ejn-w3.5-reply-refreshes-fallback-completion-in-region ()
+  ;; With neither corfu nor company active, the reply path falls back to
+  ;; `completion-in-region'.
+  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
+    (search-forward "my_obj.met")
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook--completion-cache nil)
+          (emacs-jupyter-notebook--completion-cache-order nil)
+          (emacs-jupyter-notebook--completion-pending-key nil)
+          (emacs-jupyter-notebook--completion-pending-id nil)
+          (emacs-jupyter-notebook--completion-request-counter 0)
+          captured-cb fallback-called)
+      (let ((emacs-jupyter-notebook-jupyter-complete-function
+             (lambda (_client _code _pos cb) (setq captured-cb cb))))
+        (cl-letf (((symbol-function 'completion-in-region)
+                   (lambda (&rest _args) (setq fallback-called t))))
+          (emacs-jupyter-notebook--request-completion t)
+          (should captured-cb)
+          (funcall captured-cb
+                   '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10)
+                   nil)
+          (should fallback-called))))))
+
+(ert-deftest ejn-w3.5-context-changed-suppresses-refresh ()
+  ;; If the user moved point so the live key no longer matches the
+  ;; request's key, the reply still lands in the cache (so a future capf
+  ;; call hits) but the UI refresh is NOT triggered, because the user is
+  ;; no longer asking for THIS completion.
+  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
+    (search-forward "my_obj.met")
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook--completion-cache nil)
+          (emacs-jupyter-notebook--completion-cache-order nil)
+          (emacs-jupyter-notebook--completion-pending-key nil)
+          (emacs-jupyter-notebook--completion-pending-id nil)
+          (emacs-jupyter-notebook--completion-request-counter 0)
+          captured-cb refresh-called orig-key)
+      (let ((emacs-jupyter-notebook-jupyter-complete-function
+             (lambda (_client _code _pos cb) (setq captured-cb cb))))
+        (cl-letf (((symbol-function 'completion-in-region)
+                   (lambda (&rest _args) (setq refresh-called t))))
+          (setq orig-key (emacs-jupyter-notebook--completion-key))
+          (emacs-jupyter-notebook--request-completion t)
+          (should captured-cb)
+          ;; User moves point AFTER request was sent.
+          (forward-char -3)
+          (funcall captured-cb
+                   '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10)
+                   nil)
+          ;; Reply lands in cache, but refresh is suppressed.
+          (should (gethash orig-key emacs-jupyter-notebook--completion-cache))
+          (should-not refresh-called))))))
+
 (ert-deftest ejn-w3.1-completion-cache-reset-clears-everything ()
   (with-temp-buffer
     (let ((emacs-jupyter-notebook--completion-cache nil)

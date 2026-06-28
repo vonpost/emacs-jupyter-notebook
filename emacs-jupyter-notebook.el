@@ -1232,23 +1232,37 @@ Never sends a request and never blocks."
 
 (defun emacs-jupyter-notebook--completion-refresh-ui ()
   "Push freshly-cached candidates to the active completion frontend.
-Supports corfu (refreshes via `corfu--candidates' / `corfu--auto-complete-deferred')
-and company (kicks `company-idle-begin' if a `company-mode' session is active).
-If neither frontend is loaded this falls back to `completion-in-region' so
-explicit `complete-at-point' calls still surface the new candidates."
+Detection order:
+- Corfu: when `corfu-mode' is on, refresh the popup.  If
+  `completion-in-region-mode' is already active, call `corfu--exhibit'
+  so the popup picks up the new candidates immediately.  Otherwise
+  call `corfu--auto-complete-deferred' when available, which is the
+  newer corfu hook for an external candidate provider.
+- Company: when `company-mode' is on, kick `company-manual-begin' (or
+  `company-idle-begin' on older versions) to surface the new
+  candidates.
+- Neither active: fall back to `completion-in-region', so explicit
+  `complete-at-point' invocations still surface the new candidates.
+All branches are guarded with `fboundp' / `bound-and-true-p' so the
+function is safe to call when neither frontend is loaded."
   (cond
-   ((and (bound-and-true-p corfu-mode)
-         (fboundp 'corfu--auto-complete-deferred))
-    (funcall 'corfu--auto-complete-deferred))
    ((bound-and-true-p corfu-mode)
-    ;; Older corfu: nudge via post-command machinery; safe no-op if absent.
-    (when (fboundp 'completion-in-region)
+    (cond
+     ((and (bound-and-true-p completion-in-region-mode)
+           (fboundp 'corfu--exhibit))
+      (funcall 'corfu--exhibit))
+     ((fboundp 'corfu--auto-complete-deferred)
+      (funcall 'corfu--auto-complete-deferred))
+     (t
       (let ((result (emacs-jupyter-notebook--completion-result)))
         (when result
-          (apply #'completion-in-region result)))))
-   ((and (bound-and-true-p company-mode)
-         (fboundp 'company-manual-begin))
-    (funcall 'company-manual-begin))
+          (apply #'completion-in-region result))))))
+   ((bound-and-true-p company-mode)
+    (cond
+     ((fboundp 'company-manual-begin) (funcall 'company-manual-begin))
+     ((fboundp 'company-idle-begin)
+      (funcall 'company-idle-begin (current-buffer) (selected-window)
+               (buffer-chars-modified-tick) (point)))))
    (t
     (let ((result (emacs-jupyter-notebook--completion-result)))
       (when result
