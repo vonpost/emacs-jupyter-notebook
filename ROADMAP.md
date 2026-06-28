@@ -201,7 +201,7 @@ Fringe indicator contract:
 
 Rows:
 
-- [~] owner=W2-agent claimed=2026-06-28 W2.1 Define the panel buffer mode (`emacs-jupyter-notebook-panel-mode`,
+- [x] sha=f61cd49 W2.1 Define the panel buffer mode (`emacs-jupyter-notebook-panel-mode`,
       derived from `special-mode`) and its API:
       `ejn-panel-ensure BUFFER` returns the panel for source BUFFER,
       `ejn-panel-start-entry PANEL CELL-KEY CODE` returns an entry handle,
