@@ -211,7 +211,7 @@ Rows:
       `ejn-panel-finish-entry HANDLE STATUS EXECUTION-COUNT`,
       `ejn-panel-clear-entry HANDLE`. ERT for the API in isolation
       (no kernel).
-- [~] owner=W2-agent claimed=2026-06-28 W2.2 Implement the latest-per-cell view as the default. Cell key is
+- [x] sha=2806a6b W2.2 Implement the latest-per-cell view as the default. Cell key is
       `(buffer-file-name . marker-line-start)`. Re-evaluating the same cell
       replaces its section in place. Sections render in cell order. ERT:
       two evals of the same cell leave one section; evals of two cells leave
