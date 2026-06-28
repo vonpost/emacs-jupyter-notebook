@@ -2965,6 +2965,33 @@ batch timing, but it must be a tiny fraction of the event count."
               (should (= (point) cell-pos)))))
       (when (buffer-live-p buf) (kill-buffer buf)))))
 
+(ert-deftest ejn-w2.6-q-buries-panel-window ()
+  "W2.6: q in the panel calls `quit-window' to bury the panel."
+  (let ((buf (ejn-test--make-source-buffer))
+        quit-called)
+    (unwind-protect
+        (let ((panel (ejn-panel-ensure buf)))
+          (cl-letf (((symbol-function 'quit-window)
+                     (lambda (&rest _) (setq quit-called t))))
+            (with-current-buffer panel
+              (emacs-jupyter-notebook-panel-quit)))
+          (should quit-called))
+      (ejn-test--kill-source-buffer buf))))
+
+(ert-deftest ejn-w2.6-keymap-bindings ()
+  "W2.6: q, H, RET, n, p are bound in the panel keymap."
+  (let ((map emacs-jupyter-notebook-panel-mode-map))
+    (should (eq (lookup-key map (kbd "q"))
+                #'emacs-jupyter-notebook-panel-quit))
+    (should (eq (lookup-key map (kbd "H"))
+                #'emacs-jupyter-notebook-panel-toggle-view))
+    (should (eq (lookup-key map (kbd "RET"))
+                #'emacs-jupyter-notebook-panel-visit-source))
+    (should (eq (lookup-key map (kbd "n"))
+                #'emacs-jupyter-notebook-panel-next-entry))
+    (should (eq (lookup-key map (kbd "p"))
+                #'emacs-jupyter-notebook-panel-previous-entry))))
+
 (ert-deftest ejn-w2.6-n-p-navigate-headers ()
   "W2.6: n and p step between entry headers in the panel."
   (let ((buf (ejn-test--make-source-buffer)))
