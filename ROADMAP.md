@@ -388,7 +388,7 @@ flow stays fully non-blocking.
       Remote launch shell emits `EJN_PID=<pid>` on its own line; `--parse-pid`
       matches `^EJN_PID=\([0-9]+\)$`. ERT: spurious MOTD numbers do not poison
       the parse.
-- [ ] W4.3 Pure SSH-stderr classifier in `-ssh.el`:
+- [~] owner=W4-fixup claimed=2026-06-28 W4.3 Pure SSH-stderr classifier in `-ssh.el`:
       `emacs-jupyter-notebook-ssh-classify-stderr STDERR` →
       `(:kind <symbol> :hint <string>)`. Kinds: `auth-failed`,
       `host-unreachable`, `connection-refused`, `forward-refused`,
