@@ -249,7 +249,7 @@ Rows:
       `emacs-jupyter-notebook-panel-default-view` (default `latest`),
       `emacs-jupyter-notebook-panel-stream-throttle-ms` (default 50),
       `emacs-jupyter-notebook-fringe-side` (default `left-fringe`).
-- [~] owner=W2-fixup claimed=2026-06-28 W2.11 Stable cell key across edits.
+- [x] sha=5d4151d W2.11 Stable cell key across edits.
       `--cell-key-for` currently returns a numeric marker-position snapshot:
       inserts above a cell shift the marker but the cons changes, so
       latest-per-cell replacement and fringe lookup stop recognizing the cell.
@@ -266,7 +266,7 @@ Rows:
       scope here.  Add an ERT that introspects the indicator overlay's
       `before-string` `display` property and asserts it matches the documented
       Emacs margin-display form.
-- [ ] W2.13 History view accumulates all evaluations.  The panel currently
+- [x] sha=5d4151d W2.13 History view accumulates all evaluations.  The panel currently
       deletes the prior same-cell entry from `--entries` on re-eval, so the
       history-log view loses past runs.  Fix: stop deleting on re-eval; let
       the latest-view renderer (which already groups by cell-key) filter the
