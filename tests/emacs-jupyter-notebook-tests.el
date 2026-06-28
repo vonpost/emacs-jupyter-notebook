@@ -1360,6 +1360,93 @@ leaves source-buffer text untouched."
             (should-not emacs-jupyter-notebook--completion-pending-id))
         (emacs-jupyter-notebook--completion-cancel-idle-timer)))))
 
+(ert-deftest ejn-w3.3-stale-reply-dropped-by-superseded-id ()
+  ;; Two requests fire; the first one's reply arrives AFTER the second has
+  ;; superseded it.  The first reply must not populate the cache and must
+  ;; not refresh the UI.
+  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
+    (search-forward "my_obj.met")
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook--completion-cache nil)
+          (emacs-jupyter-notebook--completion-cache-order nil)
+          (emacs-jupyter-notebook--completion-pending-key nil)
+          (emacs-jupyter-notebook--completion-pending-id nil)
+          (emacs-jupyter-notebook--completion-request-counter 0)
+          first-callback second-callback ui-refresh-count)
+      (let ((emacs-jupyter-notebook-jupyter-complete-function
+             (lambda (_client _code _pos cb)
+               (cond ((null first-callback) (setq first-callback cb))
+                     (t (setq second-callback cb))))))
+        (cl-letf (((symbol-function 'completion-in-region)
+                   (lambda (&rest _args)
+                     (setq ui-refresh-count (1+ (or ui-refresh-count 0))))))
+          ;; First request fires.
+          (emacs-jupyter-notebook--request-completion t)
+          (should first-callback)
+          ;; Simulate user keystroke: bump key by moving point, then a new
+          ;; schedule sends a second request.
+          (forward-char -1)
+          (emacs-jupyter-notebook--request-completion t)
+          (should second-callback)
+          ;; First reply arrives AFTER the second request superseded it.
+          (funcall first-callback
+                   '(:matches ("stale_match") :cursor_start 0 :cursor_end 5)
+                   nil)
+          ;; The stale reply must NOT have populated the cache.
+          (should (or (null emacs-jupyter-notebook--completion-cache)
+                      (= 0 (hash-table-count
+                            emacs-jupyter-notebook--completion-cache))))
+          (should-not ui-refresh-count))))))
+
+(ert-deftest ejn-w3.3-fresh-reply-populates-cache ()
+  ;; Counterpoint: when the reply matches the live pending id and key,
+  ;; it lands in the cache and the UI refresh runs.
+  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
+    (search-forward "my_obj.met")
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook--completion-cache nil)
+          (emacs-jupyter-notebook--completion-cache-order nil)
+          (emacs-jupyter-notebook--completion-pending-key nil)
+          (emacs-jupyter-notebook--completion-pending-id nil)
+          (emacs-jupyter-notebook--completion-request-counter 0)
+          captured-callback ui-refresh-count)
+      (let ((emacs-jupyter-notebook-jupyter-complete-function
+             (lambda (_client _code _pos cb)
+               (setq captured-callback cb))))
+        (cl-letf (((symbol-function 'completion-in-region)
+                   (lambda (&rest _args)
+                     (setq ui-refresh-count (1+ (or ui-refresh-count 0))))))
+          (emacs-jupyter-notebook--request-completion t)
+          (should captured-callback)
+          (funcall captured-callback
+                   '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10)
+                   nil)
+          (let ((key (emacs-jupyter-notebook--completion-key)))
+            (should (gethash key emacs-jupyter-notebook--completion-cache)))
+          (should (equal ui-refresh-count 1)))))))
+
+(ert-deftest ejn-w3.3-reply-after-buffer-killed-is-safe ()
+  ;; If the buffer that owns the request is killed before the reply
+  ;; arrives, the callback must not raise.
+  (let (buffer captured-cb)
+    (with-current-buffer (setq buffer (generate-new-buffer "ejn-w3.3"))
+      (python-mode)
+      (insert "# %%\nmy_obj.met\n")
+      (goto-char (point-max))
+      (setq-local emacs-jupyter-notebook--client 'mock-client)
+      (let ((emacs-jupyter-notebook-jupyter-complete-function
+             (lambda (_client _code _pos cb) (setq captured-cb cb))))
+        (emacs-jupyter-notebook--request-completion t)))
+    (should captured-cb)
+    (kill-buffer buffer)
+    ;; Should not raise.
+    (should
+     (eq nil
+         (progn
+           (funcall captured-cb
+                    '(:matches ("x") :cursor_start 0 :cursor_end 1) nil)
+           nil)))))
+
 (ert-deftest ejn-w3.1-completion-cache-reset-clears-everything ()
   (with-temp-buffer
     (let ((emacs-jupyter-notebook--completion-cache nil)
