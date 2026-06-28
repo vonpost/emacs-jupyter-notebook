@@ -114,7 +114,47 @@ For remote behavior, structure code so SSH/process execution can be mocked.
 - Do not commit generated artifacts such as `.elc` files, transient connection JSON files, local registry files, or `.opencode/` tooling data.
 - Before committing, inspect status, diff, and recent log; stage only intended project files.
 
+## Binding Design Rules
+
+These rules supersede anything older in this document. The full and current
+list lives under `## Design decisions` in `ROADMAP.md`; the entries below are
+the load-bearing constraints every agent must respect.
+
+- No backwards compatibility. The package is not in external use; prefer the
+  better shape over a compat shim. Do not add deprecation aliases.
+- The remote kernel outlives Emacs. Only the explicit user commands
+  `emacs-jupyter-notebook-shutdown-kernel` and
+  `emacs-jupyter-notebook-clean-orphaned-kernels` may terminate it. No
+  automatic cleanup from `kill-buffer-hook`, `kill-emacs-hook`, mode-disable,
+  or async failure paths.
+- Single buffer per kernel for now. Multi-buffer sharing of a single remote
+  kernel is out of scope until explicitly opened by a future workstream.
+- The registry is the durable truth. Local state may be freely torn down; the
+  registry entry and the remote connection file must not be touched on buffer
+  kill, mode disable, or Emacs exit.
+- The source buffer stays clean. Evaluation output is rendered in a dedicated
+  side-panel buffer, not in the source. The only permitted source-side
+  decoration is a fringe/margin indicator that carries no buffer text, has no
+  `cursor-intangible` or `read-only` adjacency to user text, and cannot
+  interfere with editing. Inline result overlays are removed.
+- Cells are the primary eval unit; region/paragraph/defun are secondary.
+  Latest-per-cell output replacement is keyed by cell marker position. Output
+  produced by region/paragraph/defun goes only to the history-log view.
+- Async is the rule, not the exception. No code path a user can hit during
+  ordinary editing may block the UI. Initial first-time start may be slow on
+  high-latency links but must remain non-blocking.
+
 ## Roadmap
 
-- [x] Solidify remote kernel handling: async start, reconnect, SSH tunnels, SCP retrieval, registry persistence, connection-file rewriting, file-associated sessions, and cell evaluation.
-- [ ] Add Jupyter runtime niceties after remote kernel handling is solid: runtime completion, inspect-at-point, code-completeness checks, kernel busy/idle status, rich MIME rendering, live `update_display_data`, `clear_output`, stdin prompts, and optional watch values via `user_expressions`.
+The active work plan is tracked in `ROADMAP.md` as six workstreams (W1–W6)
+with a claim/done protocol so multiple agents can land changes in parallel
+without colliding. Read `ROADMAP.md` before starting any task. The bootstrap
+phase (initial async start, reconnect, SSH tunnels, SCP retrieval, registry
+persistence, connection-file rewriting, file-associated sessions, cell
+evaluation, overlay rendering) is complete; everything else lives in
+`ROADMAP.md`.
+
+Jupyter runtime niceties (richer MIME rendering beyond text and PNG/JPEG,
+runtime completion polish, inspect-at-point polish, code-completeness checks,
+stdin prompts polish, watch values via `user_expressions`) remain a future
+workstream after W1–W6 are done.
