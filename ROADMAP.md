@@ -273,7 +273,7 @@ Rows:
       duplicates for the latest view only.  Update the W2.3
       `ejn-w2.3-history-view-keeps-all-evals` test to assert all four entries
       remain in history view.
-- [~] owner=W2-fixup claimed=2026-06-28 W2.14 Panel buffer name disambiguation.  `--name-for` uses
+- [x] sha=0486e17 W2.14 Panel buffer name disambiguation.  `--name-for` uses
       `file-name-nondirectory`, so two source buffers visiting different files
       with the same basename collide on one `*ejn: foo.py*` buffer.  Fix: use
       `(buffer-name SOURCE)` (which Emacs already disambiguates as `foo.py<2>`)
