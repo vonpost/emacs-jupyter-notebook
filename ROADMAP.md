@@ -381,7 +381,7 @@ Goal: Detect tunnel and remote-kernel death proactively, surface SSH errors
 with actionable hints, refuse to reconnect to a dead remote PID. Reconnect
 flow stays fully non-blocking.
 
-- [~] owner=W4-agent claimed=2026-06-28 W4.1 Add `-o ServerAliveInterval=15 -o ServerAliveCountMax=3` to the
+- [x] sha=2af4948 W4.1 Add `-o ServerAliveInterval=15 -o ServerAliveCountMax=3` to the
       tunnel argv builder; keep `-o ExitOnForwardFailure=yes`. Customization
       `emacs-jupyter-notebook-tunnel-keepalive-interval` (default 15). ERT.
 - [ ] W4.2 Replace the unanchored `[0-9]+` PID parse with a printed sentinel.
