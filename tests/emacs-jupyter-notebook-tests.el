@@ -3161,6 +3161,52 @@ batch timing, but it must be a tiny fraction of the event count."
       (should-not (get-text-property 0 'cursor-intangible before))
       (should-not (get-text-property 0 'read-only before)))))
 
+;; W2.12: indicator display spec uses Emacs margin syntax
+(ert-deftest ejn-w2.12-indicator-display-uses-margin-syntax ()
+  "W2.12: the indicator overlay's `before-string' carries a `display'
+property of the form `((margin SIDE) STRING)' as required by Emacs.
+The previous implementation used `((SIDE STRING))' which is silently
+ignored, so the indicator never actually rendered."
+  (with-temp-buffer
+    (insert "# %%\nx = 1\n")
+    (goto-char (point-min))
+    (let* ((key (emacs-jupyter-notebook--cell-key-for (point)))
+           (ov (emacs-jupyter-notebook-fringe-set key 'ok 3))
+           (before (overlay-get ov 'before-string))
+           (display (get-text-property 0 'display before)))
+      (should display)
+      ;; The display spec should mention `margin'.
+      (should (equal (car display) '(margin left-margin)))
+      ;; The string is the second element of the spec.
+      (should (stringp (cadr display)))
+      (should (string-match-p "✓" (cadr display)))
+      (should (string-match-p "3" (cadr display))))))
+
+(ert-deftest ejn-w2.12-fringe-side-falls-back-to-margin ()
+  "W2.12: choosing a fringe value for `--fringe-side' falls back to
+`left-margin' rendering rather than emitting an invalid display spec."
+  (let ((emacs-jupyter-notebook-fringe-side 'left-fringe))
+    (with-temp-buffer
+      (insert "# %%\nx = 1\n")
+      (goto-char (point-min))
+      (let* ((key (emacs-jupyter-notebook--cell-key-for (point)))
+             (ov (emacs-jupyter-notebook-fringe-set key 'running))
+             (before (overlay-get ov 'before-string))
+             (display (get-text-property 0 'display before)))
+        (should (equal (car display) '(margin left-margin)))))))
+
+(ert-deftest ejn-w2.12-fringe-ensures-margin-width ()
+  "W2.12: setting an indicator widens the buffer-local left margin so the
+glyph has room to render."
+  (with-temp-buffer
+    (insert "# %%\nx = 1\n")
+    (goto-char (point-min))
+    (let ((key (emacs-jupyter-notebook--cell-key-for (point))))
+      (should (or (null left-margin-width) (zerop left-margin-width)))
+      (emacs-jupyter-notebook-fringe-set key 'running)
+      (should (>= (or left-margin-width 0)
+                  emacs-jupyter-notebook-fringe-margin-width)))))
+
 ;; W2.11: stable cell key across edits
 (ert-deftest ejn-w2.11-cell-key-stable-across-edits-above ()
   "W2.11: the cell key returned for the same cell stays `equal' after the
@@ -3241,7 +3287,9 @@ same cell across ordinary editing."
   (should (= emacs-jupyter-notebook-panel-width 80))
   (should (eq emacs-jupyter-notebook-panel-default-view 'latest))
   (should (= emacs-jupyter-notebook-panel-stream-throttle-ms 50))
-  (should (eq emacs-jupyter-notebook-fringe-side 'left-fringe)))
+  ;; W2.12 changed the default from `left-fringe' (invalid for string glyphs)
+  ;; to `left-margin' (the working margin syntax).
+  (should (eq emacs-jupyter-notebook-fringe-side 'left-margin)))
 
 (ert-deftest ejn-w2.10-inline-overlay-customizations-removed ()
   "W2.10: legacy inline-overlay customizations are gone."

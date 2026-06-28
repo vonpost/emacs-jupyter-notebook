@@ -747,22 +747,44 @@ treated as a literal buffer position (test convenience)."
                         (make-overlay line-pos line-pos
                                       (current-buffer) t nil))))
            (glyph (emacs-jupyter-notebook--fringe-glyph state exec-count))
-           (face (emacs-jupyter-notebook--fringe-face state)))
+           (face (emacs-jupyter-notebook--fringe-face state))
+           (side (emacs-jupyter-notebook--fringe-margin-side
+                  emacs-jupyter-notebook-fringe-side)))
       (when ov
+        (emacs-jupyter-notebook--fringe-ensure-margin-width side)
         (overlay-put ov 'emacs-jupyter-notebook-fringe t)
         (overlay-put ov 'emacs-jupyter-notebook-cell-key cell-key)
         (overlay-put ov 'emacs-jupyter-notebook-state state)
         (overlay-put ov 'emacs-jupyter-notebook-exec-count exec-count)
+        ;; Emacs `display' margin syntax: `((margin SIDE) STRING)'.  The
+        ;; outer overlay carries this on a 1-char `before-string' so the
+        ;; glyph renders in the chosen margin without inserting source text.
         (overlay-put
          ov 'before-string
-         (propertize
-          " "
-          'display `((,emacs-jupyter-notebook-fringe-side
-                      ,(propertize glyph 'face face)))))
+         (propertize " "
+                     'display `((margin ,side)
+                                ,(propertize glyph 'face face))))
         (setf (alist-get cell-key emacs-jupyter-notebook--fringe-overlays
                          nil nil #'equal)
               ov)
         ov))))
+
+(defun emacs-jupyter-notebook--fringe-margin-side (side)
+  "Map SIDE (any of the customization options) to a valid margin symbol.
+The fringe values silently fall back to `left-margin'."
+  (cond
+   ((memq side '(left-margin right-margin)) side)
+   (t 'left-margin)))
+
+(defun emacs-jupyter-notebook--fringe-ensure-margin-width (side)
+  "Ensure SIDE's margin in the current buffer is wide enough to render."
+  (let ((var (if (eq side 'right-margin) 'right-margin-width 'left-margin-width)))
+    (when (< (or (symbol-value var) 0)
+             emacs-jupyter-notebook-fringe-margin-width)
+      (set (make-local-variable var)
+           emacs-jupyter-notebook-fringe-margin-width)
+      (dolist (window (get-buffer-window-list (current-buffer) nil t))
+        (set-window-buffer window (current-buffer))))))
 
 (defun emacs-jupyter-notebook-fringe-clear-all ()
   "Remove all fringe indicator overlays from the current buffer."

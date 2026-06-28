@@ -193,12 +193,27 @@ reduce churn further."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
-(defcustom emacs-jupyter-notebook-fringe-side 'left-fringe
-  "Where to draw the per-cell status indicator in the source buffer."
-  :type '(choice (const :tag "Left fringe" left-fringe)
-                 (const :tag "Right fringe" right-fringe)
-                 (const :tag "Left margin" left-margin)
-                 (const :tag "Right margin" right-margin))
+(defcustom emacs-jupyter-notebook-fringe-side 'left-margin
+  "Where to draw the per-cell status indicator in the source buffer.
+Only the margin sides are fully supported today: fringe rendering of an
+arbitrary glyph string would require `define-fringe-bitmap' variants per
+state and per digit, which is out of scope.  If a fringe side is chosen
+the indicator silently falls back to `left-margin'."
+  :type '(choice (const :tag "Left margin (default)" left-margin)
+                 (const :tag "Right margin" right-margin)
+                 (const :tag "Left fringe (falls back to left-margin)"
+                        left-fringe)
+                 (const :tag "Right fringe (falls back to left-margin)"
+                        right-fringe))
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-fringe-margin-width 2
+  "Buffer-local margin width applied when an indicator first appears.
+Margin contents are only visible when the window's margin is wide enough
+to render them; the indicator setter raises `left-margin-width' or
+`right-margin-width' to at least this value the first time a cell gains an
+indicator in a buffer."
+  :type 'integer
   :group 'emacs-jupyter-notebook)
 
 (defconst emacs-jupyter-notebook-connection-port-keys
