@@ -241,7 +241,7 @@ Rows:
       indicator state transitions for queued→running→ok and →error; ERT:
       typing arbitrary text on the cell marker line does not move, delete,
       or interfere with the indicator.
-- [ ] W2.9 Panel cleanup: killing the source buffer (via W1.1's hook) kills
+- [~] owner=W2-agent claimed=2026-06-28 W2.9 Panel cleanup: killing the source buffer (via W1.1's hook) kills
       the panel; killing the panel alone does not affect the kernel or
       registry. ERT.
 - [ ] W2.10 Customization: `emacs-jupyter-notebook-panel-side` (default
