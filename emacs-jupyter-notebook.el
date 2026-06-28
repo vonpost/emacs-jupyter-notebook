@@ -1101,7 +1101,54 @@ CALLBACK is called on success, ERROR-CALLBACK on failure."
                      profile entry callback error-callback)))
       (with-current-buffer buffer
         (setq emacs-jupyter-notebook--async-context context))
-      (emacs-jupyter-notebook--async-retrieve context))))
+      (emacs-jupyter-notebook--async-probe-pid-alive context))))
+
+(defun emacs-jupyter-notebook--async-probe-pid-alive (context)
+  "W4.4: probe the remote kernel PID for CONTEXT, then proceed.
+When the registry entry carries a `:remote-pid', run `kill -0 <pid>' over
+SSH; on success call `--async-retrieve' so reconnect continues normally,
+on nonzero exit fail the context with a `kernel-dead' explanation that
+points the user at `M-x emacs-jupyter-notebook-start-remote-kernel'.
+The registry entry is NOT removed: the user may want to inspect it or
+clean it explicitly via `clean-orphaned-kernels'.
+
+When the entry has no `:remote-pid' (older sessions, or sessions launched
+before the W4.2 sentinel landed), skip the probe and proceed directly to
+the retrieve step."
+  (let* ((entry (plist-get context :entry))
+         (pid (and entry (plist-get entry :remote-pid)))
+         (profile (plist-get context :profile)))
+    (cond
+     ((not pid)
+      (emacs-jupyter-notebook--async-retrieve context))
+     (t
+      (setq context (emacs-jupyter-notebook--async-put context :phase 'probe))
+      (let ((argv (emacs-jupyter-notebook-ssh-build-pid-alive profile pid))
+            (buffer (plist-get context :origin-buffer)))
+        (emacs-jupyter-notebook-ssh-start-process
+         (format "emacs-jupyter-notebook-pid-probe-%s"
+                 (or (plist-get context :session-id) pid))
+         argv
+         (lambda (process _event)
+           (when (memq (process-status process) '(exit signal))
+             (if (and (eq (process-status process) 'exit)
+                      (zerop (process-exit-status process)))
+                 (when (buffer-live-p buffer)
+                   (with-current-buffer buffer
+                     (when (eq emacs-jupyter-notebook--async-context context)
+                       (emacs-jupyter-notebook--async-retrieve context))))
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (when (eq emacs-jupyter-notebook--async-context context)
+                     (emacs-jupyter-notebook--async-fail
+                      (emacs-jupyter-notebook--async-put
+                       context :error-kind 'kernel-dead)
+                      (format
+                       (concat "Remote kernel %s is no longer alive on %s. "
+                               "Start a new one with "
+                               "`M-x emacs-jupyter-notebook-start-remote-kernel'.")
+                       pid
+                       (or (plist-get entry :remote-host) "the remote host")))))))))))))))
 
 ;;; Synchronous connect path
 
@@ -1608,7 +1655,7 @@ non-nil, do not send a Jupyter shutdown request to the current client."
   (emacs-jupyter-notebook--ensure-clean-before-start)
   (emacs-jupyter-notebook-jupyter--ensure)
   (let ((profile (emacs-jupyter-notebook--entry-profile entry)))
-    (emacs-jupyter-notebook--async-retrieve
+    (emacs-jupyter-notebook--async-probe-pid-alive
      (emacs-jupyter-notebook--async-reconnect-context profile entry callback error-callback))))
 
 ;;;###autoload

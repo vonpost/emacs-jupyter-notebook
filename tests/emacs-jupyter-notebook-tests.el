@@ -651,6 +651,91 @@ sentinel is present."
         (emacs-jupyter-notebook--async-fail context "unparseable noise\n"))
       (should (equal captured "unparseable noise\n")))))
 
+(ert-deftest ejn-w4.4-build-pid-alive-uses-kill-zero ()
+  "W4.4: the PID-alive probe argv ends with `kill -0 <pid>'."
+  (let ((argv (emacs-jupyter-notebook-ssh-build-pid-alive
+               '(:profile "p" :host "mother") 12345)))
+    (should (member "kill -0 12345" argv))))
+
+(ert-deftest ejn-w4.4-async-probe-skips-when-no-pid ()
+  "W4.4: when the registry entry has no `:remote-pid' the probe is skipped
+and `--async-retrieve' is invoked directly."
+  (let* (retrieve-called probe-called
+         (entry '(:profile "p" :session-id "s1" :remote-host "h"
+                  :remote-connection-file "/r/k.json"))
+         (context (emacs-jupyter-notebook--async-new-context
+                   :phase 'retrieve
+                   :profile '(:profile "p" :host "h")
+                   :entry entry
+                   :origin-buffer (current-buffer))))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-retrieve)
+               (lambda (_ctx) (setq retrieve-called t)))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
+               (lambda (&rest _) (setq probe-called t) nil)))
+      (emacs-jupyter-notebook--async-probe-pid-alive context))
+    (should retrieve-called)
+    (should-not probe-called)))
+
+(ert-deftest ejn-w4.4-async-probe-success-proceeds-to-retrieve ()
+  "W4.4: a successful PID-alive probe leads to `--async-retrieve'."
+  (let* ((retrieve-called nil)
+         (entry '(:profile "p" :session-id "s1" :remote-host "h"
+                  :remote-pid 12345
+                  :remote-connection-file "/r/k.json"))
+         (context (emacs-jupyter-notebook--async-new-context
+                   :phase 'retrieve
+                   :profile '(:profile "p" :host "h")
+                   :entry entry
+                   :session-id "s1"
+                   :origin-buffer (current-buffer))))
+    (setq emacs-jupyter-notebook--async-context context)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-retrieve)
+               (lambda (_ctx) (setq retrieve-called t)))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
+               (lambda (_name _argv sentinel)
+                 ;; Synthesize a process whose sentinel reports exit 0.
+                 (let ((proc (start-process "ejn-test-probe-ok" nil "true")))
+                   (set-process-sentinel proc sentinel)
+                   proc))))
+      (emacs-jupyter-notebook--async-probe-pid-alive context)
+      ;; Drive the sentinel by waiting for the process to exit.
+      (let ((deadline (+ (float-time) 5)))
+        (while (and (not retrieve-called) (< (float-time) deadline))
+          (sleep-for 0.01))))
+    (setq emacs-jupyter-notebook--async-context nil)
+    (should retrieve-called)))
+
+(ert-deftest ejn-w4.4-async-probe-dead-pid-fails-context ()
+  "W4.4: a nonzero PID-alive probe fails the context with a `kernel-dead'
+explanation, leaving the registry entry intact."
+  (let* (fail-called fail-reason
+         (entry '(:profile "p" :session-id "s1" :remote-host "h"
+                  :remote-pid 99999
+                  :remote-connection-file "/r/k.json"))
+         (context (emacs-jupyter-notebook--async-new-context
+                   :phase 'retrieve
+                   :profile '(:profile "p" :host "h")
+                   :entry entry
+                   :session-id "s1"
+                   :origin-buffer (current-buffer))))
+    (setq emacs-jupyter-notebook--async-context context)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-fail)
+               (lambda (_ctx err)
+                 (setq fail-called t fail-reason err)))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
+               (lambda (_name _argv sentinel)
+                 (let ((proc (start-process "ejn-test-probe-fail" nil "false")))
+                   (set-process-sentinel proc sentinel)
+                   proc))))
+      (emacs-jupyter-notebook--async-probe-pid-alive context)
+      (let ((deadline (+ (float-time) 5)))
+        (while (and (not fail-called) (< (float-time) deadline))
+          (sleep-for 0.01))))
+    (setq emacs-jupyter-notebook--async-context nil)
+    (should fail-called)
+    (should (string-match-p "no longer alive" fail-reason))
+    (should (string-match-p "start-remote-kernel" fail-reason))))
+
 (ert-deftest ejn-ssh-remote-launch-preserves-home-expansion ()
   (let* ((launch (emacs-jupyter-notebook-ssh-build-remote-launch
                   '(:profile "p" :host "mother" :remote-cwd "~" :remote-cache-dir "~/.cache/ejn" :kernelspec "python3")

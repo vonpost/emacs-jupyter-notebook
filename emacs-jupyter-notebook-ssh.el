@@ -183,6 +183,15 @@ The return value is a plist containing :argv, :remote-command,
    profile
    (format "kill %s" (shell-quote-argument (format "%s" pid)))))
 
+(defun emacs-jupyter-notebook-ssh-build-pid-alive (profile pid)
+  "Return an SSH argv list that exits 0 iff PID is alive on PROFILE's host.
+Uses `kill -0 <pid>' which sends no signal but reports whether the process
+exists and is owned by the SSH user.  Intended for the W4.4 reconnect-time
+liveness probe."
+  (emacs-jupyter-notebook-ssh-command
+   profile
+   (format "kill -0 %s" (shell-quote-argument (format "%s" pid)))))
+
 (defun emacs-jupyter-notebook-ssh-build-remote-cleanup (profile connection-file)
   "Return an SSH argv list that cleans remote processes for CONNECTION-FILE."
   (let ((remote-file (emacs-jupyter-notebook-ssh--quote-remote-path connection-file))
