@@ -1071,61 +1071,81 @@ leaves source-buffer text untouched."
     (should (equal is-complete-result '(:client client :code "abc" :status "complete")))))
 
 (ert-deftest ejn-completion-at-point-does-not-request-on-cursor-motion ()
+  ;; Cursor motion: capf returns nil without scheduling an idle timer.
+  ;; The existing assertion that the adapter is never called still holds —
+  ;; W3 strengthens it: even the idle timer must not be installed.
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
     (search-forward "my_obj.met")
     (let ((emacs-jupyter-notebook--client 'mock-client)
           (emacs-jupyter-notebook--completion-cache nil)
           (emacs-jupyter-notebook--completion-pending-key nil)
+          (emacs-jupyter-notebook--completion-idle-timer nil)
           (this-command 'next-line)
           called)
       (let ((emacs-jupyter-notebook-jupyter-complete-function
              (lambda (_client _code _pos _callback)
                (setq called t))))
         (should-not (emacs-jupyter-notebook-completion-at-point))
-        (should-not called)))))
+        (should-not called)
+        (should-not (timerp emacs-jupyter-notebook--completion-idle-timer))))))
 
 (ert-deftest ejn-completion-at-point-requests-after-self-insert ()
+  ;; W3.2: capf schedules an idle timer after self-insert.  The adapter is
+  ;; NOT called synchronously by the capf — the timer is the proxy for the
+  ;; pending request.
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
     (search-forward "my_obj.met")
     (let ((emacs-jupyter-notebook--client 'mock-client)
           (emacs-jupyter-notebook--completion-cache nil)
           (emacs-jupyter-notebook--completion-pending-key nil)
+          (emacs-jupyter-notebook--completion-idle-timer nil)
           (this-command 'self-insert-command)
-          called)
+          adapter-called)
       (let ((emacs-jupyter-notebook-jupyter-complete-function
              (lambda (_client _code _pos _callback)
-               (setq called t))))
+               (setq adapter-called t))))
         (should-not (emacs-jupyter-notebook-completion-at-point))
-        (should called)))))
+        (should-not adapter-called)
+        (should (timerp emacs-jupyter-notebook--completion-idle-timer))
+        (cancel-timer emacs-jupyter-notebook--completion-idle-timer)))))
 
 (ert-deftest ejn-completion-at-point-returns-cached-data ()
+  ;; W3.1: cache is a hash-table keyed by (point . line-up-to-point).
   (ejn-test-with-temp-buffer "# %% setup\nx = 1\n# %% work\nmy_obj.met\n"
     (search-forward "my_obj.met")
     (let* ((emacs-jupyter-notebook--client 'mock-client)
-           (context (emacs-jupyter-notebook--completion-context))
-           (emacs-jupyter-notebook--completion-cache
-            (list :key (plist-get context :key)
-                  :reply '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10))))
+           (emacs-jupyter-notebook--completion-cache nil)
+           (emacs-jupyter-notebook--completion-cache-order nil)
+           (key (emacs-jupyter-notebook--completion-key)))
+      (emacs-jupyter-notebook--completion-cache-put
+       key '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10))
       (should (equal (emacs-jupyter-notebook-completion-at-point)
-                     (list (- (point) 10) (point) '("my_obj.method")))))))
+                     (list (- (point) 10) (point) '("my_obj.method")
+                           :exclusive 'no))))))
 
 (ert-deftest ejn-completion-at-point-returns-nil-when-kernel-busy ()
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
     (search-forward "my_obj.met")
     (let* ((emacs-jupyter-notebook--client 'mock-client)
            (emacs-jupyter-notebook--kernel-status 'busy)
-           (context (emacs-jupyter-notebook--completion-context))
-           (emacs-jupyter-notebook--completion-cache
-            (list :key (plist-get context :key)
-                  :reply '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10))))
+           (emacs-jupyter-notebook--completion-cache nil)
+           (emacs-jupyter-notebook--completion-cache-order nil)
+           (key (emacs-jupyter-notebook--completion-key)))
+      (emacs-jupyter-notebook--completion-cache-put
+       key '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10))
       (should-not (emacs-jupyter-notebook-completion-at-point)))))
 
 (ert-deftest ejn-completion-callback-triggers-completion-in-region ()
+  ;; Forces the fallback UI branch (no corfu/company) so the reply lands
+  ;; via `completion-in-region'.
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
     (search-forward "my_obj.met")
     (let* ((emacs-jupyter-notebook--client 'mock-client)
            (emacs-jupyter-notebook--completion-pending-key nil)
+           (emacs-jupyter-notebook--completion-pending-id nil)
+           (emacs-jupyter-notebook--completion-request-counter 0)
            (emacs-jupyter-notebook--completion-cache nil)
+           (emacs-jupyter-notebook--completion-cache-order nil)
            triggered)
       (let ((emacs-jupyter-notebook-jupyter-complete-function
              (lambda (_client _code _pos callback)
@@ -1138,13 +1158,17 @@ leaves source-buffer text untouched."
           (should triggered))))))
 
 (ert-deftest ejn-completion-no-duplicate-request ()
+  ;; Dedup: when the pending key matches the current key and an id is
+  ;; already set, the adapter must not be called twice.
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
     (search-forward "my_obj.met")
     (let* ((emacs-jupyter-notebook--client 'mock-client)
-           (context (emacs-jupyter-notebook--completion-context))
-           (key (plist-get context :key))
+           (key (emacs-jupyter-notebook--completion-key))
            (emacs-jupyter-notebook--completion-pending-key key)
+           (emacs-jupyter-notebook--completion-pending-id 42)
+           (emacs-jupyter-notebook--completion-request-counter 42)
            (emacs-jupyter-notebook--completion-cache nil)
+           (emacs-jupyter-notebook--completion-cache-order nil)
            call-count)
       (let ((emacs-jupyter-notebook-jupyter-complete-function
              (lambda (_client _code _pos _callback)
@@ -1152,18 +1176,25 @@ leaves source-buffer text untouched."
         (emacs-jupyter-notebook--request-completion)
         (should-not call-count)))))
 
-(ert-deftest ejn-completion-explicit-command-fires-request ()
+(ert-deftest ejn-completion-explicit-command-schedules-request-when-empty ()
+  ;; Explicit `complete-at-point' with no cached candidates schedules the
+  ;; idle async request rather than calling the adapter synchronously.
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
     (search-forward "my_obj.met")
     (let ((emacs-jupyter-notebook--client 'mock-client)
           (emacs-jupyter-notebook--completion-pending-key nil)
+          (emacs-jupyter-notebook--completion-pending-id nil)
           (emacs-jupyter-notebook--completion-cache nil)
-          called)
+          (emacs-jupyter-notebook--completion-cache-order nil)
+          (emacs-jupyter-notebook--completion-idle-timer nil)
+          adapter-called)
       (let ((emacs-jupyter-notebook-jupyter-complete-function
              (lambda (_client _code _pos _callback)
-               (setq called t))))
+               (setq adapter-called t))))
         (emacs-jupyter-notebook-complete-at-point)
-        (should called)))))
+        (should-not adapter-called)
+        (should (timerp emacs-jupyter-notebook--completion-idle-timer))
+        (cancel-timer emacs-jupyter-notebook--completion-idle-timer)))))
 
 (ert-deftest ejn-completion-idle-timer-set-up-on-mode-enable ()
   (with-temp-buffer
@@ -1177,6 +1208,71 @@ leaves source-buffer text untouched."
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
     (goto-char (point-max))
     (should-not (emacs-jupyter-notebook-completion-at-point))))
+
+(ert-deftest ejn-w3.1-completion-key-shape ()
+  ;; Key shape contract: (point . line-up-to-point).
+  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
+    (search-forward "my_obj.met")
+    (let ((key (emacs-jupyter-notebook--completion-key)))
+      (should (consp key))
+      (should (integerp (car key)))
+      (should (stringp (cdr key)))
+      (should (string-suffix-p "my_obj.met" (cdr key))))))
+
+(ert-deftest ejn-w3.1-completion-cache-hit-miss ()
+  ;; Cache hit returns the put value; miss returns nil.
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--completion-cache nil)
+          (emacs-jupyter-notebook--completion-cache-order nil))
+      (should-not (emacs-jupyter-notebook--completion-cache-get '(1 . "a")))
+      (emacs-jupyter-notebook--completion-cache-put '(1 . "a") '(:matches ("a")))
+      (should (equal (emacs-jupyter-notebook--completion-cache-get '(1 . "a"))
+                     '(:matches ("a"))))
+      (should-not (emacs-jupyter-notebook--completion-cache-get '(2 . "b"))))))
+
+(ert-deftest ejn-w3.1-completion-cache-lru-eviction ()
+  ;; When the LRU exceeds the bound, the least-recently-used key is evicted.
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--completion-cache nil)
+          (emacs-jupyter-notebook--completion-cache-order nil)
+          (emacs-jupyter-notebook-completion-cache-size 3))
+      (emacs-jupyter-notebook--completion-cache-put '(1 . "a") 'r1)
+      (emacs-jupyter-notebook--completion-cache-put '(2 . "b") 'r2)
+      (emacs-jupyter-notebook--completion-cache-put '(3 . "c") 'r3)
+      (should (equal (emacs-jupyter-notebook--completion-cache-get '(1 . "a")) 'r1))
+      ;; (1 . "a") now MRU; (2 . "b") becomes LRU.
+      (emacs-jupyter-notebook--completion-cache-put '(4 . "d") 'r4)
+      (should-not (gethash '(2 . "b") emacs-jupyter-notebook--completion-cache))
+      (should (gethash '(1 . "a") emacs-jupyter-notebook--completion-cache))
+      (should (gethash '(3 . "c") emacs-jupyter-notebook--completion-cache))
+      (should (gethash '(4 . "d") emacs-jupyter-notebook--completion-cache))
+      (should (= (hash-table-count emacs-jupyter-notebook--completion-cache) 3)))))
+
+(ert-deftest ejn-w3.1-completion-cache-promotes-on-hit ()
+  ;; A cache hit promotes the entry to most-recently-used.
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--completion-cache nil)
+          (emacs-jupyter-notebook--completion-cache-order nil)
+          (emacs-jupyter-notebook-completion-cache-size 2))
+      (emacs-jupyter-notebook--completion-cache-put '(1 . "a") 'r1)
+      (emacs-jupyter-notebook--completion-cache-put '(2 . "b") 'r2)
+      ;; Touch (1 . "a") so it becomes MRU.
+      (emacs-jupyter-notebook--completion-cache-get '(1 . "a"))
+      ;; Insert (3 . "c"): now (2 . "b") is LRU and gets evicted.
+      (emacs-jupyter-notebook--completion-cache-put '(3 . "c") 'r3)
+      (should (gethash '(1 . "a") emacs-jupyter-notebook--completion-cache))
+      (should-not (gethash '(2 . "b") emacs-jupyter-notebook--completion-cache))
+      (should (gethash '(3 . "c") emacs-jupyter-notebook--completion-cache)))))
+
+(ert-deftest ejn-w3.1-completion-cache-reset-clears-everything ()
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--completion-cache nil)
+          (emacs-jupyter-notebook--completion-cache-order nil))
+      (emacs-jupyter-notebook--completion-cache-put '(1 . "a") 'r1)
+      (emacs-jupyter-notebook--completion-cache-put '(2 . "b") 'r2)
+      (emacs-jupyter-notebook--completion-cache-reset)
+      (should (= (hash-table-count emacs-jupyter-notebook--completion-cache) 0))
+      (should-not emacs-jupyter-notebook--completion-cache-order))))
 
 (ert-deftest ejn-inspect-at-point-callback-displays-text-plain ()
   (ejn-test-with-temp-buffer "# %%\nrange(5)\n"

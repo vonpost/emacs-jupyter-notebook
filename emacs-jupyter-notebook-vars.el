@@ -135,6 +135,24 @@ short to avoid making normal editing feel blocked."
   :type 'number
   :group 'emacs-jupyter-notebook)
 
+;;; W3 completion customization
+
+(defcustom emacs-jupyter-notebook-completion-idle 0.10
+  "Seconds of idle time before sending an async completion request.
+The capf returns immediately; the request fires only after the user
+pauses typing for this long.  Smaller values feel snappier but hammer
+the kernel during fast typing."
+  :type 'number
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-completion-cache-size 200
+  "Maximum number of cached completion replies per buffer.
+Evicted in least-recently-used order.  The cache key is
+\(point . line-up-to-point\), so identical contexts within a single
+buffer reuse the prior reply without a round trip."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
 (defcustom emacs-jupyter-notebook-check-code-completeness nil
   "Whether to ask the kernel if a cell is complete before evaluation.
 This uses Jupyter's `is_complete_request' and may block up to
