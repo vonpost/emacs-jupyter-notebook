@@ -69,6 +69,30 @@ Less common but useful commands remain keybound: `C-c C-b` evaluates the full bu
 
 Recovery and diagnostics are intentionally secondary: `C-c C-y` retries with a fresh kernel, `C-c C-v` fetches the remote log, `C-c C-q` lists remote processes, and `C-c C-w` cleans orphaned remote kernels.
 
+## Completion
+
+Completion runs against the remote kernel through `completion-at-point` and is designed never to block the UI, even when the remote link is slow.
+
+How it works:
+
+- The capf returns immediately from whatever is in a buffer-local LRU cache. Even if the kernel is on the other side of a 500ms link, the capf hot path stays in the single-millisecond range.
+- After the user pauses typing for `emacs-jupyter-notebook-completion-idle` seconds (default `0.10`), an async `complete_request` is sent to the kernel.
+- A new keystroke invalidates any in-flight request. When the stale reply finally arrives, it is dropped on arrival — never rendered, never blocking.
+- The cache key is `(point . line-up-to-point)`, so identical contexts in the same buffer reuse the prior reply without a round trip.
+- The cache is bounded by `emacs-jupyter-notebook-completion-cache-size` (default 200) with LRU eviction.
+
+Frontend integration:
+
+- **Vanilla `completion-at-point`** works out of the box. The capf returns cached candidates; the next call after a reply arrives sees the fresh cache.
+- **Corfu**: when `corfu-mode` is on, the reply path calls `corfu--exhibit` (inside a `completion-in-region` session) or `corfu--auto-complete-deferred` to refresh the popup immediately as candidates land.
+- **Company**: when `company-mode` is on, the reply path kicks `company-manual-begin` (or `company-idle-begin` on older versions) so the popup picks up the fresh candidates.
+- **Cape** and similar capf composers: just include `emacs-jupyter-notebook-completion-at-point` in your `completion-at-point-functions` (the minor mode does this for you).
+
+Tuning:
+
+- `emacs-jupyter-notebook-completion-idle` — seconds of typing pause before an async request fires. Lower values feel snappier; higher values hammer the kernel less during fast typing.
+- `emacs-jupyter-notebook-completion-cache-size` — maximum number of cached replies per buffer.
+
 ## Notes
 
 Inline results are overlays, not file edits. Large output is truncated inline; use `C-c C-o` for the full copyable output buffer.
