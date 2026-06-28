@@ -2783,6 +2783,106 @@ reconnect key)."
       (delete-directory registry-dir t)
       (delete-directory local-dir t))))
 
+(defun ejn-test--mode-disable-during-phase (phase)
+  "Helper for W1.5: disable the mode while async context is in PHASE.
+Returns a plist describing post-disable state of the in-flight processes."
+  (let* ((registry-dir (make-temp-file "ejn-w15-registry-" t))
+         (registry-file (expand-file-name "registry.eld" registry-dir))
+         (entry `(:profile "p"
+                  :session-id ,(format "w15-%s" phase)
+                  :remote-host "example.com"
+                  :remote-connection-file "/remote/kernel.json"))
+         (emacs-jupyter-notebook-registry-file registry-file)
+         result)
+    (unwind-protect
+        (progn
+          (emacs-jupyter-notebook-registry-save (list entry) registry-file)
+          (with-temp-buffer
+            (emacs-jupyter-notebook-mode 1)
+            (let* ((launch (emacs-jupyter-notebook-ssh-start-process
+                            (format "ejn-test-w15-%s-launch" phase)
+                            '("sleep" "60")))
+                   (scp (emacs-jupyter-notebook-ssh-start-process
+                         (format "ejn-test-w15-%s-scp" phase)
+                         '("sleep" "60")))
+                   (tunnel (emacs-jupyter-notebook-ssh-start-process
+                            (format "ejn-test-w15-%s-tunnel" phase)
+                            '("sleep" "60")))
+                   (timer (run-at-time 600 nil #'ignore))
+                   (stderrs (mapcar (lambda (p)
+                                      (process-get
+                                       p 'emacs-jupyter-notebook-stderr-buffer))
+                                    (list launch scp tunnel))))
+              (setq emacs-jupyter-notebook--session-entry entry)
+              (setq emacs-jupyter-notebook--async-context
+                    (emacs-jupyter-notebook--async-new-context
+                     :phase phase
+                     :launch-process launch
+                     :scp-process scp
+                     :tunnel-process tunnel
+                     :timer timer
+                     :origin-buffer (current-buffer)))
+              (emacs-jupyter-notebook-mode -1)
+              (setq result
+                    (list :phase-cleared (null emacs-jupyter-notebook--async-context)
+                          :launch-dead (not (process-live-p launch))
+                          :scp-dead (not (process-live-p scp))
+                          :tunnel-dead (not (process-live-p tunnel))
+                          :timer-cancelled (not (memq timer timer-list))
+                          :stderrs-dead (cl-every (lambda (b)
+                                                    (not (buffer-live-p b)))
+                                                  stderrs)
+                          :session-entry emacs-jupyter-notebook--session-entry
+                          :registry-entries
+                          (emacs-jupyter-notebook-registry-load registry-file))))))
+      (delete-directory registry-dir t))
+    result))
+
+(ert-deftest ejn-mode-disable-during-launch-phase-resets-and-preserves-registry ()
+  "W1.5: disabling the mode during phase=launch kills processes, preserves registry."
+  (let ((result (ejn-test--mode-disable-during-phase 'launch)))
+    (should (plist-get result :phase-cleared))
+    (should (plist-get result :launch-dead))
+    (should (plist-get result :scp-dead))
+    (should (plist-get result :tunnel-dead))
+    (should (plist-get result :timer-cancelled))
+    (should (plist-get result :stderrs-dead))
+    (should (plist-get result :session-entry))
+    (should (= 1 (length (plist-get result :registry-entries))))))
+
+(ert-deftest ejn-mode-disable-during-retrieve-phase-resets-and-preserves-registry ()
+  "W1.5: disabling the mode during phase=retrieve kills processes, preserves registry."
+  (let ((result (ejn-test--mode-disable-during-phase 'retrieve)))
+    (should (plist-get result :phase-cleared))
+    (should (plist-get result :launch-dead))
+    (should (plist-get result :scp-dead))
+    (should (plist-get result :tunnel-dead))
+    (should (plist-get result :timer-cancelled))
+    (should (plist-get result :stderrs-dead))
+    (should (= 1 (length (plist-get result :registry-entries))))))
+
+(ert-deftest ejn-mode-disable-during-tunnel-phase-resets-and-preserves-registry ()
+  "W1.5: disabling the mode during phase=tunnel kills processes, preserves registry."
+  (let ((result (ejn-test--mode-disable-during-phase 'tunnel)))
+    (should (plist-get result :phase-cleared))
+    (should (plist-get result :launch-dead))
+    (should (plist-get result :scp-dead))
+    (should (plist-get result :tunnel-dead))
+    (should (plist-get result :timer-cancelled))
+    (should (plist-get result :stderrs-dead))
+    (should (= 1 (length (plist-get result :registry-entries))))))
+
+(ert-deftest ejn-mode-disable-during-connect-phase-resets-and-preserves-registry ()
+  "W1.5: disabling the mode during phase=connect kills processes, preserves registry."
+  (let ((result (ejn-test--mode-disable-during-phase 'connect)))
+    (should (plist-get result :phase-cleared))
+    (should (plist-get result :launch-dead))
+    (should (plist-get result :scp-dead))
+    (should (plist-get result :tunnel-dead))
+    (should (plist-get result :timer-cancelled))
+    (should (plist-get result :stderrs-dead))
+    (should (= 1 (length (plist-get result :registry-entries))))))
+
 (provide 'emacs-jupyter-notebook-tests)
 
 ;;; emacs-jupyter-notebook-tests.el ends here
