@@ -166,7 +166,7 @@ The return value is a plist containing :argv, :remote-command,
                     (emacs-jupyter-notebook-ssh--quote-remote-path remote-cwd))
             (format (concat "{ nohup %s kernel --kernel=%s "
                             "--KernelManager.connection_file=%s "
-                            "> %s 2>&1 < /dev/null & printf '%%s\\n' \"$!\"; }")
+                            "> %s 2>&1 < /dev/null & printf 'EJN_PID=%%s\\n' \"$!\"; }")
                     jupyter-cmd
                     (shell-quote-argument kernelspec)
                     (emacs-jupyter-notebook-ssh--quote-remote-path connection-file)
