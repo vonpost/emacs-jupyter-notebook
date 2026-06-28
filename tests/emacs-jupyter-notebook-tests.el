@@ -2617,8 +2617,11 @@
       (should-not (memq eval-timer timer-list))
       (should-not emacs-jupyter-notebook--completion-idle-timer))))
 
-(ert-deftest ejn-mode-disable-preserves-session-entry-and-client ()
-  "W1.2: mode disable does not call jupyter-shutdown or touch the registry."
+(ert-deftest ejn-mode-disable-preserves-session-entry-and-registry ()
+  "W1.2 + W1.9: mode disable does not call jupyter-shutdown, does not touch the
+registry, and preserves the buffer's `--session-entry'.  It DOES drop the
+buffer-local client handle: that handle is a local resource and the W1 GOAL
+explicitly lists it among the things released on mode disable."
   (let (shutdown-called cleanup-called registry-removed
         (entry '(:profile "p" :session-id "session")))
     (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
@@ -2638,7 +2641,24 @@
         (should-not shutdown-called)
         (should-not cleanup-called)
         (should-not registry-removed)
-        (should (equal emacs-jupyter-notebook--session-entry entry))))))
+        (should (equal emacs-jupyter-notebook--session-entry entry))
+        (should-not emacs-jupyter-notebook--client)))))
+
+(ert-deftest ejn-mode-disable-disposes-tunnel-process-and-stderr-buffer ()
+  "W1.9: mode disable disposes the buffer-local tunnel process and its stderr
+buffer.  The remote kernel and registry stay alive; only the local SSH tunnel
+goes away."
+  (with-temp-buffer
+    (let ((proc (emacs-jupyter-notebook-ssh-start-process
+                 "ejn-test-w19-tunnel" '("sleep" "60"))))
+      (let ((stderr (process-get proc 'emacs-jupyter-notebook-stderr-buffer)))
+        (should (buffer-live-p stderr))
+        (emacs-jupyter-notebook-mode 1)
+        (setq emacs-jupyter-notebook--tunnel-process proc)
+        (emacs-jupyter-notebook-mode -1)
+        (should-not (process-live-p proc))
+        (should-not (buffer-live-p stderr))
+        (should-not emacs-jupyter-notebook--tunnel-process)))))
 
 (ert-deftest ejn-mode-disable-cleanup-swallows-errors ()
   "W1.2: mode-disable cleanup swallows disposer errors without raising."

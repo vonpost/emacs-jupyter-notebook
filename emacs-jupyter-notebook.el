@@ -318,15 +318,14 @@ reconnect surface and must survive buffer kill."
 
 (defun emacs-jupyter-notebook--mode-disable-cleanup ()
   "Cleanup invoked from the mode-disable branch.
-Cancels any in-flight async context locally and clears the buffer-local timers.
-Does NOT touch the client handle, the tunnel process, the registry entry, or the
-remote kernel.  Errors are swallowed so disable cannot raise."
+Releases the buffer's LOCAL kernel handles via `--release-local-resources':
+cancels the in-flight async context, clears buffer-local timers, disposes
+the SSH tunnel process and its stderr buffer, and drops the buffer-local
+client handle.  Does NOT touch the session entry, the registry, the remote
+kernel, or the local connection file — those are durable reconnect surfaces
+and survive mode disable.  Errors are swallowed so disable cannot raise."
   (condition-case err
-      (progn
-        (emacs-jupyter-notebook--cancel-async-context-locally
-         emacs-jupyter-notebook--async-context)
-        (setq emacs-jupyter-notebook--async-context nil)
-        (emacs-jupyter-notebook--clear-buffer-timers))
+      (emacs-jupyter-notebook--release-local-resources)
     (error
      (message "emacs-jupyter-notebook: mode-disable cleanup failed: %s"
               (error-message-string err)))))
