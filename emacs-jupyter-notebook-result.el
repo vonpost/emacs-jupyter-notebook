@@ -630,11 +630,15 @@ If WAIT is non-nil, defer the clear until the next text arrives
 
 ;;; Fringe indicator (W2.8)
 
-;; The indicator is a zero-width overlay anchored at the cell marker's line
-;; beginning, carrying a `before-string' whose display property places the
-;; glyph in the configured fringe.  Because the overlay is zero-width and the
-;; glyph lives in a display property (not the buffer text), nothing the user
-;; types on or near the cell line can interfere with it.
+;; Implementation choice: zero-width overlay anchored at the cell line's
+;; beginning, carrying a `before-string' whose `display' property places the
+;; glyph either in a fringe (the default) or a margin.  The overlay text is
+;; a single space whose `display' property carries the actual content, so
+;; nothing the user types or deletes around the cell line can move, edit, or
+;; delete the indicator.  No `cursor-intangible' or `read-only' property is
+;; placed adjacent to user text.  This passes the
+;; "user-edits-do-not-interfere" test and avoids the wrap/jump-into-overlay
+;; class of bugs that historically plagued inline result overlays.
 
 (defvar-local emacs-jupyter-notebook--fringe-overlays nil
   "Alist of (CELL-KEY . OVERLAY) for source-buffer fringe indicators.")
