@@ -2924,6 +2924,49 @@ subject of this test."
     (let ((leaked (cl-set-difference (ejn-test--ejn-process-buffers) baseline)))
       (should-not leaked))))
 
+(ert-deftest ejn-kill-buffer-with-live-client-does-not-shutdown-or-deregister ()
+  "W1.7: killing a buffer that owns a live client does not call the configured
+`emacs-jupyter-notebook-jupyter-shutdown-function' and does not remove the
+session's registry entry.  The remote kernel and its registry entry are the
+durable reconnect surface and must survive buffer kill."
+  (let* ((registry-dir (make-temp-file "ejn-w17-registry-" t))
+         (registry-file (expand-file-name "registry.eld" registry-dir))
+         (entry '(:profile "p"
+                  :session-id "w17-session"
+                  :remote-host "example.com"
+                  :remote-connection-file "/remote/kernel.json"
+                  :local-connection-file "/tmp/w17-local.json"))
+         (emacs-jupyter-notebook-registry-file registry-file)
+         shutdown-called registry-removed remote-cleanup-called)
+    (unwind-protect
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
+                   (lambda (&rest _) (setq shutdown-called t)))
+                  ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
+                   (lambda (&rest _) (setq remote-cleanup-called t)))
+                  ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
+                   (lambda (&rest _) (setq registry-removed t)))
+                  ;; The kernel-info adapter would otherwise touch the network
+                  ;; when the buffer's local hooks run.
+                  ((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+                   #'ignore))
+          (let ((emacs-jupyter-notebook-jupyter-shutdown-function
+                 (lambda (&rest _) (setq shutdown-called t))))
+            (emacs-jupyter-notebook-registry-save (list entry) registry-file)
+            (let ((buffer (generate-new-buffer "ejn-w17")))
+              (with-current-buffer buffer
+                (emacs-jupyter-notebook-mode 1)
+                (setq emacs-jupyter-notebook--client 'mock-client)
+                (setq emacs-jupyter-notebook--session-entry entry))
+              (kill-buffer buffer))
+            (should-not shutdown-called)
+            (should-not registry-removed)
+            (should-not remote-cleanup-called)
+            (let ((remaining (emacs-jupyter-notebook-registry-load registry-file)))
+              (should (= (length remaining) 1))
+              (should (equal (plist-get (car remaining) :session-id)
+                             "w17-session")))))
+      (delete-directory registry-dir t))))
+
 (provide 'emacs-jupyter-notebook-tests)
 
 ;;; emacs-jupyter-notebook-tests.el ends here
