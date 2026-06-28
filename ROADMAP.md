@@ -222,7 +222,7 @@ Rows:
 - [x] sha=c13f9f0 W2.4 Streaming throttle. Stream events buffer at the panel level and
       flush at most every 50 ms. ERT: 1000 small stream events produce ≤ 20
       redisplays in batch (mock by counting `ejn-panel--render` calls).
-- [ ] W2.5 Image rendering. PNG/JPEG inline; large images downscaled with
+- [~] owner=W2-agent claimed=2026-06-28 W2.5 Image rendering. PNG/JPEG inline; large images downscaled with
       `:max-width` / `:max-height` from the existing vars. Native image keys
       (`+`, `-`, `=`) work in the panel. ERT: image-bearing entry survives
       view toggle and panel kill/reopen.
