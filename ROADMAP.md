@@ -388,13 +388,13 @@ flow stays fully non-blocking.
       Remote launch shell emits `EJN_PID=<pid>` on its own line; `--parse-pid`
       matches `^EJN_PID=\([0-9]+\)$`. ERT: spurious MOTD numbers do not poison
       the parse.
-- [~] owner=W4-fixup claimed=2026-06-28 W4.3 Pure SSH-stderr classifier in `-ssh.el`:
+- [x] sha=c874f45 W4.3 Pure SSH-stderr classifier in `-ssh.el`:
       `emacs-jupyter-notebook-ssh-classify-stderr STDERR` →
       `(:kind <symbol> :hint <string>)`. Kinds: `auth-failed`,
       `host-unreachable`, `connection-refused`, `forward-refused`,
       `host-key-changed`, `unknown`. Wired into `--async-fail` to enrich
       user-visible errors. ERT per kind with representative stderr fixtures.
-- [ ] W4.4 Async dead-PID probe in reconnect path. Before scp-ing the
+- [~] owner=W4-fixup claimed=2026-06-28 W4.4 Async dead-PID probe in reconnect path. Before scp-ing the
       connection file, run `ssh kill -0 <pid>` async; on nonzero exit, fail
       the context with kind `kernel-dead` and surface a non-modal hint
       ("Remote kernel <pid> is no longer alive. Start a new one with
