@@ -216,7 +216,7 @@ Rows:
       replaces its section in place. Sections render in cell order. ERT:
       two evals of the same cell leave one section; evals of two cells leave
       two sections in order.
-- [~] owner=W2-agent claimed=2026-06-28 W2.3 Implement the history-log view. Toggle via `H` in the panel.
+- [x] sha=031436e W2.3 Implement the history-log view. Toggle via `H` in the panel.
       Region/paragraph/defun evals appear only here. ERT: toggle round-trip
       preserves data; region eval shows in history but not in latest-per-cell.
 - [ ] W2.4 Streaming throttle. Stream events buffer at the panel level and
