@@ -332,7 +332,7 @@ Rows:
       buffer's context changes (point moves, character typed). ERT.
 - [x] sha=5375c78 W3.3 In-flight invalidation: replies for stale requests are dropped
       without rendering. ERT.
-- [~] owner=W3-agent claimed=2026-06-28 W3.4 capf integration that never blocks. ERT proves capf returns in
+- [x] sha=788ada8 W3.4 capf integration that never blocks. ERT proves capf returns in
       ≤ 5 ms regardless of kernel state (mock the adapter to delay 10 s and
       assert capf still returns within budget).
 - [ ] W3.5 Frontend refresh trigger: on reply arrival, if the buffer's
