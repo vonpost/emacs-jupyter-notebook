@@ -88,6 +88,16 @@ When REMOTE-COMMAND is non-nil, append it as the remote shell command."
           (list (emacs-jupyter-notebook-ssh-destination profile))
           (when remote-command (list remote-command))))
 
+(defun emacs-jupyter-notebook-ssh--keepalive-args ()
+  "Return SSH keepalive option args based on the keepalive customization.
+When `emacs-jupyter-notebook-tunnel-keepalive-interval' is a
+positive integer, return `(\"-o\" \"ServerAliveInterval=N\" \"-o\"
+\"ServerAliveCountMax=3\")'.  Otherwise return nil."
+  (let ((interval emacs-jupyter-notebook-tunnel-keepalive-interval))
+    (when (and (integerp interval) (> interval 0))
+      (list "-o" (format "ServerAliveInterval=%d" interval)
+            "-o" "ServerAliveCountMax=3"))))
+
 (defun emacs-jupyter-notebook-ssh-tunnel-command (profile remote-ports local-ports)
   "Return an SSH tunnel argv list for PROFILE.
 REMOTE-PORTS and LOCAL-PORTS are plists keyed by Jupyter channel
@@ -95,6 +105,7 @@ port keys."
   (append (list emacs-jupyter-notebook-ssh-command)
           (emacs-jupyter-notebook-ssh--option-args profile)
           (list "-N" "-T" "-o" "ExitOnForwardFailure=yes")
+          (emacs-jupyter-notebook-ssh--keepalive-args)
           (cl-loop for key in emacs-jupyter-notebook-connection-port-keys
                    for remote = (plist-get remote-ports key)
                    for local = (plist-get local-ports key)

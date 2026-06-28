@@ -116,6 +116,41 @@ The durable reconnect source remains the registry regardless of this value."
   :type 'number
   :group 'emacs-jupyter-notebook)
 
+(defcustom emacs-jupyter-notebook-tunnel-keepalive-interval 15
+  "Seconds between SSH ServerAlive keepalive probes for the tunnel.
+Passed as `-o ServerAliveInterval=<N>' alongside
+`-o ServerAliveCountMax=3' on the tunnel argv.  When the remote
+fails to respond to three consecutive probes the SSH client tears
+the tunnel down, which lets the tunnel sentinel mark the buffer
+dead within a bounded time window even when TCP keepalives are
+swallowed by a stateful NAT.  Set to 0 to disable keepalives."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-heartbeat-interval 20
+  "Seconds between per-buffer kernel-info heartbeat probes.
+The heartbeat fires a `kernel_info_request' and treats no reply
+within `emacs-jupyter-notebook-heartbeat-timeout' as a miss.  After
+`emacs-jupyter-notebook-heartbeat-misses-allowed' consecutive
+misses the tunnel is flagged dead."
+  :type 'number
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-heartbeat-timeout 3
+  "Seconds to wait for a kernel-info heartbeat reply before counting a miss."
+  :type 'number
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-heartbeat-misses-allowed 2
+  "Number of consecutive heartbeat misses tolerated before declaring death.
+When this many heartbeats in a row time out, the buffer's tunnel is
+marked dead, the kernel status is cleared, and the mode-line is
+refreshed.  The remote kernel is NOT shut down — heartbeat-driven
+death is a local-state-only signal, consistent with the binding rule
+that the remote kernel outlives Emacs."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
 (defcustom emacs-jupyter-notebook-jupyter-connect-timeout 45
   "Seconds emacs-jupyter may spend during initial client connection.
 This needs to be generous for high-latency remote kernels, especially

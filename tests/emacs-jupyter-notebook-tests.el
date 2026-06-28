@@ -3798,6 +3798,45 @@ same cell across ordinary editing."
   (should-not (boundp 'emacs-jupyter-notebook-result-inline-max-bytes))
   (should-not (boundp 'emacs-jupyter-notebook-result-max-lines)))
 
+;;; W4.1 — Tunnel keepalives
+
+(ert-deftest ejn-w4.1-tunnel-command-includes-server-alive-keepalive ()
+  "W4.1: the tunnel argv carries ServerAlive keepalive options.
+The keepalive option pair must appear together (Interval + CountMax),
+and the existing ExitOnForwardFailure option must still be present."
+  (let* ((emacs-jupyter-notebook-tunnel-keepalive-interval 15)
+         (cmd (emacs-jupyter-notebook-ssh-tunnel-command
+               '(:profile "p" :host "example.com")
+               '(:shell_port 1)
+               '(:shell_port 1001))))
+    (should (member "ExitOnForwardFailure=yes" cmd))
+    (should (member "ServerAliveInterval=15" cmd))
+    (should (member "ServerAliveCountMax=3" cmd))))
+
+(ert-deftest ejn-w4.1-tunnel-keepalive-interval-respected ()
+  "W4.1: customizing the interval changes the rendered option value."
+  (let* ((emacs-jupyter-notebook-tunnel-keepalive-interval 30)
+         (cmd (emacs-jupyter-notebook-ssh-tunnel-command
+               '(:profile "p" :host "example.com")
+               '(:shell_port 1)
+               '(:shell_port 1001))))
+    (should (member "ServerAliveInterval=30" cmd))
+    (should-not (member "ServerAliveInterval=15" cmd))))
+
+(ert-deftest ejn-w4.1-tunnel-keepalive-disabled-when-zero ()
+  "W4.1: setting the interval to 0 omits the keepalive options entirely."
+  (let* ((emacs-jupyter-notebook-tunnel-keepalive-interval 0)
+         (cmd (emacs-jupyter-notebook-ssh-tunnel-command
+               '(:profile "p" :host "example.com")
+               '(:shell_port 1)
+               '(:shell_port 1001))))
+    (should (member "ExitOnForwardFailure=yes" cmd))
+    (should-not (cl-some (lambda (arg)
+                           (and (stringp arg)
+                                (string-prefix-p "ServerAliveInterval" arg)))
+                         cmd))
+    (should-not (member "ServerAliveCountMax=3" cmd))))
+
 (provide 'emacs-jupyter-notebook-tests)
 
 ;;; emacs-jupyter-notebook-tests.el ends here
