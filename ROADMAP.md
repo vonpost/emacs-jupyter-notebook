@@ -111,7 +111,7 @@ the registry or the remote kernel.
 - [x] sha=ea5f732 W1.5 ERT: disabling the minor mode while phase ∈ {launch, retrieve,
       tunnel, connect} resets phase, kills processes, and leaves the registry
       untouched.
-- [~] owner=W1-agent claimed=2026-06-28 W1.6 ERT: a failed launch leaves zero `*emacs-jupyter-notebook-*`
+- [x] sha=117f47a W1.6 ERT: a failed launch leaves zero `*emacs-jupyter-notebook-*`
       buffers behind (use `(buffer-list)` filtered by name prefix).
 - [ ] W1.7 ERT: killing the buffer that owns a live client does **not** call
       the configured `…-jupyter-shutdown-function` and does **not** remove
