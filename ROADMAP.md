@@ -92,7 +92,7 @@ Goal: Local resources (tunnel proc, stderr buffers, timers, client handle) are
 released on buffer kill, mode disable, and async failure — without touching
 the registry or the remote kernel.
 
-- [ ] W1.1 Buffer-local `kill-buffer-hook` installed by the minor mode that
+- [~] owner=W1-agent claimed=2026-06-28 W1.1 Buffer-local `kill-buffer-hook` installed by the minor mode that
       tears down the tunnel process and its stderr buffer, cancels timers,
       and drops `--client`. Must not call `--cleanup-remote-entry`, must not
       call `jupyter-shutdown`, must not delete the registry entry, must not
