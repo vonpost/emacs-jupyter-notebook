@@ -2883,6 +2883,47 @@ Returns a plist describing post-disable state of the in-flight processes."
     (should (plist-get result :stderrs-dead))
     (should (= 1 (length (plist-get result :registry-entries))))))
 
+(defun ejn-test--ejn-process-buffers ()
+  "Return live buffers whose names start with the EJN process buffer prefix."
+  (cl-remove-if-not
+   (lambda (b)
+     (string-prefix-p " *emacs-jupyter-notebook-" (buffer-name b)))
+   (buffer-list)))
+
+(ert-deftest ejn-failed-launch-leaves-no-ejn-process-buffers ()
+  "W1.6: a failed remote launch leaks no `*emacs-jupyter-notebook-*' buffers.
+Spawn real launch/scp/tunnel processes through the SSH starter so each carries
+both a stdout and a stderr buffer.  After `--async-fail' runs there must be
+zero EJN-prefixed buffers above the baseline; the remote-kernel-cleanup branch
+is stubbed because that path is intentionally fire-and-forget and not the
+subject of this test."
+  (let* ((baseline (ejn-test--ejn-process-buffers))
+         (launch (emacs-jupyter-notebook-ssh-start-process
+                  "emacs-jupyter-notebook-launch-w16" '("sleep" "60")))
+         (scp (emacs-jupyter-notebook-ssh-start-process
+               "emacs-jupyter-notebook-scp-w16" '("sleep" "60")))
+         (tunnel (emacs-jupyter-notebook-ssh-start-process
+                  "emacs-jupyter-notebook-tunnel-w16" '("sleep" "60")))
+         (context (emacs-jupyter-notebook--async-new-context
+                   :phase 'launch
+                   :launch-process launch
+                   :scp-process scp
+                   :tunnel-process tunnel
+                   :owns-kernel t)))
+    (should (>= (length (cl-set-difference
+                         (ejn-test--ejn-process-buffers) baseline))
+                6))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-kill-remote-kernel)
+               #'ignore)
+              ((symbol-function 'display-warning) #'ignore))
+      (with-temp-buffer
+        (emacs-jupyter-notebook--async-fail context "simulated launch failure")))
+    (should-not (process-live-p launch))
+    (should-not (process-live-p scp))
+    (should-not (process-live-p tunnel))
+    (let ((leaked (cl-set-difference (ejn-test--ejn-process-buffers) baseline)))
+      (should-not leaked))))
+
 (provide 'emacs-jupyter-notebook-tests)
 
 ;;; emacs-jupyter-notebook-tests.el ends here
