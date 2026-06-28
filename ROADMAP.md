@@ -257,7 +257,7 @@ Rows:
       that maps id → marker; the cell-key becomes `(file . id)` for the
       lifetime of the buffer.  Add an ERT that inserts text above a cell and
       proves the returned cell key is identical to the pre-edit key.
-- [ ] W2.12 Indicator display spec correctness.  The previous spec
+- [~] owner=W2-fixup claimed=2026-06-28 W2.12 Indicator display spec correctness.  The previous spec
       `'((<side> "<glyph>"))' is invalid in both fringe and margin slots
       (fringe needs a bitmap symbol, margin needs `((margin <side>) STRING)`).
       Fix: use the proper margin syntax and default to `left-margin` so the
