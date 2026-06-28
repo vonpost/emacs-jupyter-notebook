@@ -108,7 +108,7 @@ the registry or the remote kernel.
 - [x] sha=5e62394 W1.4 ERT: killing a buffer that owns an async context disposes the
       launch/scp/tunnel processes and their stderr buffers; the registry
       entry and the local connection file are still present after the kill.
-- [~] owner=W1-agent claimed=2026-06-28 W1.5 ERT: disabling the minor mode while phase ∈ {launch, retrieve,
+- [x] sha=ea5f732 W1.5 ERT: disabling the minor mode while phase ∈ {launch, retrieve,
       tunnel, connect} resets phase, kills processes, and leaves the registry
       untouched.
 - [ ] W1.6 ERT: a failed launch leaves zero `*emacs-jupyter-notebook-*`
