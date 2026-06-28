@@ -2721,6 +2721,68 @@
         (should-not (process-live-p proc))
         (should-not (buffer-live-p stderr))))))
 
+(ert-deftest ejn-kill-buffer-with-async-context-cleans-locally-and-preserves-registry ()
+  "W1.4: killing a buffer with an in-flight async context kills the local
+launch/scp/tunnel processes and their stderr buffers, yet leaves the registry
+entry and the local connection file on disk untouched (they are the offline
+reconnect key)."
+  (let* ((registry-dir (make-temp-file "ejn-w14-registry-" t))
+         (registry-file (expand-file-name "registry.eld" registry-dir))
+         (local-dir (make-temp-file "ejn-w14-local-" t))
+         (local-file (expand-file-name "kernel.json" local-dir))
+         (entry `(:profile "p"
+                  :session-id "w14-session"
+                  :remote-host "example.com"
+                  :remote-connection-file "/remote/kernel.json"
+                  :local-connection-file ,local-file))
+         shutdown-called cleanup-called
+         (emacs-jupyter-notebook-registry-file registry-file))
+    (unwind-protect
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
+                   (lambda (&rest _) (setq shutdown-called t)))
+                  ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
+                   (lambda (&rest _) (setq cleanup-called t))))
+          (with-temp-file local-file (insert "{}"))
+          (emacs-jupyter-notebook-registry-save (list entry) registry-file)
+          (let* ((buffer (generate-new-buffer "ejn-w14"))
+                 (launch (emacs-jupyter-notebook-ssh-start-process
+                          "ejn-test-w14-launch" '("sleep" "60")))
+                 (scp (emacs-jupyter-notebook-ssh-start-process
+                       "ejn-test-w14-scp" '("sleep" "60")))
+                 (tunnel (emacs-jupyter-notebook-ssh-start-process
+                          "ejn-test-w14-tunnel" '("sleep" "60")))
+                 (stderrs (mapcar (lambda (p)
+                                    (process-get
+                                     p 'emacs-jupyter-notebook-stderr-buffer))
+                                  (list launch scp tunnel))))
+            (with-current-buffer buffer
+              (emacs-jupyter-notebook-mode 1)
+              (setq emacs-jupyter-notebook--client 'mock-client)
+              (setq emacs-jupyter-notebook--session-entry entry)
+              (setq emacs-jupyter-notebook--tunnel-process tunnel)
+              (setq emacs-jupyter-notebook--async-context
+                    (emacs-jupyter-notebook--async-new-context
+                     :phase 'launch
+                     :launch-process launch
+                     :scp-process scp
+                     :tunnel-process tunnel
+                     :origin-buffer buffer)))
+            (kill-buffer buffer)
+            (should-not (process-live-p launch))
+            (should-not (process-live-p scp))
+            (should-not (process-live-p tunnel))
+            (dolist (b stderrs)
+              (should-not (buffer-live-p b)))
+            (should-not shutdown-called)
+            (should-not cleanup-called)
+            (should (file-exists-p local-file))
+            (let ((remaining (emacs-jupyter-notebook-registry-load registry-file)))
+              (should (= (length remaining) 1))
+              (should (equal (plist-get (car remaining) :session-id)
+                             "w14-session")))))
+      (delete-directory registry-dir t)
+      (delete-directory local-dir t))))
+
 (provide 'emacs-jupyter-notebook-tests)
 
 ;;; emacs-jupyter-notebook-tests.el ends here
