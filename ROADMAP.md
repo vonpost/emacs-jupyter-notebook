@@ -384,7 +384,7 @@ flow stays fully non-blocking.
 - [x] sha=2af4948 W4.1 Add `-o ServerAliveInterval=15 -o ServerAliveCountMax=3` to the
       tunnel argv builder; keep `-o ExitOnForwardFailure=yes`. Customization
       `emacs-jupyter-notebook-tunnel-keepalive-interval` (default 15). ERT.
-- [ ] W4.2 Replace the unanchored `[0-9]+` PID parse with a printed sentinel.
+- [~] owner=W4-agent claimed=2026-06-28 W4.2 Replace the unanchored `[0-9]+` PID parse with a printed sentinel.
       Remote launch shell emits `EJN_PID=<pid>` on its own line; `--parse-pid`
       matches `^EJN_PID=\([0-9]+\)$`. ERT: spurious MOTD numbers do not poison
       the parse.
