@@ -235,7 +235,7 @@ Rows:
       `-vars.el`. ERT: callbacks update the panel for stream/execute_result/
       display_data/update_display_data/error/clear_output/execute_reply/
       status messages, with no buffer-text mutation in the source.
-- [ ] W2.8 Fringe/margin indicator. Per cell-marker overlay reflecting the
+- [~] owner=W2-agent claimed=2026-06-28 W2.8 Fringe/margin indicator. Per cell-marker overlay reflecting the
       latest known state for that cell (queued / running / ok-N / error /
       blank). Driven by the same callbacks that update the panel. ERT:
       indicator state transitions for queued→running→ok and →error; ERT:
