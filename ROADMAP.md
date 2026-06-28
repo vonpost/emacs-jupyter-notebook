@@ -105,7 +105,7 @@ the registry or the remote kernel.
       `emacs-jupyter-notebook-stderr-buffer` (see ssh.el:235). Audit
       `--async-fail`, `--cleanup-current-state`, and W1.1's hook to use the
       fixed disposer.
-- [ ] W1.4 ERT: killing a buffer that owns an async context disposes the
+- [~] owner=W1-agent claimed=2026-06-28 W1.4 ERT: killing a buffer that owns an async context disposes the
       launch/scp/tunnel processes and their stderr buffers; the registry
       entry and the local connection file are still present after the kill.
 - [ ] W1.5 ERT: disabling the minor mode while phase ∈ {launch, retrieve,
