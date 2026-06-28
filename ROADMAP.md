@@ -116,7 +116,7 @@ the registry or the remote kernel.
 - [x] sha=ed5d15c W1.7 ERT: killing the buffer that owns a live client does **not** call
       the configured `…-jupyter-shutdown-function` and does **not** remove
       the registry entry.
-- [~] owner=W1-fixup claimed=2026-06-28 W1.8 Remove `--async-kill-remote-kernel`
+- [x] sha=f5ff50f W1.8 Remove `--async-kill-remote-kernel`
       call and `:local-file` deletion from `--async-fail` (binding-rule
       compliance: async failure paths must not terminate the remote kernel,
       and `:local-file` is the future `:local-connection-file` reconnect key
