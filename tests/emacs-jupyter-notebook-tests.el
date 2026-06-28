@@ -2879,7 +2879,42 @@ batch timing, but it must be a tiny fraction of the event count."
             (should (<= emacs-jupyter-notebook-panel--render-count 20))))
       (ejn-test--kill-source-buffer buf))))
 
-;; W2.5: image entry survives toggle (no kernel)
+;; W2.5: image entry survives toggle / image zoom keys
+(ert-deftest ejn-w2.5-image-zoom-in-out-scales-image ()
+  "W2.5: + and - on an image entry scale the display image up and down."
+  (let ((buf (ejn-test--make-source-buffer)))
+    (unwind-protect
+        (let* ((panel (ejn-panel-ensure buf))
+               (handle (ejn-panel-start-entry panel '("f" . 1) "plot")))
+          (ejn-panel-set-image
+           handle (create-image (make-string 100 ?\0) 'pbm t :scale 1.0))
+          (emacs-jupyter-notebook-panel-flush-now panel)
+          (with-current-buffer panel
+            (goto-char (point-min))
+            ;; Walk to a position where the display property holds the image:
+            (let ((pos nil))
+              (while (and (not pos) (not (eobp)))
+                (when-let ((d (get-text-property (point) 'display)))
+                  (when (and (consp d) (eq (car d) 'image))
+                    (setq pos (point))))
+                (goto-char (or (next-single-property-change (point) 'display)
+                               (point-max))))
+              (should pos)
+              (goto-char pos)
+              (let ((before (or (image-property
+                                 (get-text-property (point) 'display) :scale)
+                                1.0)))
+                (emacs-jupyter-notebook-panel-image-zoom-in)
+                (should (> (image-property
+                            (get-text-property (point) 'display) :scale)
+                           before))
+                (emacs-jupyter-notebook-panel-image-zoom-out)
+                (emacs-jupyter-notebook-panel-image-zoom-out)
+                (should (< (image-property
+                            (get-text-property (point) 'display) :scale)
+                           before))))))
+      (ejn-test--kill-source-buffer buf))))
+
 (ert-deftest ejn-w2.5-image-survives-view-toggle ()
   "W2.5: image-bearing entry remains intact across a view toggle round-trip."
   (let ((buf (ejn-test--make-source-buffer)))

@@ -173,6 +173,10 @@ Each entry plist supports:
     (define-key map (kbd "RET") #'emacs-jupyter-notebook-panel-visit-source)
     (define-key map (kbd "n") #'emacs-jupyter-notebook-panel-next-entry)
     (define-key map (kbd "p") #'emacs-jupyter-notebook-panel-previous-entry)
+    ;; W2.5: native image zoom keys for images rendered inline in the panel.
+    (define-key map (kbd "+") #'emacs-jupyter-notebook-panel-image-zoom-in)
+    (define-key map (kbd "=") #'emacs-jupyter-notebook-panel-image-zoom-in)
+    (define-key map (kbd "-") #'emacs-jupyter-notebook-panel-image-zoom-out)
     map)
   "Keymap for `emacs-jupyter-notebook-panel-mode'.")
 
@@ -583,6 +587,31 @@ If WAIT is non-nil, defer the clear until the next text arrives
          (before (cl-find-if (lambda (p) (< p (point))) (reverse positions))))
     (when before
       (goto-char before))))
+
+(defun emacs-jupyter-notebook-panel--image-at-point ()
+  "Return the image spec on display at point, or nil."
+  (or (get-text-property (point) 'display)
+      (let ((next (next-single-property-change (point) 'display)))
+        (when next (get-text-property next 'display)))))
+
+(defun emacs-jupyter-notebook-panel--scale-image-at-point (factor)
+  "Scale the image at point in the panel by FACTOR (multiplicative)."
+  (let ((image (emacs-jupyter-notebook-panel--image-at-point)))
+    (when (and image (consp image) (eq (car image) 'image))
+      (let* ((scale (or (image-property image :scale) 1.0))
+             (new-scale (max 0.05 (* scale factor))))
+        (setf (image-property image :scale) new-scale)
+        (force-window-update (current-buffer))))))
+
+(defun emacs-jupyter-notebook-panel-image-zoom-in ()
+  "Zoom in the image at point in the panel."
+  (interactive)
+  (emacs-jupyter-notebook-panel--scale-image-at-point 1.2))
+
+(defun emacs-jupyter-notebook-panel-image-zoom-out ()
+  "Zoom out the image at point in the panel."
+  (interactive)
+  (emacs-jupyter-notebook-panel--scale-image-at-point (/ 1.0 1.2)))
 
 (defun emacs-jupyter-notebook-panel-visit-source ()
   "Visit the source cell associated with the entry at point."
