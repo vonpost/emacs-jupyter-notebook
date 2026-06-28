@@ -244,7 +244,7 @@ Rows:
 - [x] sha=ea04be6 W2.9 Panel cleanup: killing the source buffer (via W1.1's hook) kills
       the panel; killing the panel alone does not affect the kernel or
       registry. ERT.
-- [~] owner=W2-agent claimed=2026-06-28 W2.10 Customization: `emacs-jupyter-notebook-panel-side` (default
+- [x] sha=38c81fd W2.10 Customization: `emacs-jupyter-notebook-panel-side` (default
       `right`), `emacs-jupyter-notebook-panel-width` (default 80),
       `emacs-jupyter-notebook-panel-default-view` (default `latest`),
       `emacs-jupyter-notebook-panel-stream-throttle-ms` (default 50),
