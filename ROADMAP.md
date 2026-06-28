@@ -339,7 +339,7 @@ Rows:
       context still matches the request's context, push results to the
       active completion UI. ERT for corfu and company variants (mock the
       UI).
-- [~] owner=W3-agent claimed=2026-06-28 W3.6 Document the design and frontend integration in README.
+- [x] sha=d1bb60d W3.6 Document the design and frontend integration in README.
 
 Acceptance: every W3 row [x]; the timing assertion in W3.4 passes; manual
 smoke on a real link: typing `np.` shows candidates within ≤ 1 RTT and the
