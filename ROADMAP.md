@@ -330,7 +330,7 @@ Rows:
       hit/miss/eviction.
 - [x] sha=ca37259 W3.2 Idle-delayed async request that can be cancelled when the
       buffer's context changes (point moves, character typed). ERT.
-- [~] owner=W3-agent claimed=2026-06-28 W3.3 In-flight invalidation: replies for stale requests are dropped
+- [x] sha=5375c78 W3.3 In-flight invalidation: replies for stale requests are dropped
       without rendering. ERT.
 - [ ] W3.4 capf integration that never blocks. ERT proves capf returns in
       ≤ 5 ms regardless of kernel state (mock the adapter to delay 10 s and
