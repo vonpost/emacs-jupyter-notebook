@@ -257,7 +257,7 @@ Rows:
       that maps id → marker; the cell-key becomes `(file . id)` for the
       lifetime of the buffer.  Add an ERT that inserts text above a cell and
       proves the returned cell key is identical to the pre-edit key.
-- [~] owner=W2-fixup claimed=2026-06-28 W2.12 Indicator display spec correctness.  The previous spec
+- [x] sha=2693a49 W2.12 Indicator display spec correctness.  The previous spec
       `'((<side> "<glyph>"))' is invalid in both fringe and margin slots
       (fringe needs a bitmap symbol, margin needs `((margin <side>) STRING)`).
       Fix: use the proper margin syntax and default to `left-margin` so the
@@ -273,7 +273,7 @@ Rows:
       duplicates for the latest view only.  Update the W2.3
       `ejn-w2.3-history-view-keeps-all-evals` test to assert all four entries
       remain in history view.
-- [ ] W2.14 Panel buffer name disambiguation.  `--name-for` uses
+- [~] owner=W2-fixup claimed=2026-06-28 W2.14 Panel buffer name disambiguation.  `--name-for` uses
       `file-name-nondirectory`, so two source buffers visiting different files
       with the same basename collide on one `*ejn: foo.py*` buffer.  Fix: use
       `(buffer-name SOURCE)` (which Emacs already disambiguates as `foo.py<2>`)
