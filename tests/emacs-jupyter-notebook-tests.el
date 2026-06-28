@@ -2828,6 +2828,20 @@ durable reconnect surface and must survive buffer kill."
             (should (= 1 (length (emacs-jupyter-notebook-panel--visible-entries))))))
       (ejn-test--kill-source-buffer buf))))
 
+(ert-deftest ejn-w2.3-history-view-auto-scrolls-to-bottom ()
+  "W2.3: rendering the history view leaves point at the bottom of the panel."
+  (let ((buf (ejn-test--make-source-buffer)))
+    (unwind-protect
+        (let ((panel (ejn-panel-ensure buf)))
+          (with-current-buffer panel
+            (setq emacs-jupyter-notebook-panel--view 'history))
+          (ejn-panel-start-entry panel '("f" . 1) "c1")
+          (ejn-panel-start-entry panel '("f" . 2) "c2")
+          (emacs-jupyter-notebook-panel-flush-now panel)
+          (with-current-buffer panel
+            (should (= (point) (point-max)))))
+      (ejn-test--kill-source-buffer buf))))
+
 (ert-deftest ejn-w2.3-toggle-view-roundtrips ()
   "W2.3: H toggle moves between latest and history views without data loss."
   (let ((buf (ejn-test--make-source-buffer)))

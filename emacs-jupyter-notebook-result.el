@@ -359,7 +359,9 @@ UPDATER is called with the current entry plist and must return a new plist."
      'emacs-jupyter-notebook-cell-key (plist-get entry :cell-key))))
 
 (defun emacs-jupyter-notebook-panel--render (panel)
-  "Render PANEL contents according to current view."
+  "Render PANEL contents according to current view.
+History view auto-scrolls to the bottom of the buffer so the newest
+entry is visible; latest-per-cell view goes to the top."
   (with-current-buffer panel
     (let ((inhibit-read-only t)
           (entries (emacs-jupyter-notebook-panel--visible-entries)))
@@ -386,7 +388,9 @@ UPDATER is called with the current entry plist and must return a new plist."
                 (insert "\n"))))
            (t nil)))
         (insert "\n"))
-      (goto-char (point-min)))))
+      (if (eq emacs-jupyter-notebook-panel--view 'history)
+          (goto-char (point-max))
+        (goto-char (point-min))))))
 
 ;;; Public API
 
