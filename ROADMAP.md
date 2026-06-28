@@ -400,7 +400,7 @@ flow stays fully non-blocking.
       ("Remote kernel <pid> is no longer alive. Start a new one with
       `M-x emacs-jupyter-notebook-start-remote-kernel`."). Do not auto-start;
       leave the stale registry entry intact. ERT.
-- [~] owner=W4-fixup claimed=2026-06-28 W4.5 Periodic kernel-info heartbeat. Per-buffer repeating timer
+- [x] sha=72d7f54 W4.5 Periodic kernel-info heartbeat. Per-buffer repeating timer
       (`emacs-jupyter-notebook-heartbeat-interval` default 20 s) calls a new
       adapter function var `…-jupyter-kernel-info-function` (analogous to
       complete/inspect). On `emacs-jupyter-notebook-heartbeat-misses-allowed`
@@ -408,7 +408,7 @@ flow stays fully non-blocking.
       `--kernel-status`, force mode-line update, log via the W6 log buffer.
       Cancel in W1.1's kill-buffer-hook and on mode-disable. ERT with
       stubbed adapter.
-- [ ] W4.6 ERT: heartbeat-driven death routes through `--tunnel-reconnect`
+- [~] owner=W4-fixup claimed=2026-06-28 W4.6 ERT: heartbeat-driven death routes through `--tunnel-reconnect`
       indistinguishably from sentinel-driven death.
 - [ ] W4.7 Audit and remove the sync `--retrieve-connection-file` code path.
       All retrieval must go through the async retrieve. ERT: there is no
