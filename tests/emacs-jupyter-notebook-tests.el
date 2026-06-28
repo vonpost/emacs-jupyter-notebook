@@ -3161,6 +3161,31 @@ batch timing, but it must be a tiny fraction of the event count."
       (should-not (get-text-property 0 'cursor-intangible before))
       (should-not (get-text-property 0 'read-only before)))))
 
+;; W2.14: panel buffer name disambiguates same-basename sources
+(ert-deftest ejn-w2.14-panel-names-distinguish-same-basename ()
+  "W2.14: two source buffers whose visited files share a basename get
+distinct panel buffers (Emacs already disambiguates `buffer-name' with
+`<2>')."
+  (let* ((dir1 (make-temp-file "ejn-w214-a-" t))
+         (dir2 (make-temp-file "ejn-w214-b-" t))
+         (file1 (expand-file-name "foo.py" dir1))
+         (file2 (expand-file-name "foo.py" dir2)))
+    (unwind-protect
+        (let ((buf1 (find-file-noselect file1))
+              (buf2 (find-file-noselect file2)))
+          (unwind-protect
+              (let ((panel1 (ejn-panel-ensure buf1))
+                    (panel2 (ejn-panel-ensure buf2)))
+                (should (buffer-live-p panel1))
+                (should (buffer-live-p panel2))
+                (should-not (eq panel1 panel2))
+                (should-not (equal (buffer-name panel1)
+                                   (buffer-name panel2))))
+            (kill-buffer buf1)
+            (kill-buffer buf2)))
+      (delete-directory dir1 t)
+      (delete-directory dir2 t))))
+
 ;; W2.12: indicator display spec uses Emacs margin syntax
 (ert-deftest ejn-w2.12-indicator-display-uses-margin-syntax ()
   "W2.12: the indicator overlay's `before-string' carries a `display'

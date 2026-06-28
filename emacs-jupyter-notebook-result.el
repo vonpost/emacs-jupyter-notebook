@@ -200,10 +200,11 @@ history-log view appends every evaluation in time order."
 ;;; Buffer naming & lookup
 
 (defun emacs-jupyter-notebook-panel--name-for (source-buffer)
-  "Return the panel buffer name for SOURCE-BUFFER."
-  (let ((base (or (buffer-file-name source-buffer)
-                  (buffer-name source-buffer))))
-    (format "*ejn: %s*" (file-name-nondirectory base))))
+  "Return the panel buffer name for SOURCE-BUFFER.
+Uses SOURCE-BUFFER's `buffer-name' verbatim (which Emacs already
+disambiguates with `<2>' suffixes when two buffers visit different files
+with the same basename) so distinct sources always map to distinct panels."
+  (format "*ejn: %s*" (buffer-name source-buffer)))
 
 (defvar-local emacs-jupyter-notebook--panel-buffer nil
   "Source-buffer-local: the panel buffer attached to this source.")
