@@ -2458,6 +2458,131 @@
     (should-not (memq 'emacs-jupyter-notebook--before-change
                       before-change-functions))))
 
+(ert-deftest ejn-mode-enable-installs-buffer-local-kill-buffer-hook ()
+  "W1.1: enabling the minor mode installs the buffer-local kill-buffer-hook."
+  (with-temp-buffer
+    (emacs-jupyter-notebook-mode 1)
+    (should (memq 'emacs-jupyter-notebook--kill-buffer-hook
+                  kill-buffer-hook))
+    (should (local-variable-p 'kill-buffer-hook))))
+
+(ert-deftest ejn-mode-disable-removes-kill-buffer-hook ()
+  "W1.1: disabling the minor mode removes the buffer-local kill-buffer-hook."
+  (with-temp-buffer
+    (emacs-jupyter-notebook-mode 1)
+    (should (memq 'emacs-jupyter-notebook--kill-buffer-hook
+                  kill-buffer-hook))
+    (emacs-jupyter-notebook-mode -1)
+    (should-not (memq 'emacs-jupyter-notebook--kill-buffer-hook
+                      kill-buffer-hook))))
+
+(ert-deftest ejn-release-local-resources-drops-client-without-shutdown ()
+  "W1.1: the disposer drops the client without calling jupyter-shutdown."
+  (let (shutdown-called)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
+               (lambda (&rest _)
+                 (setq shutdown-called t))))
+      (with-temp-buffer
+        (setq emacs-jupyter-notebook--client 'mock-client)
+        (emacs-jupyter-notebook--release-local-resources)
+        (should-not shutdown-called)
+        (should-not emacs-jupyter-notebook--client)))))
+
+(ert-deftest ejn-release-local-resources-preserves-session-entry ()
+  "W1.1: the disposer leaves the registry-bearing session entry untouched."
+  (let ((entry '(:profile "p"
+                 :session-id "session"
+                 :remote-connection-file "/tmp/kernel.json"
+                 :local-connection-file "/tmp/local.json"))
+        cleanup-called registry-removed)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
+               (lambda (&rest _)
+                 (setq cleanup-called t)))
+              ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
+               (lambda (&rest _)
+                 (setq registry-removed t))))
+      (with-temp-buffer
+        (setq emacs-jupyter-notebook--session-entry entry)
+        (emacs-jupyter-notebook--release-local-resources)
+        (should-not cleanup-called)
+        (should-not registry-removed)
+        (should (equal emacs-jupyter-notebook--session-entry entry))))))
+
+(ert-deftest ejn-release-local-resources-preserves-local-connection-file ()
+  "W1.1: the disposer does not delete the local connection file."
+  (let* ((dir (make-temp-file "ejn-release-" t))
+         (local-file (expand-file-name "kernel.json" dir))
+         (entry `(:profile "p"
+                  :session-id "session"
+                  :remote-connection-file "/tmp/kernel.json"
+                  :local-connection-file ,local-file)))
+    (unwind-protect
+        (progn
+          (with-temp-file local-file (insert "{}"))
+          (with-temp-buffer
+            (setq emacs-jupyter-notebook--session-entry entry)
+            (emacs-jupyter-notebook--release-local-resources)
+            (should (file-exists-p local-file))))
+      (delete-directory dir t))))
+
+(ert-deftest ejn-release-local-resources-kills-tunnel-process ()
+  "W1.1: the disposer kills the SSH tunnel process and its buffer."
+  (with-temp-buffer
+    (let ((proc (start-process "ejn-test-tunnel-release" nil "sleep" "60")))
+      (setq emacs-jupyter-notebook--tunnel-process proc)
+      (let ((proc-buffer (process-buffer proc)))
+        (emacs-jupyter-notebook--release-local-resources)
+        (should-not (process-live-p proc))
+        (should-not (and proc-buffer (buffer-live-p proc-buffer)))
+        (should-not emacs-jupyter-notebook--tunnel-process)))))
+
+(ert-deftest ejn-release-local-resources-cancels-evaluation-timer ()
+  "W1.1: the disposer cancels the buffer-local evaluation timer."
+  (with-temp-buffer
+    (let ((timer (run-at-time 600 nil #'ignore)))
+      (setq emacs-jupyter-notebook--evaluation-timer timer)
+      (emacs-jupyter-notebook--release-local-resources)
+      (should-not (memq timer timer-list))
+      (should-not emacs-jupyter-notebook--evaluation-timer))))
+
+(ert-deftest ejn-release-local-resources-cancels-async-context-processes ()
+  "W1.1: the disposer kills in-flight async launch/scp/tunnel processes."
+  (with-temp-buffer
+    (let* ((launch (start-process "ejn-test-launch" nil "sleep" "60"))
+           (scp (start-process "ejn-test-scp" nil "sleep" "60"))
+           (tunnel (start-process "ejn-test-tunnel-ctx" nil "sleep" "60"))
+           (remote-copy (make-temp-file "ejn-remote-" nil ".json"))
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'tunnel
+                     :launch-process launch
+                     :scp-process scp
+                     :tunnel-process tunnel
+                     :remote-copy remote-copy
+                     :origin-buffer (current-buffer))))
+      (setq emacs-jupyter-notebook--async-context context)
+      (emacs-jupyter-notebook--release-local-resources)
+      (should-not (process-live-p launch))
+      (should-not (process-live-p scp))
+      (should-not (process-live-p tunnel))
+      (should-not (file-exists-p remote-copy))
+      (should-not emacs-jupyter-notebook--async-context))))
+
+(ert-deftest ejn-release-local-resources-does-not-delete-async-local-file ()
+  "W1.1: the disposer does not delete the in-flight context's local-file path."
+  (with-temp-buffer
+    (let* ((local-file (make-temp-file "ejn-local-" nil ".json"))
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'retrieve
+                     :local-file local-file
+                     :origin-buffer (current-buffer))))
+      (unwind-protect
+          (progn
+            (setq emacs-jupyter-notebook--async-context context)
+            (emacs-jupyter-notebook--release-local-resources)
+            (should (file-exists-p local-file)))
+        (when (file-exists-p local-file)
+          (delete-file local-file))))))
+
 (provide 'emacs-jupyter-notebook-tests)
 
 ;;; emacs-jupyter-notebook-tests.el ends here

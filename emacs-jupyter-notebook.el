@@ -265,6 +265,53 @@ newline are treated as text below the output, so the result stays in place."
     map)
   "Keymap for `emacs-jupyter-notebook-mode'.")
 
+(defun emacs-jupyter-notebook--release-local-resources ()
+  "Drop the current buffer's local kernel handles without touching durable state.
+Cancels the in-flight async context's local processes and timers, tears down the
+SSH tunnel process and its stderr buffer, cancels the evaluation timer and the
+completion idle timer, and drops the buffer-local Jupyter client handle.
+
+This is the disposer used by `kill-buffer-hook' and by `mode-disable'.  It does
+not call `jupyter-shutdown', does not call `--cleanup-remote-entry', does not
+remove the registry entry, does not delete the local connection file, and does
+not touch the remote kernel.  The registry entry and the remote kernel are the
+durable reconnect surface and must survive buffer kill or mode disable."
+  (let ((context emacs-jupyter-notebook--async-context))
+    (when context
+      (emacs-jupyter-notebook--async-cancel-timer context)
+      (emacs-jupyter-notebook--async-delete-process
+       (plist-get context :launch-process))
+      (emacs-jupyter-notebook--async-delete-process
+       (plist-get context :scp-process))
+      (emacs-jupyter-notebook--async-delete-process
+       (plist-get context :tunnel-process))
+      (emacs-jupyter-notebook--async-delete-file
+       (plist-get context :remote-copy))))
+  (when (timerp emacs-jupyter-notebook--evaluation-timer)
+    (cancel-timer emacs-jupyter-notebook--evaluation-timer))
+  (emacs-jupyter-notebook--completion-cancel-idle-timer)
+  (when (processp emacs-jupyter-notebook--tunnel-process)
+    (emacs-jupyter-notebook--async-delete-process
+     emacs-jupyter-notebook--tunnel-process))
+  (setq emacs-jupyter-notebook--client nil
+        emacs-jupyter-notebook--async-context nil
+        emacs-jupyter-notebook--tunnel-process nil
+        emacs-jupyter-notebook--tunnel-dead nil
+        emacs-jupyter-notebook--kernel-status nil
+        emacs-jupyter-notebook--evaluation-timer nil
+        emacs-jupyter-notebook--completion-cache nil
+        emacs-jupyter-notebook--completion-pending-key nil))
+
+(defun emacs-jupyter-notebook--kill-buffer-hook ()
+  "Buffer-local `kill-buffer-hook' that releases local kernel resources.
+Errors are swallowed so a failure here cannot prevent the buffer from being
+killed."
+  (condition-case err
+      (emacs-jupyter-notebook--release-local-resources)
+    (error
+     (message "emacs-jupyter-notebook: kill-buffer cleanup failed: %s"
+              (error-message-string err)))))
+
 ;;;###autoload
 (define-minor-mode emacs-jupyter-notebook-mode
   "Minor mode for evaluating local source cells in remote Jupyter kernels."
@@ -279,6 +326,8 @@ newline are treated as text below the output, so the result stays in place."
                   #'emacs-jupyter-notebook--before-change nil t)
         (add-hook 'after-change-functions
                   #'emacs-jupyter-notebook--after-change-cleanup nil t)
+        (add-hook 'kill-buffer-hook
+                  #'emacs-jupyter-notebook--kill-buffer-hook nil t)
         (emacs-jupyter-notebook--enable-imenu)
         (emacs-jupyter-notebook--completion-start-idle-timer))
     (code-cells-mode -1)
@@ -288,6 +337,8 @@ newline are treated as text below the output, so the result stays in place."
                  #'emacs-jupyter-notebook--before-change t)
     (remove-hook 'after-change-functions
                  #'emacs-jupyter-notebook--after-change-cleanup t)
+    (remove-hook 'kill-buffer-hook
+                 #'emacs-jupyter-notebook--kill-buffer-hook t)
     (emacs-jupyter-notebook--disable-imenu)
     (emacs-jupyter-notebook--completion-cancel-idle-timer)))
 
