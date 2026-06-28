@@ -113,7 +113,7 @@ the registry or the remote kernel.
       untouched.
 - [x] sha=117f47a W1.6 ERT: a failed launch leaves zero `*emacs-jupyter-notebook-*`
       buffers behind (use `(buffer-list)` filtered by name prefix).
-- [ ] W1.7 ERT: killing the buffer that owns a live client does **not** call
+- [~] owner=W1-agent claimed=2026-06-28 W1.7 ERT: killing the buffer that owns a live client does **not** call
       the configured `…-jupyter-shutdown-function` and does **not** remove
       the registry entry.
 
