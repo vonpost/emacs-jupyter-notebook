@@ -2796,7 +2796,10 @@ durable reconnect surface and must survive buffer kill."
 
 ;; W2.3: history-log view + toggle
 (ert-deftest ejn-w2.3-history-view-keeps-all-evals ()
-  "W2.3: history view shows every evaluation, including keyless ones."
+  "W2.3 + W2.13: history view shows every evaluation in insertion order.
+Re-evaluating the same cell key does NOT delete the prior entry; the latest
+view dedupes by cell key at render time but the history view shows the full
+timeline."
   (let ((buf (ejn-test--make-source-buffer)))
     (unwind-protect
         (let* ((panel (ejn-panel-ensure buf)))
@@ -2807,12 +2810,11 @@ durable reconnect surface and must survive buffer kill."
           (with-current-buffer panel
             (setq emacs-jupyter-notebook-panel--view 'history)
             (let ((vis (emacs-jupyter-notebook-panel--visible-entries)))
-              (should (= (length vis) 3))
-              ;; The re-eval of cell1 replaced the prior cell1 entry, so the
-              ;; history view sees: cell2, region-eval, cell1-again.
-              (should (equal (plist-get (nth 0 vis) :code) "cell2"))
-              (should (equal (plist-get (nth 1 vis) :code) "region-eval"))
-              (should (equal (plist-get (nth 2 vis) :code) "cell1-again")))))
+              (should (= (length vis) 4))
+              (should (equal (plist-get (nth 0 vis) :code) "cell1"))
+              (should (equal (plist-get (nth 1 vis) :code) "cell2"))
+              (should (equal (plist-get (nth 2 vis) :code) "region-eval"))
+              (should (equal (plist-get (nth 3 vis) :code) "cell1-again")))))
       (ejn-test--kill-source-buffer buf))))
 
 (ert-deftest ejn-w2.3-region-eval-absent-from-latest-view ()
@@ -3158,6 +3160,41 @@ batch timing, but it must be a tiny fraction of the event count."
       (should before)
       (should-not (get-text-property 0 'cursor-intangible before))
       (should-not (get-text-property 0 'read-only before)))))
+
+;; W2.11: stable cell key across edits
+(ert-deftest ejn-w2.11-cell-key-stable-across-edits-above ()
+  "W2.11: the cell key returned for the same cell stays `equal' after the
+user inserts or deletes text above the cell.  This guarantees that
+latest-per-cell replacement and fringe-state lookup keep recognizing the
+same cell across ordinary editing."
+  (with-temp-buffer
+    (insert "before\n# %%\nx = 1\n")
+    (goto-char (point-min))
+    (search-forward "# %%")
+    (beginning-of-line)
+    (let ((key-before (emacs-jupyter-notebook--cell-key-for (point))))
+      ;; Insert several lines above the cell marker.
+      (save-excursion
+        (goto-char (point-min))
+        (insert "extra1\nextra2\nextra3\n"))
+      ;; Re-query at the (now shifted) cell line.  Because cell-key markers
+      ;; have insertion-type t, the marker followed the cell line; the id
+      ;; stays the same; the key is still `equal'.
+      (search-forward "# %%")
+      (beginning-of-line)
+      (let ((key-after (emacs-jupyter-notebook--cell-key-for (point))))
+        (should (equal key-before key-after))))))
+
+(ert-deftest ejn-w2.11-cell-key-distinguishes-different-cells ()
+  "W2.11: cell keys are distinct for distinct cell-marker lines."
+  (with-temp-buffer
+    (insert "# %% one\n1\n# %% two\n2\n")
+    (goto-char (point-min))
+    (let ((k1 (emacs-jupyter-notebook--cell-key-for (point))))
+      (search-forward "# %% two")
+      (beginning-of-line)
+      (let ((k2 (emacs-jupyter-notebook--cell-key-for (point))))
+        (should-not (equal k1 k2))))))
 
 ;; W2.9: panel cleanup
 (ert-deftest ejn-w2.9-killing-source-buffer-kills-panel ()

@@ -324,24 +324,57 @@ state the entries are in at flush time."
 
 ;;; Rendering
 
+(defun emacs-jupyter-notebook-panel--key-position (key source-buffer)
+  "Return the current buffer position for cell KEY in SOURCE-BUFFER.
+If KEY's cdr is an integer cell id and SOURCE-BUFFER has a registered
+marker for it, return that marker's current position.  Otherwise fall
+back to the cdr verbatim when it is a number, or nil."
+  (let ((id (cdr key)))
+    (or (and (integerp id)
+             (buffer-live-p source-buffer)
+             (with-current-buffer source-buffer
+               (let ((marker (and emacs-jupyter-notebook--cell-key-markers
+                                  (gethash id emacs-jupyter-notebook--cell-key-markers))))
+                 (and (markerp marker)
+                      (eq (marker-buffer marker) source-buffer)
+                      (marker-position marker)))))
+        (and (numberp id) id))))
+
+(defun emacs-jupyter-notebook-panel--latest-per-cell (entries)
+  "Return ENTRIES filtered to one (latest) per cell-key.
+Order of the returned list is preserved from ENTRIES."
+  (let ((seen (make-hash-table :test 'equal))
+        keep)
+    ;; Walk back-to-front; first occurrence per key (i.e. the latest) wins.
+    (dolist (e (reverse entries))
+      (let ((key (plist-get e :cell-key)))
+        (when (and key (not (gethash key seen)))
+          (puthash key t seen)
+          (push e keep))))
+    keep))
+
 (defun emacs-jupyter-notebook-panel--visible-entries ()
-  "Return the entries visible under the current view, in display order."
+  "Return the entries visible under the current view, in display order.
+History view shows every entry in insertion order.  Latest-per-cell view
+collapses to the most recent entry per cell key and sorts by the cell's
+current position in the source buffer (falling back to the key cdr when
+no source-buffer marker is registered, e.g. in tests)."
   (let ((all (mapcar #'cdr emacs-jupyter-notebook-panel--entries)))
     (cond
      ((eq emacs-jupyter-notebook-panel--view 'history)
       all)
      (t
-      ;; W2.2: Latest-per-cell shows only entries with a cell-key.
-      ;; Re-evaluating a cell already replaces its prior entry in
-      ;; `ejn-panel-start-entry', so here we filter to keyed entries and
-      ;; sort by the key's marker position so sections render in cell order.
-      (let ((entries (cl-remove-if-not
-                      (lambda (e) (plist-get e :cell-key))
-                      all)))
+      (let* ((source (or emacs-jupyter-notebook-panel--source-buffer
+                         (current-buffer)))
+             (entries (cl-remove-if-not
+                       (lambda (e) (plist-get e :cell-key))
+                       (emacs-jupyter-notebook-panel--latest-per-cell all))))
         (sort (copy-sequence entries)
               (lambda (a b)
-                (let ((pa (cdr (plist-get a :cell-key)))
-                      (pb (cdr (plist-get b :cell-key))))
+                (let ((pa (emacs-jupyter-notebook-panel--key-position
+                           (plist-get a :cell-key) source))
+                      (pb (emacs-jupyter-notebook-panel--key-position
+                           (plist-get b :cell-key) source)))
                   (cond
                    ((and (numberp pa) (numberp pb)) (< pa pb))
                    ((numberp pa) t)
@@ -415,16 +448,9 @@ state appears in place."
   (unless (buffer-live-p panel)
     (error "Panel buffer is not live"))
   (with-current-buffer panel
-    ;; Replace the prior entry for this CELL-KEY (latest-per-cell behavior).
-    (when cell-key
-      (let ((existing (cl-find-if (lambda (cell)
-                                    (equal (plist-get (cdr cell) :cell-key)
-                                           cell-key))
-                                  emacs-jupyter-notebook-panel--entries)))
-        (when existing
-          (setq emacs-jupyter-notebook-panel--entries
-                (assq-delete-all (car existing)
-                                 emacs-jupyter-notebook-panel--entries)))))
+    ;; W2.13: keep every entry in the panel's append-only list so the
+    ;; history-log view shows the full eval timeline.  Latest-per-cell view
+    ;; dedupes by cell key at render time via `--latest-per-cell'.
     (let* ((id (cl-incf emacs-jupyter-notebook-panel--next-id))
            (entry (list :id id
                         :cell-key cell-key
@@ -514,34 +540,49 @@ If WAIT is non-nil, defer the clear until the next text arrives
        (emacs-jupyter-notebook-panel--entry
         (plist-get handle :panel) (plist-get handle :id))))
 
-;;; Cell key (W2.2)
+;;; Cell key (W2.2 + W2.11)
 
-;; Cell key is (FILE-NAME . LINE-START-POS).  A buffer-local hash maps cell
-;; positions to permanent-local markers so that edits above the cell shift
-;; the position naturally while the entry identity stays stable across edits.
+;; Cell key is (FILE-NAME . STABLE-ID).  STABLE-ID is a small integer allocated
+;; on first observation of a cell line and never reused.  The buffer-local
+;; `--cell-key-markers' hash maps id → permanent-local marker pointing at the
+;; cell line; the marker shifts naturally when text is inserted above, but the
+;; id (and therefore the cell key) is stable across edits.  Looking up a cell
+;; by its current point scans the hash for the marker whose CURRENT position
+;; matches the line start at point.
 
 (defvar-local emacs-jupyter-notebook--cell-key-markers nil
-  "Hash table mapping cell-marker position to a permanent marker on that line.")
+  "Hash table mapping integer cell id to a permanent-local marker.")
+
+(defvar-local emacs-jupyter-notebook--cell-key-next-id 0
+  "Next integer id to allocate for an observed cell line in this buffer.")
 
 (defun emacs-jupyter-notebook--cell-key-for (position)
-  "Return a cell key for the cell whose marker line begins at POSITION."
+  "Return a cell key for the cell whose marker line begins at POSITION.
+The returned key is `(FILE-NAME . ID)' where ID is stable across edits to
+this buffer: re-evaluating the same cell after inserting or deleting text
+above it yields an `equal' key."
   (unless emacs-jupyter-notebook--cell-key-markers
     (setq emacs-jupyter-notebook--cell-key-markers
-          (make-hash-table :test 'equal)))
+          (make-hash-table :test 'eq)))
   (let* ((file (or (buffer-file-name) (buffer-name)))
          (line-start (save-excursion
                        (goto-char (max (point-min)
                                        (min (point-max) position)))
                        (line-beginning-position)))
-         (existing (gethash line-start
-                            emacs-jupyter-notebook--cell-key-markers))
-         (marker (or (and (markerp existing) (marker-position existing) existing)
-                     (let ((m (copy-marker line-start t)))
-                       (set-marker-insertion-type m t)
-                       (puthash line-start m
-                                emacs-jupyter-notebook--cell-key-markers)
-                       m))))
-    (cons file (marker-position marker))))
+         (existing-id nil))
+    (maphash (lambda (id marker)
+               (when (and (null existing-id)
+                          (markerp marker)
+                          (eq (marker-buffer marker) (current-buffer))
+                          (= (marker-position marker) line-start))
+                 (setq existing-id id)))
+             emacs-jupyter-notebook--cell-key-markers)
+    (unless existing-id
+      (setq existing-id (cl-incf emacs-jupyter-notebook--cell-key-next-id))
+      (let ((m (copy-marker line-start t)))
+        (set-marker-insertion-type m t)
+        (puthash existing-id m emacs-jupyter-notebook--cell-key-markers)))
+    (cons file existing-id)))
 
 ;;; View toggle / navigation (W2.3, W2.6)
 
@@ -623,10 +664,20 @@ If WAIT is non-nil, defer the clear until the next text arrives
       (user-error "Point is not on an entry header"))
     (unless (and key (buffer-live-p source))
       (user-error "Entry has no source cell"))
-    (let ((pos (cdr key)))
+    (let ((id (cdr key)))
       (pop-to-buffer source)
-      (when (numberp pos)
-        (goto-char (min (point-max) pos))))))
+      (let* ((marker (and (integerp id)
+                          emacs-jupyter-notebook--cell-key-markers
+                          (gethash id emacs-jupyter-notebook--cell-key-markers)))
+             (target (cond
+                      ((and (markerp marker)
+                            (eq (marker-buffer marker) (current-buffer)))
+                       (marker-position marker))
+                      ((integerp id) id)
+                      (t nil))))
+        (when target
+          (goto-char (max (point-min)
+                          (min (point-max) target))))))))
 
 ;;; Fringe indicator (W2.8)
 
@@ -668,15 +719,28 @@ If WAIT is non-nil, defer the clear until the next text arrives
 
 (defun emacs-jupyter-notebook-fringe-set (cell-key state &optional exec-count)
   "Set the source-buffer fringe indicator for CELL-KEY to STATE.
-EXEC-COUNT is the execution count (used by the `ok' state)."
+EXEC-COUNT is the execution count (used by the `ok' state).
+The cell key id is resolved against the buffer-local marker table so the
+indicator follows the cell even after edits above it.  If no marker is
+registered for the id and the cdr is a plain integer, that integer is
+treated as a literal buffer position (test convenience)."
   (when (and cell-key (buffer-live-p (current-buffer)))
-    (let* ((pos (cdr cell-key))
+    (let* ((id (cdr cell-key))
            (existing (cdr (assoc cell-key
                                  emacs-jupyter-notebook--fringe-overlays)))
-           (line-pos (when (numberp pos)
+           (marker (and (integerp id)
+                        emacs-jupyter-notebook--cell-key-markers
+                        (gethash id emacs-jupyter-notebook--cell-key-markers)))
+           (anchor-pos (cond
+                        ((and (markerp marker)
+                              (eq (marker-buffer marker) (current-buffer)))
+                         (marker-position marker))
+                        ((integerp id) id)
+                        (t nil)))
+           (line-pos (when anchor-pos
                        (save-excursion
                          (goto-char (max (point-min)
-                                         (min (point-max) pos)))
+                                         (min (point-max) anchor-pos)))
                          (line-beginning-position))))
            (ov (or (and (overlayp existing) (overlay-buffer existing) existing)
                    (and line-pos
