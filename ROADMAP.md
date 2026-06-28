@@ -394,13 +394,13 @@ flow stays fully non-blocking.
       `host-unreachable`, `connection-refused`, `forward-refused`,
       `host-key-changed`, `unknown`. Wired into `--async-fail` to enrich
       user-visible errors. ERT per kind with representative stderr fixtures.
-- [~] owner=W4-fixup claimed=2026-06-28 W4.4 Async dead-PID probe in reconnect path. Before scp-ing the
+- [x] sha=3536ffe W4.4 Async dead-PID probe in reconnect path. Before scp-ing the
       connection file, run `ssh kill -0 <pid>` async; on nonzero exit, fail
       the context with kind `kernel-dead` and surface a non-modal hint
       ("Remote kernel <pid> is no longer alive. Start a new one with
       `M-x emacs-jupyter-notebook-start-remote-kernel`."). Do not auto-start;
       leave the stale registry entry intact. ERT.
-- [ ] W4.5 Periodic kernel-info heartbeat. Per-buffer repeating timer
+- [~] owner=W4-fixup claimed=2026-06-28 W4.5 Periodic kernel-info heartbeat. Per-buffer repeating timer
       (`emacs-jupyter-notebook-heartbeat-interval` default 20 s) calls a new
       adapter function var `…-jupyter-kernel-info-function` (analogous to
       complete/inspect). On `emacs-jupyter-notebook-heartbeat-misses-allowed`
