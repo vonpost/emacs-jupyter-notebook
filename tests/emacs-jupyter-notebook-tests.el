@@ -9,6 +9,7 @@
 
 (require 'ert)
 (require 'cl-lib)
+(require 'benchmark)
 (require 'emacs-jupyter-notebook)
 
 (defmacro ejn-test-with-temp-buffer (content &rest body)
@@ -1446,6 +1447,48 @@ leaves source-buffer text untouched."
            (funcall captured-cb
                     '(:matches ("x") :cursor_start 0 :cursor_end 1) nil)
            nil)))))
+
+(ert-deftest ejn-w3.4-capf-returns-fast-even-when-adapter-stalls ()
+  ;; Load-bearing W3 test: the adapter is mocked to delay 10 seconds.
+  ;; The capf must still return well under the budget — the adapter is
+  ;; only ever called from the deferred timer, never from the capf
+  ;; itself.  This is the binding-rule guarantee in machine-checkable
+  ;; form.
+  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
+    (search-forward "my_obj.met")
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook--completion-cache nil)
+          (emacs-jupyter-notebook--completion-cache-order nil)
+          (emacs-jupyter-notebook--completion-pending-key nil)
+          (emacs-jupyter-notebook--completion-pending-id nil)
+          (emacs-jupyter-notebook--completion-idle-timer nil)
+          (emacs-jupyter-notebook-completion-idle 0.10)
+          (this-command 'self-insert-command))
+      (let ((emacs-jupyter-notebook-jupyter-complete-function
+             (lambda (_client _code _pos _callback)
+               (sleep-for 10))))
+        (unwind-protect
+            (let ((elapsed (benchmark-elapse
+                             (emacs-jupyter-notebook-completion-at-point))))
+              ;; Budget: 5 ms.  Even on a slow VM the capf body is a few
+              ;; hash-table ops and a timer install — well under that.
+              (should (< elapsed 0.005)))
+          (when (timerp emacs-jupyter-notebook--completion-idle-timer)
+            (cancel-timer emacs-jupyter-notebook--completion-idle-timer)))))))
+
+(ert-deftest ejn-w3.4-capf-returns-fast-on-cache-hit ()
+  ;; The cache-hit path must also stay in the few-ms budget.
+  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
+    (search-forward "my_obj.met")
+    (let* ((emacs-jupyter-notebook--client 'mock-client)
+           (emacs-jupyter-notebook--completion-cache nil)
+           (emacs-jupyter-notebook--completion-cache-order nil)
+           (key (emacs-jupyter-notebook--completion-key)))
+      (emacs-jupyter-notebook--completion-cache-put
+       key '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10))
+      (let ((elapsed (benchmark-elapse
+                       (emacs-jupyter-notebook-completion-at-point))))
+        (should (< elapsed 0.005))))))
 
 (ert-deftest ejn-w3.1-completion-cache-reset-clears-everything ()
   (with-temp-buffer
