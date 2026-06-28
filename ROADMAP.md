@@ -228,7 +228,7 @@ Rows:
       view toggle and panel kill/reopen.
 - [x] sha=90cf573 W2.6 Navigation keys: `q`, `RET`, `n`, `p`. ERT: `RET` on a section
       header jumps to the originating cell in the source buffer.
-- [ ] W2.7 Rewrite `emacs-jupyter-notebook-jupyter--callbacks` to drive the
+- [~] owner=W2-agent claimed=2026-06-28 W2.7 Rewrite `emacs-jupyter-notebook-jupyter--callbacks` to drive the
       panel API instead of the overlay API. Drop the inline-overlay code
       path entirely (no compat mode). Remove
       `emacs-jupyter-notebook-use-inline-overlays` and related vars from
