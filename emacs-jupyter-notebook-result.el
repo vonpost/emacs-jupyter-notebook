@@ -280,7 +280,14 @@ UPDATER is called with the current entry plist and must return a new plist."
 ;;; Render scheduling (W2.4 throttle)
 
 (defun emacs-jupyter-notebook-panel--schedule-render (panel)
-  "Mark PANEL dirty and schedule a flush within the throttle window."
+  "Mark PANEL dirty and schedule a flush within the throttle window.
+
+W2.4: every API call that changes an entry routes through this scheduler.
+The actual render runs at most once per
+`emacs-jupyter-notebook-panel-stream-throttle-ms' milliseconds; intervening
+calls just set the dirty flag.  This is non-blocking: stream events keep
+arriving while the timer is pending, and the next flush picks up whatever
+state the entries are in at flush time."
   (when (buffer-live-p panel)
     (with-current-buffer panel
       (setq emacs-jupyter-notebook-panel--dirty t)
