@@ -340,6 +340,25 @@ Rows:
       active completion UI. ERT for corfu and company variants (mock the
       UI).
 - [x] sha=d1bb60d W3.6 Document the design and frontend integration in README.
+- [~] owner=W3-fixup claimed=2026-06-28 W3.7 Remediation pass addressing review
+      findings:
+      (a) `--completion-start-idle-timer` did not capture `current-buffer`, so
+          a timer armed in buffer A could fire and mutate buffer B's pending
+          state.  Fix: capture buffer in a closure (mirror of
+          `--completion-schedule-request`).
+      (b) Moving point after an in-flight request fired did not invalidate
+          the request — the reply was still cached at the originating
+          context's key.  Fix: at reply time, only cache when the buffer's
+          CURRENT context still matches the request's key; otherwise drop.
+      (c) The active-corfu refresh path called `corfu--exhibit`, which
+          redisplays current corfu state but does not refresh candidates.
+          Fix: drop the speculative corfu refresh; rely on the fallback
+          `completion-in-region` path and on the next user keystroke to
+          re-trigger capf naturally.  Update the W3.5 tests accordingly.
+      (d) `--completion-cancel-idle-timer' did not clear the pending
+          key/id.  Fix: clear them too, so any in-flight reply is dropped
+          on arrival.
+      Add ERTs proving each behavior.
 
 Acceptance: every W3 row [x]; the timing assertion in W3.4 passes; manual
 smoke on a real link: typing `np.` shows candidates within ≤ 1 RTT and the
