@@ -270,19 +270,22 @@ newline are treated as text below the output, so the result stays in place."
 Does NOT call `--async-kill-remote-kernel' (the remote kernel must outlive any
 buffer-level cleanup) and does NOT delete the context's `:local-file' (the
 caller may have already promoted it into the registry entry as the offline
-reconnect key).  Errors raised by individual disposers are propagated; the
-buffer-level wrappers wrap this in `condition-case' so that disposer failures
-cannot prevent buffer kill or mode disable."
+reconnect key).  Each disposer is independently best-effort: a raise from one
+disposer does not prevent the remaining disposers from running."
   (when context
-    (emacs-jupyter-notebook--async-cancel-timer context)
-    (emacs-jupyter-notebook--async-delete-process
-     (plist-get context :launch-process))
-    (emacs-jupyter-notebook--async-delete-process
-     (plist-get context :scp-process))
-    (emacs-jupyter-notebook--async-delete-process
-     (plist-get context :tunnel-process))
-    (emacs-jupyter-notebook--async-delete-file
-     (plist-get context :remote-copy))))
+    (ignore-errors (emacs-jupyter-notebook--async-cancel-timer context))
+    (ignore-errors
+      (emacs-jupyter-notebook--async-delete-process
+       (plist-get context :launch-process)))
+    (ignore-errors
+      (emacs-jupyter-notebook--async-delete-process
+       (plist-get context :scp-process)))
+    (ignore-errors
+      (emacs-jupyter-notebook--async-delete-process
+       (plist-get context :tunnel-process)))
+    (ignore-errors
+      (emacs-jupyter-notebook--async-delete-file
+       (plist-get context :remote-copy)))))
 
 (defun emacs-jupyter-notebook--clear-buffer-timers ()
   "Cancel the buffer-local evaluation and completion-idle timers."
@@ -297,17 +300,24 @@ Cancels the in-flight async context's local processes and timers, tears down the
 SSH tunnel process and its stderr buffer, cancels the evaluation timer and the
 completion idle timer, and drops the buffer-local Jupyter client handle.
 
-This is the disposer used by `kill-buffer-hook'.  It does not call
-`jupyter-shutdown', does not call `--cleanup-remote-entry', does not remove the
-registry entry, does not delete the local connection file, and does not touch
-the remote kernel.  The registry entry and the remote kernel are the durable
-reconnect surface and must survive buffer kill."
-  (emacs-jupyter-notebook--cancel-async-context-locally
-   emacs-jupyter-notebook--async-context)
-  (emacs-jupyter-notebook--clear-buffer-timers)
-  (when (processp emacs-jupyter-notebook--tunnel-process)
-    (emacs-jupyter-notebook--async-delete-process
-     emacs-jupyter-notebook--tunnel-process))
+This is the disposer used by `kill-buffer-hook' and by the mode-disable
+cleanup.  It does not call `jupyter-shutdown', does not call
+`--cleanup-remote-entry', does not remove the registry entry, does not delete
+the local connection file, and does not touch the remote kernel.  The registry
+entry and the remote kernel are the durable reconnect surface and must survive
+buffer kill and mode disable.
+
+Each disposer is independently best-effort: a raise from one does not prevent
+the remaining disposers from running, and the final state-clearing setq always
+executes."
+  (ignore-errors
+    (emacs-jupyter-notebook--cancel-async-context-locally
+     emacs-jupyter-notebook--async-context))
+  (ignore-errors (emacs-jupyter-notebook--clear-buffer-timers))
+  (ignore-errors
+    (when (processp emacs-jupyter-notebook--tunnel-process)
+      (emacs-jupyter-notebook--async-delete-process
+       emacs-jupyter-notebook--tunnel-process)))
   (setq emacs-jupyter-notebook--client nil
         emacs-jupyter-notebook--async-context nil
         emacs-jupyter-notebook--tunnel-process nil

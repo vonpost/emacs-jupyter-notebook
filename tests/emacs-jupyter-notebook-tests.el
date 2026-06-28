@@ -2644,6 +2644,25 @@ explicitly lists it among the things released on mode disable."
         (should (equal emacs-jupyter-notebook--session-entry entry))
         (should-not emacs-jupyter-notebook--client)))))
 
+(ert-deftest ejn-release-local-resources-survives-one-disposer-raising ()
+  "W1.10: when one disposer in `--release-local-resources' raises, the remaining
+disposers still run and the final state-clearing setq still executes.  This
+test poisons `--clear-buffer-timers' to throw and asserts that the tunnel
+process is still disposed and the buffer-local state is still cleared."
+  (with-temp-buffer
+    (let ((proc (emacs-jupyter-notebook-ssh-start-process
+                 "ejn-test-w110-tunnel" '("sleep" "60"))))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--clear-buffer-timers)
+                 (lambda (&rest _) (error "simulated disposer failure"))))
+        (setq emacs-jupyter-notebook--tunnel-process proc)
+        (setq emacs-jupyter-notebook--client 'mock-client)
+        (setq emacs-jupyter-notebook--kernel-status 'busy)
+        (emacs-jupyter-notebook--release-local-resources)
+        (should-not (process-live-p proc))
+        (should-not emacs-jupyter-notebook--tunnel-process)
+        (should-not emacs-jupyter-notebook--client)
+        (should-not emacs-jupyter-notebook--kernel-status)))))
+
 (ert-deftest ejn-mode-disable-disposes-tunnel-process-and-stderr-buffer ()
   "W1.9: mode disable disposes the buffer-local tunnel process and its stderr
 buffer.  The remote kernel and registry stay alive; only the local SSH tunnel
