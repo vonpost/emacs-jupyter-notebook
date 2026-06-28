@@ -340,7 +340,7 @@ Rows:
       active completion UI. ERT for corfu and company variants (mock the
       UI).
 - [x] sha=d1bb60d W3.6 Document the design and frontend integration in README.
-- [~] owner=W3-fixup claimed=2026-06-28 W3.7 Remediation pass addressing review
+- [x] sha=2db7a6d W3.7 Remediation pass addressing review
       findings:
       (a) `--completion-start-idle-timer` did not capture `current-buffer`, so
           a timer armed in buffer A could fire and mutate buffer B's pending
