@@ -156,6 +156,15 @@ panel under the entry header."
   :type '(alist :key-type string :value-type string)
   :group 'emacs-jupyter-notebook)
 
+;; W2.10: removed legacy inline-overlay customizations
+;;   emacs-jupyter-notebook-use-inline-overlays
+;;   emacs-jupyter-notebook-inline-result-max-lines
+;;   emacs-jupyter-notebook-result-inline-lines
+;;   emacs-jupyter-notebook-result-inline-max-bytes
+;;   emacs-jupyter-notebook-result-max-lines
+;; These no longer apply: the source buffer carries no result text and all
+;; per-entry sizing is bounded by `emacs-jupyter-notebook-result-max-bytes'.
+
 ;;; W2 panel customization
 
 (defcustom emacs-jupyter-notebook-panel-side 'right
