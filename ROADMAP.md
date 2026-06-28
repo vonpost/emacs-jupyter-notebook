@@ -226,7 +226,7 @@ Rows:
       `:max-width` / `:max-height` from the existing vars. Native image keys
       (`+`, `-`, `=`) work in the panel. ERT: image-bearing entry survives
       view toggle and panel kill/reopen.
-- [~] owner=W2-agent claimed=2026-06-28 W2.6 Navigation keys: `q`, `RET`, `n`, `p`. ERT: `RET` on a section
+- [x] sha=90cf573 W2.6 Navigation keys: `q`, `RET`, `n`, `p`. ERT: `RET` on a section
       header jumps to the originating cell in the source buffer.
 - [ ] W2.7 Rewrite `emacs-jupyter-notebook-jupyter--callbacks` to drive the
       panel API instead of the overlay API. Drop the inline-overlay code
