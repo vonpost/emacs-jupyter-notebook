@@ -84,8 +84,8 @@ How it works:
 Frontend integration:
 
 - **Vanilla `completion-at-point`** works out of the box. The capf returns cached candidates; the next call after a reply arrives sees the fresh cache.
-- **Corfu**: when `corfu-mode` is on, the reply path calls `corfu--exhibit` (inside a `completion-in-region` session) or `corfu--auto-complete-deferred` to refresh the popup immediately as candidates land.
-- **Company**: when `company-mode` is on, the reply path kicks `company-manual-begin` (or `company-idle-begin` on older versions) so the popup picks up the fresh candidates.
+- **Corfu / Vertico / Consult**: when `completion-in-region-mode` is active the package does not try to force the popup to re-fetch candidates programmatically (no cross-version API does this reliably). The next user keystroke re-invokes capf, which finds the now-cached candidates and updates the popup. In practice the lag is invisible because the reply usually arrives in less than one keystroke.
+- **Company**: when `company-mode` is on and no popup is open, the reply path kicks `company-manual-begin` so the popup picks up the fresh candidates.
 - **Cape** and similar capf composers: just include `emacs-jupyter-notebook-completion-at-point` in your `completion-at-point-functions` (the minor mode does this for you).
 
 Tuning:

@@ -1232,21 +1232,19 @@ Never sends a request and never blocks."
 
 (defun emacs-jupyter-notebook--completion-refresh-ui ()
   "Push freshly-cached candidates to the active completion frontend.
-Detection order:
-- Corfu: when `corfu-mode' is on, refresh the popup.  If
-  `completion-in-region-mode' is already active, call `corfu--exhibit'
-  so the popup picks up the new candidates immediately.  Otherwise
-  call `corfu--auto-complete-deferred' when available, which is the
-  newer corfu hook for an external candidate provider.
-- Company: when `company-mode' is on, kick `company-manual-begin' (or
-  `company-idle-begin' on older versions) to surface the new
-  candidates.
-- Neither active: fall back to `completion-in-region', so explicit
-  `complete-at-point' invocations still surface the new candidates.
-All branches are guarded with `fboundp' / `bound-and-true-p' so the
-function is safe to call when neither frontend is loaded."
-  ;; W3.7: `corfu--exhibit' only redisplays current corfu state; it does
-  ;; not refresh candidates from capf, so a popup opened on an empty cache
+Behavior (W3.7):
+- If `company-mode' is on and no popup is yet open, kick
+  `company-manual-begin' so company picks up the fresh cache.
+- If no completion popup is active, drive `completion-in-region'
+  directly with the cached result (covers explicit `complete-at-point'
+  invocations and the vanilla path).
+- If `completion-in-region-mode' is already active (Corfu, vertico,
+  consult-completion-in-region, etc.) do nothing: there is no
+  cross-version programmatic way to force the popup to re-fetch capf
+  candidates.  The next user keystroke causes capf to be re-invoked
+  naturally and the popup picks up the new cache then."
+  ;; Justification for the missing Corfu hook: `corfu--exhibit' only
+  ;; redisplays current corfu state; it does not refresh candidates from
   ;; would stay empty.  We instead rely on the fallback path: when the
   ;; cache fills, the next user keystroke causes capf to be re-invoked
   ;; naturally and the popup picks up the new candidates.  For the
