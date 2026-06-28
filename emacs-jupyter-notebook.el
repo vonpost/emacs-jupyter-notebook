@@ -743,13 +743,21 @@ Signal an error when the tunnel exits or the timeout expires."
   (emacs-jupyter-notebook--async-put context :timer nil))
 
 (defun emacs-jupyter-notebook--async-delete-process (process)
-  "Delete PROCESS and its buffers when PROCESS is live."
+  "Delete PROCESS and the buffers it carries.
+Kills the process if it is still live, then disposes of both its stdout
+`process-buffer' and the stderr buffer stashed under the
+`emacs-jupyter-notebook-stderr-buffer' process property.  Without the second
+disposer, every SSH launch/scp/tunnel process leaked a hidden \" *NAME stderr*\"
+buffer per session (see ssh.el)."
   (when (processp process)
     (when (process-live-p process)
       (delete-process process))
-    (when-let* ((buffer (process-buffer process)))
-      (when (buffer-live-p buffer)
-        (kill-buffer buffer)))))
+    (let ((stdout (process-buffer process))
+          (stderr (process-get process 'emacs-jupyter-notebook-stderr-buffer)))
+      (when (buffer-live-p stdout)
+        (kill-buffer stdout))
+      (when (buffer-live-p stderr)
+        (kill-buffer stderr)))))
 
 (defun emacs-jupyter-notebook--async-delete-file (file)
   "Delete FILE if it exists."
@@ -1311,9 +1319,9 @@ non-nil, do not send a Jupyter shutdown request to the current client."
     (when (and emacs-jupyter-notebook--client (not skip-jupyter-shutdown))
       (ignore-errors
         (emacs-jupyter-notebook-jupyter-shutdown emacs-jupyter-notebook--client)))
-    (when (and (processp emacs-jupyter-notebook--tunnel-process)
-               (process-live-p emacs-jupyter-notebook--tunnel-process))
-      (delete-process emacs-jupyter-notebook--tunnel-process))
+    (when (processp emacs-jupyter-notebook--tunnel-process)
+      (emacs-jupyter-notebook--async-delete-process
+       emacs-jupyter-notebook--tunnel-process))
     (when entry
       (emacs-jupyter-notebook--cleanup-remote-entry entry))
     (when-let* ((key (and entry (emacs-jupyter-notebook--registry-entry-key entry))))

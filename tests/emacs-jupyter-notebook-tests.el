@@ -2650,6 +2650,77 @@
          (emacs-jupyter-notebook--mode-disable-cleanup)
          t)))))
 
+(ert-deftest ejn-async-delete-process-kills-stderr-buffer ()
+  "W1.3: the disposer kills the stderr buffer carried as a process property."
+  (let ((proc (emacs-jupyter-notebook-ssh-start-process
+               "ejn-test-stderr-leak" '("sleep" "60"))))
+    (let ((stdout (process-buffer proc))
+          (stderr (process-get proc 'emacs-jupyter-notebook-stderr-buffer)))
+      (should (buffer-live-p stderr))
+      (emacs-jupyter-notebook--async-delete-process proc)
+      (should-not (process-live-p proc))
+      (should-not (and stdout (buffer-live-p stdout)))
+      (should-not (buffer-live-p stderr)))))
+
+(ert-deftest ejn-async-delete-process-tolerates-missing-stderr-buffer ()
+  "W1.3: the disposer handles processes that have no stderr property."
+  (let ((proc (start-process "ejn-test-plain" nil "sleep" "60")))
+    (let ((stdout (process-buffer proc)))
+      (emacs-jupyter-notebook--async-delete-process proc)
+      (should-not (process-live-p proc))
+      (should-not (and stdout (buffer-live-p stdout))))))
+
+(ert-deftest ejn-async-fail-disposes-stderr-buffers ()
+  "W1.3: `--async-fail' disposes launch/scp/tunnel stderr buffers."
+  (let* ((launch (emacs-jupyter-notebook-ssh-start-process
+                  "ejn-test-fail-launch" '("sleep" "60")))
+         (scp (emacs-jupyter-notebook-ssh-start-process
+               "ejn-test-fail-scp" '("sleep" "60")))
+         (tunnel (emacs-jupyter-notebook-ssh-start-process
+                  "ejn-test-fail-tunnel" '("sleep" "60")))
+         (stderrs (mapcar (lambda (p)
+                            (process-get p 'emacs-jupyter-notebook-stderr-buffer))
+                          (list launch scp tunnel)))
+         (context (emacs-jupyter-notebook--async-new-context
+                   :phase 'launch
+                   :launch-process launch
+                   :scp-process scp
+                   :tunnel-process tunnel)))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-kill-remote-kernel)
+               #'ignore))
+      (with-temp-buffer
+        (emacs-jupyter-notebook--async-fail context "boom")
+        (dolist (b stderrs)
+          (should-not (buffer-live-p b)))))))
+
+(ert-deftest ejn-cleanup-current-state-disposes-tunnel-stderr-buffer ()
+  "W1.3: `--cleanup-current-state' disposes the tunnel stderr buffer."
+  (let ((proc (emacs-jupyter-notebook-ssh-start-process
+               "ejn-test-cleanup-tunnel" '("sleep" "60")))
+        stderr)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown) #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
+               #'ignore))
+      (setq stderr (process-get proc 'emacs-jupyter-notebook-stderr-buffer))
+      (should (buffer-live-p stderr))
+      (with-temp-buffer
+        (setq emacs-jupyter-notebook--tunnel-process proc)
+        (emacs-jupyter-notebook--cleanup-current-state "cleanup")
+        (should-not (process-live-p proc))
+        (should-not (buffer-live-p stderr))))))
+
+(ert-deftest ejn-release-local-resources-disposes-tunnel-stderr-buffer ()
+  "W1.3: the kill-buffer disposer kills the tunnel stderr buffer."
+  (with-temp-buffer
+    (let ((proc (emacs-jupyter-notebook-ssh-start-process
+                 "ejn-test-release-tunnel" '("sleep" "60"))))
+      (let ((stderr (process-get proc 'emacs-jupyter-notebook-stderr-buffer)))
+        (should (buffer-live-p stderr))
+        (setq emacs-jupyter-notebook--tunnel-process proc)
+        (emacs-jupyter-notebook--release-local-resources)
+        (should-not (process-live-p proc))
+        (should-not (buffer-live-p stderr))))))
+
 (provide 'emacs-jupyter-notebook-tests)
 
 ;;; emacs-jupyter-notebook-tests.el ends here
