@@ -2373,6 +2373,41 @@ leaves source-buffer text untouched."
         (emacs-jupyter-notebook-evaluate-current-cell)
         (should-not eval-called)))))
 
+(ert-deftest ejn-w4.6-heartbeat-death-routes-through-tunnel-reconnect ()
+  "W4.6: the --tunnel-dead flag set by a heartbeat miss-threshold leads
+`--ensure-client-async' to `--tunnel-reconnect' in exactly the same way as
+sentinel-driven death.  Heartbeat and sentinel are indistinguishable to
+the evaluate flow."
+  (ejn-test-with-temp-buffer "# %%\na = 1\n"
+    (let* ((emacs-jupyter-notebook--client nil)
+           (emacs-jupyter-notebook--async-context nil)
+           (emacs-jupyter-notebook--tunnel-dead nil)
+           (emacs-jupyter-notebook--session-entry
+            '(:profile "p" :session-id "s" :local-file "/tmp/x.py"))
+           (reconnect-called nil)
+           (eval-called nil)
+           (emacs-jupyter-notebook-jupyter-evaluate-function
+            (lambda (_client _code _entry-handle)
+              (setq eval-called t)))
+           (emacs-jupyter-notebook-heartbeat-misses-allowed 2))
+      ;; Trigger heartbeat-driven death exactly the way the runtime does.
+      (cl-letf (((symbol-function 'display-warning) #'ignore))
+        (emacs-jupyter-notebook--heartbeat-on-miss)
+        (emacs-jupyter-notebook--heartbeat-on-miss))
+      (should emacs-jupyter-notebook--tunnel-dead)
+      ;; Now evaluate: the engine must route through tunnel-reconnect
+      ;; without distinguishing how we got here.
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--tunnel-reconnect)
+                 (lambda (buffer callback _error-callback)
+                   (setq reconnect-called t)
+                   (should (functionp callback))
+                   (setq emacs-jupyter-notebook--tunnel-dead nil)
+                   (setq emacs-jupyter-notebook--client 'mock-client)
+                   (funcall callback nil))))
+        (emacs-jupyter-notebook-evaluate-current-cell)
+        (should reconnect-called)
+        (should eval-called)))))
+
 (ert-deftest ejn-install-tunnel-sentinel-detects-already-dead-process ()
   (with-temp-buffer
     (let* ((buffer (current-buffer))
