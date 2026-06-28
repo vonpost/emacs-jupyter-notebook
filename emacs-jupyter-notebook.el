@@ -787,7 +787,18 @@ buffer per session (see ssh.el)."
         (emacs-jupyter-notebook--entry-profile entry) connection-file)))))
 
 (defun emacs-jupyter-notebook--async-fail (context error-data)
-  "Move CONTEXT to error state with ERROR-DATA and clean up."
+  "Move CONTEXT to error state with ERROR-DATA and clean up.
+
+Releases only LOCAL resources: cancels the deadline timer, disposes the
+launch/scp/tunnel processes (and their stderr buffers), and removes the
+fetched :remote-copy.  Does NOT terminate the remote kernel, even when
+`:owns-kernel' is set: the binding rule forbids automatic remote-kernel
+cleanup from async failure paths.  Does NOT delete `:local-file' either —
+once `--async-connect-finalize' runs that same path becomes the registry
+entry's `:local-connection-file' (the offline reconnect key), and this
+function is also called from failure paths that may race with that
+promotion.  A small temp-file leak is acceptable; loss of the reconnect
+key is not."
   (setq context (emacs-jupyter-notebook--async-put context :phase 'error))
   (setq context (emacs-jupyter-notebook--async-put context :error error-data))
   (setq context (emacs-jupyter-notebook--async-cancel-timer context))
@@ -795,8 +806,6 @@ buffer per session (see ssh.el)."
   (emacs-jupyter-notebook--async-delete-process (plist-get context :scp-process))
   (emacs-jupyter-notebook--async-delete-process (plist-get context :tunnel-process))
   (emacs-jupyter-notebook--async-delete-file (plist-get context :remote-copy))
-  (emacs-jupyter-notebook--async-delete-file (plist-get context :local-file))
-  (emacs-jupyter-notebook--async-kill-remote-kernel context)
   (if-let ((callback (plist-get context :error-callback)))
       (funcall callback context error-data)
     (display-warning 'emacs-jupyter-notebook

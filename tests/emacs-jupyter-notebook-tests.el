@@ -2686,8 +2686,7 @@
                    :launch-process launch
                    :scp-process scp
                    :tunnel-process tunnel)))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-kill-remote-kernel)
-               #'ignore))
+    (cl-letf (((symbol-function 'display-warning) #'ignore))
       (with-temp-buffer
         (emacs-jupyter-notebook--async-fail context "boom")
         (dolist (b stderrs)
@@ -2894,9 +2893,10 @@ Returns a plist describing post-disable state of the in-flight processes."
   "W1.6: a failed remote launch leaks no `*emacs-jupyter-notebook-*' buffers.
 Spawn real launch/scp/tunnel processes through the SSH starter so each carries
 both a stdout and a stderr buffer.  After `--async-fail' runs there must be
-zero EJN-prefixed buffers above the baseline; the remote-kernel-cleanup branch
-is stubbed because that path is intentionally fire-and-forget and not the
-subject of this test."
+zero EJN-prefixed buffers above the baseline.  The remote-kernel-cleanup
+branch is NOT stubbed: post-W1.8, `--async-fail' must not call
+`--async-kill-remote-kernel' at all, so the kill helper would not run even
+with `:owns-kernel' set."
   (let* ((baseline (ejn-test--ejn-process-buffers))
          (launch (emacs-jupyter-notebook-ssh-start-process
                   "emacs-jupyter-notebook-launch-w16" '("sleep" "60")))
@@ -2913,9 +2913,7 @@ subject of this test."
     (should (>= (length (cl-set-difference
                          (ejn-test--ejn-process-buffers) baseline))
                 6))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-kill-remote-kernel)
-               #'ignore)
-              ((symbol-function 'display-warning) #'ignore))
+    (cl-letf (((symbol-function 'display-warning) #'ignore))
       (with-temp-buffer
         (emacs-jupyter-notebook--async-fail context "simulated launch failure")))
     (should-not (process-live-p launch))
@@ -2923,6 +2921,32 @@ subject of this test."
     (should-not (process-live-p tunnel))
     (let ((leaked (cl-set-difference (ejn-test--ejn-process-buffers) baseline)))
       (should-not leaked))))
+
+(ert-deftest ejn-async-fail-does-not-kill-remote-kernel-or-delete-local-file ()
+  "W1.8: `--async-fail' must not terminate the remote kernel or delete the
+context's `:local-file'.  Binding-rule compliance: no automatic remote-kernel
+cleanup from async failure paths.  The `:local-file' is the future
+`:local-connection-file' reconnect key once `--async-connect-finalize'
+promotes it."
+  (let ((kill-called nil)
+        (local-file (make-temp-file "ejn-w18-local-")))
+    (unwind-protect
+        (let ((context (emacs-jupyter-notebook--async-new-context
+                        :phase 'launch
+                        :owns-kernel t
+                        :local-file local-file
+                        :entry '(:profile "p"
+                                 :session-id "w18"
+                                 :remote-connection-file "/remote/k.json"))))
+          (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-kill-remote-kernel)
+                     (lambda (&rest _) (setq kill-called t)))
+                    ((symbol-function 'display-warning) #'ignore))
+            (with-temp-buffer
+              (emacs-jupyter-notebook--async-fail context "boom")))
+          (should-not kill-called)
+          (should (file-exists-p local-file)))
+      (when (file-exists-p local-file)
+        (delete-file local-file)))))
 
 (ert-deftest ejn-kill-buffer-with-live-client-does-not-shutdown-or-deregister ()
   "W1.7: killing a buffer that owns a live client does not call the configured
