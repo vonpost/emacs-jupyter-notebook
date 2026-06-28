@@ -1245,45 +1245,42 @@ Detection order:
   `complete-at-point' invocations still surface the new candidates.
 All branches are guarded with `fboundp' / `bound-and-true-p' so the
 function is safe to call when neither frontend is loaded."
+  ;; W3.7: `corfu--exhibit' only redisplays current corfu state; it does
+  ;; not refresh candidates from capf, so a popup opened on an empty cache
+  ;; would stay empty.  We instead rely on the fallback path: when the
+  ;; cache fills, the next user keystroke causes capf to be re-invoked
+  ;; naturally and the popup picks up the new candidates.  For the
+  ;; explicit-completion case (no popup yet active) we drive
+  ;; `completion-in-region' directly.
   (cond
-   ((bound-and-true-p corfu-mode)
-    (cond
-     ((and (bound-and-true-p completion-in-region-mode)
-           (fboundp 'corfu--exhibit))
-      (funcall 'corfu--exhibit))
-     ((fboundp 'corfu--auto-complete-deferred)
-      (funcall 'corfu--auto-complete-deferred))
-     (t
-      (let ((result (emacs-jupyter-notebook--completion-result)))
-        (when result
-          (apply #'completion-in-region result))))))
-   ((bound-and-true-p company-mode)
-    (cond
-     ((fboundp 'company-manual-begin) (funcall 'company-manual-begin))
-     ((fboundp 'company-idle-begin)
-      (funcall 'company-idle-begin (current-buffer) (selected-window)
-               (buffer-chars-modified-tick) (point)))))
-   (t
+   ((and (bound-and-true-p company-mode)
+         (not (bound-and-true-p company-candidates))
+         (fboundp 'company-manual-begin))
+    (funcall 'company-manual-begin))
+   ((not (bound-and-true-p completion-in-region-mode))
     (let ((result (emacs-jupyter-notebook--completion-result)))
       (when result
         (apply #'completion-in-region result))))))
 
 (defun emacs-jupyter-notebook--completion-on-reply (buffer key request-id show-results context-snapshot reply _error)
   "Cache REPLY for KEY under REQUEST-ID in BUFFER, optionally refreshing UI.
-Stale replies (where REQUEST-ID no longer matches the buffer-local pending id,
-or whose KEY no longer matches the live pending key) are dropped per the W3.3
-in-flight invalidation contract."
+Stale replies are dropped: a reply is stale when REQUEST-ID no longer
+matches the buffer-local pending id, when KEY no longer matches the live
+pending key, OR when the buffer's current capf context no longer matches
+the request's KEY (i.e. point moved or the line changed).  Only fresh
+replies update the cache; this prevents `out-of-date' completions from
+being cached for the original context after the user moved away from it
+(W3.3 + W3.7)."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      ;; Stale-id check: a newer request superseded this one, drop reply.
       (when (and (equal emacs-jupyter-notebook--completion-pending-id request-id)
                  (equal emacs-jupyter-notebook--completion-pending-key key))
         (setq emacs-jupyter-notebook--completion-pending-key nil
               emacs-jupyter-notebook--completion-pending-id nil)
-        (when reply
+        (when (and reply
+                   (equal (emacs-jupyter-notebook--completion-key) key))
           (emacs-jupyter-notebook--completion-cache-put key reply)
           (when (and show-results
-                     (equal (emacs-jupyter-notebook--completion-key) key)
                      (equal (emacs-jupyter-notebook--completion-context)
                             context-snapshot))
             (emacs-jupyter-notebook--completion-refresh-ui)))))))
@@ -1367,19 +1364,32 @@ when the reply arrives."
       (emacs-jupyter-notebook--completion-schedule-request t))))
 
 (defun emacs-jupyter-notebook--completion-start-idle-timer ()
-  "Start the completion cache idle timer (one-shot rescheduled on each tick)."
+  "Start the completion cache idle timer (one-shot rescheduled on each tick).
+The timer captures the current buffer in a closure so it always operates
+on the buffer that armed it, not whatever buffer happens to be current
+when the timer fires."
   (emacs-jupyter-notebook--completion-cancel-idle-timer)
-  (setq emacs-jupyter-notebook--completion-idle-timer
-        (run-with-idle-timer
-         (max 0.0 (or emacs-jupyter-notebook-completion-idle 0.10))
-         nil
-         #'emacs-jupyter-notebook--completion-idle-populate)))
+  (let ((buffer (current-buffer)))
+    (setq emacs-jupyter-notebook--completion-idle-timer
+          (run-with-idle-timer
+           (max 0.0 (or emacs-jupyter-notebook-completion-idle 0.10))
+           nil
+           (lambda ()
+             (when (buffer-live-p buffer)
+               (with-current-buffer buffer
+                 (setq emacs-jupyter-notebook--completion-idle-timer nil)
+                 (emacs-jupyter-notebook--completion-idle-populate))))))))
 
 (defun emacs-jupyter-notebook--completion-cancel-idle-timer ()
-  "Cancel the completion cache idle timer."
+  "Cancel the completion cache idle timer and clear pending request state.
+Clearing the pending key/id ensures that any reply for a request that was
+in flight when the timer was cancelled is dropped on arrival per the W3.3
+in-flight invalidation contract."
   (when (timerp emacs-jupyter-notebook--completion-idle-timer)
     (cancel-timer emacs-jupyter-notebook--completion-idle-timer))
-  (setq emacs-jupyter-notebook--completion-idle-timer nil))
+  (setq emacs-jupyter-notebook--completion-idle-timer nil
+        emacs-jupyter-notebook--completion-pending-key nil
+        emacs-jupyter-notebook--completion-pending-id nil))
 
 (defun emacs-jupyter-notebook--completion-idle-populate ()
   "Populate completion cache on idle when point sits at a fresh context."

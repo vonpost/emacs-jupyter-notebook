@@ -1496,10 +1496,12 @@ leaves source-buffer text untouched."
 (defvar completion-in-region-mode nil)
 (defvar company-mode nil)
 
-(ert-deftest ejn-w3.5-reply-refreshes-corfu-via-exhibit ()
-  ;; When corfu is active inside a completion-in-region session, the
-  ;; reply path calls `corfu--exhibit' so the popup picks up the new
-  ;; candidates immediately.
+(ert-deftest ejn-w3.5-refresh-ui-skips-when-completion-in-region-active ()
+  ;; W3.7: when `completion-in-region-mode' is active there is no reliable
+  ;; cross-version way to force the popup to re-fetch capf candidates.
+  ;; The refresh hook deliberately becomes a no-op in that case; the
+  ;; next user keystroke causes capf to be re-invoked naturally and the
+  ;; popup picks up the new candidates from the cache then.
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
     (search-forward "my_obj.met")
     (let ((emacs-jupyter-notebook--client 'mock-client)
@@ -1508,45 +1510,18 @@ leaves source-buffer text untouched."
           (emacs-jupyter-notebook--completion-pending-key nil)
           (emacs-jupyter-notebook--completion-pending-id nil)
           (emacs-jupyter-notebook--completion-request-counter 0)
-          captured-cb refresh-called)
+          captured-cb fallback-called)
       (let ((emacs-jupyter-notebook-jupyter-complete-function
              (lambda (_client _code _pos cb) (setq captured-cb cb))))
-        (cl-letf* (((symbol-value 'corfu-mode) t)
-                   ((symbol-value 'completion-in-region-mode) t)
-                   ((symbol-function 'corfu--exhibit)
-                    (lambda (&rest _) (setq refresh-called 'corfu-exhibit))))
+        (cl-letf* (((symbol-value 'completion-in-region-mode) t)
+                   ((symbol-function 'completion-in-region)
+                    (lambda (&rest _) (setq fallback-called t))))
           (emacs-jupyter-notebook--request-completion t)
           (should captured-cb)
           (funcall captured-cb
                    '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10)
                    nil)
-          (should (eq refresh-called 'corfu-exhibit)))))))
-
-(ert-deftest ejn-w3.5-reply-refreshes-corfu-via-auto-complete-deferred ()
-  ;; When corfu is active outside a completion-in-region session, the
-  ;; reply path calls `corfu--auto-complete-deferred' if available.
-  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
-    (search-forward "my_obj.met")
-    (let ((emacs-jupyter-notebook--client 'mock-client)
-          (emacs-jupyter-notebook--completion-cache nil)
-          (emacs-jupyter-notebook--completion-cache-order nil)
-          (emacs-jupyter-notebook--completion-pending-key nil)
-          (emacs-jupyter-notebook--completion-pending-id nil)
-          (emacs-jupyter-notebook--completion-request-counter 0)
-          captured-cb refresh-called)
-      (let ((emacs-jupyter-notebook-jupyter-complete-function
-             (lambda (_client _code _pos cb) (setq captured-cb cb))))
-        (cl-letf* (((symbol-value 'corfu-mode) t)
-                   ((symbol-value 'completion-in-region-mode) nil)
-                   ((symbol-function 'corfu--auto-complete-deferred)
-                    (lambda (&rest _)
-                      (setq refresh-called 'auto-complete-deferred))))
-          (emacs-jupyter-notebook--request-completion t)
-          (should captured-cb)
-          (funcall captured-cb
-                   '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10)
-                   nil)
-          (should (eq refresh-called 'auto-complete-deferred)))))))
+          (should-not fallback-called))))))
 
 (ert-deftest ejn-w3.5-reply-refreshes-company-via-manual-begin ()
   ;; When company is active, the reply path calls `company-manual-begin'.
@@ -1595,11 +1570,11 @@ leaves source-buffer text untouched."
                    nil)
           (should fallback-called))))))
 
-(ert-deftest ejn-w3.5-context-changed-suppresses-refresh ()
-  ;; If the user moved point so the live key no longer matches the
-  ;; request's key, the reply still lands in the cache (so a future capf
-  ;; call hits) but the UI refresh is NOT triggered, because the user is
-  ;; no longer asking for THIS completion.
+(ert-deftest ejn-w3.7-context-changed-drops-reply-entirely ()
+  ;; W3.7: if the user moved point so the live key no longer matches the
+  ;; request's key, the reply is DROPPED entirely.  Caching it under the
+  ;; original key would risk surfacing out-of-date candidates if the user
+  ;; later returned to that context after the kernel state had drifted.
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
     (search-forward "my_obj.met")
     (let ((emacs-jupyter-notebook--client 'mock-client)
@@ -1621,9 +1596,51 @@ leaves source-buffer text untouched."
           (funcall captured-cb
                    '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10)
                    nil)
-          ;; Reply lands in cache, but refresh is suppressed.
-          (should (gethash orig-key emacs-jupyter-notebook--completion-cache))
+          ;; Reply is dropped: cache does not contain orig-key, no refresh.
+          (should-not (and emacs-jupyter-notebook--completion-cache
+                           (gethash orig-key emacs-jupyter-notebook--completion-cache)))
           (should-not refresh-called))))))
+
+(ert-deftest ejn-w3.7-idle-timer-captures-buffer ()
+  ;; W3.7: `--completion-start-idle-timer' must capture `current-buffer'
+  ;; in a closure so the timer fires in the buffer that armed it, not in
+  ;; whatever buffer happens to be current when it fires.  Without this
+  ;; fix, a timer armed in buffer A would mutate buffer B's pending state.
+  (let ((buf-a (generate-new-buffer "ejn-w37-a"))
+        (buf-b (generate-new-buffer "ejn-w37-b"))
+        timer populate-buffer)
+    (unwind-protect
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook--completion-idle-populate)
+                   (lambda () (setq populate-buffer (current-buffer)))))
+          (with-current-buffer buf-a
+            (setq-local emacs-jupyter-notebook-mode t)
+            (emacs-jupyter-notebook--completion-start-idle-timer)
+            (setq timer emacs-jupyter-notebook--completion-idle-timer))
+          (should (timerp timer))
+          ;; Switch to a different buffer and fire buf-a's timer.
+          (with-current-buffer buf-b
+            (timer-event-handler timer))
+          (should (eq populate-buffer buf-a)))
+      (when (timerp timer)
+        (cancel-timer timer))
+      (kill-buffer buf-a)
+      (kill-buffer buf-b))))
+
+(ert-deftest ejn-w3.7-cancel-idle-timer-clears-pending-state ()
+  ;; W3.7: cancelling the idle timer must also clear the pending key/id
+  ;; so any in-flight reply is dropped on arrival.  Without this, a
+  ;; cancelled timer could still leave the buffer in a state where an
+  ;; old reply is accepted and cached against a context the user has
+  ;; already left.
+  (with-temp-buffer
+    (setq emacs-jupyter-notebook--completion-idle-timer
+          (run-with-timer 1000 nil #'ignore))
+    (setq emacs-jupyter-notebook--completion-pending-key '(123 . "foo"))
+    (setq emacs-jupyter-notebook--completion-pending-id 7)
+    (emacs-jupyter-notebook--completion-cancel-idle-timer)
+    (should-not emacs-jupyter-notebook--completion-idle-timer)
+    (should-not emacs-jupyter-notebook--completion-pending-key)
+    (should-not emacs-jupyter-notebook--completion-pending-id)))
 
 (ert-deftest ejn-w3.1-completion-cache-reset-clears-everything ()
   (with-temp-buffer
