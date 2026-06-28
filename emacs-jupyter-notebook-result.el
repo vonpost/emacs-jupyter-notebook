@@ -320,9 +320,10 @@ UPDATER is called with the current entry plist and must return a new plist."
      ((eq emacs-jupyter-notebook-panel--view 'history)
       all)
      (t
-      ;; Latest-per-cell: only entries with a cell-key, deduped to the latest
-      ;; per key (subsequent start-entry already replaces the older entry, so
-      ;; here we just filter and order by the key's marker position).
+      ;; W2.2: Latest-per-cell shows only entries with a cell-key.
+      ;; Re-evaluating a cell already replaces its prior entry in
+      ;; `ejn-panel-start-entry', so here we filter to keyed entries and
+      ;; sort by the key's marker position so sections render in cell order.
       (let ((entries (cl-remove-if-not
                       (lambda (e) (plist-get e :cell-key))
                       all)))
