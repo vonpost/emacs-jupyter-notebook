@@ -129,6 +129,12 @@ Reset to 0 on every successful `kernel_info_reply'.")
 The reply callback only updates state when the token still matches; this
 prevents a late reply from a previous probe from masking a true miss.")
 
+(defvar-local emacs-jupyter-notebook--heartbeat-timeout-timer nil
+  "One-shot timer that fires `--heartbeat-on-miss' when a probe is silent.
+Stored so it can be cancelled when the reply lands first, when the user
+disables the mode, or when the buffer is killed.  Without this reference
+the timer would survive cleanup until it fires.")
+
 (defun emacs-jupyter-notebook--heartbeat-start ()
   "Start the per-buffer kernel-info heartbeat.
 The repeating timer fires every `emacs-jupyter-notebook-heartbeat-interval'
@@ -148,10 +154,16 @@ the tunnel is flagged dead; the remote kernel is NOT shut down."
                  (emacs-jupyter-notebook--heartbeat-tick))))))))
 
 (defun emacs-jupyter-notebook--heartbeat-cancel ()
-  "Cancel the buffer-local heartbeat timer and reset its state."
+  "Cancel the buffer-local heartbeat timer and reset its state.
+W4.8: also cancels any in-flight per-probe timeout timer so it does not
+fire (and miss-bump) after the buffer's heartbeat machinery has been
+released by `--release-local-resources' or `--mode-disable-cleanup'."
   (when (timerp emacs-jupyter-notebook--heartbeat-timer)
     (cancel-timer emacs-jupyter-notebook--heartbeat-timer))
+  (when (timerp emacs-jupyter-notebook--heartbeat-timeout-timer)
+    (cancel-timer emacs-jupyter-notebook--heartbeat-timeout-timer))
   (setq emacs-jupyter-notebook--heartbeat-timer nil
+        emacs-jupyter-notebook--heartbeat-timeout-timer nil
         emacs-jupyter-notebook--heartbeat-misses 0
         emacs-jupyter-notebook--heartbeat-inflight nil))
 
@@ -167,14 +179,16 @@ when the inflight token still matches (so late replies are ignored)."
     (let* ((buffer (current-buffer))
            (token (gensym "ejn-heartbeat-")))
       (setq emacs-jupyter-notebook--heartbeat-inflight token)
-      (run-with-timer
-       (max 0.1 (or emacs-jupyter-notebook-heartbeat-timeout 3))
-       nil
-       (lambda ()
-         (when (buffer-live-p buffer)
-           (with-current-buffer buffer
-             (when (eq emacs-jupyter-notebook--heartbeat-inflight token)
-               (emacs-jupyter-notebook--heartbeat-on-miss))))))
+      (setq emacs-jupyter-notebook--heartbeat-timeout-timer
+            (run-with-timer
+             (max 0.1 (or emacs-jupyter-notebook-heartbeat-timeout 3))
+             nil
+             (lambda ()
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (setq emacs-jupyter-notebook--heartbeat-timeout-timer nil)
+                   (when (eq emacs-jupyter-notebook--heartbeat-inflight token)
+                     (emacs-jupyter-notebook--heartbeat-on-miss)))))))
       (condition-case _err
           (emacs-jupyter-notebook-jupyter-kernel-info
            emacs-jupyter-notebook--client
@@ -182,6 +196,11 @@ when the inflight token still matches (so late replies are ignored)."
              (when (buffer-live-p buffer)
                (with-current-buffer buffer
                  (when (eq emacs-jupyter-notebook--heartbeat-inflight token)
+                   ;; The probe answered first; cancel the pending timeout
+                   ;; so it does not double-count as a miss.
+                   (when (timerp emacs-jupyter-notebook--heartbeat-timeout-timer)
+                     (cancel-timer emacs-jupyter-notebook--heartbeat-timeout-timer))
+                   (setq emacs-jupyter-notebook--heartbeat-timeout-timer nil)
                    (if reply
                        (emacs-jupyter-notebook--heartbeat-on-reply)
                      (emacs-jupyter-notebook--heartbeat-on-miss)))))))
@@ -189,6 +208,9 @@ when the inflight token still matches (so late replies are ignored)."
          (when (buffer-live-p buffer)
            (with-current-buffer buffer
              (when (eq emacs-jupyter-notebook--heartbeat-inflight token)
+               (when (timerp emacs-jupyter-notebook--heartbeat-timeout-timer)
+                 (cancel-timer emacs-jupyter-notebook--heartbeat-timeout-timer))
+               (setq emacs-jupyter-notebook--heartbeat-timeout-timer nil)
                (emacs-jupyter-notebook--heartbeat-on-miss)))))))))
 
 (defun emacs-jupyter-notebook--heartbeat-on-reply ()
@@ -878,6 +900,9 @@ underlying stderr matches a known SSH failure pattern."
     (emacs-jupyter-notebook--async-delete-process (plist-get context :launch-process))
     (emacs-jupyter-notebook--async-delete-process (plist-get context :scp-process))
     (emacs-jupyter-notebook--async-delete-process (plist-get context :tunnel-process))
+    ;; W4.8: dispose the W4.4 PID-probe process too so its stdout/stderr
+    ;; buffers do not leak when the probe itself fails the context.
+    (emacs-jupyter-notebook--async-delete-process (plist-get context :probe-process))
     (emacs-jupyter-notebook--async-delete-file (plist-get context :remote-copy))
     (if-let ((callback (plist-get context :error-callback)))
         (funcall callback context error-data)
@@ -1168,51 +1193,63 @@ CALLBACK is called on success, ERROR-CALLBACK on failure."
       (emacs-jupyter-notebook--async-probe-pid-alive context))))
 
 (defun emacs-jupyter-notebook--async-probe-pid-alive (context)
-  "W4.4: probe the remote kernel PID for CONTEXT, then proceed.
-When the registry entry carries a `:remote-pid', run `kill -0 <pid>' over
-SSH; on success call `--async-retrieve' so reconnect continues normally,
-on nonzero exit fail the context with a `kernel-dead' explanation that
-points the user at `M-x emacs-jupyter-notebook-start-remote-kernel'.
-The registry entry is NOT removed: the user may want to inspect it or
-clean it explicitly via `clean-orphaned-kernels'.
+  "W4.4: probe the remote kernel PID for CONTEXT before reconnect.
+The registry entry MUST carry a `:remote-pid' (W4.2 sentinel).  When the
+PID is alive (`kill -0 <pid>' exits 0) the context advances to
+`--async-retrieve'; otherwise the context fails with a `kernel-dead'
+explanation pointing the user at `start-remote-kernel'.  The registry
+entry is NOT removed — the user may inspect it or clean it explicitly
+via `clean-orphaned-kernels' (per the binding rule that only the
+explicit user commands may remove durable state).
 
-When the entry has no `:remote-pid' (older sessions, or sessions launched
-before the W4.2 sentinel landed), skip the probe and proceed directly to
-the retrieve step."
+W4.8: an entry without `:remote-pid' is a session from before W4.2
+landed; per the no-backwards-compat rule we surface a clear failure
+rather than silently bypass the probe.  The probe process itself is
+stored in the context and disposed in the sentinel via
+`--async-delete-process' so its stdout/stderr buffers do not leak."
   (let* ((entry (plist-get context :entry))
          (pid (and entry (plist-get entry :remote-pid)))
-         (profile (plist-get context :profile)))
+         (profile (plist-get context :profile))
+         (buffer (plist-get context :origin-buffer)))
     (cond
      ((not pid)
-      (emacs-jupyter-notebook--async-retrieve context))
+      (emacs-jupyter-notebook--async-fail
+       (emacs-jupyter-notebook--async-put context :error-kind 'no-pid)
+       (concat "This registry entry has no recorded PID (pre-W4.2 session). "
+               "Start a fresh kernel with "
+               "`M-x emacs-jupyter-notebook-start-remote-kernel'.")))
      (t
       (setq context (emacs-jupyter-notebook--async-put context :phase 'probe))
-      (let ((argv (emacs-jupyter-notebook-ssh-build-pid-alive profile pid))
-            (buffer (plist-get context :origin-buffer)))
-        (emacs-jupyter-notebook-ssh-start-process
-         (format "emacs-jupyter-notebook-pid-probe-%s"
-                 (or (plist-get context :session-id) pid))
-         argv
-         (lambda (process _event)
-           (when (memq (process-status process) '(exit signal))
-             (if (and (eq (process-status process) 'exit)
-                      (zerop (process-exit-status process)))
-                 (when (buffer-live-p buffer)
-                   (with-current-buffer buffer
-                     (when (eq emacs-jupyter-notebook--async-context context)
-                       (emacs-jupyter-notebook--async-retrieve context))))
-               (when (buffer-live-p buffer)
-                 (with-current-buffer buffer
-                   (when (eq emacs-jupyter-notebook--async-context context)
-                     (emacs-jupyter-notebook--async-fail
-                      (emacs-jupyter-notebook--async-put
-                       context :error-kind 'kernel-dead)
-                      (format
-                       (concat "Remote kernel %s is no longer alive on %s. "
+      (let* ((argv (emacs-jupyter-notebook-ssh-build-pid-alive profile pid))
+             (probe-name (format "emacs-jupyter-notebook-pid-probe-%s"
+                                 (or (plist-get context :session-id) pid)))
+             (sentinel
+              (lambda (process _event)
+                (when (memq (process-status process) '(exit signal))
+                  (let ((ok (and (eq (process-status process) 'exit)
+                                 (zerop (process-exit-status process)))))
+                    (when (buffer-live-p buffer)
+                      (with-current-buffer buffer
+                        (when (eq emacs-jupyter-notebook--async-context context)
+                          (emacs-jupyter-notebook--async-put
+                           context :probe-process nil)
+                          (emacs-jupyter-notebook--async-delete-process process)
+                          (if ok
+                              (emacs-jupyter-notebook--async-retrieve context)
+                            (emacs-jupyter-notebook--async-fail
+                             (emacs-jupyter-notebook--async-put
+                              context :error-kind 'kernel-dead)
+                             (format
+                              (concat
+                               "Remote kernel %s is no longer alive on %s. "
                                "Start a new one with "
                                "`M-x emacs-jupyter-notebook-start-remote-kernel'.")
-                       pid
-                       (or (plist-get entry :remote-host) "the remote host")))))))))))))))
+                              pid
+                              (or (plist-get entry :remote-host)
+                                  "the remote host")))))))))))
+             (process (emacs-jupyter-notebook-ssh-start-process
+                       probe-name argv sentinel)))
+        (emacs-jupyter-notebook--async-put context :probe-process process))))))
 
 ;; W4.7: the synchronous `--connect-entry' that drove the now-removed
 ;; `--retrieve-connection-file' and `--wait-for-tunnel' has been removed.
@@ -1237,17 +1274,20 @@ On failure, call ERROR-CALLBACK with (context error-data)."
        (emacs-jupyter-notebook--async-add-error-callback
         emacs-jupyter-notebook--async-context error-callback)))
    (t
-     (if-let ((entry (emacs-jupyter-notebook--current-file-registry-entry)))
-         (emacs-jupyter-notebook-reconnect-remote-kernel
-          entry callback
-          (lambda (_context error-data)
-            (emacs-jupyter-notebook--remove-registry-entry entry)
-            (message "emacs-jupyter-notebook: reconnect failed (%s); starting a new kernel"
-                     error-data)
-            (emacs-jupyter-notebook-start-remote-kernel
-             emacs-jupyter-notebook-default-profile callback error-callback)))
-       (emacs-jupyter-notebook-start-remote-kernel
-        emacs-jupyter-notebook-default-profile callback error-callback)))))
+    ;; W4.8: when reconnect to a known registry entry fails (including the
+    ;; W4.4 dead-PID case) we MUST NOT auto-remove the entry or auto-start
+    ;; a fresh kernel — only the explicit user commands `shutdown-kernel'
+    ;; and `clean-orphaned-kernels' may terminate / deregister.  Surface
+    ;; the error to the caller; the message produced by `--async-fail'
+    ;; (W4.3 / W4.4) already points the user at `start-remote-kernel'.
+    (if-let ((entry (emacs-jupyter-notebook--current-file-registry-entry)))
+        (emacs-jupyter-notebook-reconnect-remote-kernel
+         entry callback
+         (lambda (context error-data)
+           (when error-callback
+             (funcall error-callback context error-data))))
+      (emacs-jupyter-notebook-start-remote-kernel
+       emacs-jupyter-notebook-default-profile callback error-callback)))))
 
 ;;; Completion (W3: non-blocking capf with LRU cache + idle delay)
 ;;

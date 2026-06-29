@@ -351,10 +351,15 @@ W4.4 dead-PID probe test); production code must not."
         (should-not started)))))
 
 (ert-deftest ejn-reconnect-remote-kernel-uses-async-retrieve ()
+  ;; Post-W4.4: reconnect first runs `--async-probe-pid-alive', which only
+  ;; advances to `--async-retrieve' when the entry's `:remote-pid' is alive.
+  ;; The probe is stubbed here to call retrieve directly so this test still
+  ;; pins the contract "reconnect ends in async-retrieve, never sync SSH".
   (let ((entry '(:profile "p"
                  :remote-host "example.com"
                  :remote-cwd "~"
                  :kernelspec "python3"
+                 :remote-pid 12345
                  :remote-connection-file "~/.cache/ejn/kernel.json"
                  :session-id "session"))
         retrieved)
@@ -363,6 +368,9 @@ W4.4 dead-PID probe test); production code must not."
               ((symbol-function 'emacs-jupyter-notebook-ssh-run-command)
                (lambda (&rest _)
                  (ert-fail "reconnect command used synchronous SSH")))
+              ((symbol-function 'emacs-jupyter-notebook--async-probe-pid-alive)
+               (lambda (context)
+                 (emacs-jupyter-notebook--async-retrieve context)))
               ((symbol-function 'emacs-jupyter-notebook--async-retrieve)
                (lambda (context)
                  (setq retrieved t)
@@ -602,10 +610,11 @@ sentinel is present."
                '(:profile "p" :host "mother") 12345)))
     (should (member "kill -0 12345" argv))))
 
-(ert-deftest ejn-w4.4-async-probe-skips-when-no-pid ()
-  "W4.4: when the registry entry has no `:remote-pid' the probe is skipped
-and `--async-retrieve' is invoked directly."
-  (let* (retrieve-called probe-called
+(ert-deftest ejn-w4.8-async-probe-fails-when-no-pid ()
+  "W4.8: when the registry entry has no `:remote-pid' (pre-W4.2 session)
+the probe MUST fail with a clear explanation; it must NOT silently bypass
+to `--async-retrieve' (that would be a backwards-compat shim)."
+  (let* (retrieve-called probe-called fail-called fail-reason
          (entry '(:profile "p" :session-id "s1" :remote-host "h"
                   :remote-connection-file "/r/k.json"))
          (context (emacs-jupyter-notebook--async-new-context
@@ -616,10 +625,16 @@ and `--async-retrieve' is invoked directly."
     (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-retrieve)
                (lambda (_ctx) (setq retrieve-called t)))
               ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
-               (lambda (&rest _) (setq probe-called t) nil)))
+               (lambda (&rest _) (setq probe-called t) nil))
+              ((symbol-function 'emacs-jupyter-notebook--async-fail)
+               (lambda (_ctx err)
+                 (setq fail-called t fail-reason err))))
       (emacs-jupyter-notebook--async-probe-pid-alive context))
-    (should retrieve-called)
-    (should-not probe-called)))
+    (should-not retrieve-called)
+    (should-not probe-called)
+    (should fail-called)
+    (should (string-match-p "no recorded PID" fail-reason))
+    (should (string-match-p "start-remote-kernel" fail-reason))))
 
 (ert-deftest ejn-w4.4-async-probe-success-proceeds-to-retrieve ()
   "W4.4: a successful PID-alive probe leads to `--async-retrieve'."
@@ -680,6 +695,63 @@ explanation, leaving the registry entry intact."
     (should fail-called)
     (should (string-match-p "no longer alive" fail-reason))
     (should (string-match-p "start-remote-kernel" fail-reason))))
+
+(ert-deftest ejn-w4.8-ensure-client-async-does-not-auto-restart-on-dead-reconnect ()
+  "W4.8: when reconnect-to-entry fails (e.g. W4.4 dead-PID), the
+`--ensure-client-async' fallback MUST NOT remove the registry entry and
+MUST NOT start a fresh kernel.  It surfaces the error to the caller's
+error-callback so the user can decide."
+  (with-temp-buffer
+    (let* ((entry '(:profile "p" :session-id "s8" :remote-host "h"
+                    :remote-pid 99999 :local-file "/tmp/foo.py"
+                    :remote-connection-file "/r/k.json"))
+           reconnect-error-cb start-called registry-removed err-called)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
+                 (lambda () entry))
+                ((symbol-function 'emacs-jupyter-notebook-reconnect-remote-kernel)
+                 (lambda (_entry _cb error-cb)
+                   (setq reconnect-error-cb error-cb)))
+                ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
+                 (lambda (&rest _) (setq start-called t)))
+                ((symbol-function 'emacs-jupyter-notebook--remove-registry-entry)
+                 (lambda (&rest _) (setq registry-removed t))))
+        (emacs-jupyter-notebook--ensure-client-async
+         #'ignore
+         (lambda (_ctx _err) (setq err-called t)))
+        (should (functionp reconnect-error-cb))
+        ;; Simulate the W4.4 kernel-dead failure.
+        (funcall reconnect-error-cb nil "kernel-dead")
+        (should err-called)
+        (should-not start-called)
+        (should-not registry-removed)))))
+
+(ert-deftest ejn-w4.8-async-fail-disposes-probe-process-stderr-buffer ()
+  "W4.8: `--async-fail' disposes the W4.4 PID-probe process and its stderr
+buffer when the context carries one."
+  (with-temp-buffer
+    (let* ((probe (emacs-jupyter-notebook-ssh-start-process
+                   "ejn-test-probe-fail" '("sleep" "60")))
+           (stderr (process-get probe 'emacs-jupyter-notebook-stderr-buffer))
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'probe
+                     :probe-process probe)))
+      (should (buffer-live-p stderr))
+      (cl-letf (((symbol-function 'display-warning) #'ignore))
+        (emacs-jupyter-notebook--async-fail context "boom"))
+      (should-not (process-live-p probe))
+      (should-not (buffer-live-p stderr)))))
+
+(ert-deftest ejn-w4.8-heartbeat-cancel-cancels-pending-timeout-timer ()
+  "W4.8: `--heartbeat-cancel' must also cancel the per-probe timeout timer
+so it cannot fire (and bump misses) after cleanup."
+  (with-temp-buffer
+    (setq emacs-jupyter-notebook--heartbeat-timer
+          (run-with-timer 1000 nil #'ignore))
+    (setq emacs-jupyter-notebook--heartbeat-timeout-timer
+          (run-with-timer 1000 nil #'ignore))
+    (emacs-jupyter-notebook--heartbeat-cancel)
+    (should-not emacs-jupyter-notebook--heartbeat-timer)
+    (should-not emacs-jupyter-notebook--heartbeat-timeout-timer)))
 
 (ert-deftest ejn-w4.5-heartbeat-success-keeps-tunnel-alive ()
   "W4.5: a successful heartbeat reply keeps `--tunnel-dead' nil and resets
@@ -1163,36 +1235,13 @@ leaves source-buffer text untouched."
         (should (functionp (cdr start-captured)))
         (should eval-called)))))
 
-(ert-deftest ejn-evaluate-cell-stale-file-entry-falls-back-to-start-default ()
-  (ejn-test-with-temp-buffer "# %%\na = 1\n"
-    (let* ((emacs-jupyter-notebook--client nil)
-           (emacs-jupyter-notebook--async-context nil)
-           (emacs-jupyter-notebook-default-profile "mydefault")
-           (entry '(:profile "p" :session-id "stale" :local-file "/tmp/x.py"))
-           start-captured
-           removed-key
-           eval-called
-           (emacs-jupyter-notebook-jupyter-evaluate-function
-            (lambda (_client _code _entry-handle)
-              (setq eval-called t))))
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
-                 (lambda () entry))
-                ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
-                 (lambda (key &optional _file)
-                   (setq removed-key key)))
-                ((symbol-function 'emacs-jupyter-notebook-reconnect-remote-kernel)
-                 (lambda (captured-entry _callback &optional error-callback)
-                   (should (equal captured-entry entry))
-                   (funcall error-callback nil "missing connection file")))
-                ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
-                 (lambda (profile callback &optional _error-callback)
-                   (setq start-captured profile)
-                   (setq emacs-jupyter-notebook--client 'mock-client)
-                   (funcall callback nil))))
-        (emacs-jupyter-notebook-evaluate-current-cell)
-        (should (equal removed-key "stale"))
-        (should (equal start-captured "mydefault"))
-        (should eval-called)))))
+;; W4.8: `ejn-evaluate-cell-stale-file-entry-falls-back-to-start-default'
+;; was removed.  The old behavior — silently removing the registry entry
+;; and starting a fresh kernel when reconnect to a stale entry failed —
+;; violates the binding rule that only `shutdown-kernel' and
+;; `clean-orphaned-kernels' may terminate / deregister.  The new
+;; `--ensure-client-async' surfaces the reconnect error to the caller
+;; instead; see `ejn-w4.8-ensure-client-async-does-not-auto-restart-on-dead-reconnect'.
 
 (ert-deftest ejn-evaluate-cell-async-in-progress-chains-callback ()
   (ejn-test-with-temp-buffer "# %%\na = 1\n"
@@ -2206,14 +2255,21 @@ leaves source-buffer text untouched."
         (should (get-text-property 0 'display result))))))
 
 (ert-deftest ejn-tunnel-reconnect-is-async-and-uses-reconnect-context ()
+  ;; Post-W4.4: tunnel-reconnect goes through `--async-probe-pid-alive'
+  ;; before retrieve.  The probe is stubbed to call retrieve directly so
+  ;; this test still pins the async-only contract.
   (let ((entry '(:profile "p"
                  :remote-host "example.com"
                  :remote-cwd "~"
                  :kernelspec "python3"
+                 :remote-pid 12345
                  :remote-connection-file "~/.cache/ejn/kernel.json"
                  :session-id "session"))
         (retrieve-called nil))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-retrieve)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-probe-pid-alive)
+               (lambda (context)
+                 (emacs-jupyter-notebook--async-retrieve context)))
+              ((symbol-function 'emacs-jupyter-notebook--async-retrieve)
                (lambda (context)
                  (setq retrieve-called t)
                  context))
