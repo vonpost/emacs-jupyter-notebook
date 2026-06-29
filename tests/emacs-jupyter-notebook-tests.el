@@ -2905,6 +2905,50 @@ the evaluate flow."
       (let ((content (plist-get (ejn-panel-entry-snapshot handle) :content)))
         (should (string-match-p "timed out after 5s" content))))))
 
+(ert-deftest ejn-w5.4-interrupt-kernel-dispatches-through-adapter-var ()
+  "W5.4: `emacs-jupyter-notebook-interrupt-kernel' calls
+`emacs-jupyter-notebook-jupyter-interrupt-function'.  Stub the var,
+invoke the interactive command, assert the stub saw the buffer-local
+client."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          captured)
+      (let ((emacs-jupyter-notebook-jupyter-interrupt-function
+             (lambda (client) (setq captured client))))
+        (call-interactively #'emacs-jupyter-notebook-interrupt-kernel))
+      (should (eq captured 'mock-client)))))
+
+(ert-deftest ejn-w5.4-restart-kernel-dispatches-through-adapter-var ()
+  "W5.4: `emacs-jupyter-notebook-restart-kernel' calls
+`emacs-jupyter-notebook-jupyter-restart-function'."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          captured)
+      (let ((emacs-jupyter-notebook-jupyter-restart-function
+             (lambda (client) (setq captured client))))
+        (call-interactively #'emacs-jupyter-notebook-restart-kernel))
+      (should (eq captured 'mock-client)))))
+
+(ert-deftest ejn-w5.4-interrupt-kernel-errors-without-client ()
+  "W5.4: interrupt without a client surfaces a clear error, does not call adapter."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client nil)
+          adapter-called)
+      (let ((emacs-jupyter-notebook-jupyter-interrupt-function
+             (lambda (&rest _) (setq adapter-called t))))
+        (should-error (call-interactively #'emacs-jupyter-notebook-interrupt-kernel)))
+      (should-not adapter-called))))
+
+(ert-deftest ejn-w5.4-restart-kernel-errors-without-client ()
+  "W5.4: restart without a client surfaces a clear error, does not call adapter."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client nil)
+          adapter-called)
+      (let ((emacs-jupyter-notebook-jupyter-restart-function
+             (lambda (&rest _) (setq adapter-called t))))
+        (should-error (call-interactively #'emacs-jupyter-notebook-restart-kernel)))
+      (should-not adapter-called))))
+
 (ert-deftest ejn-w5.3-cancel-during-evaluation-interrupts ()
   "W5.3: cancel-operation with a live --evaluation-request calls interrupt and clears it."
   (with-temp-buffer
