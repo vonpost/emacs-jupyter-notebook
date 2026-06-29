@@ -413,6 +413,27 @@ flow stays fully non-blocking.
 - [x] sha=3c21c15 W4.7 Audit and remove the sync `--retrieve-connection-file` code path.
       All retrieval must go through the async retrieve. ERT: there is no
       `sleep-for` reachable from any user-facing command.
+- [~] owner=W4-fixup claimed=2026-06-30 W4.8 Remediation pass on review findings:
+      (a) CRITICAL: `--ensure-client-async`'s fallback removes the registry
+          entry and starts a new kernel when reconnect fails.  After W4.4 a
+          dead-PID surfaces as a reconnect failure, so this path silently
+          violates the binding rule (only `shutdown-kernel` and
+          `clean-orphaned-kernels` may remove/replace).  Fix: surface the
+          error to the user via the error-callback and STOP — no
+          auto-remove, no auto-restart.
+      (b) HIGH: the W4.4 PID-probe process is not stored or disposed,
+          leaking stdout/stderr buffers per probe.  Fix: capture the probe
+          process in the context and dispose in the sentinel.
+      (c) HIGH: the W4.5 heartbeat timeout `run-with-timer' is not stored
+          and not cancelled by `--heartbeat-cancel'.  Fix: store on the
+          buffer-local `--heartbeat-timeout-timer' and cancel from
+          `--heartbeat-cancel'.
+      (d) MEDIUM: the no-PID bypass in `--async-probe-pid-alive' is a
+          backwards-compat shim.  Fix: when the entry has no `:remote-pid'
+          the probe MUST fail with a clear "session has no PID; start a
+          fresh kernel" message rather than proceeding blind.
+      Deferred:
+      (e) heartbeat-death log via W6 log buffer — defer to W6 wiring.
 
 Acceptance: every W4 row [x]; manual smoke: drop the tunnel from outside
 Emacs, observe `EJN!` within `heartbeat-interval`; the rest of Emacs stays
