@@ -2801,6 +2801,131 @@ the evaluate flow."
         (should (eq (plist-get emacs-jupyter-notebook--evaluation-request :request-id) 7))
         (should-not emacs-jupyter-notebook--kernel-status)))))
 
+(ert-deftest ejn-w5.2-timeout-calls-interrupt-adapter ()
+  "W5.2: evaluation timeout calls the configured interrupt adapter."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
+           (emacs-jupyter-notebook--client 'mock-client)
+           (emacs-jupyter-notebook--evaluation-request
+            (list :request-id 1
+                  :panel-entry handle
+                  :cell-key '("x.py" . 1)
+                  :started-at (float-time)))
+           (emacs-jupyter-notebook-evaluation-timeout 5)
+           interrupt-arg)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-interrupt)
+                 (lambda (client) (setq interrupt-arg client))))
+        (emacs-jupyter-notebook--evaluation-on-timeout 1))
+      (should (eq interrupt-arg 'mock-client)))))
+
+(ert-deftest ejn-w5.2-timeout-annotates-panel-with-error-suffix ()
+  "W5.2: timeout appends \"timed out after Ns\" with error face to the panel entry."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
+           (emacs-jupyter-notebook--client 'mock-client)
+           (emacs-jupyter-notebook--evaluation-request
+            (list :request-id 1
+                  :panel-entry handle
+                  :cell-key '("x.py" . 1)
+                  :started-at (float-time)))
+           (emacs-jupyter-notebook-evaluation-timeout 5))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-interrupt) #'ignore))
+        (emacs-jupyter-notebook--evaluation-on-timeout 1))
+      (let* ((snap (ejn-panel-entry-snapshot handle))
+             (content (plist-get snap :content)))
+        (should (stringp content))
+        (should (string-match-p "timed out after 5s" content))
+        (should (eq (plist-get snap :status) 'error))
+        (let* ((idx (string-match "timed out after" content)))
+          (should idx)
+          (should (eq (get-text-property idx 'face content)
+                      'emacs-jupyter-notebook-result-error-face)))))))
+
+(ert-deftest ejn-w5.2-timeout-clears-evaluation-request ()
+  "W5.2: a fired timeout clears --evaluation-request."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
+           (emacs-jupyter-notebook--client 'mock-client)
+           (emacs-jupyter-notebook--evaluation-request
+            (list :request-id 1
+                  :panel-entry handle
+                  :cell-key '("x.py" . 1)
+                  :started-at (float-time)))
+           (emacs-jupyter-notebook-evaluation-timeout 5))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-interrupt) #'ignore))
+        (emacs-jupyter-notebook--evaluation-on-timeout 1))
+      (should-not emacs-jupyter-notebook--evaluation-request))))
+
+(ert-deftest ejn-w5.2-timeout-does-not-shutdown-or-touch-registry ()
+  "W5.2: binding rule — the timeout must NOT call shutdown or registry remove."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
+           (emacs-jupyter-notebook--client 'mock-client)
+           (emacs-jupyter-notebook--evaluation-request
+            (list :request-id 1
+                  :panel-entry handle
+                  :cell-key '("x.py" . 1)
+                  :started-at (float-time)))
+           (emacs-jupyter-notebook-evaluation-timeout 5)
+           shutdown-called registry-remove-called cleanup-entry-called)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-interrupt) #'ignore)
+                ((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
+                 (lambda (&rest _) (setq shutdown-called t)))
+                ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
+                 (lambda (&rest _) (setq registry-remove-called t)))
+                ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
+                 (lambda (&rest _) (setq cleanup-entry-called t))))
+        (emacs-jupyter-notebook--evaluation-on-timeout 1))
+      (should-not shutdown-called)
+      (should-not registry-remove-called)
+      (should-not cleanup-entry-called))))
+
+(ert-deftest ejn-w5.2-timeout-without-client-does-not-error ()
+  "W5.2: timeout fired with no live client annotates the panel and does not raise."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
+           (emacs-jupyter-notebook--client nil)
+           (emacs-jupyter-notebook--evaluation-request
+            (list :request-id 1
+                  :panel-entry handle
+                  :cell-key '("x.py" . 1)
+                  :started-at (float-time)))
+           (emacs-jupyter-notebook-evaluation-timeout 5)
+           interrupt-called)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-interrupt)
+                 (lambda (&rest _) (setq interrupt-called t))))
+        (emacs-jupyter-notebook--evaluation-on-timeout 1))
+      (should-not interrupt-called)
+      (should-not emacs-jupyter-notebook--evaluation-request)
+      (let ((content (plist-get (ejn-panel-entry-snapshot handle) :content)))
+        (should (string-match-p "timed out after 5s" content))))))
+
+(ert-deftest ejn-w5.2-timeout-sets-fringe-to-error ()
+  "W5.2: timeout marks the cell's fringe indicator as errored."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (cell-key '("x.py" . 1))
+           (handle (ejn-panel-start-entry panel cell-key "x = 1"))
+           (emacs-jupyter-notebook--client 'mock-client)
+           (emacs-jupyter-notebook--evaluation-request
+            (list :request-id 1
+                  :panel-entry handle
+                  :cell-key cell-key
+                  :started-at (float-time)))
+           (emacs-jupyter-notebook-evaluation-timeout 5)
+           fringe-args)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-interrupt) #'ignore)
+                ((symbol-function 'emacs-jupyter-notebook-fringe-set)
+                 (lambda (&rest args) (setq fringe-args args))))
+        (emacs-jupyter-notebook--evaluation-on-timeout 1))
+      (should (equal (car fringe-args) cell-key))
+      (should (eq (cadr fringe-args) 'error)))))
+
 (ert-deftest ejn-async-connect-calls-connect-async-function ()
   (let ((entry '(:profile "p"
                  :remote-host "example.com"

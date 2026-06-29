@@ -408,15 +408,47 @@ Called in the source buffer.  If `--evaluation-request' no longer matches
 REQUEST-ID (the reply arrived first, or another request superseded it) the
 timeout is a no-op so a stale closure cannot interrupt the wrong thing.
 
-W5.1 plumbing only: messages the user.  W5.2 wires interrupt + panel
-annotation onto this same hook."
+W5.2: when the request matches, fire-and-forget an interrupt through the
+adapter (the remote kernel outlives Emacs — interrupt is NOT shutdown),
+annotate the panel entry with an error-face suffix \"timed out after Ns\",
+clear `--evaluation-request', mark the entry finished with status=error,
+and tag the cell fringe as errored.  The remote kernel registry is left
+untouched."
   (let ((request emacs-jupyter-notebook--evaluation-request))
     (when (and request
                (eq (plist-get request :request-id) request-id))
-      (message "Evaluation timed out after %ss. Kernel may be busy or unresponsive. Use C-c C-k to interrupt."
-               emacs-jupyter-notebook-evaluation-timeout)
-      (setq emacs-jupyter-notebook--kernel-status 'busy)
-      (force-mode-line-update t))))
+      (let* ((timeout emacs-jupyter-notebook-evaluation-timeout)
+             (handle (plist-get request :panel-entry))
+             (cell-key (plist-get request :cell-key))
+             (client emacs-jupyter-notebook--client)
+             (suffix (format "\ntimed out after %ss" timeout)))
+        ;; Clear FIRST so a re-entrant timeout/cancel from anywhere in the
+        ;; downstream calls finds no in-flight request.
+        (setq emacs-jupyter-notebook--evaluation-request nil)
+        (when (timerp emacs-jupyter-notebook--evaluation-timer)
+          (cancel-timer emacs-jupyter-notebook--evaluation-timer))
+        (setq emacs-jupyter-notebook--evaluation-timer nil)
+        ;; Annotate the panel entry.  Best-effort: the panel may have been
+        ;; killed; the source buffer must not raise.
+        (when handle
+          (ignore-errors
+            (ejn-panel-append-text
+             handle suffix
+             'emacs-jupyter-notebook-result-error-face))
+          (ignore-errors (ejn-panel-finish-entry handle 'error nil)))
+        (when cell-key
+          (ignore-errors
+            (emacs-jupyter-notebook-fringe-set cell-key 'error nil)))
+        ;; Fire-and-forget interrupt through the adapter.  The contract is
+        ;; that this is async at the kernel level; we do not block on it
+        ;; here, and we do not touch the registry or call shutdown.
+        (when client
+          (ignore-errors
+            (emacs-jupyter-notebook-jupyter-interrupt client)))
+        (message "emacs-jupyter-notebook: evaluation timed out after %ss; interrupted kernel."
+                 timeout)
+        (setq emacs-jupyter-notebook--kernel-status 'busy)
+        (force-mode-line-update t)))))
 
 (defun emacs-jupyter-notebook--release-local-resources ()
   "Drop the current buffer's local kernel handles without touching durable state.
