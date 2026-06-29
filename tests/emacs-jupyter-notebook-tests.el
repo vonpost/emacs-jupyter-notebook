@@ -2905,6 +2905,113 @@ the evaluate flow."
       (let ((content (plist-get (ejn-panel-entry-snapshot handle) :content)))
         (should (string-match-p "timed out after 5s" content))))))
 
+(ert-deftest ejn-w5.3-cancel-during-evaluation-interrupts ()
+  "W5.3: cancel-operation with a live --evaluation-request calls interrupt and clears it."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
+           (emacs-jupyter-notebook--client 'mock-client)
+           (emacs-jupyter-notebook--async-context nil)
+           (emacs-jupyter-notebook--evaluation-request
+            (list :request-id 1
+                  :panel-entry handle
+                  :cell-key '("x.py" . 1)
+                  :started-at (float-time)))
+           interrupt-arg)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-interrupt)
+                 (lambda (client) (setq interrupt-arg client))))
+        (emacs-jupyter-notebook-cancel-operation))
+      (should (eq interrupt-arg 'mock-client))
+      (should-not emacs-jupyter-notebook--evaluation-request))))
+
+(ert-deftest ejn-w5.3-cancel-during-connect-does-not-interrupt ()
+  "W5.3: cancel-operation during connect cancels async context, NOT interrupt."
+  (let (interrupt-called)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry) #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook-jupyter-interrupt)
+               (lambda (&rest _) (setq interrupt-called t))))
+      (with-temp-buffer
+        (setq emacs-jupyter-notebook--session-entry '(:profile "p" :session-id "s"))
+        (setq emacs-jupyter-notebook--async-context
+              (emacs-jupyter-notebook--async-new-context
+               :phase 'connect
+               :origin-buffer (current-buffer)
+               :error-callback (lambda (_ctx _err) nil)))
+        (setq emacs-jupyter-notebook--evaluation-request nil)
+        (emacs-jupyter-notebook-cancel-operation)
+        (should-not interrupt-called)
+        (should-not emacs-jupyter-notebook--async-context)))))
+
+(ert-deftest ejn-w5.3-cancel-during-evaluation-does-not-shutdown ()
+  "W5.3: binding rule — cancel must not call shutdown / registry-remove / cleanup-remote-entry."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
+           (emacs-jupyter-notebook--client 'mock-client)
+           (emacs-jupyter-notebook--async-context nil)
+           (emacs-jupyter-notebook--evaluation-request
+            (list :request-id 1
+                  :panel-entry handle
+                  :cell-key '("x.py" . 1)
+                  :started-at (float-time)))
+           shutdown-called registry-remove-called cleanup-entry-called)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-interrupt) #'ignore)
+                ((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
+                 (lambda (&rest _) (setq shutdown-called t)))
+                ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
+                 (lambda (&rest _) (setq registry-remove-called t)))
+                ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
+                 (lambda (&rest _) (setq cleanup-entry-called t))))
+        (emacs-jupyter-notebook-cancel-operation))
+      (should-not shutdown-called)
+      (should-not registry-remove-called)
+      (should-not cleanup-entry-called))))
+
+(ert-deftest ejn-w5.3-cancel-with-nothing-in-flight-user-errors ()
+  "W5.3: cancel with neither async nor evaluation pending signals a user-error."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--async-context nil)
+          (emacs-jupyter-notebook--evaluation-request nil))
+      (should-error (emacs-jupyter-notebook-cancel-operation)
+                    :type 'user-error))))
+
+(ert-deftest ejn-w5.3-cancel-during-evaluation-annotates-panel-cancelled ()
+  "W5.3: cancel during evaluation appends \"cancelled\" with error face to the entry."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
+           (emacs-jupyter-notebook--client 'mock-client)
+           (emacs-jupyter-notebook--async-context nil)
+           (emacs-jupyter-notebook--evaluation-request
+            (list :request-id 1
+                  :panel-entry handle
+                  :cell-key '("x.py" . 1)
+                  :started-at (float-time))))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-interrupt) #'ignore))
+        (emacs-jupyter-notebook-cancel-operation))
+      (let* ((snap (ejn-panel-entry-snapshot handle))
+             (content (plist-get snap :content)))
+        (should (string-match-p "cancelled" content))
+        (should (eq (plist-get snap :status) 'error))))))
+
+(ert-deftest ejn-w5.3-cancel-completes-fast ()
+  "W5.3 async-is-the-rule: cancel-operation must be fast (single-digit ms).
+Mock interrupt to a no-op; the interactive cancel path must not block."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
+           (emacs-jupyter-notebook--client 'mock-client)
+           (emacs-jupyter-notebook--async-context nil)
+           (emacs-jupyter-notebook--evaluation-request
+            (list :request-id 1
+                  :panel-entry handle
+                  :cell-key '("x.py" . 1)
+                  :started-at (float-time))))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-interrupt) #'ignore))
+        (let ((t0 (float-time)))
+          (emacs-jupyter-notebook-cancel-operation)
+          (should (< (- (float-time) t0) 0.05)))))))
+
 (ert-deftest ejn-w5.2-timeout-sets-fringe-to-error ()
   "W5.2: timeout marks the cell's fringe indicator as errored."
   (with-temp-buffer

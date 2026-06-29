@@ -1921,14 +1921,58 @@ profile, then fall back to `emacs-jupyter-notebook-default-profile'."
         (emacs-jupyter-notebook-panel-flush-now panel)))))
 
 (defun emacs-jupyter-notebook-cancel-operation ()
-  "Cancel the current buffer's in-progress async Jupyter operation."
+  "Cancel the current buffer's in-progress operation.
+
+W5.3: two branches.
+- If an async context is in progress (launch / retrieve / tunnel /
+  connect), cancel it via `--async-fail' exactly as before — the
+  evaluation branch is NOT taken because there is no live kernel to
+  interrupt.
+- Otherwise, if an evaluation is in flight (`--evaluation-request' is
+  set), fire-and-forget an interrupt through the adapter and clear the
+  request, the timer, and the panel/fringe state for that entry.  This
+  path must complete in single-digit milliseconds — interrupt is async
+  at the kernel level and we never wait for the reply.
+
+If neither is in progress, signal a `user-error'."
   (interactive)
-  (if emacs-jupyter-notebook--async-context
-      (progn
-        (emacs-jupyter-notebook--async-fail
-         emacs-jupyter-notebook--async-context "Operation cancelled")
-        (setq emacs-jupyter-notebook--async-context nil))
-    (user-error "No emacs-jupyter-notebook operation is in progress")))
+  (cond
+   (emacs-jupyter-notebook--async-context
+    (emacs-jupyter-notebook--async-fail
+     emacs-jupyter-notebook--async-context "Operation cancelled")
+    (setq emacs-jupyter-notebook--async-context nil))
+   (emacs-jupyter-notebook--evaluation-request
+    (emacs-jupyter-notebook--cancel-evaluation))
+   (t
+    (user-error "No emacs-jupyter-notebook operation is in progress"))))
+
+(defun emacs-jupyter-notebook--cancel-evaluation ()
+  "Interrupt the in-flight evaluation and clear the request slot.
+Best-effort.  Does NOT call `jupyter-shutdown', does NOT remove the
+registry entry, does NOT touch the local connection file — the remote
+kernel outlives Emacs.  Annotates the panel entry with a \"cancelled\"
+suffix and tags the cell fringe as errored."
+  (let* ((request emacs-jupyter-notebook--evaluation-request)
+         (handle (plist-get request :panel-entry))
+         (cell-key (plist-get request :cell-key))
+         (client emacs-jupyter-notebook--client))
+    ;; Clear FIRST so re-entrancy from the disposers cannot loop.
+    (setq emacs-jupyter-notebook--evaluation-request nil)
+    (when (timerp emacs-jupyter-notebook--evaluation-timer)
+      (cancel-timer emacs-jupyter-notebook--evaluation-timer))
+    (setq emacs-jupyter-notebook--evaluation-timer nil)
+    (when handle
+      (ignore-errors
+        (ejn-panel-append-text
+         handle "\ncancelled"
+         'emacs-jupyter-notebook-result-error-face))
+      (ignore-errors (ejn-panel-finish-entry handle 'error nil)))
+    (when cell-key
+      (ignore-errors
+        (emacs-jupyter-notebook-fringe-set cell-key 'error nil)))
+    (when client
+      (ignore-errors
+        (emacs-jupyter-notebook-jupyter-interrupt client)))))
 
 (defun emacs-jupyter-notebook-toggle-panel-view ()
   "Toggle the source buffer's output panel between latest and history views."
