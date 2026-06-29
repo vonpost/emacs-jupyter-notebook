@@ -466,7 +466,7 @@ plumbing grows teeth.
       `--evaluation-request` is set, interrupt and clear it; the existing
       async-context cancel branch is untouched. ERT: cancel during
       evaluation interrupts; cancel during connect does not interrupt.
-- [ ] W5.4 ERT: interrupt and restart interactive commands dispatch through
+- [~] owner=W5-agent claimed=2026-06-30 W5.4 ERT: interrupt and restart interactive commands dispatch through
       their adapter function vars (currently completely uncovered).
 
 Acceptance: every W5 row [x]; manual smoke: start an infinite loop, hit
