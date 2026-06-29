@@ -2693,6 +2693,114 @@ the evaluate flow."
         (sit-for 2)
         (should (cl-some (lambda (m) (string-match-p "[Ee]valuation timed out" m)) messages))))))
 
+(ert-deftest ejn-w5.1-evaluation-request-set-on-evaluate ()
+  "W5.1: --evaluate records request-id, panel-entry, cell-key, started-at."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--evaluation-timer nil)
+          (emacs-jupyter-notebook--evaluation-request nil)
+          (emacs-jupyter-notebook--evaluation-request-counter 0)
+          (emacs-jupyter-notebook-evaluation-timeout 120))
+      (cl-letf* ((orig-require (symbol-function 'require))
+                 ((symbol-function 'require)
+                  (lambda (feature &optional filename noerror)
+                    (if (memq feature '(jupyter-client jupyter-messages jupyter-monads))
+                        feature
+                      (funcall orig-require feature filename noerror))))
+                 ((symbol-function 'emacs-jupyter-notebook-jupyter--ensure) #'ignore)
+                 ((symbol-function 'jupyter-run-with-state) (lambda (&rest _) nil))
+                 ((symbol-function 'jupyter-sent) (lambda (x) x))
+                 ((symbol-function 'jupyter-message-subscribed) (lambda (req _cbs) req))
+                 ((symbol-function 'jupyter-execute-request)
+                  (lambda (&rest _) 'mock-request)))
+        (insert "# %%\nx = 1\n")
+        (let* ((panel (ejn-panel-ensure (current-buffer)))
+               (cell-key '("x.py" . 1))
+               (handle (ejn-panel-start-entry panel cell-key "x = 1")))
+          (unwind-protect
+              (emacs-jupyter-notebook-jupyter--evaluate
+               'mock-client "x = 1" handle)
+            (when (timerp emacs-jupyter-notebook--evaluation-timer)
+              (cancel-timer emacs-jupyter-notebook--evaluation-timer)))
+          (let ((req emacs-jupyter-notebook--evaluation-request))
+            (should req)
+            (should (integerp (plist-get req :request-id)))
+            (should (> (plist-get req :request-id) 0))
+            (should (eq (plist-get req :panel-entry) handle))
+            (should (equal (plist-get req :cell-key) cell-key))
+            (should (numberp (plist-get req :started-at)))
+            (should (<= (plist-get req :started-at) (float-time)))))))))
+
+(ert-deftest ejn-w5.1-evaluation-request-cleared-on-execute-reply ()
+  "W5.1: execute_reply clears --evaluation-request on the source buffer."
+  (with-temp-buffer
+    (let* ((buffer (current-buffer))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
+           (reply-fn (cadr (assoc "execute_reply" callbacks))))
+      (setq emacs-jupyter-notebook--evaluation-request
+            (list :request-id 42
+                  :panel-entry handle
+                  :cell-key '("x.py" . 1)
+                  :started-at (float-time)))
+      (cl-letf (((symbol-function 'jupyter-message-content)
+                 (lambda (_msg) '(:status "ok" :execution_count 1))))
+        (funcall reply-fn 'mock-msg))
+      (should-not emacs-jupyter-notebook--evaluation-request))))
+
+(ert-deftest ejn-w5.1-evaluation-request-counter-bumps-per-call ()
+  "W5.1: every --evaluate dispatch picks up a unique request-id."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--evaluation-timer nil)
+          (emacs-jupyter-notebook--evaluation-request nil)
+          (emacs-jupyter-notebook--evaluation-request-counter 0)
+          (emacs-jupyter-notebook-evaluation-timeout 120))
+      (cl-letf* ((orig-require (symbol-function 'require))
+                 ((symbol-function 'require)
+                  (lambda (feature &optional filename noerror)
+                    (if (memq feature '(jupyter-client jupyter-messages jupyter-monads))
+                        feature
+                      (funcall orig-require feature filename noerror))))
+                 ((symbol-function 'emacs-jupyter-notebook-jupyter--ensure) #'ignore)
+                 ((symbol-function 'jupyter-run-with-state) (lambda (&rest _) nil))
+                 ((symbol-function 'jupyter-sent) (lambda (x) x))
+                 ((symbol-function 'jupyter-message-subscribed) (lambda (req _cbs) req))
+                 ((symbol-function 'jupyter-execute-request)
+                  (lambda (&rest _) 'mock-request)))
+        (insert "# %%\nx = 1\n")
+        (let* ((panel (ejn-panel-ensure (current-buffer)))
+               (handle1 (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
+               (handle2 (ejn-panel-start-entry panel '("x.py" . 2) "x = 2")))
+          (unwind-protect
+              (progn
+                (emacs-jupyter-notebook-jupyter--evaluate 'mock-client "x = 1" handle1)
+                (let ((id1 (plist-get emacs-jupyter-notebook--evaluation-request :request-id)))
+                  (emacs-jupyter-notebook-jupyter--evaluate 'mock-client "x = 2" handle2)
+                  (let ((id2 (plist-get emacs-jupyter-notebook--evaluation-request :request-id)))
+                    (should (integerp id1))
+                    (should (integerp id2))
+                    (should-not (= id1 id2))
+                    (should (> id2 id1)))))
+            (when (timerp emacs-jupyter-notebook--evaluation-timer)
+              (cancel-timer emacs-jupyter-notebook--evaluation-timer))))))))
+
+(ert-deftest ejn-w5.1-evaluation-on-timeout-ignores-stale-id ()
+  "W5.1: a stale timeout closure (mismatched request-id) is a no-op."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--evaluation-request
+           (list :request-id 7
+                 :panel-entry nil
+                 :cell-key nil
+                 :started-at (float-time)))
+          (emacs-jupyter-notebook--kernel-status nil)
+          messages)
+      (cl-letf (((symbol-function 'message)
+                 (lambda (&rest args) (push (apply #'format args) messages))))
+        (emacs-jupyter-notebook--evaluation-on-timeout 99)
+        (should-not messages)
+        (should (eq (plist-get emacs-jupyter-notebook--evaluation-request :request-id) 7))
+        (should-not emacs-jupyter-notebook--kernel-status)))))
+
 (ert-deftest ejn-async-connect-calls-connect-async-function ()
   (let ((entry '(:profile "p"
                  :remote-host "example.com"

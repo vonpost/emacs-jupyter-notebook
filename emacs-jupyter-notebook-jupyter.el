@@ -48,6 +48,10 @@
 (defvar jupyter-long-timeout)
 (defvar emacs-jupyter-notebook--kernel-status nil)
 (defvar emacs-jupyter-notebook--evaluation-timer nil)
+(defvar emacs-jupyter-notebook--evaluation-request nil)
+(defvar emacs-jupyter-notebook--evaluation-request-counter 0)
+(declare-function emacs-jupyter-notebook--evaluation-on-timeout
+                  "emacs-jupyter-notebook" (request-id))
 
 (defun emacs-jupyter-notebook-jupyter--message-content-value (msg key)
   "Return KEY from MSG content."
@@ -232,7 +236,12 @@ prompts."
                   (with-current-buffer buffer
                     (when (timerp emacs-jupyter-notebook--evaluation-timer)
                       (cancel-timer emacs-jupyter-notebook--evaluation-timer))
-                    (setq emacs-jupyter-notebook--evaluation-timer nil)))
+                    (setq emacs-jupyter-notebook--evaluation-timer nil)
+                    ;; W5.1: clear the in-flight request record.  The reply
+                    ;; for *this* request is the canonical termination
+                    ;; signal; the timeout path keys off the same slot to
+                    ;; know there is something to interrupt.
+                    (setq emacs-jupyter-notebook--evaluation-request nil)))
                 (let* ((status-s (emacs-jupyter-notebook-jupyter--message-content-value
                                   msg :status))
                        (count (emacs-jupyter-notebook-jupyter--message-content-value
@@ -387,18 +396,28 @@ in the caller's surface."
          (callbacks (emacs-jupyter-notebook-jupyter--callbacks
                      buffer entry-handle client))
          (watch-expressions
-          (emacs-jupyter-notebook-jupyter--watch-expressions-plist)))
+          (emacs-jupyter-notebook-jupyter--watch-expressions-plist))
+         (request-id (cl-incf emacs-jupyter-notebook--evaluation-request-counter))
+         (cell-key (plist-get entry-handle :cell-key)))
     (when (timerp emacs-jupyter-notebook--evaluation-timer)
       (cancel-timer emacs-jupyter-notebook--evaluation-timer))
+    ;; W5.1: record the in-flight request so the timeout, cancel, and
+    ;; future-reply paths can correlate this dispatch with its panel
+    ;; entry.  Cleared by `execute_reply' (in --callbacks) on normal
+    ;; completion, and by the timeout/cancel paths on abnormal exits.
+    (setq emacs-jupyter-notebook--evaluation-request
+          (list :request-id request-id
+                :panel-entry entry-handle
+                :cell-key cell-key
+                :started-at (float-time)))
     (setq emacs-jupyter-notebook--evaluation-timer
-          (run-at-time emacs-jupyter-notebook-evaluation-timeout nil
-                       (lambda ()
-                         (when (buffer-live-p buffer)
-                           (with-current-buffer buffer
-                             (message "Evaluation timed out after %ss. Kernel may be busy or unresponsive. Use C-c C-k to interrupt."
-                                      emacs-jupyter-notebook-evaluation-timeout)
-                             (setq emacs-jupyter-notebook--kernel-status 'busy)
-                             (force-mode-line-update t))))))
+          (run-at-time
+           emacs-jupyter-notebook-evaluation-timeout nil
+           (lambda ()
+             (when (buffer-live-p buffer)
+               (with-current-buffer buffer
+                 (emacs-jupyter-notebook--evaluation-on-timeout
+                  request-id))))))
     (jupyter-run-with-state
      client
      (jupyter-sent

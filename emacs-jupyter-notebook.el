@@ -117,6 +117,19 @@ Bumped every time a request is sent; replies for stale ids are dropped.")
 (defvar-local emacs-jupyter-notebook--evaluation-timer nil
   "Timeout timer for current evaluation.")
 
+(defvar-local emacs-jupyter-notebook--evaluation-request nil
+  "Buffer-local plist describing the in-flight execute request, or nil.
+Set by `--evaluate' when a request is dispatched and cleared by
+`execute_reply' (or by the timeout / `cancel-operation' paths).  Keys:
+  :request-id   monotonic counter unique per buffer
+  :panel-entry  the panel entry handle so the timeout/cancel paths can
+                annotate the right entry
+  :cell-key     cell key for the request (nil for region/paragraph/defun)
+  :started-at   float-time at dispatch (used for the timeout suffix)")
+
+(defvar-local emacs-jupyter-notebook--evaluation-request-counter 0
+  "Monotonic counter producing `:request-id' values for `--evaluation-request'.")
+
 (defvar-local emacs-jupyter-notebook--heartbeat-timer nil
   "Buffer-local repeating timer driving the W4.5 kernel-info heartbeat.")
 
@@ -389,6 +402,22 @@ disposer does not prevent the remaining disposers from running."
   (setq emacs-jupyter-notebook--evaluation-timer nil)
   (emacs-jupyter-notebook--completion-cancel-idle-timer))
 
+(defun emacs-jupyter-notebook--evaluation-on-timeout (request-id)
+  "Handle evaluation-timer expiry for the request identified by REQUEST-ID.
+Called in the source buffer.  If `--evaluation-request' no longer matches
+REQUEST-ID (the reply arrived first, or another request superseded it) the
+timeout is a no-op so a stale closure cannot interrupt the wrong thing.
+
+W5.1 plumbing only: messages the user.  W5.2 wires interrupt + panel
+annotation onto this same hook."
+  (let ((request emacs-jupyter-notebook--evaluation-request))
+    (when (and request
+               (eq (plist-get request :request-id) request-id))
+      (message "Evaluation timed out after %ss. Kernel may be busy or unresponsive. Use C-c C-k to interrupt."
+               emacs-jupyter-notebook-evaluation-timeout)
+      (setq emacs-jupyter-notebook--kernel-status 'busy)
+      (force-mode-line-update t))))
+
 (defun emacs-jupyter-notebook--release-local-resources ()
   "Drop the current buffer's local kernel handles without touching durable state.
 Cancels the in-flight async context's local processes and timers, tears down the
@@ -419,6 +448,7 @@ executes."
         emacs-jupyter-notebook--tunnel-process nil
         emacs-jupyter-notebook--tunnel-dead nil
         emacs-jupyter-notebook--kernel-status nil
+        emacs-jupyter-notebook--evaluation-request nil
         emacs-jupyter-notebook--completion-cache nil
         emacs-jupyter-notebook--completion-cache-order nil
         emacs-jupyter-notebook--completion-pending-key nil
@@ -1678,7 +1708,8 @@ non-nil, do not send a Jupyter shutdown request to the current client."
           emacs-jupyter-notebook--tunnel-dead nil
           emacs-jupyter-notebook--kernel-status nil
           emacs-jupyter-notebook--async-context nil
-          emacs-jupyter-notebook--evaluation-timer nil)
+          emacs-jupyter-notebook--evaluation-timer nil
+          emacs-jupyter-notebook--evaluation-request nil)
     (force-mode-line-update t)
     entry))
 
