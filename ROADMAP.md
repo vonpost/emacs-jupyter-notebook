@@ -457,7 +457,7 @@ plumbing grows teeth.
 - [x] sha=87b2c59 W5.1 Track the in-flight execute request id in a buffer-local
       `--evaluation-request` plist (request id, panel entry handle, cell
       key, started-at). Set in `--evaluate`; clear on `execute_reply`.
-- [~] owner=W5-agent claimed=2026-06-30 W5.2 `--evaluation-timer` enforces: on timeout, call
+- [x] sha=4f0d85e W5.2 `--evaluation-timer` enforces: on timeout, call
       `emacs-jupyter-notebook-jupyter-interrupt`, annotate the panel entry
       with an error face + "timed out after Ns" suffix, clear
       `--evaluation-request`, log to the W6 log buffer. ERT with stubbed
