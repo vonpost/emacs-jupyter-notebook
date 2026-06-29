@@ -627,31 +627,10 @@ spurious numbers in an SSH banner or MOTD cannot poison the parse."
         (or (cdr (assoc choice choices))
             (error "No registry entry selected"))))))
 
-(defun emacs-jupyter-notebook--retrieve-connection-file (profile remote-file local-file)
-  "Retrieve REMOTE-FILE for PROFILE into LOCAL-FILE using scp.
-Poll until the file is present and parseable or attempts are exhausted."
-  (let ((argv (emacs-jupyter-notebook-ssh-scp-from-command
-               profile remote-file local-file))
-        (attempt 0)
-        last-error
-        connection)
-    (while (and (< attempt emacs-jupyter-notebook-connection-retrieve-attempts)
-                (not connection))
-      (setq attempt (1+ attempt))
-      (condition-case err
-          (emacs-jupyter-notebook-ssh-run-command argv)
-        (error (setq last-error err)))
-      (when (file-readable-p local-file)
-        (condition-case err
-            (setq connection
-                  (emacs-jupyter-notebook-connection-read-file local-file))
-          (error (setq last-error err))))
-      (unless connection
-        (sleep-for emacs-jupyter-notebook-connection-retrieve-delay)))
-    (unless connection
-      (error "Could not retrieve remote connection file %s: %s"
-             remote-file (if last-error (error-message-string last-error) "not found")))
-    connection))
+;; W4.7: the synchronous `--retrieve-connection-file' that polled with
+;; `sleep-for' has been removed.  The async retrieve in
+;; `--async-retrieve' / `--async-retrieve-attempt' is the only path; it
+;; uses a `run-with-timer' loop and never blocks the UI.
 
 (defun emacs-jupyter-notebook--start-tunnel (profile remote-ports local-ports session-id)
   "Start an SSH tunnel for PROFILE from LOCAL-PORTS to REMOTE-PORTS."
@@ -674,26 +653,10 @@ Poll until the file is present and parseable or attempts are exhausted."
         t)
     (error nil)))
 
-(defun emacs-jupyter-notebook--wait-for-tunnel (process local-ports)
-  "Wait until PROCESS has opened all LOCAL-PORTS.
-Signal an error when the tunnel exits or the timeout expires."
-  (let ((deadline (+ (float-time) emacs-jupyter-notebook-tunnel-wait-timeout))
-        pending)
-    (while (progn
-             (setq pending
-                   (cl-remove-if
-                    (lambda (key)
-                      (emacs-jupyter-notebook--local-port-open-p
-                       (plist-get local-ports key)))
-                    emacs-jupyter-notebook-connection-port-keys))
-             (and pending (< (float-time) deadline)))
-      (unless (process-live-p process)
-        (error "Jupyter SSH tunnel exited before ports were ready"))
-      (sleep-for emacs-jupyter-notebook-tunnel-wait-delay))
-    (when pending
-      (error "Timed out waiting for Jupyter SSH tunnel ports: %s"
-             (mapconcat #'symbol-name pending ", ")))
-    t))
+;; W4.7: the synchronous `--wait-for-tunnel' that blocked the UI with
+;; `sleep-for' has been removed.  The async tunnel-readiness poller in
+;; `--async-wait-tunnel-tick' is the only path; it reschedules itself via
+;; `run-with-timer' until all ports open or the timeout expires.
 
 (defun emacs-jupyter-notebook--process-output (process)
   "Return PROCESS output buffer contents."
@@ -1251,34 +1214,10 @@ the retrieve step."
                        pid
                        (or (plist-get entry :remote-host) "the remote host")))))))))))))))
 
-;;; Synchronous connect path
-
-(defun emacs-jupyter-notebook--connect-entry (entry profile)
-  "Connect current buffer to remote kernel ENTRY using PROFILE."
-  (let* ((session-id (plist-get entry :session-id))
-         (remote-file (plist-get entry :remote-connection-file))
-         (remote-copy (make-temp-file "emacs-jupyter-notebook-remote-" nil ".json"))
-         (local-file (make-temp-file "emacs-jupyter-notebook-local-" nil ".json"))
-         (connection (emacs-jupyter-notebook--retrieve-connection-file
-                      profile remote-file remote-copy))
-         (remote-ports (emacs-jupyter-notebook-connection-ports connection))
-         (local-ports (emacs-jupyter-notebook-connection-allocate-local-ports))
-         (rewritten (emacs-jupyter-notebook-connection-rewrite-ports
-                     connection local-ports))
-         (tunnel (emacs-jupyter-notebook--start-tunnel
-                  profile remote-ports local-ports session-id)))
-    (emacs-jupyter-notebook-connection-write-file rewritten local-file)
-    (setq emacs-jupyter-notebook--tunnel-process tunnel)
-    (setq emacs-jupyter-notebook--tunnel-dead nil)
-    (emacs-jupyter-notebook--install-tunnel-sentinel tunnel (current-buffer))
-    (emacs-jupyter-notebook--wait-for-tunnel tunnel local-ports)
-    (setq emacs-jupyter-notebook--client
-          (emacs-jupyter-notebook-jupyter-connect local-file))
-    (setq entry (plist-put (copy-sequence entry) :tunnel-ports local-ports))
-    (setq entry (plist-put entry :local-connection-file local-file))
-    (setq emacs-jupyter-notebook--session-entry entry)
-    (emacs-jupyter-notebook-registry-save-entry entry)
-    entry))
+;; W4.7: the synchronous `--connect-entry' that drove the now-removed
+;; `--retrieve-connection-file' and `--wait-for-tunnel' has been removed.
+;; All reconnect goes through `--async-probe-pid-alive' →
+;; `--async-retrieve' → `--async-wait-tunnel-tick' → `--async-connect'.
 
 ;;; Ensure client (async)
 

@@ -247,93 +247,38 @@
       (emacs-jupyter-notebook-connection-write-file conn file)
       (should (equal (emacs-jupyter-notebook-connection-read-file file) conn)))))
 
-(ert-deftest ejn-retrieve-connection-file-retries-until-parseable ()
-  (ejn-test-with-temp-file local-file
-    (let ((attempts 0)
-          (sleeps 0)
-          (emacs-jupyter-notebook-connection-retrieve-attempts 3)
-          (emacs-jupyter-notebook-connection-retrieve-delay 0))
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-ssh-run-command)
-                 (lambda (_argv)
-                   (setq attempts (1+ attempts))
-                   (with-temp-file local-file
-                     (insert (if (= attempts 1)
-                                 "{"
-                               "{\"ip\":\"127.0.0.1\",\"shell_port\":123}")))
-                   ""))
-                ((symbol-function 'sleep-for)
-                 (lambda (&rest _)
-                   (setq sleeps (1+ sleeps)))))
-        (should (equal (emacs-jupyter-notebook--retrieve-connection-file
-                        '(:profile "p" :host "example.com")
-                        "/tmp/kernel.json" local-file)
-                       '(:ip "127.0.0.1" :shell_port 123)))
-        (should (= attempts 2))
-        (should (= sleeps 1))))))
+;; W4.7: the sync `--retrieve-connection-file' and `--wait-for-tunnel'
+;; tests have been removed along with the functions they exercised.  The
+;; async retrieve and tunnel-readiness poller are covered by
+;; `ejn-async-retrieve-*' / `ejn-async-wait-tunnel-*' (see ROADMAP W4.7).
 
-(ert-deftest ejn-wait-for-tunnel-retries-until-all-ports-open ()
-  (let ((attempts 0)
-        (sleeps 0)
-        (emacs-jupyter-notebook-tunnel-wait-timeout 1)
-        (emacs-jupyter-notebook-tunnel-wait-delay 0))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook--local-port-open-p)
-               (lambda (_port)
-                 (>= (cl-incf attempts) 6)))
-              ((symbol-function 'process-live-p)
-               (lambda (_process) t))
-              ((symbol-function 'sleep-for)
-               (lambda (&rest _)
-                 (setq sleeps (1+ sleeps)))))
-      (should (emacs-jupyter-notebook--wait-for-tunnel
-               'mock-process
-               '(:shell_port 1001
-                 :iopub_port 1002
-                 :stdin_port 1003
-                 :hb_port 1004
-                 :control_port 1005)))
-      (should (= sleeps 1)))))
+(ert-deftest ejn-w4.7-no-sleep-for-in-source-files ()
+  "W4.7 acceptance: no `sleep-for' call may appear in any package source
+file.  Test sources may still use it for synchronization (see the
+W4.4 dead-PID probe test); production code must not."
+  (let ((dir (file-name-directory
+              (or (locate-library "emacs-jupyter-notebook")
+                  (expand-file-name "emacs-jupyter-notebook.el")))))
+    (dolist (name '("emacs-jupyter-notebook.el"
+                    "emacs-jupyter-notebook-ssh.el"
+                    "emacs-jupyter-notebook-jupyter.el"
+                    "emacs-jupyter-notebook-result.el"
+                    "emacs-jupyter-notebook-connection.el"
+                    "emacs-jupyter-notebook-registry.el"
+                    "emacs-jupyter-notebook-vars.el"
+                    "emacs-jupyter-notebook-cell.el"))
+      (let ((path (expand-file-name name dir)))
+        (when (file-readable-p path)
+          (with-temp-buffer
+            (insert-file-contents path)
+            (goto-char (point-min))
+            (should-not
+             (re-search-forward "(sleep-for\\b" nil t))))))))
 
-(ert-deftest ejn-connect-entry-waits-for-tunnel-before-jupyter-connect ()
-  (let ((entry '(:profile "p"
-                 :remote-host "example.com"
-                 :remote-connection-file "/tmp/kernel.json"
-                 :session-id "session"))
-        (profile '(:profile "p" :host "example.com"))
-        (connection '(:ip "127.0.0.1"
-                      :transport "tcp"
-                      :shell_port 1
-                      :iopub_port 2
-                      :stdin_port 3
-                      :hb_port 4
-                      :control_port 5
-                      :key "secret"))
-        (local-ports '(:shell_port 1001
-                       :iopub_port 1002
-                       :stdin_port 1003
-                       :hb_port 1004
-                       :control_port 1005))
-        waited)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook--retrieve-connection-file)
-               (lambda (&rest _) connection))
-              ((symbol-function 'emacs-jupyter-notebook-connection-allocate-local-ports)
-               (lambda () local-ports))
-              ((symbol-function 'emacs-jupyter-notebook--start-tunnel)
-               (lambda (&rest _) 'mock-process))
-              ((symbol-function 'emacs-jupyter-notebook--wait-for-tunnel)
-               (lambda (_process ports)
-                 (should (equal ports local-ports))
-                 (setq waited t)))
-              ((symbol-function 'emacs-jupyter-notebook-jupyter-connect)
-               (lambda (_connection-file)
-                 (should waited)
-                 'mock-client))
-              ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
-               #'ignore))
-      (with-temp-buffer
-        (should (equal (plist-get (emacs-jupyter-notebook--connect-entry entry profile)
-                                  :tunnel-ports)
-                       local-ports))
-        (should (eq emacs-jupyter-notebook--client 'mock-client))))))
+;; W4.7: `ejn-connect-entry-waits-for-tunnel-before-jupyter-connect' was
+;; removed along with the synchronous `--connect-entry'.  The async
+;; tunnel-readiness behavior it asserted is covered by the
+;; `ejn-async-wait-tunnel-*' tests.
 
 (ert-deftest ejn-start-remote-kernel-uses-async-launch ()
   (let ((emacs-jupyter-notebook-remote-profiles
@@ -2084,46 +2029,10 @@ leaves source-buffer text untouched."
     (setq emacs-jupyter-notebook--tunnel-dead nil)
     (should (equal (emacs-jupyter-notebook--mode-line-string) " EJN"))))
 
-(ert-deftest ejn-tunnel-dead-reset-on-new-connection ()
-  (let ((entry '(:profile "p"
-                 :remote-host "example.com"
-                 :remote-connection-file "/tmp/kernel.json"
-                 :session-id "session"))
-        (profile '(:profile "p" :host "example.com"))
-        (connection '(:ip "127.0.0.1"
-                      :transport "tcp"
-                      :shell_port 1
-                      :iopub_port 2
-                      :stdin_port 3
-                      :hb_port 4
-                      :control_port 5
-                      :key "secret"))
-        (local-ports '(:shell_port 1001
-                       :iopub_port 1002
-                       :stdin_port 1003
-                       :hb_port 1004
-                       :control_port 1005))
-        (sentinel-installed nil))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook--retrieve-connection-file)
-               (lambda (&rest _) connection))
-              ((symbol-function 'emacs-jupyter-notebook-connection-allocate-local-ports)
-               (lambda () local-ports))
-              ((symbol-function 'emacs-jupyter-notebook--start-tunnel)
-               (lambda (&rest _) 'mock-process))
-              ((symbol-function 'emacs-jupyter-notebook--install-tunnel-sentinel)
-               (lambda (_process _buffer)
-                 (setq sentinel-installed t)))
-              ((symbol-function 'emacs-jupyter-notebook--wait-for-tunnel)
-               (lambda (&rest _) t))
-              ((symbol-function 'emacs-jupyter-notebook-jupyter-connect)
-               (lambda (_connection-file) 'mock-client))
-              ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
-               #'ignore))
-      (with-temp-buffer
-        (setq emacs-jupyter-notebook--tunnel-dead t)
-        (emacs-jupyter-notebook--connect-entry entry profile)
-        (should-not emacs-jupyter-notebook--tunnel-dead)
-        (should sentinel-installed)))))
+;; W4.7: `ejn-tunnel-dead-reset-on-new-connection' was removed along with
+;; `--connect-entry'.  The async-connect-finalize path that resets
+;; `--tunnel-dead' on a successful new client is exercised by
+;; `ejn-async-connect-finalize-sets-client-on-success'.
 
 (ert-deftest ejn-mime-select-png-over-jpeg-and-text ()
   (let ((data '(:text/plain "hello" :image/png "pngdata" :image/jpeg "jpgdata")))
