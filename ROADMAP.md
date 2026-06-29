@@ -413,7 +413,7 @@ flow stays fully non-blocking.
 - [x] sha=3c21c15 W4.7 Audit and remove the sync `--retrieve-connection-file` code path.
       All retrieval must go through the async retrieve. ERT: there is no
       `sleep-for` reachable from any user-facing command.
-- [~] owner=W4-fixup claimed=2026-06-30 W4.8 Remediation pass on review findings:
+- [x] sha=9fbd635 W4.8 Remediation pass on review findings:
       (a) CRITICAL: `--ensure-client-async`'s fallback removes the registry
           entry and starts a new kernel when reconnect fails.  After W4.4 a
           dead-PID surfaces as a reconnect failure, so this path silently
