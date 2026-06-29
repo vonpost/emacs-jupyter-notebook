@@ -462,7 +462,7 @@ plumbing grows teeth.
       with an error face + "timed out after Ns" suffix, clear
       `--evaluation-request`, log to the W6 log buffer. ERT with stubbed
       interrupt adapter.
-- [ ] W5.3 `cancel-operation` learns about in-flight evaluations: if
+- [~] owner=W5-agent claimed=2026-06-30 W5.3 `cancel-operation` learns about in-flight evaluations: if
       `--evaluation-request` is set, interrupt and clear it; the existing
       async-context cancel branch is untouched. ERT: cancel during
       evaluation interrupts; cancel during connect does not interrupt.
