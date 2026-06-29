@@ -410,7 +410,7 @@ flow stays fully non-blocking.
       stubbed adapter.
 - [x] sha=ff31aa1 W4.6 ERT: heartbeat-driven death routes through `--tunnel-reconnect`
       indistinguishably from sentinel-driven death.
-- [~] owner=W4-fixup claimed=2026-06-28 W4.7 Audit and remove the sync `--retrieve-connection-file` code path.
+- [x] sha=3c21c15 W4.7 Audit and remove the sync `--retrieve-connection-file` code path.
       All retrieval must go through the async retrieve. ERT: there is no
       `sleep-for` reachable from any user-facing command.
 
