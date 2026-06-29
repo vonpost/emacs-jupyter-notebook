@@ -454,7 +454,7 @@ File scope:
 Goal: A hung kernel never blocks the user. The existing evaluation-timeout
 plumbing grows teeth.
 
-- [~] owner=W5-agent claimed=2026-06-30 W5.1 Track the in-flight execute request id in a buffer-local
+- [x] sha=87b2c59 W5.1 Track the in-flight execute request id in a buffer-local
       `--evaluation-request` plist (request id, panel entry handle, cell
       key, started-at). Set in `--evaluate`; clear on `execute_reply`.
 - [ ] W5.2 `--evaluation-timer` enforces: on timeout, call
