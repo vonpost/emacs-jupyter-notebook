@@ -580,7 +580,7 @@ when the kernel is far away.
       whitespace-in-host errors before launching SSH. ERT.
 - [x] sha=6c3e8f2 W6.8 `--read-registry-entry` always offers a chooser when invoked
       interactively, with the current-file entry pre-selected. ERT.
-- [ ] W6.9 Update `README.md`: new keymap table, panel description,
+- [~] owner=W6-agent claimed=2026-07-01 W6.9 Update `README.md`: new keymap table, panel description,
       completion behavior, eval surfaces (cell/region/paragraph/defun),
       removal of inline overlays.
 
