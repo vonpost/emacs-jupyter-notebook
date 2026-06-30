@@ -28,13 +28,13 @@ Enable the mode in a Python buffer:
 M-x emacs-jupyter-notebook-mode
 ```
 
-Evaluate the current cell:
+Send the current cell:
 
 ```elisp
-C-c C-c
+C-c j c
 ```
 
-If no kernel is connected, evaluation starts or reconnects to one using the default profile.
+If no kernel is connected, the first send announces which profile it will use ("starting kernel via profile <name> (C-u to choose)") and then launches that kernel asynchronously. The send queues; output streams into the side panel as soon as the kernel connects. `C-u C-c j c` prompts for a profile to start with instead.
 
 ## Minimal Configuration
 
@@ -52,22 +52,97 @@ If no kernel is connected, evaluation starts or reconnects to one using the defa
 
 If `jupyter` is not directly on the remote `PATH`, set `:jupyter-command` in the profile.
 
-## Core Commands
+## Keymap
+
+All commands live under a single prefix, `emacs-jupyter-notebook-prefix-key` (default `C-c j`). The prefix is read once at load time; rebind by `setq`-ing the var before loading the package, or by binding `emacs-jupyter-notebook-prefix-map` under your own prefix.
+
+### Top-level commands
 
 | Key | Command |
 | --- | --- |
-| `C-c C-c` | evaluate current cell |
-| `C-c C-r` | evaluate region |
-| `C-c C-j` | evaluate cell and advance |
-| `C-c C-k` | interrupt kernel |
-| `C-c C-s` | start remote kernel |
-| `C-c C-n` | reconnect remote kernel |
-| `C-c C-/` | show engine/session status |
-| `C-c C-l` | clear results |
+| `C-c j c` | `send-cell` |
+| `C-c j j` | `send-cell-and-advance` |
+| `C-c j r` | `send-region` |
+| `C-c j SPC` | `send-paragraph` |
+| `C-c j d` | `send-defun` |
+| `C-c j b` | `send-buffer` (confirms; `C-u` skips) |
+| `C-c j s` | `start-remote-kernel` |
+| `C-c j R` | `reconnect-remote-kernel` |
+| `C-c j y` | `retry-fresh-kernel` (confirms; `C-u` skips) |
+| `C-c j k` | `interrupt-kernel` |
+| `C-c j K` | `restart-kernel` |
+| `C-c j S` | `shutdown-kernel` (confirms; `C-u` skips) |
+| `C-c j x` | `cancel-operation` |
+| `C-c j ?` | `status` (live-refreshing special-mode buffer) |
+| `C-c j L` | `show-log-buffer` |
+| `C-c j o` | `show-output-panel` |
+| `C-c j t` | `toggle-panel-view` (latest ↔ history) |
+| `C-c j .` | `inspect-at-point` |
+| `C-c j TAB` | `complete-at-point` (capf usually handles it) |
+| `C-c j v` | `fetch-remote-log` |
+| `C-c j q` | `list-remote-processes` |
+| `C-c j w` | `clean-orphaned-kernels` (confirms; `C-u` skips) |
+| `C-c j n` | `forward-cell` |
+| `C-c j p` | `backward-cell` |
 
-Less common but useful commands remain keybound: `C-c C-b` evaluates the full buffer, `C-c C-o` opens full output as text, `C-c C-t` toggles output, `C-c TAB` completes, `C-c C-d` inspects, and `C-c %` opens the cell command prefix.
+### Cell-edit subprefix (`C-c j %`)
 
-Recovery and diagnostics are intentionally secondary: `C-c C-y` retries with a fresh kernel, `C-c C-v` fetches the remote log, `C-c C-q` lists remote processes, and `C-c C-w` cleans orphaned remote kernels.
+| Key | Command |
+| --- | --- |
+| `n` | `forward-cell` |
+| `p` | `backward-cell` |
+| `a` | `beginning-of-cell` |
+| `e` | `end-of-cell` |
+| `i` | `insert-cell-below` |
+| `I` | `insert-cell-above` |
+| `d` | `delete-cell` |
+| `k` | `kill-cell` |
+| `K` | `clear-cell` |
+| `y` | `duplicate-cell` |
+| `P` | `move-cell-up` |
+| `N` | `move-cell-down` |
+| `@` | `code-cells-mark-cell` |
+
+## Send commands
+
+`send-cell` is the primary unit. It sends the current `# %%` cell and posts output into the cell's section of the side panel, replacing any prior section for that cell. `send-cell-and-advance` does the same and then moves point to the next cell.
+
+The secondary surfaces — `send-region`, `send-paragraph`, `send-defun`, `send-buffer` — have no cell key. Their output flows only into the panel's history-log view; they do not participate in latest-per-cell replacement. `send-paragraph` uses `mark-paragraph` semantics. `send-defun` uses `beginning-of-defun` / `end-of-defun`. `send-buffer` asks for confirmation because it commonly involves a lot of code.
+
+## Output panel
+
+Evaluation output never appears in the source buffer. A dedicated side panel (`*ejn: <buffer>*`) opens on the first evaluation and renders results there. The panel has two views:
+
+- **Latest-per-cell** (default): one section per cell, indexed by cell marker. Re-running the same cell replaces its section in place.
+- **History log**: every evaluation, including region/paragraph/defun, appended in time order with timestamp, execution count, and status.
+
+Toggle the view inside the panel with `H`, or globally with `C-c j t`. `q` buries the panel. `RET` on an entry header jumps to its originating cell. `n` / `p` step between entries. Images render inline with native zoom keys (`+`, `-`, `=`).
+
+A small fringe/margin indicator next to each cell marker reflects the cell's most recent state: blank (never run), `►` (running), `✓N` (ok with execution count `N`), `✗` (error), `…` (queued). The indicator is overlay-only and never modifies source text.
+
+## Status buffer (`C-c j ?`)
+
+`status` opens `*emacs-jupyter-notebook status*` in a derivative of `special-mode`. While the buffer is visible it refreshes once per second; when buried the refresh timer cancels itself. Suggested actions appear as clickable buttons that switch to the originating source buffer and invoke the suggested command (`start-remote-kernel`, `reconnect-remote-kernel`, `retry-fresh-kernel`, `cancel-operation`, `send-cell`, depending on engine state).
+
+## Log buffer (`C-c j L`)
+
+A global append-only log buffer, `*emacs-jupyter-notebook log*`, records every async progress message and every heartbeat miss / death. Lines are `ISO-TIMESTAMP  <buffer-name>  [PHASE]  MESSAGE`. The buffer is truncated from the front to `emacs-jupyter-notebook-log-max-lines` (default 2000) after every append so it stays bounded over long sessions. Open it with `C-c j L`.
+
+## Mode-line lighter
+
+The mode-line lighter encodes the engine state at a glance. From highest precedence to lowest:
+
+| Lighter | Meaning |
+| --- | --- |
+| ` EJN!` | tunnel flagged dead by the heartbeat or sentinel |
+| ` EJN✗` | the most recent async operation finished in `error` |
+| ` EJN…launch` | async kernel launch in flight |
+| ` EJN…retrieve` | async connection-file retrieve in flight |
+| ` EJN…tunnel` | async SSH tunnel coming up |
+| ` EJN…connect` | async Jupyter client connect in flight |
+| ` EJN*` | the kernel is busy executing a request |
+| ` EJN✓` | client connected and the kernel is idle |
+| ` EJN` | no client and nothing in flight |
 
 ## Completion
 
@@ -75,7 +150,7 @@ Completion runs against the remote kernel through `completion-at-point` and is d
 
 How it works:
 
-- The capf returns immediately from whatever is in a buffer-local LRU cache. Even if the kernel is on the other side of a 500ms link, the capf hot path stays in the single-millisecond range.
+- The capf returns immediately from whatever is in a buffer-local LRU cache. Even if the kernel is on the other side of a 500 ms link, the capf hot path stays in the single-millisecond range.
 - After the user pauses typing for `emacs-jupyter-notebook-completion-idle` seconds (default `0.10`), an async `complete_request` is sent to the kernel.
 - A new keystroke invalidates any in-flight request. When the stale reply finally arrives, it is dropped on arrival — never rendered, never blocking.
 - The cache key is `(point . line-up-to-point)`, so identical contexts in the same buffer reuse the prior reply without a round trip.
@@ -93,8 +168,8 @@ Tuning:
 - `emacs-jupyter-notebook-completion-idle` — seconds of typing pause before an async request fires. Lower values feel snappier; higher values hammer the kernel less during fast typing.
 - `emacs-jupyter-notebook-completion-cache-size` — maximum number of cached replies per buffer.
 
-## Notes
+## Reconnect
 
-Inline results are overlays, not file edits. Large output is truncated inline; use `C-c C-o` for the full copyable output buffer.
+Sessions are recorded in a local registry under `user-emacs-directory`. Reopening Emacs and visiting a previously-used file lets you reconnect to the still-running remote kernel via `C-c j R`. The chooser always appears, with the entry for the current file pre-selected as the default — press RET to accept it or pick another.
 
-Sessions are recorded in a local registry under `user-emacs-directory`, so reopening Emacs can reconnect to existing remote kernels.
+The remote kernel outlives Emacs. Only the explicit commands `shutdown-kernel` and `clean-orphaned-kernels` terminate it; closing the buffer, disabling the mode, and Emacs exit all leave the remote kernel running so a future session can reconnect.
