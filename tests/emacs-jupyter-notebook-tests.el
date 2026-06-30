@@ -424,20 +424,29 @@ W4.4 dead-PID probe test); production code must not."
         (should-not retrieved)))))
 
 (ert-deftest ejn-read-registry-entry-prefers-current-file ()
+  "W6.8: chooser ALWAYS runs, but the current-file entry is the default initial-input.
+Pressing RET on the chooser with no edit returns the current-file entry."
   (let* ((file (expand-file-name "current.py" temporary-file-directory))
          (entry `(:profile "p"
                   :session-id "current"
                   :local-file ,file
                   :created-at "2"))
-         (other '(:profile "p" :session-id "other" :created-at "3")))
+         (other '(:profile "p" :session-id "other" :created-at "3"))
+         (passed-default nil))
     (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
                (lambda (&optional _file) (list other entry)))
               ((symbol-function 'completing-read)
-               (lambda (&rest _)
-                 (ert-fail "reconnect prompted despite current file entry"))))
+               (lambda (_prompt collection &optional _pred _require _initial _hist default)
+                 (setq passed-default default)
+                 ;; Simulate the user pressing RET on the default.
+                 default)))
       (with-temp-buffer
         (setq buffer-file-name file)
-        (should (equal (emacs-jupyter-notebook--read-registry-entry) entry))))))
+        (let ((selected (emacs-jupyter-notebook--read-registry-entry)))
+          (should (equal selected entry))
+          (should (string-match-p "session-id" "session-id"))
+          ;; The default offered must be the label for the current-file entry.
+          (should (string-match-p "current" passed-default)))))))
 
 (ert-deftest ejn-ssh-basic-command-with-user-port-and-options ()
   (let ((emacs-jupyter-notebook-ssh-command "ssh")
@@ -5318,6 +5327,60 @@ Cleans up the status buffer (and its refresh timer) after BODY."
              (lambda (_p) '(:profile "p"))))
     (let ((profile (emacs-jupyter-notebook--read-host-profile "p")))
       (should (equal (plist-get profile :host) "example.com")))))
+
+;;; W6.8 — `--read-registry-entry' chooser always with current-file default
+
+(ert-deftest ejn-w6.8-read-registry-entry-always-prompts ()
+  "W6.8: even when only one entry exists, the chooser is invoked."
+  (let* ((entry '(:profile "p" :session-id "sole"))
+         (asked nil))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
+               (lambda (&optional _file) (list entry)))
+              ((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
+               (lambda () nil))
+              ((symbol-function 'completing-read)
+               (lambda (&rest _)
+                 (setq asked t)
+                 (emacs-jupyter-notebook--registry-entry-label entry))))
+      (with-temp-buffer
+        (should (equal (emacs-jupyter-notebook--read-registry-entry) entry))
+        (should asked)))))
+
+(ert-deftest ejn-w6.8-read-registry-entry-uses-current-file-default ()
+  "W6.8: when current-file entry exists, it is passed as the chooser's default."
+  (let* ((file (expand-file-name "x.py" temporary-file-directory))
+         (current `(:profile "p" :session-id "x-session" :local-file ,file))
+         (other '(:profile "p" :session-id "other"))
+         (passed-default nil))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
+               (lambda (&optional _file) (list other current)))
+              ((symbol-function 'completing-read)
+               (lambda (_prompt _collection &optional _pred _require _initial _hist default)
+                 (setq passed-default default)
+                 default)))
+      (with-temp-buffer
+        (setq buffer-file-name file)
+        (let ((selected (emacs-jupyter-notebook--read-registry-entry)))
+          (should (equal selected current))
+          (should (stringp passed-default))
+          (should (string-match-p "x-session" passed-default)))))))
+
+(ert-deftest ejn-w6.8-read-registry-entry-no-current-file-no-default ()
+  "W6.8: when there is no current-file entry, the default is nil and the chooser still runs."
+  (let* ((entries '((:profile "p" :session-id "a")
+                    (:profile "p" :session-id "b")))
+         (asked-with-default 'unset))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
+               (lambda (&optional _file) entries))
+              ((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
+               (lambda () nil))
+              ((symbol-function 'completing-read)
+               (lambda (_prompt _collection &optional _pred _require _initial _hist default)
+                 (setq asked-with-default default)
+                 (emacs-jupyter-notebook--registry-entry-label (car entries)))))
+      (with-temp-buffer
+        (emacs-jupyter-notebook--read-registry-entry)
+        (should (null asked-with-default))))))
 
 (ert-deftest ejn-w6.1-old-evaluate-command-names-removed ()
   "W6.1: the legacy `emacs-jupyter-notebook-evaluate-*' names are gone (no aliases)."

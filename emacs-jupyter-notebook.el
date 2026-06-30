@@ -781,23 +781,36 @@ spurious numbers in an SSH banner or MOTD cannot poison the parse."
                        (plist-get entry :profile))))
     (emacs-jupyter-notebook-registry-remove-entry key)))
 
+(defun emacs-jupyter-notebook--registry-entry-label (entry)
+  "Return a human-readable single-line label for registry ENTRY."
+  (format "%s  %s  %s"
+          (or (plist-get entry :display-name) "kernel")
+          (or (plist-get entry :profile) "")
+          (or (plist-get entry :session-id) "")))
+
 (defun emacs-jupyter-notebook--read-registry-entry ()
-  "Read and return a registry entry for reconnect."
-  (if-let ((entry (emacs-jupyter-notebook--current-file-registry-entry)))
-      entry
-    (let ((entries (emacs-jupyter-notebook-registry-load)))
-      (unless entries
-        (user-error "No kernel sessions found in registry"))
-      (let* ((choices (mapcar (lambda (entry)
-                                (cons (format "%s  %s  %s"
-                                              (or (plist-get entry :display-name) "kernel")
-                                              (or (plist-get entry :profile) "")
-                                              (or (plist-get entry :session-id) ""))
-                                      entry))
-                              entries))
-             (choice (completing-read "Reconnect kernel: " choices nil t)))
-        (or (cdr (assoc choice choices))
-            (error "No registry entry selected"))))))
+  "Read and return a registry entry for reconnect.
+W6.8: always offer a chooser interactively, with the current file's
+entry pre-selected as the default initial-input.  If the registry has
+exactly one entry, that entry is the default; the chooser still runs so
+the user can confirm or pick another."
+  (let ((entries (emacs-jupyter-notebook-registry-load)))
+    (unless entries
+      (user-error "No kernel sessions found in registry"))
+    (let* ((choices (mapcar (lambda (entry)
+                              (cons (emacs-jupyter-notebook--registry-entry-label
+                                     entry)
+                                    entry))
+                            entries))
+           (current (emacs-jupyter-notebook--current-file-registry-entry))
+           (default (and current
+                         (emacs-jupyter-notebook--registry-entry-label current)))
+           (prompt (if default
+                       (format "Reconnect kernel (default %s): " default)
+                     "Reconnect kernel: "))
+           (choice (completing-read prompt choices nil t nil nil default)))
+      (or (cdr (assoc choice choices))
+          (error "No registry entry selected")))))
 
 ;; W4.7: the synchronous `--retrieve-connection-file' that polled with
 ;; `sleep-for' has been removed.  The async retrieve in
