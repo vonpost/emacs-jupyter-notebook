@@ -576,7 +576,7 @@ when the kernel is far away.
       (append-only; ISO timestamp + buffer name + phase + message; truncated
       to `emacs-jupyter-notebook-log-max-lines` default 2000). Every
       `--async-message` and every heartbeat failure writes here. ERT.
-- [ ] W6.7 `--read-host-profile` validation. Empty/whitespace re-prompts;
+- [~] owner=W6-agent claimed=2026-07-01 W6.7 `--read-host-profile` validation. Empty/whitespace re-prompts;
       whitespace-in-host errors before launching SSH. ERT.
 - [ ] W6.8 `--read-registry-entry` always offers a chooser when invoked
       interactively, with the current-file entry pre-selected. ERT.
