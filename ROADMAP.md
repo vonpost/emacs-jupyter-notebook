@@ -572,7 +572,7 @@ when the kernel is far away.
       visible), font-locked sections, and button widgets on the suggested
       actions (clicking a suggestion calls the command in the originating
       buffer). ERT for content + one button-click.
-- [~] owner=W6-agent claimed=2026-07-01 W6.6 Global async log buffer `*emacs-jupyter-notebook log*`
+- [x] sha=9df65b0 W6.6 Global async log buffer `*emacs-jupyter-notebook log*`
       (append-only; ISO timestamp + buffer name + phase + message; truncated
       to `emacs-jupyter-notebook-log-max-lines` default 2000). Every
       `--async-message` and every heartbeat failure writes here. ERT.
