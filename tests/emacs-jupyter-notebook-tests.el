@@ -5271,6 +5271,54 @@ Cleans up the status buffer (and its refresh timer) after BODY."
      (should (buffer-live-p
               (get-buffer emacs-jupyter-notebook--log-buffer-name))))))
 
+;;; W6.7 — `--read-host-profile' input validation
+
+(ert-deftest ejn-w6.7-prompt-host-empty-reprompts ()
+  "W6.7: empty input re-prompts until non-empty input is given."
+  (let ((answers '("" "   " "example.com"))
+        (asked 0))
+    (cl-letf (((symbol-function 'read-string)
+               (lambda (&rest _)
+                 (cl-incf asked)
+                 (pop answers))))
+      (should (equal (emacs-jupyter-notebook--prompt-host) "example.com"))
+      (should (= asked 3)))))
+
+(ert-deftest ejn-w6.7-prompt-host-rejects-whitespace-in-host ()
+  "W6.7: input that contains internal whitespace is rejected with `user-error'."
+  (let ((answers '("bad host with space")))
+    (cl-letf (((symbol-function 'read-string)
+               (lambda (&rest _) (pop answers))))
+      (should-error
+       (emacs-jupyter-notebook--prompt-host) :type 'user-error))))
+
+(ert-deftest ejn-w6.7-prompt-host-trims-surrounding-whitespace ()
+  "W6.7: surrounding whitespace is trimmed; the trimmed value is accepted."
+  (let ((answers '("  example.com  ")))
+    (cl-letf (((symbol-function 'read-string)
+               (lambda (&rest _) (pop answers))))
+      (should (equal (emacs-jupyter-notebook--prompt-host) "example.com")))))
+
+(ert-deftest ejn-w6.7-read-host-profile-skips-prompt-when-host-set ()
+  "W6.7: when the profile already has a :host, no prompt is issued."
+  (let ((asked nil))
+    (cl-letf (((symbol-function 'read-string)
+               (lambda (&rest _) (setq asked t) "x"))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-profile)
+               (lambda (_p) '(:profile "p" :host "example.com"))))
+      (let ((profile (emacs-jupyter-notebook--read-host-profile "p")))
+        (should-not asked)
+        (should (equal (plist-get profile :host) "example.com"))))))
+
+(ert-deftest ejn-w6.7-read-host-profile-prompts-when-host-missing ()
+  "W6.7: a profile with no :host triggers `--prompt-host', value is interned."
+  (cl-letf (((symbol-function 'read-string)
+             (lambda (&rest _) "example.com"))
+            ((symbol-function 'emacs-jupyter-notebook-ssh-profile)
+             (lambda (_p) '(:profile "p"))))
+    (let ((profile (emacs-jupyter-notebook--read-host-profile "p")))
+      (should (equal (plist-get profile :host) "example.com")))))
+
 (ert-deftest ejn-w6.1-old-evaluate-command-names-removed ()
   "W6.1: the legacy `emacs-jupyter-notebook-evaluate-*' names are gone (no aliases)."
   (should-not (fboundp 'emacs-jupyter-notebook-evaluate-current-cell))

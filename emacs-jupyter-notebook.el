@@ -724,11 +724,30 @@ only the fringe indicators need clearing on a structural cell edit."
                          emacs-jupyter-notebook-default-profile)
       emacs-jupyter-notebook-default-profile)))
 
+(defun emacs-jupyter-notebook--prompt-host ()
+  "Prompt for a remote-host string, looping until valid input is given.
+W6.7 contract: empty / whitespace-only answers re-prompt; a value
+containing internal whitespace fails fast with `user-error' before any
+SSH command is launched."
+  (let (host)
+    (while (or (null host) (string-empty-p (string-trim host)))
+      (setq host (read-string "Remote host: ")))
+    (setq host (string-trim host))
+    (when (string-match-p "[ \t]" host)
+      (user-error
+       "Remote host %S contains whitespace; refusing to launch SSH"
+       host))
+    host))
+
 (defun emacs-jupyter-notebook--read-host-profile (profile-name)
-  "Return PROFILE-NAME profile, prompting for :host if needed."
+  "Return PROFILE-NAME profile, prompting for :host when missing.
+W6.7: missing host is filled by `--prompt-host', which loops until the
+user enters non-empty input and errors when the input contains
+whitespace."
   (let ((profile (emacs-jupyter-notebook-ssh-profile profile-name)))
     (unless (or (plist-get profile :host) (plist-get profile :remote-host))
-      (setq profile (plist-put profile :host (read-string "Remote host: "))))
+      (setq profile (plist-put profile :host
+                               (emacs-jupyter-notebook--prompt-host))))
     profile))
 
 (defun emacs-jupyter-notebook--parse-pid (output)
