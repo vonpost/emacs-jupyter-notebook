@@ -5063,6 +5063,114 @@ command, which is the contract a user actually depends on."
       (should-not asked)
       (should ran))))
 
+;;; W6.5 — Status buffer
+
+(defmacro ejn-test-with-status-buffer (status-buffer-var &rest body)
+  "Run BODY with STATUS-BUFFER-VAR bound to a freshly-rendered status buffer.
+Cleans up the status buffer (and its refresh timer) after BODY."
+  (declare (indent 1))
+  `(let ((,status-buffer-var (call-interactively
+                              #'emacs-jupyter-notebook-status)))
+     (unwind-protect
+         (progn ,@body)
+       (when (buffer-live-p ,status-buffer-var)
+         (with-current-buffer ,status-buffer-var
+           (emacs-jupyter-notebook--status-cancel-refresh))
+         (kill-buffer ,status-buffer-var)))))
+
+(ert-deftest ejn-w6.5-status-buffer-is-special-mode-derived ()
+  "W6.5: the status buffer's major mode is derived from `special-mode'."
+  (with-temp-buffer
+    (ejn-test-with-status-buffer status-buf
+      (with-current-buffer status-buf
+        (should (derived-mode-p 'special-mode))
+        (should (eq major-mode 'emacs-jupyter-notebook-status-mode))
+        (should buffer-read-only)))))
+
+(ert-deftest ejn-w6.5-status-buffer-renders-snapshot-content ()
+  "W6.5: status buffer shows the snapshot lines for the originating buffer."
+  (with-temp-buffer
+    (setq emacs-jupyter-notebook--client 'mock
+          emacs-jupyter-notebook--session-entry
+          '(:profile "p" :session-id "sid"
+            :remote-host "h" :remote-pid 42
+            :remote-connection-file "/r.json"
+            :local-connection-file "/l.json"
+            :tunnel-ports (:shell_port 1001)))
+    (ejn-test-with-status-buffer status-buf
+      (with-current-buffer status-buf
+        (let ((text (buffer-string)))
+          (should (string-match-p "Profile: p" text))
+          (should (string-match-p "Session: sid" text))
+          (should (string-match-p "Suggested actions" text)))))))
+
+(ert-deftest ejn-w6.5-status-buffer-source-buffer-is-recorded ()
+  "W6.5: the status buffer's `--status-source-buffer' points at the originator."
+  (with-temp-buffer
+    (let ((src (current-buffer)))
+      (ejn-test-with-status-buffer status-buf
+        (should (eq (buffer-local-value
+                     'emacs-jupyter-notebook--status-source-buffer
+                     status-buf)
+                    src))))))
+
+(ert-deftest ejn-w6.5-status-buffer-installs-refresh-timer ()
+  "W6.5: rendering installs a live-refresh timer on the status buffer."
+  (with-temp-buffer
+    (ejn-test-with-status-buffer status-buf
+      (should (timerp
+               (buffer-local-value
+                'emacs-jupyter-notebook--status-refresh-timer
+                status-buf))))))
+
+(ert-deftest ejn-w6.5-status-buffer-cancels-timer-on-kill ()
+  "W6.5: killing the status buffer cancels its refresh timer."
+  (with-temp-buffer
+    (let ((status-buf (call-interactively #'emacs-jupyter-notebook-status))
+          captured-timer)
+      (setq captured-timer
+            (buffer-local-value
+             'emacs-jupyter-notebook--status-refresh-timer status-buf))
+      (should (timerp captured-timer))
+      (kill-buffer status-buf)
+      ;; A cancelled timer is no longer in the list of live timers.
+      (should-not (memq captured-timer timer-list)))))
+
+(ert-deftest ejn-w6.5-status-buffer-tick-no-window-cancels-timer ()
+  "W6.5: when the status buffer is buried (no window), tick cancels the timer."
+  (with-temp-buffer
+    (ejn-test-with-status-buffer status-buf
+      ;; Simulate burying by removing the buffer from any window.
+      (dolist (win (get-buffer-window-list status-buf nil t))
+        (when (window-live-p win) (delete-window win)))
+      (emacs-jupyter-notebook--status-tick)
+      (should-not (buffer-local-value
+                   'emacs-jupyter-notebook--status-refresh-timer
+                   status-buf)))))
+
+(ert-deftest ejn-w6.5-status-buffer-suggestion-button-invokes-command-in-source ()
+  "W6.5: a click on a suggestion button switches to source and invokes its command."
+  (with-temp-buffer
+    (let ((src (current-buffer))
+          invoked-in-buffer)
+      ;; Force the snapshot to show no client so we always get a Start button.
+      (setq emacs-jupyter-notebook--client nil)
+      (ejn-test-with-status-buffer status-buf
+        (with-current-buffer status-buf
+          ;; Replace the Start command with a probe that records its caller.
+          (let ((actions emacs-jupyter-notebook--status-suggestion-actions))
+            (should actions)
+            (cl-letf (((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
+                       (lambda (&rest _)
+                         (interactive)
+                         (setq invoked-in-buffer (current-buffer)))))
+              ;; Find the first button and activate it.
+              (goto-char (point-min))
+              (let ((btn (next-button (point))))
+                (should btn)
+                (button-activate btn))))))
+      (should (eq invoked-in-buffer src)))))
+
 (ert-deftest ejn-w6.1-old-evaluate-command-names-removed ()
   "W6.1: the legacy `emacs-jupyter-notebook-evaluate-*' names are gone (no aliases)."
   (should-not (fboundp 'emacs-jupyter-notebook-evaluate-current-cell))

@@ -2008,15 +2008,183 @@ running per the binding rule that the remote kernel outlives Emacs."
       (emacs-jupyter-notebook--cleanup-current-state "Retrying with fresh kernel" t)
       (emacs-jupyter-notebook-start-remote-kernel profile))))
 
+(defconst emacs-jupyter-notebook--status-buffer-name
+  "*emacs-jupyter-notebook status*"
+  "Name of the W6.5 live status buffer.")
+
+(defvar emacs-jupyter-notebook--status-refresh-interval 1.0
+  "Seconds between live refreshes of the status buffer while visible.")
+
+(defvar-local emacs-jupyter-notebook--status-source-buffer nil
+  "Buffer-local pointer to the originating source buffer.
+Set by `emacs-jupyter-notebook-status' inside the status buffer so the
+live-refresh timer and the action buttons know which buffer's engine they
+are reflecting.")
+
+(defvar-local emacs-jupyter-notebook--status-refresh-timer nil
+  "Buffer-local refresh timer for the status buffer.")
+
+(defvar-local emacs-jupyter-notebook--status-suggestion-actions nil
+  "Buffer-local alist of (LABEL . COMMAND) for clickable suggestions.
+Populated by `--status-render'.  Buttons inserted on suggestion lines
+look up their command by index in this list.")
+
+(define-derived-mode emacs-jupyter-notebook-status-mode special-mode
+  "EJN-Status"
+  "Major mode for the EJN live status buffer.
+Each refresh re-renders the current engine snapshot; suggested actions
+are clickable buttons that switch to the originating source buffer and
+invoke the suggested command there."
+  (setq buffer-read-only t
+        truncate-lines nil)
+  (add-hook 'kill-buffer-hook
+            #'emacs-jupyter-notebook--status-cancel-refresh nil t))
+
+(defun emacs-jupyter-notebook--status-cancel-refresh ()
+  "Cancel the buffer-local status refresh timer if any."
+  (when (timerp emacs-jupyter-notebook--status-refresh-timer)
+    (cancel-timer emacs-jupyter-notebook--status-refresh-timer))
+  (setq emacs-jupyter-notebook--status-refresh-timer nil))
+
+(defun emacs-jupyter-notebook--status-suggestions-for (snapshot)
+  "Return a list of `(LABEL . COMMAND)' cons cells for SNAPSHOT.
+Each entry corresponds to a suggested next action.  COMMAND is the
+interactive function symbol to invoke when the action is chosen; LABEL is
+the human-readable string shown in the status buffer."
+  (let (actions)
+    (unless (plist-get snapshot :client)
+      (push (cons "Start a remote kernel"
+                  'emacs-jupyter-notebook-start-remote-kernel)
+            actions)
+      (push (cons "Reconnect to an existing remote kernel"
+                  'emacs-jupyter-notebook-reconnect-remote-kernel)
+            actions))
+    (when (memq (plist-get snapshot :tunnel-state) '(dead exited))
+      (push (cons "Retry with a fresh kernel"
+                  'emacs-jupyter-notebook-retry-fresh-kernel)
+            actions))
+    (when (plist-get snapshot :async-error)
+      (push (cons "Cancel the failed async operation"
+                  'emacs-jupyter-notebook-cancel-operation)
+            actions))
+    (when (plist-get snapshot :client)
+      (push (cons "Send the current cell"
+                  'emacs-jupyter-notebook-send-cell)
+            actions))
+    (nreverse actions)))
+
+(defun emacs-jupyter-notebook--status-snapshot-text (snapshot)
+  "Return only the descriptive lines of SNAPSHOT (no suggestions)."
+  (string-join
+   (list
+    (format "Buffer: %s" (plist-get snapshot :buffer))
+    (format "File: %s" (or (plist-get snapshot :file) "none"))
+    (format "Profile: %s" (or (plist-get snapshot :profile) "none"))
+    (format "Session: %s" (or (plist-get snapshot :session-id) "none"))
+    (format "Client: %s" (if (plist-get snapshot :client) "connected" "none"))
+    (format "Kernel status: %s" (or (plist-get snapshot :kernel-status) "unknown"))
+    (format "Tunnel: %s" (plist-get snapshot :tunnel-state))
+    (format "Async phase: %s" (or (plist-get snapshot :async-phase) "none"))
+    (format "Async error: %s" (or (plist-get snapshot :async-error) "none"))
+    (format "Remote host: %s" (or (plist-get snapshot :remote-host) "unknown"))
+    (format "Remote PID: %s" (or (plist-get snapshot :remote-pid) "unknown"))
+    (format "Remote connection: %s"
+            (or (plist-get snapshot :remote-connection-file) "none"))
+    (format "Local connection: %s"
+            (or (plist-get snapshot :local-connection-file) "none"))
+    (format "Tunnel ports: %S" (plist-get snapshot :tunnel-ports)))
+   "\n"))
+
+(defun emacs-jupyter-notebook--status-suggestion-button-action (button)
+  "Activate suggested action carried by BUTTON.
+Switches back to the originating source buffer (recorded on the status
+buffer) and invokes the action's command there via `call-interactively'."
+  (let* ((source (button-get button 'ejn-source-buffer))
+         (command (button-get button 'ejn-action)))
+    (cond
+     ((not (buffer-live-p source))
+      (message "emacs-jupyter-notebook: originating buffer no longer alive"))
+     ((not (commandp command))
+      (message "emacs-jupyter-notebook: invalid suggested command %s" command))
+     (t
+      (pop-to-buffer source)
+      (call-interactively command)))))
+
+(defun emacs-jupyter-notebook--status-render (status-buffer source-buffer)
+  "Render STATUS-BUFFER with the current engine snapshot of SOURCE-BUFFER."
+  (require 'button)
+  (when (buffer-live-p source-buffer)
+    (let* ((snapshot (with-current-buffer source-buffer
+                       (emacs-jupyter-notebook-status-snapshot)))
+           (actions (emacs-jupyter-notebook--status-suggestions-for snapshot)))
+      (with-current-buffer status-buffer
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert (emacs-jupyter-notebook--status-snapshot-text snapshot))
+          (insert "\n\nSuggested actions:\n")
+          (if (null actions)
+              (insert "  (engine looks healthy)\n")
+            (dolist (action actions)
+              (insert "  ")
+              (insert-text-button
+               (car action)
+               'follow-link t
+               'help-echo (format "Run M-x %s" (cdr action))
+               'action #'emacs-jupyter-notebook--status-suggestion-button-action
+               'ejn-source-buffer source-buffer
+               'ejn-action (cdr action))
+              (insert "\n"))))
+        (setq emacs-jupyter-notebook--status-source-buffer source-buffer
+              emacs-jupyter-notebook--status-suggestion-actions actions)
+        (goto-char (point-min))))))
+
+(defun emacs-jupyter-notebook--status-tick ()
+  "Refresh-tick body for the status buffer's live timer.
+Re-renders the snapshot if the status buffer is visible; otherwise
+cancels the timer so an off-screen status buffer doesn't keep ticking."
+  (let ((status-buffer (get-buffer emacs-jupyter-notebook--status-buffer-name)))
+    (cond
+     ((not (buffer-live-p status-buffer)) nil)
+     ((not (get-buffer-window status-buffer 'visible))
+      (with-current-buffer status-buffer
+        (emacs-jupyter-notebook--status-cancel-refresh)))
+     (t
+      (emacs-jupyter-notebook--status-render
+       status-buffer
+       (buffer-local-value 'emacs-jupyter-notebook--status-source-buffer
+                           status-buffer))))))
+
 ;;;###autoload
 (defun emacs-jupyter-notebook-status ()
-  "Display the current buffer's EJN engine state."
+  "Render the current buffer's engine state in `*emacs-jupyter-notebook status*'.
+W6.5: the status buffer is a `special-mode' derivative.  While the
+buffer is visible, the content is re-rendered every
+`emacs-jupyter-notebook--status-refresh-interval' seconds; the timer is
+cancelled when the buffer is buried or killed.  Suggested actions are
+clickable buttons that switch back to the originating source buffer and
+invoke the relevant command.
+
+When called from Lisp (non-interactively) the function returns the
+rendered text instead of displaying a buffer."
   (interactive)
-  (let ((text (emacs-jupyter-notebook--format-status
-               (emacs-jupyter-notebook-status-snapshot))))
-    (if (called-interactively-p 'interactive)
-        (emacs-jupyter-notebook--display-command-output "*ejn-status*" text)
-      text)))
+  (if (not (called-interactively-p 'any))
+      (emacs-jupyter-notebook--format-status
+       (emacs-jupyter-notebook-status-snapshot))
+    (let ((source (current-buffer))
+          (status (get-buffer-create emacs-jupyter-notebook--status-buffer-name)))
+      (with-current-buffer status
+        (unless (derived-mode-p 'emacs-jupyter-notebook-status-mode)
+          (emacs-jupyter-notebook-status-mode)))
+      (emacs-jupyter-notebook--status-render status source)
+      (display-buffer status)
+      (with-current-buffer status
+        (emacs-jupyter-notebook--status-cancel-refresh)
+        (setq emacs-jupyter-notebook--status-refresh-timer
+              (run-with-timer
+               emacs-jupyter-notebook--status-refresh-interval
+               emacs-jupyter-notebook--status-refresh-interval
+               #'emacs-jupyter-notebook--status-tick)))
+      status)))
 
 (defun emacs-jupyter-notebook-show-log-buffer ()
   "Show the global async log buffer `*emacs-jupyter-notebook log*'.
