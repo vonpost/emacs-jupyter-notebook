@@ -5171,6 +5171,106 @@ Cleans up the status buffer (and its refresh timer) after BODY."
                 (button-activate btn))))))
       (should (eq invoked-in-buffer src)))))
 
+;;; W6.6 — Global async log buffer
+
+(defmacro ejn-test-with-fresh-log-buffer (&rest body)
+  "Run BODY with a freshly-created log buffer; clean up afterwards."
+  (declare (indent 0))
+  `(progn
+     (let ((buf (get-buffer emacs-jupyter-notebook--log-buffer-name)))
+       (when (buffer-live-p buf) (kill-buffer buf)))
+     (unwind-protect
+         (progn ,@body)
+       (let ((buf (get-buffer emacs-jupyter-notebook--log-buffer-name)))
+         (when (buffer-live-p buf) (kill-buffer buf))))))
+
+(ert-deftest ejn-w6.6-log-buffer-is-special-mode ()
+  "W6.6: the log buffer is derived from `special-mode' and read-only."
+  (ejn-test-with-fresh-log-buffer
+   (let ((buf (emacs-jupyter-notebook--log-buffer-ensure)))
+     (with-current-buffer buf
+       (should (derived-mode-p 'special-mode))
+       (should buffer-read-only)))))
+
+(ert-deftest ejn-w6.6-log-append-writes-timestamped-entry ()
+  "W6.6: an appended entry carries timestamp, buffer name, phase, and message."
+  (ejn-test-with-fresh-log-buffer
+   (with-temp-buffer
+     (rename-buffer "*ejn-test-source*" t)
+     (emacs-jupyter-notebook--log-append 'launch "hello %s" "world"))
+   (let* ((buf (get-buffer emacs-jupyter-notebook--log-buffer-name))
+          (text (with-current-buffer buf (buffer-string))))
+     (should (string-match-p "hello world" text))
+     (should (string-match-p "\\[launch\\]" text))
+     (should (string-match-p "\\*ejn-test-source\\*" text))
+     (should (string-match-p "^[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}T" text)))))
+
+(ert-deftest ejn-w6.6-log-append-truncates-to-log-max-lines ()
+  "W6.6: appends beyond `--log-max-lines' drop the oldest lines."
+  (ejn-test-with-fresh-log-buffer
+   (let ((emacs-jupyter-notebook-log-max-lines 5))
+     (dotimes (i 12)
+       (emacs-jupyter-notebook--log-append 'tick "entry %d" i))
+     (with-current-buffer (get-buffer emacs-jupyter-notebook--log-buffer-name)
+       (should (= (count-lines (point-min) (point-max)) 5))
+       (let ((text (buffer-string)))
+         ;; Oldest entries 0..6 are gone; 7..11 remain.
+         (should-not (string-match-p "entry 0\n" text))
+         (should-not (string-match-p "entry 6\n" text))
+         (should (string-match-p "entry 7\n" text))
+         (should (string-match-p "entry 11\n" text)))))))
+
+(ert-deftest ejn-w6.6-async-message-writes-to-log ()
+  "W6.6: `--async-message' writes a structured entry tagged with the phase."
+  (ejn-test-with-fresh-log-buffer
+   (emacs-jupyter-notebook--async-message '(:phase tunnel) "ports up")
+   (let* ((buf (get-buffer emacs-jupyter-notebook--log-buffer-name))
+          (text (with-current-buffer buf (buffer-string))))
+     (should (string-match-p "ports up" text))
+     (should (string-match-p "\\[tunnel\\]" text)))))
+
+(ert-deftest ejn-w6.6-async-message-nil-context-tags-none ()
+  "W6.6: when the context is nil, the log line is tagged `[none]'."
+  (ejn-test-with-fresh-log-buffer
+   (emacs-jupyter-notebook--async-message nil "bare message")
+   (let* ((buf (get-buffer emacs-jupyter-notebook--log-buffer-name))
+          (text (with-current-buffer buf (buffer-string))))
+     (should (string-match-p "bare message" text))
+     (should (string-match-p "\\[none\\]" text)))))
+
+(ert-deftest ejn-w6.6-heartbeat-miss-logs ()
+  "W6.6: each heartbeat miss writes a `heartbeat-miss' line."
+  (ejn-test-with-fresh-log-buffer
+   (with-temp-buffer
+     (let ((emacs-jupyter-notebook-heartbeat-misses-allowed 99))
+       (emacs-jupyter-notebook--heartbeat-on-miss))
+     (let* ((buf (get-buffer emacs-jupyter-notebook--log-buffer-name))
+            (text (with-current-buffer buf (buffer-string))))
+       (should (string-match-p "\\[heartbeat-miss\\]" text))))))
+
+(ert-deftest ejn-w6.6-heartbeat-death-logs ()
+  "W6.6: crossing the miss-allowed threshold writes `heartbeat-dead'."
+  (ejn-test-with-fresh-log-buffer
+   (with-temp-buffer
+     (let ((emacs-jupyter-notebook-heartbeat-misses-allowed 1))
+       ;; First miss already crosses since allowed=1.
+       (cl-letf (((symbol-function 'display-warning) (lambda (&rest _))))
+         (emacs-jupyter-notebook--heartbeat-on-miss)))
+     (let* ((buf (get-buffer emacs-jupyter-notebook--log-buffer-name))
+            (text (with-current-buffer buf (buffer-string))))
+       (should (string-match-p "\\[heartbeat-dead\\]" text))))))
+
+(ert-deftest ejn-w6.6-show-log-buffer-displays-existing ()
+  "W6.6: `show-log-buffer' creates and displays the log buffer."
+  (ejn-test-with-fresh-log-buffer
+   (cl-letf* (((symbol-function 'display-buffer)
+               (lambda (b &rest _)
+                 (should (eq b (get-buffer emacs-jupyter-notebook--log-buffer-name)))
+                 b)))
+     (emacs-jupyter-notebook-show-log-buffer)
+     (should (buffer-live-p
+              (get-buffer emacs-jupyter-notebook--log-buffer-name))))))
+
 (ert-deftest ejn-w6.1-old-evaluate-command-names-removed ()
   "W6.1: the legacy `emacs-jupyter-notebook-evaluate-*' names are gone (no aliases)."
   (should-not (fboundp 'emacs-jupyter-notebook-evaluate-current-cell))

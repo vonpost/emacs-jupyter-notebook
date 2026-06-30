@@ -235,14 +235,27 @@ when the inflight token still matches (so late replies are ignored)."
   "Handle a heartbeat miss: increment the counter; on threshold flag dead.
 Per the binding rule the remote kernel is NOT shut down — heartbeat-driven
 death sets `--tunnel-dead' locally so `--ensure-client-async' routes the
-next evaluation through `--tunnel-reconnect'."
+next evaluation through `--tunnel-reconnect'.
+
+W6.6: every miss writes a `heartbeat-miss' line to the global log buffer;
+crossing the misses-allowed threshold writes a `heartbeat-dead' line."
   (setq emacs-jupyter-notebook--heartbeat-inflight nil)
   (cl-incf emacs-jupyter-notebook--heartbeat-misses)
+  (emacs-jupyter-notebook--log-append
+   'heartbeat-miss
+   "kernel-info miss %d/%d in `%s'"
+   emacs-jupyter-notebook--heartbeat-misses
+   (max 1 (or emacs-jupyter-notebook-heartbeat-misses-allowed 2))
+   (buffer-name))
   (when (>= emacs-jupyter-notebook--heartbeat-misses
             (max 1 (or emacs-jupyter-notebook-heartbeat-misses-allowed 2)))
     (setq emacs-jupyter-notebook--tunnel-dead t)
     (setq emacs-jupyter-notebook--kernel-status nil)
     (force-mode-line-update t)
+    (emacs-jupyter-notebook--log-append
+     'heartbeat-dead
+     "tunnel flagged dead after %d consecutive misses in `%s'"
+     emacs-jupyter-notebook--heartbeat-misses (buffer-name))
     (display-warning
      'emacs-jupyter-notebook
      (format
@@ -496,6 +509,10 @@ untouched."
         (when client
           (ignore-errors
             (emacs-jupyter-notebook-jupyter-interrupt client)))
+        ;; W6.6: route the timeout into the global log buffer too.
+        (emacs-jupyter-notebook--log-append
+         'eval-timeout
+         "evaluation timed out after %ss; interrupted kernel" timeout)
         (message "emacs-jupyter-notebook: evaluation timed out after %ss; interrupted kernel."
                  timeout)
         (setq emacs-jupyter-notebook--kernel-status 'busy)
@@ -921,8 +938,13 @@ spurious numbers in an SSH banner or MOTD cannot poison the parse."
   "Return non-nil when CONTEXT's origin buffer is live."
   (buffer-live-p (plist-get context :origin-buffer)))
 
-(defun emacs-jupyter-notebook--async-message (_context format-string &rest args)
-  "Report async progress using FORMAT-STRING and ARGS."
+(defun emacs-jupyter-notebook--async-message (context format-string &rest args)
+  "Report async progress using FORMAT-STRING and ARGS.
+W6.6: every call also writes a structured entry into the global
+`*emacs-jupyter-notebook log*' buffer, tagged with the originating
+async-context phase (or `none' when the context is nil)."
+  (let ((phase (or (plist-get context :phase) 'none)))
+    (apply #'emacs-jupyter-notebook--log-append phase format-string args))
   (apply #'message (concat "emacs-jupyter-notebook: " format-string) args))
 
 (defun emacs-jupyter-notebook--async-cancel-timer (context)
@@ -2186,18 +2208,67 @@ rendered text instead of displaying a buffer."
                #'emacs-jupyter-notebook--status-tick)))
       status)))
 
-(defun emacs-jupyter-notebook-show-log-buffer ()
-  "Show the global async log buffer `*emacs-jupyter-notebook log*'.
-W6.6 owns the log-buffer creation and append behavior; this command
-displays whatever already exists, creating an empty buffer if the log has
-not yet been written to."
-  (interactive)
-  (let ((buf (get-buffer-create "*emacs-jupyter-notebook log*")))
+(defconst emacs-jupyter-notebook--log-buffer-name
+  "*emacs-jupyter-notebook log*"
+  "Name of the W6.6 append-only async log buffer.")
+
+(defun emacs-jupyter-notebook--log-buffer-ensure ()
+  "Return the W6.6 log buffer, creating it in `special-mode' if needed."
+  (let ((buf (get-buffer emacs-jupyter-notebook--log-buffer-name)))
+    (unless buf
+      (setq buf (get-buffer-create emacs-jupyter-notebook--log-buffer-name))
+      (with-current-buffer buf
+        (special-mode)
+        (setq-local truncate-lines nil
+                    buffer-read-only t)))
+    buf))
+
+(defun emacs-jupyter-notebook--log-truncate ()
+  "Trim the W6.6 log buffer to `emacs-jupyter-notebook-log-max-lines'.
+Called by `--log-append' after every append.  Trims by deleting the
+oldest lines (those at the top of the buffer) until the line count is at
+most the configured maximum."
+  (let* ((max (max 0 (or emacs-jupyter-notebook-log-max-lines 2000)))
+         (total (count-lines (point-min) (point-max))))
+    (when (> total max)
+      (let ((to-delete (- total max))
+            (inhibit-read-only t))
+        (save-excursion
+          (goto-char (point-min))
+          (forward-line to-delete)
+          (delete-region (point-min) (point)))))))
+
+(defun emacs-jupyter-notebook--log-append (phase format-string &rest args)
+  "Append a single timestamped entry to the W6.6 log buffer.
+PHASE is a short phase symbol or string (`launch', `retrieve',
+`heartbeat-miss', etc.).  FORMAT-STRING is the human-readable message;
+remaining ARGS are spliced via `format'.  The line shape is:
+
+  ISO-TIMESTAMP  <buffer-name>  [PHASE]  MESSAGE
+
+After each append the buffer is truncated to
+`emacs-jupyter-notebook-log-max-lines' lines (oldest dropped first)."
+  (let* ((buf (emacs-jupyter-notebook--log-buffer-ensure))
+         (msg (apply #'format format-string args))
+         (origin (buffer-name))
+         (ts (format-time-string "%Y-%m-%dT%H:%M:%S%z"))
+         (line (format "%s  %s  [%s]  %s\n" ts origin
+                       (if phase (format "%s" phase) "-")
+                       msg)))
     (with-current-buffer buf
-      (unless (derived-mode-p 'special-mode)
-        (special-mode))
-      (setq-local truncate-lines nil))
-    (display-buffer buf)))
+      (let ((inhibit-read-only t)
+            (was-at-end (= (point) (point-max))))
+        (save-excursion
+          (goto-char (point-max))
+          (insert line))
+        (emacs-jupyter-notebook--log-truncate)
+        (when was-at-end
+          (goto-char (point-max)))))))
+
+(defun emacs-jupyter-notebook-show-log-buffer ()
+  "Show the global W6.6 async log buffer `*emacs-jupyter-notebook log*'."
+  (interactive)
+  (display-buffer (emacs-jupyter-notebook--log-buffer-ensure)))
 
 (defun emacs-jupyter-notebook-fetch-remote-log ()
   "Fetch and display the current session's remote kernel log."
