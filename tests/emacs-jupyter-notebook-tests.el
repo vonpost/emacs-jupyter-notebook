@@ -4913,6 +4913,156 @@ command, which is the contract a user actually depends on."
                    "workstation")
            "emacs-jupyter-notebook: starting kernel via profile workstation (C-u to choose)")))
 
+;;; W6.4 — Confirmations on destructive commands
+
+(ert-deftest ejn-w6.4-confirm-helper-lisp-callers-always-pass ()
+  "W6.4: from Lisp (interactive-p nil) the action is always authorized."
+  (let ((asked nil))
+    (cl-letf (((symbol-function 'y-or-n-p)
+               (lambda (_p) (setq asked t) nil)))
+      (should (emacs-jupyter-notebook--confirm nil nil "?"))
+      (should-not asked))))
+
+(ert-deftest ejn-w6.4-confirm-helper-c-u-skips-prompt ()
+  "W6.4: a non-nil FORCE prefix bypasses `y-or-n-p'."
+  (let ((asked nil))
+    (cl-letf (((symbol-function 'y-or-n-p)
+               (lambda (_p) (setq asked t) nil)))
+      (should (emacs-jupyter-notebook--confirm t '(4) "?"))
+      (should-not asked))))
+
+(ert-deftest ejn-w6.4-confirm-helper-interactive-no-prefix-prompts ()
+  "W6.4: interactive call without FORCE asks `y-or-n-p'."
+  (let ((asked nil) (response t))
+    (cl-letf (((symbol-function 'y-or-n-p)
+               (lambda (_p) (setq asked t) response)))
+      (should (emacs-jupyter-notebook--confirm t nil "?"))
+      (should asked)
+      (setq response nil)
+      (should-not (emacs-jupyter-notebook--confirm t nil "?")))))
+
+(ert-deftest ejn-w6.4-shutdown-from-lisp-skips-prompt ()
+  "W6.4: calling `shutdown-kernel' from Lisp does not prompt."
+  (let ((asked nil) cleanup-called)
+    (cl-letf (((symbol-function 'y-or-n-p)
+               (lambda (_p) (setq asked t) t))
+              ((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
+               (lambda (&rest _) (setq cleanup-called t))))
+      (emacs-jupyter-notebook-shutdown-kernel)
+      (should-not asked)
+      (should cleanup-called))))
+
+(ert-deftest ejn-w6.4-shutdown-interactive-asks-and-aborts-on-no ()
+  "W6.4: interactive call with a `no' answer does NOT run cleanup."
+  (let ((asked nil) cleanup-called)
+    (cl-letf (((symbol-function 'y-or-n-p)
+               (lambda (_p) (setq asked t) nil))
+              ((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
+               (lambda (&rest _) (setq cleanup-called t))))
+      (call-interactively #'emacs-jupyter-notebook-shutdown-kernel)
+      (should asked)
+      (should-not cleanup-called))))
+
+(ert-deftest ejn-w6.4-shutdown-interactive-with-c-u-skips-prompt ()
+  "W6.4: interactive call with C-u skips the prompt."
+  (let ((asked nil) cleanup-called)
+    (cl-letf (((symbol-function 'y-or-n-p)
+               (lambda (_p) (setq asked t) nil))
+              ((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
+               (lambda (&rest _) (setq cleanup-called t))))
+      (let ((current-prefix-arg '(4)))
+        (call-interactively #'emacs-jupyter-notebook-shutdown-kernel))
+      (should-not asked)
+      (should cleanup-called))))
+
+(ert-deftest ejn-w6.4-send-buffer-from-lisp-skips-prompt ()
+  "W6.4: Lisp callers of `send-buffer' bypass the confirmation."
+  (ejn-test-with-temp-buffer "x = 1\n"
+    (let ((asked nil) sent)
+      (cl-letf (((symbol-function 'y-or-n-p)
+                 (lambda (_p) (setq asked t) t))
+                ((symbol-function 'emacs-jupyter-notebook--evaluate-code)
+                 (lambda (&rest args) (setq sent args))))
+        (emacs-jupyter-notebook-send-buffer))
+      (should-not asked)
+      (should sent))))
+
+(ert-deftest ejn-w6.4-send-buffer-interactive-asks-and-aborts-on-no ()
+  "W6.4: interactive `send-buffer' aborts on a `no' answer."
+  (ejn-test-with-temp-buffer "x = 1\n"
+    (let (asked sent)
+      (cl-letf (((symbol-function 'y-or-n-p)
+                 (lambda (_p) (setq asked t) nil))
+                ((symbol-function 'emacs-jupyter-notebook--evaluate-code)
+                 (lambda (&rest args) (setq sent args))))
+        (call-interactively #'emacs-jupyter-notebook-send-buffer))
+      (should asked)
+      (should-not sent))))
+
+(ert-deftest ejn-w6.4-retry-fresh-from-lisp-with-profile-string ()
+  "W6.4: Lisp call with a profile string skips the confirmation."
+  (let ((asked nil) cleanup-called start-called)
+    (cl-letf (((symbol-function 'y-or-n-p)
+               (lambda (_p) (setq asked t) nil))
+              ((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
+               (lambda (&rest _) (setq cleanup-called t)))
+              ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
+               (lambda (profile &rest _)
+                 (setq start-called profile))))
+      (with-temp-buffer
+        (emacs-jupyter-notebook-retry-fresh-kernel "specific")
+        (should-not asked)
+        (should cleanup-called)
+        (should (equal start-called "specific"))))))
+
+(ert-deftest ejn-w6.4-retry-fresh-interactive-prompts-and-aborts-on-no ()
+  "W6.4: interactive `retry-fresh-kernel' with a `no' answer aborts."
+  (let (asked cleanup-called start-called)
+    (cl-letf (((symbol-function 'y-or-n-p)
+               (lambda (_p) (setq asked t) nil))
+              ((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
+               (lambda (&rest _) (setq cleanup-called t)))
+              ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
+               (lambda (&rest _) (setq start-called t))))
+      (with-temp-buffer
+        (call-interactively #'emacs-jupyter-notebook-retry-fresh-kernel))
+      (should asked)
+      (should-not cleanup-called)
+      (should-not start-called))))
+
+(ert-deftest ejn-w6.4-clean-orphaned-kernels-interactive-prompts ()
+  "W6.4: interactive `clean-orphaned-kernels' prompts and aborts on no."
+  (let (asked ran)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--read-profile-name)
+               (lambda () "p"))
+              ((symbol-function 'emacs-jupyter-notebook--read-host-profile)
+               (lambda (_p)
+                 '(:profile "p" :host "host" :remote-cache-dir "/tmp/ejn")))
+              ((symbol-function 'y-or-n-p)
+               (lambda (_p) (setq asked t) nil))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-run-command)
+               (lambda (_argv) (setq ran t) "")))
+      (call-interactively #'emacs-jupyter-notebook-clean-orphaned-kernels)
+      (should asked)
+      (should-not ran))))
+
+(ert-deftest ejn-w6.4-clean-orphaned-kernels-with-c-u-skips-prompt ()
+  "W6.4: interactive `clean-orphaned-kernels' with C-u skips the prompt."
+  (let (asked ran)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--read-profile-name)
+               (lambda () "p"))
+              ((symbol-function 'emacs-jupyter-notebook--read-host-profile)
+               (lambda (_p)
+                 '(:profile "p" :host "host" :remote-cache-dir "/tmp/ejn")))
+              ((symbol-function 'y-or-n-p)
+               (lambda (_p) (setq asked t) nil))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-run-command)
+               (lambda (_argv) (setq ran t) "")))
+      (let ((current-prefix-arg '(4)))
+        (call-interactively #'emacs-jupyter-notebook-clean-orphaned-kernels))
+      (should-not asked)
+      (should ran))))
+
 (ert-deftest ejn-w6.1-old-evaluate-command-names-removed ()
   "W6.1: the legacy `emacs-jupyter-notebook-evaluate-*' names are gone (no aliases)."
   (should-not (fboundp 'emacs-jupyter-notebook-evaluate-current-cell))

@@ -1935,13 +1935,28 @@ has no cell key and appears only in the history-log view of the panel."
       (emacs-jupyter-notebook--evaluate-code
        (buffer-substring-no-properties beg end) nil))))
 
-(defun emacs-jupyter-notebook-send-buffer ()
+(defun emacs-jupyter-notebook--confirm (interactive-p force prompt)
+  "Return non-nil when a destructive action is authorized.
+W6.4 contract: when called from Lisp (INTERACTIVE-P nil) the action is
+always authorized — Lisp callers are presumed deliberate.  When called
+interactively (INTERACTIVE-P non-nil) and FORCE is non-nil (a raw prefix
+arg via \\[universal-argument]) the prompt is skipped.  Otherwise ask
+PROMPT via `y-or-n-p' and require an explicit positive answer."
+  (or (not interactive-p)
+      force
+      (y-or-n-p prompt)))
+
+(defun emacs-jupyter-notebook-send-buffer (&optional force)
   "Send the current buffer to the remote kernel.
 Buffer evaluations have no cell key and appear only in the history-log
-view of the panel."
-  (interactive)
-  (emacs-jupyter-notebook--evaluate-code
-   (buffer-substring-no-properties (point-min) (point-max)) nil))
+view of the panel.  W6.4: when called interactively, ask `y-or-n-p'
+before sending; a \\[universal-argument] FORCE prefix skips the prompt."
+  (interactive "P")
+  (when (emacs-jupyter-notebook--confirm
+         (called-interactively-p 'any) force
+         "Send entire buffer to the kernel? ")
+    (emacs-jupyter-notebook--evaluate-code
+     (buffer-substring-no-properties (point-min) (point-max)) nil)))
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-interrupt-kernel ()
@@ -1958,24 +1973,40 @@ view of the panel."
    (emacs-jupyter-notebook--ensure-client)))
 
 ;;;###autoload
-(defun emacs-jupyter-notebook-shutdown-kernel ()
-  "Shut down the current kernel, close tunnel, and reset state."
-  (interactive)
-  (emacs-jupyter-notebook--cleanup-current-state "Kernel shut down"))
+(defun emacs-jupyter-notebook-shutdown-kernel (&optional force)
+  "Shut down the current kernel, close tunnel, and reset state.
+W6.4: when called interactively, ask for confirmation via `y-or-n-p';
+a \\[universal-argument] FORCE prefix skips the prompt."
+  (interactive "P")
+  (when (emacs-jupyter-notebook--confirm
+         (called-interactively-p 'any) force
+         "Shut down the remote kernel (this terminates it)? ")
+    (emacs-jupyter-notebook--cleanup-current-state "Kernel shut down")))
 
-(defun emacs-jupyter-notebook-retry-fresh-kernel (&optional profile-name)
+(defun emacs-jupyter-notebook-retry-fresh-kernel (&optional force-or-profile)
   "Cancel/cleanup current state and start a fresh kernel.
-With PROFILE-NAME, start that profile.  Otherwise reuse the current session's
-profile, then fall back to `emacs-jupyter-notebook-default-profile'."
-  (interactive)
-  (let* ((entry emacs-jupyter-notebook--session-entry)
+FORCE-OR-PROFILE is the raw prefix arg when called interactively (so a
+\\[universal-argument] FORCE prefix skips the confirmation prompt).  A
+Lisp caller passing a string is treated as the profile name to start.
+
+W6.4: when called interactively, ask `y-or-n-p' before destroying the
+current session and starting fresh; a \\[universal-argument] FORCE prefix
+skips the prompt.  The remote kernel that is currently registered is left
+running per the binding rule that the remote kernel outlives Emacs."
+  (interactive "P")
+  (let* ((profile-name (and (stringp force-or-profile) force-or-profile))
+         (force (and (not profile-name) force-or-profile))
+         (entry emacs-jupyter-notebook--session-entry)
          (context emacs-jupyter-notebook--async-context)
          (profile (or profile-name
                       (plist-get entry :profile)
                       (plist-get (plist-get context :profile) :profile)
                       emacs-jupyter-notebook-default-profile)))
-    (emacs-jupyter-notebook--cleanup-current-state "Retrying with fresh kernel" t)
-    (emacs-jupyter-notebook-start-remote-kernel profile)))
+    (when (emacs-jupyter-notebook--confirm
+           (called-interactively-p 'any) force
+           "Discard current session and start a fresh kernel? ")
+      (emacs-jupyter-notebook--cleanup-current-state "Retrying with fresh kernel" t)
+      (emacs-jupyter-notebook-start-remote-kernel profile))))
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-status ()
@@ -2025,15 +2056,20 @@ not yet been written to."
      (emacs-jupyter-notebook-ssh-run-command
       (emacs-jupyter-notebook-ssh-build-remote-ps-command profile)))))
 
-(defun emacs-jupyter-notebook-clean-orphaned-kernels (&optional profile-name)
-  "Clean all EJN kernel files and processes in PROFILE-NAME's remote cache."
-  (interactive (list (emacs-jupyter-notebook--read-profile-name)))
+(defun emacs-jupyter-notebook-clean-orphaned-kernels (&optional profile-name force)
+  "Clean all EJN kernel files and processes in PROFILE-NAME's remote cache.
+W6.4: when called interactively, ask `y-or-n-p' before issuing the
+remote cleanup; a \\[universal-argument] FORCE prefix skips the prompt.
+Lisp callers do not see the prompt and proceed unconditionally."
+  (interactive (list (emacs-jupyter-notebook--read-profile-name)
+                     current-prefix-arg))
   (let ((profile (emacs-jupyter-notebook--read-host-profile
                   (or profile-name emacs-jupyter-notebook-default-profile))))
-    (when (or (not (called-interactively-p 'interactive))
-              (yes-or-no-p (format "Clean EJN kernels in %s on %s? "
-                                   (plist-get profile :remote-cache-dir)
-                                   (emacs-jupyter-notebook-ssh-destination profile))))
+    (when (emacs-jupyter-notebook--confirm
+           (called-interactively-p 'any) force
+           (format "Clean EJN kernels in %s on %s? "
+                   (plist-get profile :remote-cache-dir)
+                   (emacs-jupyter-notebook-ssh-destination profile)))
       (emacs-jupyter-notebook-ssh-run-command
        (emacs-jupyter-notebook-ssh-build-remote-cleanup-all profile))
       (message "emacs-jupyter-notebook: requested remote orphan cleanup"))))
