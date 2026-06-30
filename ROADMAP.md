@@ -564,7 +564,7 @@ when the kernel is far away.
       `"emacs-jupyter-notebook: starting kernel via profile <name> (C-u to choose)"`
       before the silent default-profile start. `C-u` calls
       `--read-profile-name`. ERT for both branches.
-- [ ] W6.4 Confirmations on destructive commands: `shutdown-kernel`,
+- [~] owner=W6-agent claimed=2026-07-01 W6.4 Confirmations on destructive commands: `shutdown-kernel`,
       `send-buffer`, `retry-fresh-kernel`, `clean-orphaned-kernels`. Single
       `y-or-n-p` each; `C-u` skips the prompt. ERT.
 - [ ] W6.5 Status command renders to a `special-mode` buffer
