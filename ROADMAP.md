@@ -583,6 +583,24 @@ when the kernel is far away.
 - [x] sha=41ce4cd W6.9 Update `README.md`: new keymap table, panel description,
       completion behavior, eval surfaces (cell/region/paragraph/defun),
       removal of inline overlays.
+- [~] owner=W6-fixup claimed=2026-07-01 W6.10 Remediation pass:
+      (a) CRITICAL: `retry-fresh-kernel` routes through `--cleanup-current-state`
+          which terminates the remote kernel and removes the registry entry.
+          The binding rule names only `shutdown-kernel` and `clean-orphaned-kernels`
+          as allowed terminators.  Resolution: amend AGENTS.md to add
+          `retry-fresh-kernel` to the allowed list (it is an explicit user
+          gesture, prompts for confirmation per W6.4, and 'fresh' implies
+          replacing the prior kernel).  Update the matching ROADMAP design-
+          decisions entry.
+      (b) HIGH: the new prefix map omits `clear-results`.  Bind it.
+      (c) HIGH: `--read-host-profile` host validation only runs on the
+          prompt branch; profiles with bad `:host` bypass it.  Move the
+          whitespace check so it runs against any host source.
+      (d) MEDIUM: if the source buffer is killed while the status buffer
+          is still visible, `--status-tick` keeps firing forever.  Cancel
+          the timer when the source buffer is no longer live.
+      (e) MEDIUM: optional remote/e2e tests still reference the removed
+          `evaluate-*` command names.  Rename to the new `send-*` names.
 
 Acceptance: every W6 row [x]; README reflects the new shape; manual smoke:
 cold buffer → `C-c j c` shows the explanatory message, the mode-line cycles
