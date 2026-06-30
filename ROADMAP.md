@@ -578,7 +578,7 @@ when the kernel is far away.
       `--async-message` and every heartbeat failure writes here. ERT.
 - [x] sha=4d1bed3 W6.7 `--read-host-profile` validation. Empty/whitespace re-prompts;
       whitespace-in-host errors before launching SSH. ERT.
-- [ ] W6.8 `--read-registry-entry` always offers a chooser when invoked
+- [~] owner=W6-agent claimed=2026-07-01 W6.8 `--read-registry-entry` always offers a chooser when invoked
       interactively, with the current-file entry pre-selected. ERT.
 - [ ] W6.9 Update `README.md`: new keymap table, panel description,
       completion behavior, eval surfaces (cell/region/paragraph/defun),
