@@ -552,7 +552,7 @@ when the kernel is far away.
       ERT covers a representative sample of bindings → commands. No
       backwards-compat aliases.
 
-- [ ] W6.2 Mode-line lighter is a function returning one of:
+- [~] owner=W6-agent claimed=2026-07-01 W6.2 Mode-line lighter is a function returning one of:
       `" EJN"` (no client), `" EJN…launch"`, `" EJN…retrieve"`,
       `" EJN…tunnel"`, `" EJN…connect"`, `" EJN*"` (busy),
       `" EJN!"` (tunnel dead), `" EJN✗"` (last async errored),
