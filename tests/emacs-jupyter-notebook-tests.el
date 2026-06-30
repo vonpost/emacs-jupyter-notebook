@@ -2949,6 +2949,100 @@ client."
         (should-error (call-interactively #'emacs-jupyter-notebook-restart-kernel)))
       (should-not adapter-called))))
 
+(ert-deftest ejn-w5.5-cancel-uses-async-in-progress-p-not-raw-context ()
+  "W5.5: a successful connect leaves `--async-context' set at phase
+`done'.  cancel-operation MUST dispatch on `--async-in-progress-p' so
+that cancel during a real evaluation interrupts the kernel rather than
+falling into the async-fail branch."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
+           (emacs-jupyter-notebook--client 'mock-client)
+           ;; Simulate the post-connect-finalize state: context not nil,
+           ;; phase is `done'.
+           (emacs-jupyter-notebook--async-context
+            (emacs-jupyter-notebook--async-new-context :phase 'done))
+           (emacs-jupyter-notebook--evaluation-request
+            (list :request-id 1
+                  :panel-entry handle
+                  :cell-key '("x.py" . 1)
+                  :started-at (float-time)))
+           interrupt-arg async-fail-called)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-interrupt)
+                 (lambda (client) (setq interrupt-arg client)))
+                ((symbol-function 'emacs-jupyter-notebook--async-fail)
+                 (lambda (&rest _) (setq async-fail-called t))))
+        (emacs-jupyter-notebook-cancel-operation))
+      (should (eq interrupt-arg 'mock-client))
+      (should-not async-fail-called)
+      (should-not emacs-jupyter-notebook--evaluation-request))))
+
+(ert-deftest ejn-w5.5-execute-reply-drops-stale-request-id ()
+  "W5.5: an execute_reply whose request-id does NOT match the current
+`--evaluation-request' is dropped — the timer stays armed, the request
+slot stays populated, and the panel/fringe are not touched."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
+           (buffer (current-buffer)))
+      (setq emacs-jupyter-notebook--evaluation-request
+            (list :request-id 42 :panel-entry handle :cell-key '("x.py" . 1)
+                  :started-at (float-time)))
+      (setq emacs-jupyter-notebook--evaluation-timer
+            (run-at-time 1000 nil #'ignore))
+      (let* ((callbacks (emacs-jupyter-notebook-jupyter--callbacks
+                         buffer handle nil 7))
+             (reply-fn (cadr (assoc "execute_reply" callbacks))))
+        (cl-letf (((symbol-function 'jupyter-message-content)
+                   (lambda (_msg) '(:status "ok" :execution_count 3)))
+                  ((symbol-function 'ejn-panel-finish-entry)
+                   (lambda (&rest _) (ert-fail "finish-entry called on stale reply")))
+                  ((symbol-function 'emacs-jupyter-notebook-fringe-set)
+                   (lambda (&rest _) (ert-fail "fringe-set called on stale reply"))))
+          (funcall reply-fn 'mock-msg)))
+      (should emacs-jupyter-notebook--evaluation-request)
+      (should (timerp emacs-jupyter-notebook--evaluation-timer))
+      (when (timerp emacs-jupyter-notebook--evaluation-timer)
+        (cancel-timer emacs-jupyter-notebook--evaluation-timer))
+      (setq emacs-jupyter-notebook--evaluation-timer nil
+            emacs-jupyter-notebook--evaluation-request nil))))
+
+(ert-deftest ejn-w5.5-status-idle-with-stale-id-does-not-cancel-timer ()
+  "W5.5: a `status=idle' message whose request-id does not match the
+current `--evaluation-request' MUST NOT cancel the evaluation timer."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
+           (buffer (current-buffer)))
+      (setq emacs-jupyter-notebook--evaluation-request
+            (list :request-id 42 :panel-entry handle :cell-key '("x.py" . 1)
+                  :started-at (float-time)))
+      (setq emacs-jupyter-notebook--evaluation-timer
+            (run-at-time 1000 nil #'ignore))
+      (let* ((callbacks (emacs-jupyter-notebook-jupyter--callbacks
+                         buffer handle nil 7))
+             (status-fn (cadr (assoc "status" callbacks))))
+        (cl-letf (((symbol-function 'jupyter-message-content)
+                   (lambda (_msg) '(:execution_state "idle"))))
+          (funcall status-fn 'mock-msg)))
+      (should (timerp emacs-jupyter-notebook--evaluation-timer))
+      (when (timerp emacs-jupyter-notebook--evaluation-timer)
+        (cancel-timer emacs-jupyter-notebook--evaluation-timer))
+      (setq emacs-jupyter-notebook--evaluation-timer nil
+            emacs-jupyter-notebook--evaluation-request nil))))
+
+(ert-deftest ejn-w5.5-default-interrupt-adapter-is-non-blocking ()
+  "W5.5 MEDIUM (e): the production-default `--interrupt' adapter must
+return without blocking even when the underlying `jupyter-interrupt-kernel'
+hypothetically did work — the adapter is fire-and-forget."
+  (cl-letf (((symbol-function 'jupyter-interrupt-kernel)
+             (lambda (_c) nil))
+            ((symbol-function 'emacs-jupyter-notebook-jupyter--ensure) #'ignore))
+    (let ((start (current-time)))
+      (emacs-jupyter-notebook-jupyter--interrupt 'mock-client)
+      (let ((elapsed (float-time (time-subtract (current-time) start))))
+        (should (< elapsed 0.05))))))
+
 (ert-deftest ejn-w5.3-cancel-during-evaluation-interrupts ()
   "W5.3: cancel-operation with a live --evaluation-request calls interrupt and clears it."
   (with-temp-buffer

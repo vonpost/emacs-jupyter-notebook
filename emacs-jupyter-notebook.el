@@ -1937,7 +1937,11 @@ W5.3: two branches.
 If neither is in progress, signal a `user-error'."
   (interactive)
   (cond
-   (emacs-jupyter-notebook--async-context
+   ;; W5.5: only treat the async branch as live when an actual phase is in
+   ;; flight.  A successful connect leaves `--async-context' set at phase
+   ;; `done', which previously caused cancel-during-evaluation to take the
+   ;; wrong branch and never interrupt the kernel.
+   ((emacs-jupyter-notebook--async-in-progress-p)
     (emacs-jupyter-notebook--async-fail
      emacs-jupyter-notebook--async-context "Operation cancelled")
     (setq emacs-jupyter-notebook--async-context nil))

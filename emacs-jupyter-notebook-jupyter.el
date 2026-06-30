@@ -118,13 +118,19 @@
   "Apply ANSI color escapes in TEXT for panel display."
   (when text (ansi-color-apply text)))
 
-(defun emacs-jupyter-notebook-jupyter--callbacks (buffer entry-handle &optional client)
+(defun emacs-jupyter-notebook-jupyter--callbacks (buffer entry-handle &optional client request-id)
   "Return execution callbacks that drive panel ENTRY-HANDLE in BUFFER.
 
 Stream/execute_result/display_data/update_display_data/error/clear_output/
 execute_reply/status all flow through the panel API; the source BUFFER
 is not mutated.  The optional CLIENT is used to reply to input_request
-prompts."
+prompts.
+
+W5.5: REQUEST-ID, when non-nil, is the W5.1 request-id assigned to this
+evaluation.  `execute_reply' and `status=idle' use it to correlate so a
+late reply or a stale idle from a superseded evaluation cannot clear the
+current `--evaluation-request' / `--evaluation-timer' or overwrite the
+panel/fringe state set by the timeout or `cancel-operation' paths."
   (let ((had-result nil))
     `(("input_request"
        ,(lambda (msg)
@@ -231,47 +237,55 @@ prompts."
       ("execute_reply"
        ,(lambda (msg)
           (condition-case nil
-              (progn
-                (when (buffer-live-p buffer)
-                  (with-current-buffer buffer
-                    (when (timerp emacs-jupyter-notebook--evaluation-timer)
-                      (cancel-timer emacs-jupyter-notebook--evaluation-timer))
-                    (setq emacs-jupyter-notebook--evaluation-timer nil)
-                    ;; W5.1: clear the in-flight request record.  The reply
-                    ;; for *this* request is the canonical termination
-                    ;; signal; the timeout path keys off the same slot to
-                    ;; know there is something to interrupt.
-                    (setq emacs-jupyter-notebook--evaluation-request nil)))
-                (let* ((status-s (emacs-jupyter-notebook-jupyter--message-content-value
-                                  msg :status))
-                       (count (emacs-jupyter-notebook-jupyter--message-content-value
-                               msg :execution_count))
-                       (watch-text (emacs-jupyter-notebook-jupyter--watch-results-text
-                                    (emacs-jupyter-notebook-jupyter--message-content-value
-                                     msg :user_expressions)))
-                       (status-sym (cond ((equal status-s "ok") 'ok)
-                                         ((equal status-s "error") 'error)
-                                         (t 'ok))))
-                  (when watch-text
-                    (setq had-result t)
-                    (ejn-panel-append-text entry-handle watch-text))
-                  (unless had-result
-                    (when (equal status-s "error")
-                      (ejn-panel-append-text
-                       entry-handle
-                       (format "%s: %s"
-                               (or (emacs-jupyter-notebook-jupyter--message-content-value
-                                    msg :ename) "Error")
-                               (or (emacs-jupyter-notebook-jupyter--message-content-value
-                                    msg :evalue) ""))
-                       'emacs-jupyter-notebook-result-error-face)))
-                  (ejn-panel-finish-entry entry-handle status-sym count)
+              ;; W5.5: only act when this reply belongs to the current
+              ;; in-flight request.  A late reply from a superseded
+              ;; evaluation, or any reply arriving after timeout/cancel
+              ;; cleared the slot, is dropped silently — we do NOT clear
+              ;; the timer or overwrite the panel/fringe error state set
+              ;; by the cancel/timeout paths.
+              (let ((current-id
+                     (and (buffer-live-p buffer)
+                          (with-current-buffer buffer
+                            (plist-get emacs-jupyter-notebook--evaluation-request
+                                       :request-id)))))
+                (when (or (null request-id)
+                          (and current-id (equal current-id request-id)))
                   (when (buffer-live-p buffer)
                     (with-current-buffer buffer
-                      (let ((cell-key (plist-get entry-handle :cell-key)))
-                        (when cell-key
-                          (emacs-jupyter-notebook-fringe-set
-                           cell-key status-sym count)))))))
+                      (when (timerp emacs-jupyter-notebook--evaluation-timer)
+                        (cancel-timer emacs-jupyter-notebook--evaluation-timer))
+                      (setq emacs-jupyter-notebook--evaluation-timer nil)
+                      (setq emacs-jupyter-notebook--evaluation-request nil)))
+                  (let* ((status-s (emacs-jupyter-notebook-jupyter--message-content-value
+                                    msg :status))
+                         (count (emacs-jupyter-notebook-jupyter--message-content-value
+                                 msg :execution_count))
+                         (watch-text (emacs-jupyter-notebook-jupyter--watch-results-text
+                                      (emacs-jupyter-notebook-jupyter--message-content-value
+                                       msg :user_expressions)))
+                         (status-sym (cond ((equal status-s "ok") 'ok)
+                                           ((equal status-s "error") 'error)
+                                           (t 'ok))))
+                    (when watch-text
+                      (setq had-result t)
+                      (ejn-panel-append-text entry-handle watch-text))
+                    (unless had-result
+                      (when (equal status-s "error")
+                        (ejn-panel-append-text
+                         entry-handle
+                         (format "%s: %s"
+                                 (or (emacs-jupyter-notebook-jupyter--message-content-value
+                                      msg :ename) "Error")
+                                 (or (emacs-jupyter-notebook-jupyter--message-content-value
+                                      msg :evalue) ""))
+                         'emacs-jupyter-notebook-result-error-face)))
+                    (ejn-panel-finish-entry entry-handle status-sym count)
+                    (when (buffer-live-p buffer)
+                      (with-current-buffer buffer
+                        (let ((cell-key (plist-get entry-handle :cell-key)))
+                          (when cell-key
+                            (emacs-jupyter-notebook-fringe-set
+                             cell-key status-sym count))))))))
             (error nil))))
       ("status"
        ,(lambda (msg)
@@ -284,10 +298,20 @@ prompts."
                           (cond ((equal state "busy") 'busy)
                                 ((equal state "idle") 'idle)
                                 (t nil)))
+                    ;; W5.5: only cancel the evaluation timer on idle when
+                    ;; the current request matches.  A stale idle from a
+                    ;; superseded execute would otherwise disarm the
+                    ;; timeout for a newer hung evaluation.
                     (when (equal state "idle")
-                      (when (timerp emacs-jupyter-notebook--evaluation-timer)
-                        (cancel-timer emacs-jupyter-notebook--evaluation-timer))
-                      (setq emacs-jupyter-notebook--evaluation-timer nil))
+                      (let ((current-id (plist-get
+                                         emacs-jupyter-notebook--evaluation-request
+                                         :request-id)))
+                        (when (or (null current-id)
+                                  (null request-id)
+                                  (equal current-id request-id))
+                          (when (timerp emacs-jupyter-notebook--evaluation-timer)
+                            (cancel-timer emacs-jupyter-notebook--evaluation-timer))
+                          (setq emacs-jupyter-notebook--evaluation-timer nil))))
                     (force-mode-line-update t))))
             (error nil)))))))
 
@@ -393,11 +417,14 @@ in the caller's surface."
   (require 'jupyter-messages)
   (require 'jupyter-monads)
   (let* ((buffer (current-buffer))
+         ;; W5.5: compute request-id BEFORE building callbacks so it can
+         ;; be threaded into the closures for execute_reply / status
+         ;; correlation.
+         (request-id (cl-incf emacs-jupyter-notebook--evaluation-request-counter))
          (callbacks (emacs-jupyter-notebook-jupyter--callbacks
-                     buffer entry-handle client))
+                     buffer entry-handle client request-id))
          (watch-expressions
           (emacs-jupyter-notebook-jupyter--watch-expressions-plist))
-         (request-id (cl-incf emacs-jupyter-notebook--evaluation-request-counter))
          (cell-key (plist-get entry-handle :cell-key)))
     (when (timerp emacs-jupyter-notebook--evaluation-timer)
       (cancel-timer emacs-jupyter-notebook--evaluation-timer))
