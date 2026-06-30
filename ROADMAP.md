@@ -516,7 +516,7 @@ File scope:
 Goal: Predictable, discoverable surface. The package feels responsive even
 when the kernel is far away.
 
-- [~] owner=W6-agent claimed=2026-07-01 W6.1 Single prefix key. Customization
+- [x] sha=a71ac47 W6.1 Single prefix key. Customization
       `emacs-jupyter-notebook-prefix-key` defaults to `"C-c j"`. All
       commands move under it. Suggested layout (the W6 agent makes the
       final call but it must be consistent):
