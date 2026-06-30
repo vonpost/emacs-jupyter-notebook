@@ -567,7 +567,7 @@ when the kernel is far away.
 - [x] sha=9fdf878 W6.4 Confirmations on destructive commands: `shutdown-kernel`,
       `send-buffer`, `retry-fresh-kernel`, `clean-orphaned-kernels`. Single
       `y-or-n-p` each; `C-u` skips the prompt. ERT.
-- [ ] W6.5 Status command renders to a `special-mode` buffer
+- [~] owner=W6-agent claimed=2026-07-01 W6.5 Status command renders to a `special-mode` buffer
       `*emacs-jupyter-notebook status*` with live refresh (1 s while
       visible), font-locked sections, and button widgets on the suggested
       actions (clicking a suggestion calls the command in the originating
