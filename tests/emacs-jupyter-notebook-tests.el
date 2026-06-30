@@ -4695,6 +4695,142 @@ command, which is the contract a user actually depends on."
         (should-not (string-match-p "def second" code))
         (should (null key))))))
 
+;;; W6.2 — Mode-line lighter branches
+
+(ert-deftest ejn-w6.2-mode-line-no-client ()
+  "W6.2: no client and no context → ` EJN'."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client nil)
+          (emacs-jupyter-notebook--tunnel-dead nil)
+          (emacs-jupyter-notebook--async-context nil)
+          (emacs-jupyter-notebook--async-last-error nil)
+          (emacs-jupyter-notebook--kernel-status nil))
+      (should (equal (emacs-jupyter-notebook--mode-line-string) " EJN")))))
+
+(ert-deftest ejn-w6.2-mode-line-healthy ()
+  "W6.2: live client + idle kernel + alive tunnel → ` EJN✓'."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client 'mock)
+          (emacs-jupyter-notebook--tunnel-dead nil)
+          (emacs-jupyter-notebook--async-context nil)
+          (emacs-jupyter-notebook--async-last-error nil)
+          (emacs-jupyter-notebook--kernel-status 'idle))
+      (should (equal (emacs-jupyter-notebook--mode-line-string) " EJN✓")))))
+
+(ert-deftest ejn-w6.2-mode-line-busy ()
+  "W6.2: kernel status busy → ` EJN*'."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client 'mock)
+          (emacs-jupyter-notebook--tunnel-dead nil)
+          (emacs-jupyter-notebook--async-context nil)
+          (emacs-jupyter-notebook--async-last-error nil)
+          (emacs-jupyter-notebook--kernel-status 'busy))
+      (should (equal (emacs-jupyter-notebook--mode-line-string) " EJN*")))))
+
+(ert-deftest ejn-w6.2-mode-line-launch-phase ()
+  "W6.2: in-progress async at launch phase → ` EJN…launch'."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client nil)
+          (emacs-jupyter-notebook--tunnel-dead nil)
+          (emacs-jupyter-notebook--async-context '(:phase launch))
+          (emacs-jupyter-notebook--async-last-error nil)
+          (emacs-jupyter-notebook--kernel-status nil))
+      (should (equal (emacs-jupyter-notebook--mode-line-string) " EJN…launch")))))
+
+(ert-deftest ejn-w6.2-mode-line-retrieve-phase ()
+  "W6.2: retrieve phase → ` EJN…retrieve'."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client nil)
+          (emacs-jupyter-notebook--tunnel-dead nil)
+          (emacs-jupyter-notebook--async-context '(:phase retrieve))
+          (emacs-jupyter-notebook--async-last-error nil)
+          (emacs-jupyter-notebook--kernel-status nil))
+      (should (equal (emacs-jupyter-notebook--mode-line-string) " EJN…retrieve")))))
+
+(ert-deftest ejn-w6.2-mode-line-tunnel-phase ()
+  "W6.2: tunnel phase → ` EJN…tunnel'."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client nil)
+          (emacs-jupyter-notebook--tunnel-dead nil)
+          (emacs-jupyter-notebook--async-context '(:phase tunnel))
+          (emacs-jupyter-notebook--async-last-error nil)
+          (emacs-jupyter-notebook--kernel-status nil))
+      (should (equal (emacs-jupyter-notebook--mode-line-string) " EJN…tunnel")))))
+
+(ert-deftest ejn-w6.2-mode-line-connect-phase ()
+  "W6.2: connect phase → ` EJN…connect'."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client nil)
+          (emacs-jupyter-notebook--tunnel-dead nil)
+          (emacs-jupyter-notebook--async-context '(:phase connect))
+          (emacs-jupyter-notebook--async-last-error nil)
+          (emacs-jupyter-notebook--kernel-status nil))
+      (should (equal (emacs-jupyter-notebook--mode-line-string) " EJN…connect")))))
+
+(ert-deftest ejn-w6.2-mode-line-async-error ()
+  "W6.2: most recent async failed → ` EJN✗' (above busy / phases)."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client 'mock)
+          (emacs-jupyter-notebook--tunnel-dead nil)
+          (emacs-jupyter-notebook--async-context nil)
+          (emacs-jupyter-notebook--async-last-error t)
+          (emacs-jupyter-notebook--kernel-status 'busy))
+      (should (equal (emacs-jupyter-notebook--mode-line-string) " EJN✗")))))
+
+(ert-deftest ejn-w6.2-mode-line-tunnel-dead-wins ()
+  "W6.2: tunnel-dead beats async-error, async-phase, busy, idle, and no-client."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client 'mock)
+          (emacs-jupyter-notebook--tunnel-dead t)
+          (emacs-jupyter-notebook--async-context '(:phase tunnel))
+          (emacs-jupyter-notebook--async-last-error t)
+          (emacs-jupyter-notebook--kernel-status 'busy))
+      (should (equal (emacs-jupyter-notebook--mode-line-string) " EJN!")))))
+
+(ert-deftest ejn-w6.2-mode-line-precedence-async-phase-over-busy ()
+  "W6.2: when an async phase is live AND kernel status is busy, the phase wins."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client 'mock)
+          (emacs-jupyter-notebook--tunnel-dead nil)
+          (emacs-jupyter-notebook--async-context '(:phase connect))
+          (emacs-jupyter-notebook--async-last-error nil)
+          (emacs-jupyter-notebook--kernel-status 'busy))
+      (should (equal (emacs-jupyter-notebook--mode-line-string) " EJN…connect")))))
+
+(ert-deftest ejn-w6.2-mode-line-terminal-phase-not-pending ()
+  "W6.2: terminal phases (done/error) do not show as `…' phases on the lighter."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client 'mock)
+          (emacs-jupyter-notebook--tunnel-dead nil)
+          (emacs-jupyter-notebook--async-context '(:phase done))
+          (emacs-jupyter-notebook--async-last-error nil)
+          (emacs-jupyter-notebook--kernel-status 'idle))
+      (should (equal (emacs-jupyter-notebook--mode-line-string) " EJN✓")))))
+
+(ert-deftest ejn-w6.2-async-fail-records-error-on-origin-buffer ()
+  "W6.2: `--async-fail' sets `--async-last-error' on the originating buffer."
+  (with-temp-buffer
+    (let* ((buf (current-buffer))
+           (ctx (list :phase 'launch :origin-buffer buf)))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-cancel-timer)
+                 (lambda (c) c))
+                ((symbol-function 'emacs-jupyter-notebook--async-delete-process)
+                 (lambda (_)))
+                ((symbol-function 'emacs-jupyter-notebook--async-delete-file)
+                 (lambda (_)))
+                ((symbol-function 'display-warning)
+                 (lambda (&rest _))))
+        (emacs-jupyter-notebook--async-fail ctx "boom"))
+      (should emacs-jupyter-notebook--async-last-error)
+      (should (equal (emacs-jupyter-notebook--mode-line-string) " EJN✗")))))
+
+(ert-deftest ejn-w6.2-ensure-clean-before-start-clears-error ()
+  "W6.2: starting a new operation clears the lingering ` EJN✗' state."
+  (with-temp-buffer
+    (setq emacs-jupyter-notebook--async-last-error t)
+    (emacs-jupyter-notebook--ensure-clean-before-start)
+    (should-not emacs-jupyter-notebook--async-last-error)))
+
 (ert-deftest ejn-w6.1-old-evaluate-command-names-removed ()
   "W6.1: the legacy `emacs-jupyter-notebook-evaluate-*' names are gone (no aliases)."
   (should-not (fboundp 'emacs-jupyter-notebook-evaluate-current-cell))

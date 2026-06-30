@@ -250,12 +250,42 @@ next evaluation through `--tunnel-reconnect'."
       emacs-jupyter-notebook--heartbeat-misses (buffer-name)))
     (emacs-jupyter-notebook--heartbeat-cancel)))
 
+(defvar-local emacs-jupyter-notebook--async-last-error nil
+  "Buffer-local flag: set when the last async operation finished with `error'.
+Cleared by any new successful async transition.  W6.2 uses this to drive
+the ` EJN✗' lighter branch independently of `--tunnel-dead'.")
+
+(defun emacs-jupyter-notebook--async-phase ()
+  "Return the phase symbol of the in-flight async context, or nil.
+Returns nil when no context exists or the context is at terminal phase
+\\='done or \\='error."
+  (let* ((ctx emacs-jupyter-notebook--async-context)
+         (phase (and ctx (plist-get ctx :phase))))
+    (and (memq phase '(launch retrieve tunnel connect)) phase)))
+
 (defun emacs-jupyter-notebook--mode-line-string ()
-  "Return the mode line lighter string based on kernel state."
-  (cond
-   (emacs-jupyter-notebook--tunnel-dead " EJN!")
-    ((eq emacs-jupyter-notebook--kernel-status 'busy) " EJN*")
-    (t " EJN")))
+  "Return the mode-line lighter string for the W6.2 state machine.
+Precedence (highest first):
+  tunnel-dead       → \" EJN!\"
+  async-error       → \" EJN✗\"
+  async-in-progress → \" EJN…launch\" / \" EJN…retrieve\" /
+                       \" EJN…tunnel\" / \" EJN…connect\"
+  kernel busy       → \" EJN*\"
+  healthy (idle)    → \" EJN✓\"
+  no client         → \" EJN\""
+  (let ((phase (emacs-jupyter-notebook--async-phase)))
+    (cond
+     (emacs-jupyter-notebook--tunnel-dead " EJN!")
+     (emacs-jupyter-notebook--async-last-error " EJN✗")
+     ((eq phase 'launch)    " EJN…launch")
+     ((eq phase 'retrieve)  " EJN…retrieve")
+     ((eq phase 'tunnel)    " EJN…tunnel")
+     ((eq phase 'connect)   " EJN…connect")
+     ((eq emacs-jupyter-notebook--kernel-status 'busy) " EJN*")
+     ((and emacs-jupyter-notebook--client
+           (memq emacs-jupyter-notebook--kernel-status '(idle nil)))
+      " EJN✓")
+     (t " EJN"))))
 
 (defun emacs-jupyter-notebook--tunnel-state ()
   "Return the current tunnel state as a symbol."
@@ -498,6 +528,7 @@ executes."
        emacs-jupyter-notebook--tunnel-process)))
   (setq emacs-jupyter-notebook--client nil
         emacs-jupyter-notebook--async-context nil
+        emacs-jupyter-notebook--async-last-error nil
         emacs-jupyter-notebook--tunnel-process nil
         emacs-jupyter-notebook--tunnel-dead nil
         emacs-jupyter-notebook--kernel-status nil
@@ -859,7 +890,10 @@ spurious numbers in an SSH banner or MOTD cannot poison the parse."
 (defun emacs-jupyter-notebook--ensure-clean-before-start ()
   "Ensure the current buffer can start or reconnect a kernel without leaking one."
   (when (emacs-jupyter-notebook--active-session-p)
-    (user-error "A kernel is already active; shut it down or retry fresh first")))
+    (user-error "A kernel is already active; shut it down or retry fresh first"))
+  ;; W6.2: a brand-new operation clears the lingering ` EJN✗' state.
+  (setq emacs-jupyter-notebook--async-last-error nil)
+  (force-mode-line-update t))
 
 (defun emacs-jupyter-notebook--async-add-callback (context callback)
   "Add CALLBACK to CONTEXT's callback chain."
@@ -987,6 +1021,12 @@ underlying stderr matches a known SSH failure pattern."
     ;; buffers do not leak when the probe itself fails the context.
     (emacs-jupyter-notebook--async-delete-process (plist-get context :probe-process))
     (emacs-jupyter-notebook--async-delete-file (plist-get context :remote-copy))
+    ;; W6.2: record the error for the mode-line lighter.
+    (when-let* ((buffer (plist-get context :origin-buffer)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (setq emacs-jupyter-notebook--async-last-error t)
+          (force-mode-line-update t))))
     (if-let ((callback (plist-get context :error-callback)))
         (funcall callback context error-data)
       (display-warning 'emacs-jupyter-notebook
