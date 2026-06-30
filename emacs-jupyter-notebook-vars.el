@@ -260,6 +260,24 @@ the indicator silently falls back to `left-margin'."
                         right-fringe))
   :group 'emacs-jupyter-notebook)
 
+(defcustom emacs-jupyter-notebook-prefix-key "C-c j"
+  "Single keymap prefix under which all `emacs-jupyter-notebook' commands live.
+W6.1 contract: every command moves under one prefix to make the surface
+discoverable.  Setting this customization after `emacs-jupyter-notebook'
+is loaded does NOT retroactively rebind the keymap.  Set it before the
+package is loaded, or rebuild the keymap manually."
+  :type 'string
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-log-max-lines 2000
+  "Maximum number of lines retained in the `*emacs-jupyter-notebook log*' buffer.
+The log buffer is append-only.  After every append the oldest lines are
+trimmed until the buffer is at most this many lines tall.  Set to a small
+value to keep memory bounded on long sessions; set to a large value if you
+want a longer scrollback for debugging."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
 (defcustom emacs-jupyter-notebook-fringe-margin-width 2
   "Buffer-local margin width applied when an indicator first appears.
 Margin contents are only visible when the window's margin is wide enough

@@ -107,13 +107,13 @@
                    "# %% A\na = 1\n# %% B\nb = 2\n# %% B\nb = 2\n# %% C\nc = 3\n"))
     (should (looking-at-p "b = 2"))))
 
-(ert-deftest ejn-cell-evaluate-and-advance-moves-to-next-cell ()
+(ert-deftest ejn-cell-send-and-advance-moves-to-next-cell ()
   (ejn-test-with-temp-buffer "# %% A\na = 1\n# %% B\nb = 2\n"
     (goto-char (point-min))
     (let (called)
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-evaluate-current-cell)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-send-cell)
                  (lambda () (setq called t))))
-        (emacs-jupyter-notebook-evaluate-current-cell-and-advance))
+        (emacs-jupyter-notebook-send-cell-and-advance))
       (should called)
       (should (looking-at-p "b = 2")))))
 
@@ -868,7 +868,7 @@ Output goes to the panel; the source buffer is untouched."
       (let ((emacs-jupyter-notebook-jupyter-evaluate-function
              (lambda (_client code _entry)
                (setq captured-code code))))
-        (emacs-jupyter-notebook-evaluate-current-cell))
+        (emacs-jupyter-notebook-send-cell))
       (should (equal captured-code "a = 1\n"))
       (should (equal (buffer-string) before)))))
 
@@ -892,7 +892,7 @@ leaves source-buffer text untouched."
                        (string-match-p "Evaluation failed: connect failed" c)))
                    emacs-jupyter-notebook-panel--entries)))))))
 
-(ert-deftest ejn-evaluate-region-and-buffer-do-not-mutate-source ()
+(ert-deftest ejn-send-region-and-buffer-do-not-mutate-source ()
   "W2: region/buffer eval does not mutate source-buffer text and has cell-key nil."
   (ejn-test-with-temp-buffer "x = 1\ny = 2\n"
     (let ((before (buffer-string))
@@ -902,8 +902,8 @@ leaves source-buffer text untouched."
       (let ((emacs-jupyter-notebook-jupyter-evaluate-function
              (lambda (_client code entry-handle)
                (push (list code (plist-get entry-handle :cell-key)) calls))))
-        (emacs-jupyter-notebook-evaluate-region (point-min) (line-end-position))
-        (emacs-jupyter-notebook-evaluate-buffer))
+        (emacs-jupyter-notebook-send-region (point-min) (line-end-position))
+        (emacs-jupyter-notebook-send-buffer))
       (should (equal (buffer-string) before))
       (should (equal (buffer-modified-p) modified))
       (let ((codes (mapcar #'car (nreverse calls)))
@@ -1028,7 +1028,7 @@ leaves source-buffer text untouched."
   (let ((text (emacs-jupyter-notebook--status-suggestions
                '(:client t :tunnel-state alive))))
     (should (string-match-p "Engine looks healthy" text))
-    (should (string-match-p "C-c C-c" text))))
+    (should (string-match-p "C-c j c" text))))
 
 (ert-deftest ejn-cleanup-current-state-resets-buffer-state ()
   (let* ((dir (make-temp-file "ejn-cleanup-" t))
@@ -1188,7 +1188,7 @@ leaves source-buffer text untouched."
       (let ((emacs-jupyter-notebook-jupyter-evaluate-function
              (lambda (_client code _entry-handle)
                (push code captured))))
-        (emacs-jupyter-notebook-evaluate-current-cell))
+        (emacs-jupyter-notebook-send-cell))
       (should (equal captured '("a = 1\n"))))))
 
 (ert-deftest ejn-evaluate-cell-no-client-with-file-entry-calls-reconnect ()
@@ -1208,7 +1208,7 @@ leaves source-buffer text untouched."
                     (setq reconnect-captured (cons captured-entry callback))
                     (setq emacs-jupyter-notebook--client 'mock-client)
                     (funcall callback nil))))
-        (emacs-jupyter-notebook-evaluate-current-cell)
+        (emacs-jupyter-notebook-send-cell)
         (should (equal (car reconnect-captured) entry))
         (should (functionp (cdr reconnect-captured)))
         (should eval-called)))))
@@ -1230,7 +1230,7 @@ leaves source-buffer text untouched."
                     (setq start-captured (cons profile callback))
                     (setq emacs-jupyter-notebook--client 'mock-client)
                     (funcall callback nil))))
-        (emacs-jupyter-notebook-evaluate-current-cell)
+        (emacs-jupyter-notebook-send-cell)
         (should (equal (car start-captured) "mydefault"))
         (should (functionp (cdr start-captured)))
         (should eval-called)))))
@@ -1254,7 +1254,7 @@ leaves source-buffer text untouched."
             (emacs-jupyter-notebook--async-new-context
              :phase 'launch
              :origin-buffer (current-buffer))))
-      (emacs-jupyter-notebook-evaluate-current-cell)
+      (emacs-jupyter-notebook-send-cell)
       (should-not eval-called)
       (let ((cb (plist-get emacs-jupyter-notebook--async-context :callback)))
         (should (functionp cb))
@@ -1273,7 +1273,7 @@ leaves source-buffer text untouched."
       (cl-letf (((symbol-function 'message)
                  (lambda (format-string &rest args)
                    (push (apply #'format format-string args) messages))))
-        (emacs-jupyter-notebook-evaluate-current-cell)
+        (emacs-jupyter-notebook-send-cell)
         (let ((cb (plist-get emacs-jupyter-notebook--async-context
                              :error-callback)))
           (should (functionp cb))
@@ -1925,7 +1925,7 @@ leaves source-buffer text untouched."
             (emacs-jupyter-notebook-jupyter-evaluate-function
              (lambda (&rest _)
                (setq eval-called t))))
-        (emacs-jupyter-notebook-evaluate-current-cell))
+        (emacs-jupyter-notebook-send-cell))
       (should callback)
       (should-not eval-called)
       (funcall callback '(:status "incomplete" :indent "    ") nil)
@@ -2019,7 +2019,7 @@ leaves source-buffer text untouched."
             (emacs-jupyter-notebook-jupyter-evaluate-function
              (lambda (&rest _)
                (setq eval-called t))))
-        (emacs-jupyter-notebook-evaluate-current-cell)
+        (emacs-jupyter-notebook-send-cell)
         (should callback)
         (should-not eval-called)
         (funcall callback '(:status "complete") nil))
@@ -2316,7 +2316,7 @@ leaves source-buffer text untouched."
                    (setq emacs-jupyter-notebook--tunnel-dead nil)
                    (setq emacs-jupyter-notebook--client 'mock-client)
                    (funcall callback nil))))
-        (emacs-jupyter-notebook-evaluate-current-cell)
+        (emacs-jupyter-notebook-send-cell)
         (should reconnect-called)
         (should eval-called)))))
 
@@ -2335,7 +2335,7 @@ leaves source-buffer text untouched."
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--tunnel-reconnect)
                  (lambda (_buffer _callback error-callback)
                    (funcall error-callback nil "tunnel reconnect failed"))))
-        (emacs-jupyter-notebook-evaluate-current-cell)
+        (emacs-jupyter-notebook-send-cell)
         (should-not eval-called)))))
 
 (ert-deftest ejn-w4.6-heartbeat-death-routes-through-tunnel-reconnect ()
@@ -2369,7 +2369,7 @@ the evaluate flow."
                    (setq emacs-jupyter-notebook--tunnel-dead nil)
                    (setq emacs-jupyter-notebook--client 'mock-client)
                    (funcall callback nil))))
-        (emacs-jupyter-notebook-evaluate-current-cell)
+        (emacs-jupyter-notebook-send-cell)
         (should reconnect-called)
         (should eval-called)))))
 
@@ -4553,6 +4553,154 @@ and the existing ExitOnForwardFailure option must still be present."
                                 (string-prefix-p "ServerAliveInterval" arg)))
                          cmd))
     (should-not (member "ServerAliveCountMax=3" cmd))))
+
+;;; W6.1 — Single-prefix keymap
+
+(ert-deftest ejn-w6.1-prefix-key-customization-defaults-to-c-c-j ()
+  "W6.1: the prefix-key customization defaults to `C-c j'."
+  (should (equal emacs-jupyter-notebook-prefix-key "C-c j")))
+
+(ert-deftest ejn-w6.1-mode-map-routes-through-prefix ()
+  "W6.1: the mode-map contains exactly one binding — the prefix."
+  ;; Bindings are a representative sample; what we assert is that every
+  ;; expected command lives under `C-c j' on the prefix-map.
+  (let ((map emacs-jupyter-notebook-prefix-map))
+    (should (eq (lookup-key map (kbd "c"))
+                #'emacs-jupyter-notebook-send-cell))
+    (should (eq (lookup-key map (kbd "j"))
+                #'emacs-jupyter-notebook-send-cell-and-advance))
+    (should (eq (lookup-key map (kbd "r"))
+                #'emacs-jupyter-notebook-send-region))
+    (should (eq (lookup-key map (kbd "SPC"))
+                #'emacs-jupyter-notebook-send-paragraph))
+    (should (eq (lookup-key map (kbd "d"))
+                #'emacs-jupyter-notebook-send-defun))
+    (should (eq (lookup-key map (kbd "b"))
+                #'emacs-jupyter-notebook-send-buffer))
+    (should (eq (lookup-key map (kbd "s"))
+                #'emacs-jupyter-notebook-start-remote-kernel))
+    (should (eq (lookup-key map (kbd "R"))
+                #'emacs-jupyter-notebook-reconnect-remote-kernel))
+    (should (eq (lookup-key map (kbd "y"))
+                #'emacs-jupyter-notebook-retry-fresh-kernel))
+    (should (eq (lookup-key map (kbd "k"))
+                #'emacs-jupyter-notebook-interrupt-kernel))
+    (should (eq (lookup-key map (kbd "K"))
+                #'emacs-jupyter-notebook-restart-kernel))
+    (should (eq (lookup-key map (kbd "S"))
+                #'emacs-jupyter-notebook-shutdown-kernel))
+    (should (eq (lookup-key map (kbd "x"))
+                #'emacs-jupyter-notebook-cancel-operation))
+    (should (eq (lookup-key map (kbd "?"))
+                #'emacs-jupyter-notebook-status))
+    (should (eq (lookup-key map (kbd "L"))
+                #'emacs-jupyter-notebook-show-log-buffer))
+    (should (eq (lookup-key map (kbd "o"))
+                #'emacs-jupyter-notebook-show-output-panel))
+    (should (eq (lookup-key map (kbd "t"))
+                #'emacs-jupyter-notebook-toggle-panel-view))
+    (should (eq (lookup-key map (kbd "."))
+                #'emacs-jupyter-notebook-inspect-at-point))
+    (should (eq (lookup-key map (kbd "TAB"))
+                #'emacs-jupyter-notebook-complete-at-point))
+    (should (eq (lookup-key map (kbd "v"))
+                #'emacs-jupyter-notebook-fetch-remote-log))
+    (should (eq (lookup-key map (kbd "q"))
+                #'emacs-jupyter-notebook-list-remote-processes))
+    (should (eq (lookup-key map (kbd "w"))
+                #'emacs-jupyter-notebook-clean-orphaned-kernels))
+    (should (eq (lookup-key map (kbd "n"))
+                #'emacs-jupyter-notebook-forward-cell))
+    (should (eq (lookup-key map (kbd "p"))
+                #'emacs-jupyter-notebook-backward-cell))))
+
+(ert-deftest ejn-w6.1-cell-edit-subprefix ()
+  "W6.1: cell-edit subprefix is `%' with the documented sub-bindings."
+  (let* ((prefix emacs-jupyter-notebook-prefix-map)
+         (sub (lookup-key prefix (kbd "%"))))
+    (should (keymapp sub))
+    (should (eq (lookup-key sub (kbd "n")) #'emacs-jupyter-notebook-forward-cell))
+    (should (eq (lookup-key sub (kbd "p")) #'emacs-jupyter-notebook-backward-cell))
+    (should (eq (lookup-key sub (kbd "a")) #'emacs-jupyter-notebook-beginning-of-cell))
+    (should (eq (lookup-key sub (kbd "e")) #'emacs-jupyter-notebook-end-of-cell))
+    (should (eq (lookup-key sub (kbd "i")) #'emacs-jupyter-notebook-insert-cell-below))
+    (should (eq (lookup-key sub (kbd "I")) #'emacs-jupyter-notebook-insert-cell-above))
+    (should (eq (lookup-key sub (kbd "d")) #'emacs-jupyter-notebook-delete-cell))
+    (should (eq (lookup-key sub (kbd "k")) #'emacs-jupyter-notebook-kill-cell))
+    (should (eq (lookup-key sub (kbd "K")) #'emacs-jupyter-notebook-clear-cell))
+    (should (eq (lookup-key sub (kbd "y")) #'emacs-jupyter-notebook-duplicate-cell))
+    (should (eq (lookup-key sub (kbd "P")) #'emacs-jupyter-notebook-move-cell-up))
+    (should (eq (lookup-key sub (kbd "N")) #'emacs-jupyter-notebook-move-cell-down))
+    (should (eq (lookup-key sub (kbd "@")) #'code-cells-mark-cell))))
+
+(ert-deftest ejn-w6.1-old-cell-edit-send-bindings-removed ()
+  "W6.1: the old `s' / `RET' send-cell-and-advance bindings on `C-c j %' are gone."
+  (let* ((prefix emacs-jupyter-notebook-prefix-map)
+         (sub (lookup-key prefix (kbd "%"))))
+    (should (keymapp sub))
+    ;; `s' on the cell-edit subprefix used to send-and-advance; now unbound.
+    (should-not (commandp (lookup-key sub (kbd "s"))))
+    ;; `RET' likewise.
+    (should-not (commandp (lookup-key sub (kbd "RET"))))))
+
+(ert-deftest ejn-w6.1-mode-map-uses-customized-prefix ()
+  "W6.1: the mode-map binds the prefix at `emacs-jupyter-notebook-prefix-key'.
+This sanity-checks one keystroke from the mode-map all the way to a leaf
+command, which is the contract a user actually depends on."
+  (should (keymapp (lookup-key emacs-jupyter-notebook-mode-map (kbd "C-c j"))))
+  (should (eq (lookup-key emacs-jupyter-notebook-mode-map (kbd "C-c j c"))
+              #'emacs-jupyter-notebook-send-cell))
+  (should (eq (lookup-key emacs-jupyter-notebook-mode-map (kbd "C-c j SPC"))
+              #'emacs-jupyter-notebook-send-paragraph))
+  (should (eq (lookup-key emacs-jupyter-notebook-mode-map (kbd "C-c j % i"))
+              #'emacs-jupyter-notebook-insert-cell-below)))
+
+(ert-deftest ejn-w6.1-old-c-c-c-binding-removed ()
+  "W6.1: legacy `C-c C-c' / `C-c C-r' / `C-c C-b' bindings are gone."
+  (should-not (commandp (lookup-key emacs-jupyter-notebook-mode-map (kbd "C-c C-c"))))
+  (should-not (commandp (lookup-key emacs-jupyter-notebook-mode-map (kbd "C-c C-r"))))
+  (should-not (commandp (lookup-key emacs-jupyter-notebook-mode-map (kbd "C-c C-b")))))
+
+(ert-deftest ejn-w6.1-send-paragraph-routes-to-evaluate-code ()
+  "W6.1: send-paragraph delimits via `mark-paragraph' and posts code with cell-key nil."
+  (ejn-test-with-temp-buffer "para1 line1\npara1 line2\n\npara2 line1\n"
+    (goto-char (point-min))
+    (let (captured)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--evaluate-code)
+                 (lambda (code key) (push (list code key) captured))))
+        (emacs-jupyter-notebook-send-paragraph))
+      (should (= (length captured) 1))
+      (let* ((entry (car captured))
+             (code (nth 0 entry))
+             (key (nth 1 entry)))
+        (should (string-match-p "para1 line1" code))
+        (should (string-match-p "para1 line2" code))
+        (should (null key))))))
+
+(ert-deftest ejn-w6.1-send-defun-routes-to-evaluate-code ()
+  "W6.1: send-defun delimits via beginning-of-defun/end-of-defun and posts code with nil key."
+  (ejn-test-with-temp-buffer "def first():\n    return 1\n\ndef second():\n    return 2\n"
+    (goto-char (point-min))
+    ;; Place point inside `first'.
+    (search-forward "return 1")
+    (let (captured)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--evaluate-code)
+                 (lambda (code key) (push (list code key) captured))))
+        (emacs-jupyter-notebook-send-defun))
+      (should (= (length captured) 1))
+      (let* ((entry (car captured))
+             (code (nth 0 entry))
+             (key (nth 1 entry)))
+        (should (string-match-p "def first" code))
+        (should-not (string-match-p "def second" code))
+        (should (null key))))))
+
+(ert-deftest ejn-w6.1-old-evaluate-command-names-removed ()
+  "W6.1: the legacy `emacs-jupyter-notebook-evaluate-*' names are gone (no aliases)."
+  (should-not (fboundp 'emacs-jupyter-notebook-evaluate-current-cell))
+  (should-not (fboundp 'emacs-jupyter-notebook-evaluate-region))
+  (should-not (fboundp 'emacs-jupyter-notebook-evaluate-buffer))
+  (should-not (fboundp 'emacs-jupyter-notebook-evaluate-current-cell-and-advance)))
 
 (provide 'emacs-jupyter-notebook-tests)
 

@@ -325,7 +325,7 @@ next evaluation through `--tunnel-reconnect'."
       (push (format "Last async failure: %s" error) suggestions))
     (if suggestions
         (concat "Suggested actions:\n- " (string-join (nreverse suggestions) "\n- "))
-      "Suggested actions:\n- Engine looks healthy; evaluate with `C-c C-c'.")))
+      "Suggested actions:\n- Engine looks healthy; send the current cell with `C-c j c'.")))
 
 (defvar emacs-jupyter-notebook-cell-map
   (let ((map (make-sparse-keymap)))
@@ -333,8 +333,6 @@ next evaluation through `--tunnel-reconnect'."
     (define-key map (kbd "p") #'emacs-jupyter-notebook-backward-cell)
     (define-key map (kbd "a") #'emacs-jupyter-notebook-beginning-of-cell)
     (define-key map (kbd "e") #'emacs-jupyter-notebook-end-of-cell)
-    (define-key map (kbd "s") #'emacs-jupyter-notebook-evaluate-current-cell-and-advance)
-    (define-key map (kbd "RET") #'emacs-jupyter-notebook-evaluate-current-cell-and-advance)
     (define-key map (kbd "i") #'emacs-jupyter-notebook-insert-cell-below)
     (define-key map (kbd "I") #'emacs-jupyter-notebook-insert-cell-above)
     (define-key map (kbd "d") #'emacs-jupyter-notebook-delete-cell)
@@ -345,33 +343,56 @@ next evaluation through `--tunnel-reconnect'."
     (define-key map (kbd "N") #'emacs-jupyter-notebook-move-cell-down)
     (define-key map (kbd "@") #'code-cells-mark-cell)
     map)
-  "Cell editing keymap for `emacs-jupyter-notebook-mode'.")
+  "Cell editing keymap, bound under `emacs-jupyter-notebook-prefix-key' + `%'.
+The old `s' / `RET' send-current-cell-and-advance bindings have been
+removed; use the top-level send-cell binding instead.")
+
+(defun emacs-jupyter-notebook--build-prefix-map ()
+  "Return the W6.1 single-prefix command keymap.
+All command bindings live under `emacs-jupyter-notebook-prefix-key'
+\(default `C-c j').  The cell-editing keymap is attached on `%'."
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "c")    #'emacs-jupyter-notebook-send-cell)
+    (define-key map (kbd "j")    #'emacs-jupyter-notebook-send-cell-and-advance)
+    (define-key map (kbd "r")    #'emacs-jupyter-notebook-send-region)
+    (define-key map (kbd "SPC")  #'emacs-jupyter-notebook-send-paragraph)
+    (define-key map (kbd "d")    #'emacs-jupyter-notebook-send-defun)
+    (define-key map (kbd "b")    #'emacs-jupyter-notebook-send-buffer)
+    (define-key map (kbd "s")    #'emacs-jupyter-notebook-start-remote-kernel)
+    (define-key map (kbd "R")    #'emacs-jupyter-notebook-reconnect-remote-kernel)
+    (define-key map (kbd "y")    #'emacs-jupyter-notebook-retry-fresh-kernel)
+    (define-key map (kbd "k")    #'emacs-jupyter-notebook-interrupt-kernel)
+    (define-key map (kbd "K")    #'emacs-jupyter-notebook-restart-kernel)
+    (define-key map (kbd "S")    #'emacs-jupyter-notebook-shutdown-kernel)
+    (define-key map (kbd "x")    #'emacs-jupyter-notebook-cancel-operation)
+    (define-key map (kbd "?")    #'emacs-jupyter-notebook-status)
+    (define-key map (kbd "L")    #'emacs-jupyter-notebook-show-log-buffer)
+    (define-key map (kbd "o")    #'emacs-jupyter-notebook-show-output-panel)
+    (define-key map (kbd "t")    #'emacs-jupyter-notebook-toggle-panel-view)
+    (define-key map (kbd ".")    #'emacs-jupyter-notebook-inspect-at-point)
+    (define-key map (kbd "TAB")  #'emacs-jupyter-notebook-complete-at-point)
+    (define-key map (kbd "v")    #'emacs-jupyter-notebook-fetch-remote-log)
+    (define-key map (kbd "q")    #'emacs-jupyter-notebook-list-remote-processes)
+    (define-key map (kbd "w")    #'emacs-jupyter-notebook-clean-orphaned-kernels)
+    (define-key map (kbd "n")    #'emacs-jupyter-notebook-forward-cell)
+    (define-key map (kbd "p")    #'emacs-jupyter-notebook-backward-cell)
+    (define-key map (kbd "%")    emacs-jupyter-notebook-cell-map)
+    map))
+
+(defvar emacs-jupyter-notebook-prefix-map
+  (emacs-jupyter-notebook--build-prefix-map)
+  "The W6.1 single-prefix command keymap.
+Bound under `emacs-jupyter-notebook-prefix-key' in
+`emacs-jupyter-notebook-mode-map'.")
 
 (defvar emacs-jupyter-notebook-mode-map
   (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "C-c C-c") #'emacs-jupyter-notebook-evaluate-current-cell)
-    (define-key map (kbd "C-c C-r") #'emacs-jupyter-notebook-evaluate-region)
-    (define-key map (kbd "C-c C-b") #'emacs-jupyter-notebook-evaluate-buffer)
-    (define-key map (kbd "C-c TAB") #'emacs-jupyter-notebook-complete-at-point)
-    (define-key map (kbd "C-c C-d") #'emacs-jupyter-notebook-inspect-at-point)
-    (define-key map (kbd "C-c C-k") #'emacs-jupyter-notebook-interrupt-kernel)
-    (define-key map (kbd "C-c C-s") #'emacs-jupyter-notebook-start-remote-kernel)
-    (define-key map (kbd "C-c C-n") #'emacs-jupyter-notebook-reconnect-remote-kernel)
-    (define-key map (kbd "C-c C-y") #'emacs-jupyter-notebook-retry-fresh-kernel)
-    (define-key map (kbd "C-c C-/") #'emacs-jupyter-notebook-status)
-    (define-key map (kbd "C-c C-v") #'emacs-jupyter-notebook-fetch-remote-log)
-    (define-key map (kbd "C-c C-q") #'emacs-jupyter-notebook-list-remote-processes)
-    (define-key map (kbd "C-c C-w") #'emacs-jupyter-notebook-clean-orphaned-kernels)
-    (define-key map (kbd "C-c C-l") #'emacs-jupyter-notebook-clear-results)
-    (define-key map (kbd "C-c C-x") #'emacs-jupyter-notebook-cancel-operation)
-    (define-key map (kbd "C-c C-o") #'emacs-jupyter-notebook-show-output-panel)
-    (define-key map (kbd "C-c C-t") #'emacs-jupyter-notebook-toggle-panel-view)
-    (define-key map (kbd "C-c C-f") #'emacs-jupyter-notebook-forward-cell)
-    (define-key map (kbd "C-c C-p") #'emacs-jupyter-notebook-backward-cell)
-    (define-key map (kbd "C-c C-j") #'emacs-jupyter-notebook-evaluate-current-cell-and-advance)
-    (define-key map (kbd "C-c %") emacs-jupyter-notebook-cell-map)
+    (define-key map (kbd emacs-jupyter-notebook-prefix-key)
+                emacs-jupyter-notebook-prefix-map)
     map)
-  "Keymap for `emacs-jupyter-notebook-mode'.")
+  "Keymap for `emacs-jupyter-notebook-mode'.
+A single prefix (`emacs-jupyter-notebook-prefix-key', default `C-c j')
+hosts the entire command surface.  See `emacs-jupyter-notebook-prefix-map'.")
 
 (defun emacs-jupyter-notebook--cancel-async-context-locally (context)
   "Cancel CONTEXT's in-flight local processes, timers, and temp files.
@@ -542,7 +563,7 @@ panel's own kill-buffer-hook only cancels its flush timer)."
     (emacs-jupyter-notebook--mode-disable-cleanup)))
 
 (add-to-list 'code-cells-eval-region-commands
-              '(emacs-jupyter-notebook-mode . emacs-jupyter-notebook-evaluate-region))
+              '(emacs-jupyter-notebook-mode . emacs-jupyter-notebook-send-region))
 
 (defun emacs-jupyter-notebook--clear-cell-region-artifacts (_beg _end)
   "Clear source-side fringe indicators in the BEG..END region.
@@ -627,10 +648,10 @@ only the fringe indicators need clearing on a structural cell edit."
   (code-cells-move-cell-down (or arg 1))
   (emacs-jupyter-notebook-cell-goto-code-start))
 
-(defun emacs-jupyter-notebook-evaluate-current-cell-and-advance ()
-  "Evaluate the current cell, then move to the next cell when one exists."
+(defun emacs-jupyter-notebook-send-cell-and-advance ()
+  "Send the current cell, then move to the next cell when one exists."
   (interactive)
-  (emacs-jupyter-notebook-evaluate-current-cell)
+  (emacs-jupyter-notebook-send-cell)
   (condition-case nil
       (emacs-jupyter-notebook-forward-cell 1)
     (user-error nil)))
@@ -1802,8 +1823,8 @@ non-nil, do not send a Jupyter shutdown request to the current client."
      (emacs-jupyter-notebook--async-reconnect-context profile entry callback error-callback))))
 
 ;;;###autoload
-(defun emacs-jupyter-notebook-evaluate-current-cell ()
-  "Evaluate the current # %% cell, sending output to the cell's panel entry."
+(defun emacs-jupyter-notebook-send-cell ()
+  "Send the current # %% cell, posting output to the cell's panel entry."
   (interactive)
   (pcase-let ((`(,beg . ,end) (emacs-jupyter-notebook-cell-bounds)))
     (let ((code (buffer-substring-no-properties beg end))
@@ -1811,16 +1832,44 @@ non-nil, do not send a Jupyter shutdown request to the current client."
       (emacs-jupyter-notebook--evaluate-code code key))))
 
 ;;;###autoload
-(defun emacs-jupyter-notebook-evaluate-region (beg end)
-  "Evaluate the active region from BEG to END.
+(defun emacs-jupyter-notebook-send-region (beg end)
+  "Send the active region from BEG to END.
 Region evaluations have no cell key and appear only in the history-log
 view of the panel."
   (interactive "r")
   (emacs-jupyter-notebook--evaluate-code
    (buffer-substring-no-properties beg end) nil))
 
-(defun emacs-jupyter-notebook-evaluate-buffer ()
-  "Evaluate the current buffer.
+;;;###autoload
+(defun emacs-jupyter-notebook-send-paragraph ()
+  "Send the current paragraph to the remote kernel.
+Uses `mark-paragraph' semantics to delimit the paragraph; output has no
+cell key and appears only in the history-log view of the panel."
+  (interactive)
+  (save-mark-and-excursion
+    (mark-paragraph)
+    (let ((beg (region-beginning))
+          (end (region-end)))
+      (emacs-jupyter-notebook--evaluate-code
+       (buffer-substring-no-properties beg end) nil))))
+
+;;;###autoload
+(defun emacs-jupyter-notebook-send-defun ()
+  "Send the current defun to the remote kernel.
+Uses `beginning-of-defun' / `end-of-defun' to delimit the defun; output
+has no cell key and appears only in the history-log view of the panel."
+  (interactive)
+  (save-mark-and-excursion
+    (let (beg end)
+      (end-of-defun)
+      (setq end (point))
+      (beginning-of-defun)
+      (setq beg (point))
+      (emacs-jupyter-notebook--evaluate-code
+       (buffer-substring-no-properties beg end) nil))))
+
+(defun emacs-jupyter-notebook-send-buffer ()
+  "Send the current buffer to the remote kernel.
 Buffer evaluations have no cell key and appear only in the history-log
 view of the panel."
   (interactive)
@@ -1870,6 +1919,19 @@ profile, then fall back to `emacs-jupyter-notebook-default-profile'."
     (if (called-interactively-p 'interactive)
         (emacs-jupyter-notebook--display-command-output "*ejn-status*" text)
       text)))
+
+(defun emacs-jupyter-notebook-show-log-buffer ()
+  "Show the global async log buffer `*emacs-jupyter-notebook log*'.
+W6.6 owns the log-buffer creation and append behavior; this command
+displays whatever already exists, creating an empty buffer if the log has
+not yet been written to."
+  (interactive)
+  (let ((buf (get-buffer-create "*emacs-jupyter-notebook log*")))
+    (with-current-buffer buf
+      (unless (derived-mode-p 'special-mode)
+        (special-mode))
+      (setq-local truncate-lines nil))
+    (display-buffer buf)))
 
 (defun emacs-jupyter-notebook-fetch-remote-log ()
   "Fetch and display the current session's remote kernel log."
