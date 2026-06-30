@@ -468,7 +468,7 @@ plumbing grows teeth.
       evaluation interrupts; cancel during connect does not interrupt.
 - [x] sha=420d391 W5.4 ERT: interrupt and restart interactive commands dispatch through
       their adapter function vars (currently completely uncovered).
-- [~] owner=W5-fixup claimed=2026-06-30 W5.5 Remediation pass on review
+- [x] sha=f65e5e0 W5.5 Remediation pass on review
       findings — all four real bugs share one root cause (callbacks do not
       correlate by request-id) plus two scope clarifications:
       (a) CRITICAL: `cancel-operation` tests raw `--async-context' instead
