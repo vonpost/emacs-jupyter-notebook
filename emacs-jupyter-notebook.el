@@ -1862,14 +1862,41 @@ non-nil, do not send a Jupyter shutdown request to the current client."
     (emacs-jupyter-notebook--async-probe-pid-alive
      (emacs-jupyter-notebook--async-reconnect-context profile entry callback error-callback))))
 
+(defun emacs-jupyter-notebook--cold-start-p ()
+  "Return non-nil when sending would trigger a cold remote-kernel start.
+Cold means no buffer-local client, no in-flight async operation, and no
+registry entry for this file."
+  (and (not emacs-jupyter-notebook--client)
+       (not (emacs-jupyter-notebook--async-in-progress-p))
+       (not (emacs-jupyter-notebook--current-file-registry-entry))))
+
+(defun emacs-jupyter-notebook--announce-cold-start (profile-name)
+  "Message the W6.3 friendly-first-start banner for PROFILE-NAME."
+  (message
+   "emacs-jupyter-notebook: starting kernel via profile %s (C-u to choose)"
+   profile-name))
+
 ;;;###autoload
-(defun emacs-jupyter-notebook-send-cell ()
-  "Send the current # %% cell, posting output to the cell's panel entry."
-  (interactive)
-  (pcase-let ((`(,beg . ,end) (emacs-jupyter-notebook-cell-bounds)))
-    (let ((code (buffer-substring-no-properties beg end))
-          (key (emacs-jupyter-notebook--current-cell-key)))
-      (emacs-jupyter-notebook--evaluate-code code key))))
+(defun emacs-jupyter-notebook-send-cell (&optional choose)
+  "Send the current # %% cell, posting output to the cell's panel entry.
+
+W6.3 contract: when no kernel is connected and no in-flight async exists,
+this command messages the user about which profile it is about to start
+with (the package's `default-profile') before the silent launch.  With a
+\\[universal-argument] CHOOSE prefix, prompt for the profile to start
+instead of using the default."
+  (interactive "P")
+  (let ((profile (if (and choose (emacs-jupyter-notebook--cold-start-p))
+                     (emacs-jupyter-notebook--read-profile-name)
+                   emacs-jupyter-notebook-default-profile)))
+    (when (and (emacs-jupyter-notebook--cold-start-p) (not choose))
+      (emacs-jupyter-notebook--announce-cold-start profile))
+    ;; Pin the resolved profile for `--ensure-client-async' fallback path.
+    (let ((emacs-jupyter-notebook-default-profile profile))
+      (pcase-let ((`(,beg . ,end) (emacs-jupyter-notebook-cell-bounds)))
+        (let ((code (buffer-substring-no-properties beg end))
+              (key (emacs-jupyter-notebook--current-cell-key)))
+          (emacs-jupyter-notebook--evaluate-code code key))))))
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-send-region (beg end)

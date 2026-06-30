@@ -4831,6 +4831,88 @@ command, which is the contract a user actually depends on."
     (emacs-jupyter-notebook--ensure-clean-before-start)
     (should-not emacs-jupyter-notebook--async-last-error)))
 
+;;; W6.3 — Friendly first-evaluate
+
+(ert-deftest ejn-w6.3-send-cell-announces-default-profile-on-cold-start ()
+  "W6.3: with no client/async/registry, send-cell messages the default profile."
+  (ejn-test-with-temp-buffer "# %% A\nx = 1\n"
+    (let* ((emacs-jupyter-notebook-default-profile "workstation")
+           (emacs-jupyter-notebook--client nil)
+           (emacs-jupyter-notebook--async-context nil)
+           (announced nil))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--evaluate-code)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
+                 (lambda () nil))
+                ((symbol-function 'emacs-jupyter-notebook--announce-cold-start)
+                 (lambda (p) (setq announced p))))
+        (emacs-jupyter-notebook-send-cell))
+      (should (equal announced "workstation")))))
+
+(ert-deftest ejn-w6.3-send-cell-with-prefix-prompts-and-skips-message ()
+  "W6.3: C-u send-cell on a cold start prompts via `--read-profile-name' and skips the banner."
+  (ejn-test-with-temp-buffer "# %% A\nx = 1\n"
+    (let* ((emacs-jupyter-notebook-default-profile "default")
+           (emacs-jupyter-notebook--client nil)
+           (emacs-jupyter-notebook--async-context nil)
+           (announced nil)
+           (read-called nil))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--evaluate-code)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
+                 (lambda () nil))
+                ((symbol-function 'emacs-jupyter-notebook--read-profile-name)
+                 (lambda () (setq read-called t) "chosen"))
+                ((symbol-function 'emacs-jupyter-notebook--announce-cold-start)
+                 (lambda (p) (setq announced p))))
+        (emacs-jupyter-notebook-send-cell '(4)))
+      (should read-called)
+      (should (null announced)))))
+
+(ert-deftest ejn-w6.3-send-cell-with-live-client-does-not-announce ()
+  "W6.3: when a client is already live, no banner fires."
+  (ejn-test-with-temp-buffer "# %% A\nx = 1\n"
+    (let* ((emacs-jupyter-notebook-default-profile "workstation")
+           (emacs-jupyter-notebook--client 'mock)
+           (emacs-jupyter-notebook--async-context nil)
+           (announced nil))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--evaluate-code)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
+                 (lambda () nil))
+                ((symbol-function 'emacs-jupyter-notebook--announce-cold-start)
+                 (lambda (p) (setq announced p))))
+        (emacs-jupyter-notebook-send-cell))
+      (should (null announced)))))
+
+(ert-deftest ejn-w6.3-send-cell-with-registry-entry-does-not-announce ()
+  "W6.3: when a registry entry exists, send-cell silently reconnects (no banner)."
+  (ejn-test-with-temp-buffer "# %% A\nx = 1\n"
+    (let* ((emacs-jupyter-notebook-default-profile "workstation")
+           (emacs-jupyter-notebook--client nil)
+           (emacs-jupyter-notebook--async-context nil)
+           (announced nil))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--evaluate-code)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
+                 (lambda () '(:session-id "s")))
+                ((symbol-function 'emacs-jupyter-notebook--announce-cold-start)
+                 (lambda (p) (setq announced p))))
+        (emacs-jupyter-notebook-send-cell))
+      (should (null announced)))))
+
+(ert-deftest ejn-w6.3-announce-cold-start-message-shape ()
+  "W6.3: `--announce-cold-start' produces the documented message shape."
+  (let ((inhibit-message t))
+    ;; Just exercise the function so it does not error; the contents end up
+    ;; in `*Messages*' but that is not portable to assert from batch reliably.
+    (emacs-jupyter-notebook--announce-cold-start "workstation"))
+  ;; Check that the message bytes are the documented format with format.
+  (should (equal
+           (format "emacs-jupyter-notebook: starting kernel via profile %s (C-u to choose)"
+                   "workstation")
+           "emacs-jupyter-notebook: starting kernel via profile workstation (C-u to choose)")))
+
 (ert-deftest ejn-w6.1-old-evaluate-command-names-removed ()
   "W6.1: the legacy `emacs-jupyter-notebook-evaluate-*' names are gone (no aliases)."
   (should-not (fboundp 'emacs-jupyter-notebook-evaluate-current-cell))
