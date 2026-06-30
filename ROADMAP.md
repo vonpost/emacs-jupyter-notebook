@@ -468,6 +468,34 @@ plumbing grows teeth.
       evaluation interrupts; cancel during connect does not interrupt.
 - [x] sha=420d391 W5.4 ERT: interrupt and restart interactive commands dispatch through
       their adapter function vars (currently completely uncovered).
+- [~] owner=W5-fixup claimed=2026-06-30 W5.5 Remediation pass on review
+      findings — all four real bugs share one root cause (callbacks do not
+      correlate by request-id) plus two scope clarifications:
+      (a) CRITICAL: `cancel-operation` tests raw `--async-context' instead
+          of `--async-in-progress-p'.  A successful connect leaves the
+          context at `:phase 'done', so cancel during a real evaluation
+          would take the async-fail branch and never interrupt the kernel.
+          Fix: dispatch on `--async-in-progress-p' for the async branch.
+      (b) HIGH: `execute_reply' clears `--evaluation-request' and cancels
+          `--evaluation-timer' unconditionally.  A late reply from a
+          superseded eval can clear the current eval's request/timer.  Fix:
+          plumb the request-id through the execute_reply callback closure;
+          only clear when ids match.
+      (c) HIGH: late `execute_reply' arriving after timeout/cancel
+          overwrites the panel error annotation.  Fix: the request-id
+          check from (b) also gates the panel-finish call so a stale reply
+          is dropped.
+      (d) HIGH: `status=idle' cancels the evaluation timer unconditionally.
+          Fix: only cancel when the current `--evaluation-request' is nil
+          OR when the idle's request-id matches.
+      (e) MEDIUM: timeout/cancel call the interrupt adapter directly.
+          Document in code that the default `--interrupt' is fire-and-
+          forget (it already is; the docstring just needs to say so) and
+          add an ERT that asserts the production-default impl returns
+          without blocking when given a mock client.
+      (f) MEDIUM: W6 log buffer wiring — DEFERRED.  W6 has not landed; the
+          current `message' is the documented stand-in.  ROADMAP entry W6.6
+          will own the swap.
 
 Acceptance: every W5 row [x]; manual smoke: start an infinite loop, hit
 interrupt, panel annotates "interrupted"; start an infinite loop, wait for
