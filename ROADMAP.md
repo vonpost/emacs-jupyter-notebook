@@ -559,7 +559,7 @@ when the kernel is far away.
       `" EJN✓"` (idle and healthy). Precedence:
       tunnel-dead > async-error > async-in-progress > kernel-busy >
       healthy > no-client. ERT per branch.
-- [~] owner=W6-agent claimed=2026-07-01 W6.3 Friendly first-evaluate. When `C-c j c` is hit with no client,
+- [x] sha=a26f898 W6.3 Friendly first-evaluate. When `C-c j c` is hit with no client,
       message
       `"emacs-jupyter-notebook: starting kernel via profile <name> (C-u to choose)"`
       before the silent default-profile start. `C-u` calls
