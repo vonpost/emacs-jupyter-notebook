@@ -216,6 +216,8 @@ Each entry plist supports:
     (define-key map (kbd "+") #'emacs-jupyter-notebook-panel-image-zoom-in)
     (define-key map (kbd "=") #'emacs-jupyter-notebook-panel-image-zoom-in)
     (define-key map (kbd "-") #'emacs-jupyter-notebook-panel-image-zoom-out)
+    ;; W8.5: open the figure at point interactively in the local viewer.
+    (define-key map (kbd "v") #'emacs-jupyter-notebook-panel-open-figure)
     map)
   "Keymap for `emacs-jupyter-notebook-panel-mode'.")
 
@@ -864,6 +866,44 @@ The fringe values silently fall back to `left-margin'."
 (defun emacs-jupyter-notebook-fringe-overlay (cell-key)
   "Return the fringe overlay for CELL-KEY, or nil."
   (cdr (assoc cell-key emacs-jupyter-notebook--fringe-overlays)))
+
+;;; Interactive figure open (W8.5)
+
+(declare-function emacs-jupyter-notebook-open-figure-with-pickle
+                  "emacs-jupyter-notebook" (base64))
+
+(defun emacs-jupyter-notebook-panel--entry-pickle-at-point ()
+  "Return the matplotlib pickle stashed on the panel entry at point, or nil."
+  (let ((id (get-text-property (point) 'emacs-jupyter-notebook-entry-id)))
+    (when id
+      (plist-get (emacs-jupyter-notebook-panel--entry (current-buffer) id)
+                 :mpl-pickle))))
+
+(defun emacs-jupyter-notebook-panel-latest-pickle-for-cell (source-buffer cell-key)
+  "Return the newest pickle stashed for CELL-KEY in SOURCE-BUFFER's panel.
+Returns nil when no matching entry carries a pickle payload."
+  (let ((panel (emacs-jupyter-notebook-panel-buffer source-buffer)))
+    (when (buffer-live-p panel)
+      (with-current-buffer panel
+        (let (found)
+          (dolist (cell emacs-jupyter-notebook-panel--entries)
+            (let ((entry (cdr cell)))
+              (when (and (equal (plist-get entry :cell-key) cell-key)
+                         (plist-get entry :mpl-pickle))
+                (setq found (plist-get entry :mpl-pickle)))))
+          found)))))
+
+(defun emacs-jupyter-notebook-panel-open-figure ()
+  "Open the figure of the panel entry at point interactively (W8.5).
+Signals a `user-error' when point is not on an entry that carries a
+matplotlib pickle payload."
+  (interactive)
+  (unless (derived-mode-p 'emacs-jupyter-notebook-panel-mode)
+    (user-error "Not in an EJN output panel"))
+  (let ((base64 (emacs-jupyter-notebook-panel--entry-pickle-at-point)))
+    (unless base64
+      (user-error "No interactive figure on this entry (no pickle payload)"))
+    (emacs-jupyter-notebook-open-figure-with-pickle base64)))
 
 ;;; Panel cleanup (W2.9)
 

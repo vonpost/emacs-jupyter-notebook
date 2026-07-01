@@ -6217,6 +6217,124 @@ wiring.  Skipped when no local python3 is available in this environment."
         (goto-char (point-min))
         (should (re-search-forward "SELFCHECK OK" nil t))))))
 
+;;; W8.5 — interactive open command + error branches
+
+(ert-deftest ejn-w8.5-support-probe-reports-no-python ()
+  "W8.5: the support probe returns :no-python for an unresolvable command."
+  (let ((emacs-jupyter-notebook--viewer-support-cache nil)
+        (emacs-jupyter-notebook-local-python-command "ejn-nonexistent-python-xyz"))
+    (should (eq (emacs-jupyter-notebook--viewer-check-local-support)
+                :no-python))))
+
+(ert-deftest ejn-w8.5-open-with-pickle-errors-without-python ()
+  "W8.5: opening a figure surfaces a friendly user-error when no local
+Python is available, and never calls the viewer."
+  (let ((opened nil))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--viewer-check-local-support)
+               (lambda () :no-python))
+              ((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
+               (lambda (b64) (setq opened b64))))
+      (should-error (emacs-jupyter-notebook-open-figure-with-pickle "abc")
+                    :type 'user-error)
+      (should (null opened)))))
+
+(ert-deftest ejn-w8.5-open-with-pickle-errors-without-matplotlib ()
+  "W8.5: opening a figure surfaces a friendly user-error when matplotlib is
+missing locally, and never calls the viewer."
+  (let ((opened nil))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--viewer-check-local-support)
+               (lambda () :no-matplotlib))
+              ((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
+               (lambda (b64) (setq opened b64))))
+      (should-error (emacs-jupyter-notebook-open-figure-with-pickle "abc")
+                    :type 'user-error)
+      (should (null opened)))))
+
+(ert-deftest ejn-w8.5-open-with-pickle-hands-off-when-supported ()
+  "W8.5: with local support present the base64 payload is handed to the viewer."
+  (let ((opened nil))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--viewer-check-local-support)
+               (lambda () t))
+              ((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
+               (lambda (b64) (setq opened b64))))
+      (emacs-jupyter-notebook-open-figure-with-pickle "PAYLOAD64")
+      (should (equal opened "PAYLOAD64")))))
+
+(ert-deftest ejn-w8.5-open-with-pickle-errors-when-viewer-fails ()
+  "W8.5: a spawn/hand-off failure becomes a friendly viewer-failed user-error."
+  (cl-letf (((symbol-function 'emacs-jupyter-notebook--viewer-check-local-support)
+             (lambda () t))
+            ((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
+             (lambda (_b64) (error "no viewer script"))))
+    (should-error (emacs-jupyter-notebook-open-figure-with-pickle "abc")
+                  :type 'user-error)))
+
+(ert-deftest ejn-w8.5-open-interactive-errors-without-figure ()
+  "W8.5: `C-c j I' with no pickled figure for the cell signals a user-error."
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--figure-pickle-for-current-cell)
+               (lambda () nil)))
+      (should-error (emacs-jupyter-notebook-open-figure-interactive)
+                    :type 'user-error))))
+
+(ert-deftest ejn-w8.5-open-interactive-dispatches-with-cell-pickle ()
+  "W8.5: `C-c j I' hands the current cell's pickle to the open helper."
+  (with-temp-buffer
+    (let ((dispatched nil))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--figure-pickle-for-current-cell)
+                 (lambda () "CELL64"))
+                ((symbol-function 'emacs-jupyter-notebook-open-figure-with-pickle)
+                 (lambda (b64) (setq dispatched b64))))
+        (emacs-jupyter-notebook-open-figure-interactive)
+        (should (equal dispatched "CELL64"))))))
+
+(ert-deftest ejn-w8.5-panel-latest-pickle-for-cell ()
+  "W8.5: the panel returns the newest pickle stashed for a cell key."
+  (with-temp-buffer
+    (let* ((buffer (current-buffer))
+           (panel (ejn-panel-ensure buffer))
+           (key '("x.py" . 7))
+           (h1 (ejn-panel-start-entry panel key ""))
+           (h2 (ejn-panel-start-entry panel key "")))
+      (ejn-panel-set-pickle h1 "old")
+      (ejn-panel-set-pickle h2 "new")
+      (should (equal (emacs-jupyter-notebook-panel-latest-pickle-for-cell buffer key)
+                     "new"))
+      (should (null (emacs-jupyter-notebook-panel-latest-pickle-for-cell
+                     buffer '("x.py" . 99)))))))
+
+(ert-deftest ejn-w8.5-panel-open-figure-errors-without-pickle ()
+  "W8.5: `v' in the panel on a pickle-less entry signals a user-error."
+  (with-temp-buffer
+    (let* ((buffer (current-buffer))
+           (panel (ejn-panel-ensure buffer)))
+      (ejn-panel-start-entry panel '("x.py" . 1) "")
+      (emacs-jupyter-notebook-panel-flush-now panel)
+      (with-current-buffer panel
+        (goto-char (point-max))
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-open-figure-with-pickle)
+                   (lambda (_b64) (error "should not be called"))))
+          (should-error (emacs-jupyter-notebook-panel-open-figure)
+                        :type 'user-error))))))
+
+(ert-deftest ejn-w8.5-panel-open-figure-dispatches-entry-pickle ()
+  "W8.5: `v' in the panel hands the entry-at-point's pickle to the open helper."
+  (with-temp-buffer
+    (let* ((buffer (current-buffer))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (dispatched nil))
+      (ejn-panel-set-pickle handle "ENTRY64")
+      (emacs-jupyter-notebook-panel-flush-now panel)
+      (with-current-buffer panel
+        (goto-char (point-min))
+        (goto-char (next-single-property-change
+                    (point) 'emacs-jupyter-notebook-entry-id))
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-open-figure-with-pickle)
+                   (lambda (b64) (setq dispatched b64))))
+          (emacs-jupyter-notebook-panel-open-figure)))
+      (should (equal dispatched "ENTRY64")))))
+
 (provide 'emacs-jupyter-notebook-tests)
 
 ;;; emacs-jupyter-notebook-tests.el ends here

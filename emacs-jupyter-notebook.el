@@ -113,6 +113,77 @@ connect or restart."
           'viewer-inject "formatter injection failed: %s"
           (error-message-string err)))))))
 
+;;; W8.5 — open a stashed figure interactively in the local viewer
+
+(defvar emacs-jupyter-notebook--viewer-support-cache nil
+  "Cached result of the local-viewer support probe.
+`t' once the local Python + matplotlib have been confirmed; nil until
+first checked (or after a failed probe, so a later install is picked up).")
+
+(defun emacs-jupyter-notebook--viewer-check-local-support ()
+  "Probe the LOCAL Python for interactive-viewer support.
+Returns `t' when the configured Python is found and imports matplotlib,
+`:no-python' when the command cannot be resolved, or `:no-matplotlib'
+when matplotlib is not importable.  A positive result is cached so the
+subprocess probe runs at most once per session."
+  (if (eq emacs-jupyter-notebook--viewer-support-cache t)
+      t
+    (let ((python (emacs-jupyter-notebook-viewer--python-path
+                   emacs-jupyter-notebook-local-python-command)))
+      (cond
+       ((null python) :no-python)
+       ((not (zerop (call-process python nil nil nil "-c" "import matplotlib")))
+        :no-matplotlib)
+       (t (setq emacs-jupyter-notebook--viewer-support-cache t))))))
+
+(defun emacs-jupyter-notebook-open-figure-with-pickle (base64)
+  "Open the matplotlib figure encoded by BASE64 in the local viewer (W8.5).
+Validates local support and surfaces friendly `user-error's for the
+missing-Python, missing-matplotlib, and viewer-failed-to-start cases.
+The actual hand-off to the viewer is asynchronous and never blocks."
+  (pcase (emacs-jupyter-notebook--viewer-check-local-support)
+    (:no-python
+     (user-error
+      "No local Python found; set `emacs-jupyter-notebook-local-python-command'"))
+    (:no-matplotlib
+     (user-error
+      "Local Python (%s) has no matplotlib; the interactive viewer needs it"
+      emacs-jupyter-notebook-local-python-command))
+    (_
+     (condition-case err
+         (progn
+           (emacs-jupyter-notebook-viewer-open-pickle base64)
+           (emacs-jupyter-notebook--log-append
+            'viewer "handed figure to local interactive viewer")
+           (message "emacs-jupyter-notebook: opening figure in local viewer"))
+       (error
+        (emacs-jupyter-notebook--log-append
+         'viewer "interactive viewer failed to start: %s"
+         (error-message-string err))
+        (user-error "Interactive viewer failed to start: %s"
+                    (error-message-string err)))))))
+
+(defun emacs-jupyter-notebook--figure-pickle-for-current-cell ()
+  "Return the newest matplotlib pickle stashed for the current cell, or nil."
+  (let ((cell-key (emacs-jupyter-notebook--current-cell-key)))
+    (and cell-key
+         (emacs-jupyter-notebook-panel-latest-pickle-for-cell
+          (current-buffer) cell-key))))
+
+;;;###autoload
+(defun emacs-jupyter-notebook-open-figure-interactive ()
+  "Open the current cell's latest figure interactively in the local viewer.
+W8.5: bound to `C-c j I'.  Looks up the newest panel entry for the cell at
+point that carries a matplotlib pickle payload and hands it to the local
+viewer.  Signals a friendly `user-error' when the cell has no interactive
+figure or the local viewer is unavailable."
+  (interactive)
+  (let ((base64 (emacs-jupyter-notebook--figure-pickle-for-current-cell)))
+    (unless base64
+      (user-error
+       "No interactive figure for this cell; run a cell that displays a matplotlib figure first"))
+    (emacs-jupyter-notebook-open-figure-with-pickle base64)))
+
 (defvar-local emacs-jupyter-notebook--saved-imenu-create-index-function nil
   "Previous buffer-local value of `imenu-create-index-function'.")
 
@@ -502,6 +573,7 @@ All command bindings live under `emacs-jupyter-notebook-prefix-key'
     (define-key map (kbd "l")    #'emacs-jupyter-notebook-clear-results)
     (define-key map (kbd "o")    #'emacs-jupyter-notebook-show-output-panel)
     (define-key map (kbd "t")    #'emacs-jupyter-notebook-toggle-panel-view)
+    (define-key map (kbd "I")    #'emacs-jupyter-notebook-open-figure-interactive)
     (define-key map (kbd ".")    #'emacs-jupyter-notebook-inspect-at-point)
     (define-key map (kbd "TAB")  #'emacs-jupyter-notebook-complete-at-point)
     (define-key map (kbd "v")    #'emacs-jupyter-notebook-fetch-remote-log)
