@@ -613,6 +613,45 @@ sentinel is present."
         (emacs-jupyter-notebook--async-fail context "unparseable noise\n"))
       (should (equal captured "unparseable noise\n")))))
 
+(ert-deftest ejn-w7.1-launch-sentinel-nonzero-exit-classifies-auth-failed-stderr ()
+  "W7.1: `--async-launch-sentinel' firing on nonzero exit transitions the
+async context to phase `error' and the classified stderr from W4.3
+appears in the user-visible message.  A launch process whose stderr
+contains an SSH auth-failed pattern must surface as `AUTH-FAILED:' with
+a `Hint:' line."
+  (with-temp-buffer
+    (let* ((origin (current-buffer))
+           captured captured-context
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'launch
+                     :session-id "s1"
+                     :origin-buffer origin
+                     :error-callback (lambda (ctx err)
+                                       (setq captured err
+                                             captured-context ctx)))))
+      (cl-letf (((symbol-function 'display-warning) #'ignore))
+        ;; Real subprocess so the sentinel fires on a real exit.  Route
+        ;; the auth-failed stderr through the real ssh-start-process path
+        ;; so `--process-output' picks it up from the stderr buffer.
+        (let ((process (emacs-jupyter-notebook-ssh-start-process
+                        "ejn-test-w7.1-launch-fail"
+                        '("sh" "-c"
+                          "printf 'Permission denied (publickey).\\n' 1>&2; exit 1")
+                        (lambda (proc _event)
+                          (emacs-jupyter-notebook--async-launch-sentinel
+                           context proc)))))
+          (setq context (emacs-jupyter-notebook--async-put
+                         context :launch-process process))
+          (let ((deadline (+ (float-time) 5)))
+            (while (and (not captured) (< (float-time) deadline))
+              (accept-process-output process 0.05)))))
+      (should captured)
+      (should captured-context)
+      (should (eq (plist-get captured-context :phase) 'error))
+      (should (stringp (plist-get captured-context :error)))
+      (should (string-prefix-p "AUTH-FAILED:" captured))
+      (should (string-match-p "Hint: " captured)))))
+
 (ert-deftest ejn-w4.4-build-pid-alive-uses-kill-zero ()
   "W4.4: the PID-alive probe argv ends with `kill -0 <pid>'."
   (let ((argv (emacs-jupyter-notebook-ssh-build-pid-alive
