@@ -78,6 +78,18 @@ These are binding for every workstream. Update only by appending a new entry.
   completion, inspect, send-cell, reconnect, fetch-log, list-procs, and
   clean-orphans. Initial first-time start may be slow (30–90 s on
   high-latency links is acceptable) but must remain non-blocking.
+- **2026-07-01 / Zero per-remote install.** Features must not require
+  installing anything on the remote beyond a running Python Jupyter kernel
+  (with matplotlib for the plotting features). Remote capability is added by
+  injecting in-memory setup code into the kernel session at runtime, never
+  by writing files to the remote or requiring `pip install`. The user has
+  many remotes and must not have to provision any of them.
+- **2026-07-01 / The local interactive viewer is Emacs-owned.** The W8
+  matplotlib viewer runs on the LOCAL workstation and, unlike the remote
+  kernel, IS reaped on Emacs exit (`kill-emacs-hook`). It is GUI-Emacs-only
+  (needs a windowing system + a local Python/matplotlib at a version
+  matching the remote). The remote stays headless (inline/Agg) and is never
+  given a GUI dependency.
 
 ## Cross-cutting changes
 
@@ -688,11 +700,137 @@ real bug, file a CC row in `## Cross-cutting changes` and stop.
 
 ---
 
+## W8 — Local interactive matplotlib viewer
+
+Depends on: W2 (panel), W6 (keymap + log buffer). All merged.
+
+Goal: give the medical-imaging user a real interactive matplotlib window
+for figures produced on the remote kernel — with native hover
+pixel-value + array index readout, zoom/pan, and linked-subplot crop —
+WITHOUT installing anything on any remote.
+
+The architecture (settled 2026-07-01 with opencode design probes):
+
+- The remote is always HEADLESS (inline/Agg backend) and never touched by
+  an install. Emacs injects a one-time formatter-registration snippet into
+  the running kernel session (silent `execute_request`, `store_history` nil,
+  no panel entry, re-run on connect/restart, idempotent). The snippet
+  registers a `matplotlib.figure.Figure` formatter on a custom MIME type
+  `application/x-ejn-mpl-pickle` via IPython's display machinery
+  (`ip.display_formatter.formatters[...].for_type_by_name(...)`), so any
+  inline-displayed figure automatically carries `pickle.dumps(fig)` (base64)
+  ALONGSIDE the normal `image/png`.  Everything the snippet needs is already
+  present on a Python Jupyter kernel with matplotlib: IPython, matplotlib,
+  pickle/base64 (stdlib).  No remote filesystem writes, no pip.
+- Emacs keeps rendering the PNG thumbnail in the panel (all of W2's
+  scrollback value is preserved) and stashes the pickle base64 on the panel
+  entry.
+- A binding opens the figure interactively: Emacs decodes the pickle to a
+  temp file and hands the path to a LOCAL persistent viewer process over a
+  unix domain socket.  The viewer (a small Python script shipped WITH this
+  package, run by a LOCAL Python) unpickles, reattaches a GUI canvas (the
+  unpickled figure arrives canvas-less — the viewer encapsulates the
+  `manager.canvas.figure = fig; fig.set_canvas(...)` reattach recipe),
+  installs the enhancements, and shows the window.
+- Pickle-only payload (no spec-reconstruct fallback): the package is
+  single-user and the user pins matplotlib to the same version on remote
+  and local.  If a pickle ever fails to load, the viewer degrades
+  gracefully with a clear message and the PNG stays in the panel.
+
+Asymmetry (the whole point): per-remote setup is ZERO — the formatter is
+injected at runtime and works on every remote automatically.  One-time
+LOCAL setup on the workstation running Emacs: a local Python with
+matplotlib and a GUI backend (Qt/Tk).  Never on the remotes.
+
+File scope:
+- `emacs-jupyter-notebook.el` (setup-snippet injection on connect/restart)
+- `emacs-jupyter-notebook-jupyter.el` (custom-MIME recognition in callbacks)
+- `emacs-jupyter-notebook-result.el` (stash pickle on the panel entry;
+  panel-entry command surface)
+- `emacs-jupyter-notebook-viewer.el` (NEW — local viewer process manager)
+- `viewer/ejn_viewer.py` (NEW — the local Python viewer script, shipped
+  with the package)
+- `emacs-jupyter-notebook-vars.el` (new customization vars)
+- `tests/emacs-jupyter-notebook-tests.el`
+- `README.md`
+
+Rows:
+
+- [ ] W8.1 Emacs injects the one-time formatter-registration snippet into
+      the kernel session: silent `execute_request` (`store-history` nil, no
+      panel entry), run on connect and re-run on restart, idempotent.
+      Registers the `Figure → application/x-ejn-mpl-pickle` formatter using
+      `for_type_by_name` (lazy — does not force a matplotlib import until a
+      Figure is formatted).  Graceful no-op when `get_ipython()` is nil or
+      matplotlib is unavailable.  The pickle strips stale canvas/backend
+      state before dumping.  ERT: the injected code is sent as a silent
+      request that produces no panel entry; a canned `application/x-ejn-mpl-pickle`
+      display payload round-trips through the callbacks without disturbing
+      the PNG path.  (The Python snippet's correctness — exact IPython
+      formatter API — is verified against a real IPython in the agent's own
+      check; consult opencode for the precise registration form.)
+- [ ] W8.2 Emacs MIME recognition: teach the `display_data` /
+      `execute_result` callbacks and `--select-mime-type` to recognize
+      `application/x-ejn-mpl-pickle`, stash its base64 on the panel entry
+      (new entry field, e.g. `:mpl-pickle`), and continue rendering the
+      `image/png` thumbnail exactly as today.  ERT: a bundle with both keys
+      renders the PNG AND stores the pickle; a bundle with only PNG behaves
+      unchanged.
+- [ ] W8.3 Local viewer process manager (`emacs-jupyter-notebook-viewer.el`):
+      lazily spawn one PERSISTENT local Python running `viewer/ejn_viewer.py`;
+      create a unix domain socket; hand a decoded-pickle temp-file path to
+      the viewer asynchronously (never block Emacs); reuse the process across
+      figures; reap on `kill-emacs-hook`; the viewer self-exits on idle
+      timeout so a hard Emacs crash cannot orphan it forever.  ERT with a
+      MOCK viewer (a stub process + socket) exercising: lazy spawn once,
+      reuse, async hand-off protocol, kill-emacs reap.  No real GUI needed
+      for these tests.
+- [ ] W8.4 The viewer Python script (`viewer/ejn_viewer.py`): persistent
+      process; select `QtAgg`, fall back to `TkAgg`; `plt.show(block=False)`
+      with a socket listener pumped by a matplotlib canvas timer (not a
+      blocking accept loop); on each incoming path, `pickle.loads`, reattach
+      a GUI canvas, install (a) a per-imshow `format_coord` override showing
+      integer `row/col` + value, (b) linked-subplot zoom via
+      `ax.callbacks.connect('xlim_changed'/'ylim_changed', …)` with a
+      recursion guard and `set_xlim(..., emit=False)` across the figure's
+      imshow axes group; show the window.  Graceful message on unpickle
+      failure.  Tested as a standalone script (headless Agg smoke for the
+      non-GUI logic — format_coord math, link-group wiring; GUI parts are
+      manual).
+- [ ] W8.5 Command + binding: `C-c j I` and `v` on a panel plot entry open
+      the figure interactively.  Friendly `user-error`s: no local Python
+      configured / found, matplotlib missing locally, no pickle on this
+      entry, viewer failed to start.  Route viewer lifecycle events to the
+      W6 log buffer.  ERT for the command dispatch + error branches (mock
+      the viewer manager).
+- [ ] W8.6 Customization + README:
+      `emacs-jupyter-notebook-local-python-command` (default "python3"),
+      `emacs-jupyter-notebook-viewer-backend` (default `qt`, choice qt/tk),
+      `emacs-jupyter-notebook-viewer-idle-timeout` (default 900),
+      `emacs-jupyter-notebook-viewer-auto-open` (default nil — on-demand).
+      README section documenting the zero-remote-install model, the
+      one-time LOCAL setup, the version-pinning requirement, and the
+      GUI-Emacs-only constraint.
+
+Hard rules for W8:
+- ZERO per-remote install.  No remote filesystem writes.  The only remote
+  interaction is the injected in-memory formatter snippet.
+- The local viewer is Emacs-owned and MUST be reaped on Emacs exit
+  (`kill-emacs-hook`) — the deliberate inverse of the remote-kernel rule.
+- Async is still the rule: spawning/handing-off to the viewer must never
+  block Emacs.
+- The panel PNG path must not regress: a figure with no pickle payload, or
+  a user with no local viewer, behaves exactly as today.
+
+Acceptance: every W8 row [x]; ERTs green (≥ current count); manual smoke on
+a real remote + local GUI: plot an imshow subplot, see the PNG in the panel,
+hit `C-c j I`, a local window opens, hover shows `row/col/value`, zoom on one
+subplot crops all siblings, killing Emacs reaps the viewer.
+
+---
+
 ## Future workstreams (not yet scheduled)
 
-- **Interactive image zoom for medical imaging.** Crop-and-zoom on one
-  subplot mirrors the same crop on all sibling subplots in the panel. Needs
-  research into Emacs image transform support + a custom matplotlib backend.
 - **Multi-buffer sharing one kernel.** Registry refcount + buffer set per
   session-id + tunnel-share. Requires reconsidering W1.1's kill-buffer-hook
   to refcount instead of unconditionally tearing down.
