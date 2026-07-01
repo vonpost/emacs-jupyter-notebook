@@ -6193,6 +6193,30 @@ and returns nil for a bogus command."
     (should (equal (emacs-jupyter-notebook-viewer--python-path "/bin/sh")
                    "/bin/sh"))))
 
+;;; W8.4 — viewer Python script
+
+(ert-deftest ejn-w8.4-bundled-viewer-script-exists ()
+  "W8.4: the manager resolves the bundled viewer/ejn_viewer.py and it exists."
+  (let ((path (emacs-jupyter-notebook-viewer--script-path)))
+    (should path)
+    (should (string-suffix-p "viewer/ejn_viewer.py" path))
+    (should (file-exists-p path))))
+
+(ert-deftest ejn-w8.4-viewer-selfcheck-passes ()
+  "W8.4: the viewer script's headless non-GUI self-check passes.
+Covers the format_coord row/col/value math and the linked-zoom LinkGroup
+wiring.  Skipped when no local python3 is available in this environment."
+  (let ((python (executable-find "python3"))
+        (script (emacs-jupyter-notebook-viewer--script-path)))
+    (unless python
+      (ert-skip "python3 not available"))
+    (should script)
+    (with-temp-buffer
+      (let ((status (call-process python nil t nil script "--selfcheck")))
+        (should (= status 0))
+        (goto-char (point-min))
+        (should (re-search-forward "SELFCHECK OK" nil t))))))
+
 (provide 'emacs-jupyter-notebook-tests)
 
 ;;; emacs-jupyter-notebook-tests.el ends here
