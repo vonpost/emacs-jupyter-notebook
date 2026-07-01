@@ -1206,6 +1206,91 @@ leaves source-buffer text untouched."
         (should (equal emacs-jupyter-notebook--session-entry entry))
         (should-not cleanup-called)))))
 
+(ert-deftest ejn-w7.3-cancel-during-tunnel-reconnect-tears-tunnel-preserves-registry ()
+  "W7.3 reconnect branch (`:owns-kernel nil'): cancelling during the
+tunnel phase kills the live tunnel process, clears the async context,
+and leaves the pre-existing registry entry untouched (because the entry
+is the durable reconnect key)."
+  (let* ((registry-dir (make-temp-file "ejn-w73-reg-" t))
+         (registry-file (expand-file-name "registry.eld" registry-dir))
+         (entry '(:profile "p"
+                  :session-id "w73-reconn"
+                  :remote-host "example.com"
+                  :remote-connection-file "/remote/kernel.json"))
+         (emacs-jupyter-notebook-registry-file registry-file))
+    (unwind-protect
+        (cl-letf (((symbol-function 'display-warning) #'ignore))
+          (emacs-jupyter-notebook-registry-save (list entry) registry-file)
+          (with-temp-buffer
+            (let* ((tunnel (emacs-jupyter-notebook-ssh-start-process
+                            "emacs-jupyter-notebook-tunnel-w73-reconn"
+                            '("sleep" "60")))
+                   (stderr (process-get tunnel
+                                        'emacs-jupyter-notebook-stderr-buffer)))
+              (setq emacs-jupyter-notebook--session-entry entry)
+              (setq emacs-jupyter-notebook--tunnel-process tunnel)
+              (setq emacs-jupyter-notebook--async-context
+                    (emacs-jupyter-notebook--async-new-context
+                     :phase 'tunnel
+                     :owns-kernel nil
+                     :profile '(:profile "p" :host "example.com")
+                     :entry entry
+                     :tunnel-process tunnel
+                     :origin-buffer (current-buffer)
+                     :error-callback (lambda (_ctx _err) nil)))
+              (emacs-jupyter-notebook-cancel-operation)
+              (should-not emacs-jupyter-notebook--async-context)
+              (should-not (process-live-p tunnel))
+              (should-not (buffer-live-p stderr))
+              ;; Registry entry survives the cancellation.
+              (let ((remaining (emacs-jupyter-notebook-registry-load
+                                registry-file)))
+                (should (= 1 (length remaining)))
+                (should (equal (plist-get (car remaining) :session-id)
+                               "w73-reconn"))))))
+      (delete-directory registry-dir t))))
+
+(ert-deftest ejn-w7.3-cancel-during-tunnel-fresh-start-tears-tunnel-registry-untouched ()
+  "W7.3 fresh-start branch (`:owns-kernel t'): cancelling during the
+tunnel phase kills the live tunnel process, clears the async context,
+and leaves the registry file untouched.  In the fresh-start flow the
+entry is only written by `--async-connect-finalize', so cancelling
+before that point should NOT create a stray registry row."
+  (let* ((registry-dir (make-temp-file "ejn-w73-reg-" t))
+         (registry-file (expand-file-name "registry.eld" registry-dir))
+         (emacs-jupyter-notebook-registry-file registry-file))
+    (unwind-protect
+        (cl-letf (((symbol-function 'display-warning) #'ignore))
+          (with-temp-buffer
+            (let* ((tunnel (emacs-jupyter-notebook-ssh-start-process
+                            "emacs-jupyter-notebook-tunnel-w73-fresh"
+                            '("sleep" "60")))
+                   (stderr (process-get tunnel
+                                        'emacs-jupyter-notebook-stderr-buffer)))
+              (setq emacs-jupyter-notebook--session-entry nil)
+              (setq emacs-jupyter-notebook--tunnel-process tunnel)
+              (setq emacs-jupyter-notebook--async-context
+                    (emacs-jupyter-notebook--async-new-context
+                     :phase 'tunnel
+                     :owns-kernel t
+                     :session-id "w73-fresh"
+                     :profile '(:profile "p" :host "example.com")
+                     :entry '(:profile "p"
+                              :session-id "w73-fresh"
+                              :remote-host "example.com"
+                              :remote-connection-file "/remote/kernel.json")
+                     :tunnel-process tunnel
+                     :origin-buffer (current-buffer)
+                     :error-callback (lambda (_ctx _err) nil)))
+              (emacs-jupyter-notebook-cancel-operation)
+              (should-not emacs-jupyter-notebook--async-context)
+              (should-not (process-live-p tunnel))
+              (should-not (buffer-live-p stderr))
+              ;; No registry entry was ever created for this session; no file.
+              (should-not (file-exists-p registry-file))
+              (should-not emacs-jupyter-notebook--session-entry))))
+      (delete-directory registry-dir t))))
+
 (ert-deftest ejn-retry-fresh-kernel-cleans-state-and-starts-profile ()
   (let ((entry '(:profile "p" :session-id "old"))
         cleanup-called started-profile)
