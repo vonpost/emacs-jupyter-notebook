@@ -653,7 +653,7 @@ Per-row dependencies:
       `shutdown-kernel`, kill the buffer, `find-file-noselect` again,
       `reconnect-remote-kernel`, and assert connection succeeds. Order so
       reconnect runs before any shutdown.
-- [~] owner=W7-agent claimed=2026-07-01 W7.5 Continuous coverage backfill:
+- [x] sha=97c35fd W7.5 Continuous coverage backfill:
       spot-fill 3-6 regression ERTs on important paths surfaced by an
       opencode audit — corrupt registry file loads gracefully; SSH profile
       `:identity-file` + `:port` flow into argv (scp uses `-P`, ssh uses
