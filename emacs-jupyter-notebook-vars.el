@@ -287,6 +287,42 @@ indicator in a buffer."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
+;;; W8 local interactive matplotlib viewer customization
+
+(defcustom emacs-jupyter-notebook-local-python-command "python3"
+  "Local Python executable used to run the interactive matplotlib viewer.
+This is the LOCAL workstation's Python (never a remote one).  It must
+have matplotlib and a GUI backend (Qt or Tk) installed, and — because W8
+transports figures as pickles — matplotlib pinned to the same version as
+the remote kernels.  Set to an absolute path or a command found on
+`exec-path'."
+  :type 'string
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-viewer-backend 'qt
+  "Preferred GUI backend for the local matplotlib viewer.
+The viewer selects `QtAgg' for `qt' and `TkAgg' for `tk', falling back to
+the other automatically when the preferred one is unavailable."
+  :type '(choice (const :tag "Qt (QtAgg)" qt)
+                 (const :tag "Tk (TkAgg)" tk))
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-viewer-idle-timeout 900
+  "Seconds the local viewer stays alive with no open figures before self-exiting.
+The viewer is Emacs-owned and reaped on `kill-emacs-hook', but it also
+self-exits after this idle period so a hard Emacs crash cannot orphan it
+forever.  Set to 0 to disable the idle self-exit."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-viewer-auto-open nil
+  "When non-nil, automatically open every pickled figure in the local viewer.
+By default figures open on demand (`C-c j I', or `v' on a panel entry).
+Enabling this pops a GUI window for every inline figure produced on the
+remote kernel, which requires a GUI Emacs and a working local viewer."
+  :type 'boolean
+  :group 'emacs-jupyter-notebook)
+
 (defconst emacs-jupyter-notebook-connection-port-keys
   '(:shell_port :iopub_port :stdin_port :hb_port :control_port)
   "Jupyter connection plist keys that contain channel ports.")

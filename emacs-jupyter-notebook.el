@@ -24,6 +24,7 @@
 (require 'emacs-jupyter-notebook-ssh)
 (require 'emacs-jupyter-notebook-result)
 (require 'emacs-jupyter-notebook-jupyter)
+(require 'emacs-jupyter-notebook-viewer)
 
 ;;; W8 — local interactive matplotlib viewer: remote formatter injection
 ;;

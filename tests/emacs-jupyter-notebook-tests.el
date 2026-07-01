@@ -6072,6 +6072,127 @@ pickle on the entry."
         (should (equal (plist-get e :image) '(image :type png :data "imgdata")))
         (should (null (plist-get e :mpl-pickle)))))))
 
+;;; W8.3 — local viewer process manager
+
+(defvar ejn-w8.3--received nil
+  "Cons cell whose car accumulates strings received by the stub viewer.")
+
+(defun ejn-w8.3--make-stub-server (socket-path)
+  "Create a real unix-socket server on SOCKET-PATH that records input.
+Received strings are pushed onto `(car ejn-w8.3--received)'.  Returns the
+server process, which doubles as the manager's placeholder process."
+  (make-network-process
+   :name "ejn-w8.3-stub-viewer"
+   :server t
+   :family 'local
+   :service socket-path
+   :noquery t
+   :filter (lambda (_proc string)
+             (push string (car ejn-w8.3--received)))))
+
+(defmacro ejn-w8.3-with-clean-manager (&rest body)
+  "Run BODY with fresh, isolated viewer-manager global state, then reap."
+  (declare (indent 0))
+  `(let ((emacs-jupyter-notebook-viewer--process nil)
+         (emacs-jupyter-notebook-viewer--socket-path nil))
+     (unwind-protect
+         (progn ,@body)
+       (ignore-errors (emacs-jupyter-notebook-viewer-reap)))))
+
+(ert-deftest ejn-w8.3-ensure-spawns-once-and-reuses ()
+  "W8.3: the manager spawns the viewer lazily exactly once and reuses it."
+  (ejn-w8.3-with-clean-manager
+    (let* ((ejn-w8.3--received (list nil))
+           (spawn-count 0)
+           (emacs-jupyter-notebook-viewer-spawn-function
+            (lambda (socket-path)
+              (cl-incf spawn-count)
+              (ejn-w8.3--make-stub-server socket-path))))
+      (let ((p1 (emacs-jupyter-notebook-viewer-ensure))
+            (p2 (emacs-jupyter-notebook-viewer-ensure)))
+        (should (= spawn-count 1))
+        (should (eq p1 p2))
+        (should (emacs-jupyter-notebook-viewer-live-p))))))
+
+(ert-deftest ejn-w8.3-ensure-installs-kill-emacs-reaper ()
+  "W8.3: ensuring the viewer installs the `kill-emacs-hook' reaper."
+  (ejn-w8.3-with-clean-manager
+    (let* ((ejn-w8.3--received (list nil))
+           (kill-emacs-hook nil)
+           (emacs-jupyter-notebook-viewer-spawn-function
+            #'ejn-w8.3--make-stub-server))
+      (emacs-jupyter-notebook-viewer-ensure)
+      (should (memq #'emacs-jupyter-notebook-viewer-reap kill-emacs-hook)))))
+
+(ert-deftest ejn-w8.3-reap-kills-process-and-removes-socket ()
+  "W8.3: reap deletes the process, removes the socket file, and clears state."
+  (ejn-w8.3-with-clean-manager
+    (let* ((ejn-w8.3--received (list nil))
+           (kill-emacs-hook nil)
+           (emacs-jupyter-notebook-viewer-spawn-function
+            #'ejn-w8.3--make-stub-server))
+      (emacs-jupyter-notebook-viewer-ensure)
+      (let ((socket-path emacs-jupyter-notebook-viewer--socket-path)
+            (proc emacs-jupyter-notebook-viewer--process))
+        (should (process-live-p proc))
+        (should (file-exists-p socket-path))
+        (emacs-jupyter-notebook-viewer-reap)
+        (should-not (process-live-p proc))
+        (should-not (file-exists-p socket-path))
+        (should (null emacs-jupyter-notebook-viewer--process))
+        (should (null emacs-jupyter-notebook-viewer--socket-path))
+        (should-not (memq #'emacs-jupyter-notebook-viewer-reap
+                          kill-emacs-hook))))))
+
+(ert-deftest ejn-w8.3-send-path-delivers-over-socket ()
+  "W8.3: the async hand-off writes the newline-terminated path to the socket."
+  (ejn-w8.3-with-clean-manager
+    (let* ((ejn-w8.3--received (list nil))
+           (emacs-jupyter-notebook-viewer-spawn-function
+            #'ejn-w8.3--make-stub-server))
+      (emacs-jupyter-notebook-viewer-send-path "/tmp/fig-123.pkl")
+      ;; Pump the event loop so the server's connection filter runs.
+      (let ((deadline (+ (float-time) 2)))
+        (while (and (null (car ejn-w8.3--received))
+                    (< (float-time) deadline))
+          (accept-process-output nil 0.05)))
+      (should (equal (apply #'concat (reverse (car ejn-w8.3--received)))
+                     "/tmp/fig-123.pkl\n")))))
+
+(ert-deftest ejn-w8.3-open-pickle-decodes-and-sends-existing-file ()
+  "W8.3: open-pickle decodes base64 to a real temp file and hands it off."
+  (ejn-w8.3-with-clean-manager
+    (let* ((ejn-w8.3--received (list nil))
+           (emacs-jupyter-notebook-viewer-spawn-function
+            #'ejn-w8.3--make-stub-server)
+           (payload (base64-encode-string "PICKLEBYTES" t))
+           (tmp (emacs-jupyter-notebook-viewer-open-pickle payload)))
+      (unwind-protect
+          (progn
+            (should (file-exists-p tmp))
+            (with-temp-buffer
+              (set-buffer-multibyte nil)
+              (let ((coding-system-for-read 'binary))
+                (insert-file-contents-literally tmp))
+              (should (equal (buffer-string) "PICKLEBYTES")))
+            (let ((deadline (+ (float-time) 2)))
+              (while (and (null (car ejn-w8.3--received))
+                          (< (float-time) deadline))
+                (accept-process-output nil 0.05)))
+            (should (equal (apply #'concat (reverse (car ejn-w8.3--received)))
+                           (concat tmp "\n"))))
+        (when (file-exists-p tmp) (delete-file tmp))))))
+
+(ert-deftest ejn-w8.3-python-path-resolves-command ()
+  "W8.3: `--python-path' resolves an absolute executable or PATH command,
+and returns nil for a bogus command."
+  (should (null (emacs-jupyter-notebook-viewer--python-path
+                 "ejn-nonexistent-python-xyz")))
+  ;; /bin/sh is a reliable absolute executable on the CI host.
+  (when (file-executable-p "/bin/sh")
+    (should (equal (emacs-jupyter-notebook-viewer--python-path "/bin/sh")
+                   "/bin/sh"))))
+
 (provide 'emacs-jupyter-notebook-tests)
 
 ;;; emacs-jupyter-notebook-tests.el ends here
