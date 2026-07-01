@@ -756,7 +756,7 @@ File scope:
 
 Rows:
 
-- [ ] W8.1 Emacs injects the one-time formatter-registration snippet into
+- [~] owner=W8-agent claimed=2026-07-01 W8.1 Emacs injects the one-time formatter-registration snippet into
       the kernel session: silent `execute_request` (`store-history` nil, no
       panel entry), run on connect and re-run on restart, idempotent.
       Registers the `Figure → application/x-ejn-mpl-pickle` formatter using
