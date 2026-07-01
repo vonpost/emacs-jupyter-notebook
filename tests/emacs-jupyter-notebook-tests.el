@@ -6219,54 +6219,67 @@ wiring.  Skipped when no local python3 is available in this environment."
 
 ;;; W8.5 — interactive open command + error branches
 
-(ert-deftest ejn-w8.5-support-probe-reports-no-python ()
-  "W8.5: the support probe returns :no-python for an unresolvable command."
-  (let ((emacs-jupyter-notebook--viewer-support-cache nil)
-        (emacs-jupyter-notebook-local-python-command "ejn-nonexistent-python-xyz"))
-    (should (eq (emacs-jupyter-notebook--viewer-check-local-support)
-                :no-python))))
-
 (ert-deftest ejn-w8.5-open-with-pickle-errors-without-python ()
   "W8.5: opening a figure surfaces a friendly user-error when no local
-Python is available, and never calls the viewer."
-  (let ((opened nil))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook--viewer-check-local-support)
-               (lambda () :no-python))
-              ((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
+Python is available, and never calls the viewer.  The Python resolution is
+synchronous and instant (`executable-find'); the matplotlib probe is not."
+  (let ((opened nil)
+        (emacs-jupyter-notebook--viewer-support-cache nil)
+        (emacs-jupyter-notebook-local-python-command "ejn-nonexistent-python-xyz"))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
                (lambda (b64) (setq opened b64))))
       (should-error (emacs-jupyter-notebook-open-figure-with-pickle "abc")
                     :type 'user-error)
       (should (null opened)))))
 
-(ert-deftest ejn-w8.5-open-with-pickle-errors-without-matplotlib ()
-  "W8.5: opening a figure surfaces a friendly user-error when matplotlib is
-missing locally, and never calls the viewer."
-  (let ((opened nil))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook--viewer-check-local-support)
-               (lambda () :no-matplotlib))
-              ((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
-               (lambda (b64) (setq opened b64))))
-      (should-error (emacs-jupyter-notebook-open-figure-with-pickle "abc")
-                    :type 'user-error)
-      (should (null opened)))))
-
-(ert-deftest ejn-w8.5-open-with-pickle-hands-off-when-supported ()
-  "W8.5: with local support present the base64 payload is handed to the viewer."
-  (let ((opened nil))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook--viewer-check-local-support)
-               (lambda () t))
-              ((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
+(ert-deftest ejn-w8.5-open-with-pickle-hands-off-when-cached ()
+  "W8.5: when matplotlib support is already cached the payload is handed off
+synchronously without spawning a probe."
+  (let ((opened nil)
+        (emacs-jupyter-notebook--viewer-support-cache t)
+        (emacs-jupyter-notebook-local-python-command "true"))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
                (lambda (b64) (setq opened b64))))
       (emacs-jupyter-notebook-open-figure-with-pickle "PAYLOAD64")
       (should (equal opened "PAYLOAD64")))))
 
-(ert-deftest ejn-w8.5-open-with-pickle-errors-when-viewer-fails ()
+(ert-deftest ejn-w8.5-async-probe-hands-off-when-matplotlib-present ()
+  "W8.5: the async matplotlib probe (exit 0) caches support and hands off.
+Uses `/bin/true' as a stand-in Python that exits 0."
+  (skip-unless (executable-find "true"))
+  (let ((opened nil)
+        (emacs-jupyter-notebook--viewer-support-cache nil)
+        (emacs-jupyter-notebook-local-python-command "true"))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
+               (lambda (b64) (setq opened b64))))
+      (emacs-jupyter-notebook-open-figure-with-pickle "PAYLOAD64")
+      (let ((deadline (+ (float-time) 3)))
+        (while (and (null opened) (< (float-time) deadline))
+          (accept-process-output nil 0.05)))
+      (should (equal opened "PAYLOAD64"))
+      (should (eq emacs-jupyter-notebook--viewer-support-cache t)))))
+
+(ert-deftest ejn-w8.5-async-probe-reports-missing-matplotlib ()
+  "W8.5: the async probe (nonzero exit) does NOT hand off and leaves the
+support cache unset.  Uses `/bin/false' as a stand-in Python that exits 1."
+  (skip-unless (executable-find "false"))
+  (let ((opened nil)
+        (emacs-jupyter-notebook--viewer-support-cache nil)
+        (emacs-jupyter-notebook-local-python-command "false"))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
+               (lambda (b64) (setq opened b64))))
+      (emacs-jupyter-notebook-open-figure-with-pickle "PAYLOAD64")
+      (let ((deadline (+ (float-time) 3)))
+        (while (and (process-list) (< (float-time) deadline))
+          (accept-process-output nil 0.05)))
+      (should (null opened))
+      (should (null emacs-jupyter-notebook--viewer-support-cache)))))
+
+(ert-deftest ejn-w8.5-hand-off-errors-when-viewer-fails ()
   "W8.5: a spawn/hand-off failure becomes a friendly viewer-failed user-error."
-  (cl-letf (((symbol-function 'emacs-jupyter-notebook--viewer-check-local-support)
-             (lambda () t))
-            ((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
+  (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
              (lambda (_b64) (error "no viewer script"))))
-    (should-error (emacs-jupyter-notebook-open-figure-with-pickle "abc")
+    (should-error (emacs-jupyter-notebook--viewer-hand-off "abc")
                   :type 'user-error)))
 
 (ert-deftest ejn-w8.5-open-interactive-errors-without-figure ()

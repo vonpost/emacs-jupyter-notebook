@@ -136,16 +136,32 @@ class LinkGroup(object):
 # --------------------------------------------------------------------------
 
 def _select_backend(preferred):
-    """Select QtAgg/TkAgg (preferring PREFERRED) and return the chosen name."""
+    """Select and VALIDATE a GUI backend, preferring PREFERRED.
+
+    ``matplotlib.use(name)`` succeeds even when the underlying GUI bindings
+    (PyQt/PySide, tkinter) are absent -- the ImportError only surfaces later
+    at first ``pyplot.figure()``.  So each candidate is validated here by
+    actually creating and closing a throwaway figure; only a backend that
+    survives that is returned, otherwise the next candidate is tried.
+    """
     import matplotlib
 
     order = ["QtAgg", "TkAgg"] if preferred == "qt" else ["TkAgg", "QtAgg"]
+    last_exc = None
     for backend in order:
         try:
             matplotlib.use(backend, force=True)
+            import matplotlib.pyplot as plt
+
+            fig = plt.figure()
+            plt.close(fig)
             return backend
-        except Exception:
+        except Exception as exc:
+            last_exc = exc
             continue
+    if last_exc is not None:
+        sys.stderr.write("ejn_viewer: no working GUI backend (%s)\n" % last_exc)
+        sys.stderr.flush()
     return matplotlib.get_backend()
 
 
