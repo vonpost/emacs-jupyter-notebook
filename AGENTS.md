@@ -114,6 +114,13 @@ For remote behavior, structure code so SSH/process execution can be mocked.
 - Do not commit generated artifacts such as `.elc` files, transient connection JSON files, local registry files, or `.opencode/` tooling data.
 - Before committing, inspect status, diff, and recent log; stage only intended project files.
 
+## Learnings
+
+Read `LEARNINGS.md` before starting any workstream that touches the async
+pipeline, the Jupyter adapter, the panel, or the display layer. It captures
+concrete lessons (with file:line and workstream-row references) from
+landing W1–W7, and answers common footguns before you have to hit them.
+
 ## Binding Design Rules
 
 These rules supersede anything older in this document. The full and current
