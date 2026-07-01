@@ -797,7 +797,7 @@ Rows:
       failure.  Tested as a standalone script (headless Agg smoke for the
       non-GUI logic — format_coord math, link-group wiring; GUI parts are
       manual).
-- [ ] W8.5 Command + binding: `C-c j I` and `v` on a panel plot entry open
+- [~] owner=W8-agent claimed=2026-07-01 W8.5 Command + binding: `C-c j I` and `v` on a panel plot entry open
       the figure interactively.  Friendly `user-error`s: no local Python
       configured / found, matplotlib missing locally, no pickle on this
       entry, viewer failed to start.  Route viewer lifecycle events to the
