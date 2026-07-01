@@ -652,6 +652,82 @@ a `Hint:' line."
       (should (string-prefix-p "AUTH-FAILED:" captured))
       (should (string-match-p "Hint: " captured)))))
 
+(ert-deftest ejn-w7.2-async-retrieve-exhausts-retries-fails-cleanly ()
+  "W7.2: `--async-retrieve' exhausts its retries → phase `error', the
+last-error is captured on the context, and no launch/scp process buffers
+or `:remote-copy' temp files leak.  Uses real subprocesses (`sh -c
+\"exit 1\"') so the SCP sentinel drives the retry loop naturally, and
+tight limits so the test finishes in a few hundred milliseconds.
+
+Currently expected-failed: the leak assertion detects real bug CC1 —
+`--async-retrieve-attempt' overwrites `:scp-process' on every retry
+without disposing the previous process, so 2·(N-1) hidden SCP
+stdout/stderr buffers survive.  Flip `:expected-result' to `:passed'
+once CC1 lands."
+  :expected-result :failed
+  (let* ((baseline (ejn-test--ejn-process-buffers))
+         (emacs-jupyter-notebook-connection-retrieve-attempts 2)
+         (emacs-jupyter-notebook-connection-retrieve-delay 0.02)
+         (spawned nil)
+         captured captured-context)
+    (with-temp-buffer
+      (let* ((origin (current-buffer))
+             (context (emacs-jupyter-notebook--async-new-context
+                       :phase 'retrieve
+                       :session-id "w72"
+                       :profile '(:profile "p" :host "h")
+                       :entry '(:profile "p"
+                                :session-id "w72"
+                                :remote-host "h"
+                                :remote-connection-file "/remote/kernel.json")
+                       :origin-buffer origin
+                       :error-callback (lambda (ctx err)
+                                         (setq captured err
+                                               captured-context ctx)))))
+        (setq emacs-jupyter-notebook--async-context context)
+        (cl-letf (((symbol-function 'display-warning) #'ignore)
+                  ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
+                   (lambda (name _argv sentinel)
+                     ;; Real failing subprocess so the SCP sentinel fires
+                     ;; naturally and the whole retry ladder is exercised.
+                     ;; Route stderr through the process property so
+                     ;; `--async-delete-process' will kill it.
+                     (let* ((stderr (generate-new-buffer
+                                     (format " *%s stderr*" name)))
+                            (proc (make-process
+                                   :name name
+                                   :buffer (generate-new-buffer
+                                            (format " *%s*" name))
+                                   :command '("sh" "-c"
+                                              "printf 'scp: no such file\\n' 1>&2; exit 1")
+                                   :connection-type 'pipe
+                                   :noquery t
+                                   :sentinel sentinel
+                                   :stderr stderr)))
+                       (process-put proc 'emacs-jupyter-notebook-stderr-buffer
+                                    stderr)
+                       (push proc spawned)
+                       proc))))
+          (emacs-jupyter-notebook--async-retrieve context)
+          (let ((deadline (+ (float-time) 5)))
+            (while (and (not captured) (< (float-time) deadline))
+              (accept-process-output nil 0.02))))))
+    ;; Context reached the error phase and remembered the last SCP failure.
+    (should captured)
+    (should captured-context)
+    (should (eq (plist-get captured-context :phase) 'error))
+    (should (stringp (plist-get captured-context :error)))
+    (should (string-match-p "SCP failed" (plist-get captured-context :error)))
+    ;; No leaked processes and no leaked scp buffers above baseline.
+    (dolist (proc spawned)
+      (should-not (process-live-p proc)))
+    (let ((leaked (cl-set-difference (ejn-test--ejn-process-buffers) baseline)))
+      (should-not leaked))
+    ;; The transient `:remote-copy' file is gone.
+    (let ((copy (plist-get captured-context :remote-copy)))
+      (when copy
+        (should-not (file-exists-p copy))))))
+
 (ert-deftest ejn-w4.4-build-pid-alive-uses-kill-zero ()
   "W4.4: the PID-alive probe argv ends with `kill -0 <pid>'."
   (let ((argv (emacs-jupyter-notebook-ssh-build-pid-alive

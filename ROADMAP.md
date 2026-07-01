@@ -84,7 +84,14 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
-- _none yet_
+- [ ] CC1 `--async-retrieve-attempt' leaks the prior SCP process's stdout/stderr
+      buffers on every retry — it overwrites `:scp-process' without disposing
+      the old process first, so a failed retrieve with N attempts leaks 2·(N-1)
+      hidden ` *emacs-jupyter-notebook-scp-*' buffers.  Fix: call
+      `--async-delete-process' on the previous `:scp-process' at the top of
+      `--async-retrieve-attempt' before allocating the new one.  Discovered by
+      the W7.2 ERT (leak assertion against `ejn-test--ejn-process-buffers').
+      — touches: `emacs-jupyter-notebook.el` — for: W7.2
 
 ---
 
