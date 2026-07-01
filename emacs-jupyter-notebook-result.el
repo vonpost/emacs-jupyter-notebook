@@ -469,9 +469,15 @@ state appears in place."
       (emacs-jupyter-notebook-panel--handle panel id cell-key))))
 
 (defun ejn-panel-append-text (handle text &optional face)
-  "Append TEXT (optionally propertized with FACE) to HANDLE's entry."
+  "Append TEXT (optionally propertized with FACE) to HANDLE's entry.
+When TEXT already carries `face' text-properties (e.g. from
+`ansi-color-apply' on a Python traceback), FACE is composed via
+`add-face-text-property' with append priority so per-character ANSI
+colours are preserved and uncoloured spans still get the fallback FACE."
   (when (and handle text)
-    (let ((display-text (if face (propertize text 'face face) text)))
+    (let ((display-text (copy-sequence text)))
+      (when face
+        (add-face-text-property 0 (length display-text) face t display-text))
       (emacs-jupyter-notebook-panel--update-entry
        handle
        (lambda (entry)

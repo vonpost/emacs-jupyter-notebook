@@ -230,8 +230,13 @@ panel/fringe state set by the timeout or `cancel-operation' paths."
                                (string-join traceback "\n")
                              (format "%s: %s" ename evalue))))
                 (setq had-result t)
+                ;; Python tracebacks arrive with ANSI colour SGR escapes
+                ;; (highlighted frame, red error class, etc.).  Route
+                ;; through `--ansi' so they render as faces rather than
+                ;; literal `\x1b[0;31m' garbage in the panel.
                 (ejn-panel-append-text
-                 entry-handle text
+                 entry-handle
+                 (emacs-jupyter-notebook-jupyter--ansi text)
                  'emacs-jupyter-notebook-result-error-face))
             (error nil))))
       ("execute_reply"
@@ -273,11 +278,12 @@ panel/fringe state set by the timeout or `cancel-operation' paths."
                       (when (equal status-s "error")
                         (ejn-panel-append-text
                          entry-handle
-                         (format "%s: %s"
-                                 (or (emacs-jupyter-notebook-jupyter--message-content-value
-                                      msg :ename) "Error")
-                                 (or (emacs-jupyter-notebook-jupyter--message-content-value
-                                      msg :evalue) ""))
+                         (emacs-jupyter-notebook-jupyter--ansi
+                          (format "%s: %s"
+                                  (or (emacs-jupyter-notebook-jupyter--message-content-value
+                                       msg :ename) "Error")
+                                  (or (emacs-jupyter-notebook-jupyter--message-content-value
+                                       msg :evalue) "")))
                          'emacs-jupyter-notebook-result-error-face)))
                     (ejn-panel-finish-entry entry-handle status-sym count)
                     (when (buffer-live-p buffer)

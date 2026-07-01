@@ -1024,6 +1024,65 @@ leaves source-buffer text untouched."
                        (string-match-p "Evaluation failed: connect failed" c)))
                    emacs-jupyter-notebook-panel--entries)))))))
 
+(ert-deftest ejn-error-callback-decodes-ansi-escape-codes-in-traceback ()
+  "Python tracebacks arrive with ANSI colour SGR escapes (`\\x1b[0;31m'
+around the error class, `\\x1b[1m' for bold, etc.).  The `error'
+callback must strip those escapes and translate them into `face'
+text-properties rather than leaving them as literal bytes."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "1/0"))
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks
+                       (current-buffer) handle 'mock-client))
+           (err-fn (cadr (assoc "error" callbacks)))
+           (raw-traceback
+            (list
+             "\e[0;31m---------------------------------------------------------------------------\e[0m"
+             "\e[0;31mZeroDivisionError\e[0m                         Traceback (most recent call last)"
+             "Cell \e[0;32mIn[1], line 1\e[0m"
+             "\e[0;31mZeroDivisionError\e[0m: division by zero")))
+      (cl-letf (((symbol-function 'jupyter-message-content)
+                 (lambda (_msg)
+                   (list :traceback raw-traceback
+                         :ename "ZeroDivisionError"
+                         :evalue "division by zero"))))
+        (funcall err-fn 'mock-msg))
+      (let* ((entry (emacs-jupyter-notebook-panel--entry
+                     panel (plist-get handle :id)))
+             (content (plist-get entry :content)))
+        (should content)
+        (should-not (string-match-p "\e\\[[0-9;]*m" content))
+        (should (string-match-p "ZeroDivisionError" content))
+        (should (string-match-p "division by zero" content))))))
+
+(ert-deftest ejn-panel-append-text-preserves-ansi-faces-under-fallback-face ()
+  "`ejn-panel-append-text' composes the optional FACE with any
+per-character faces already on TEXT (e.g. from `ansi-color-apply').
+The ANSI colours must remain visible while the fallback FACE covers
+the uncoloured spans."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "boom")))
+      (ejn-panel-append-text
+       handle
+       (concat (propertize "red-part" 'face 'font-lock-warning-face)
+               "-plain")
+       'emacs-jupyter-notebook-result-error-face)
+      (let* ((entry (emacs-jupyter-notebook-panel--entry
+                     panel (plist-get handle :id)))
+             (content (plist-get entry :content))
+             (red-face (get-text-property 0 'face content))
+             (plain-face (get-text-property (length "red-part") 'face content)))
+        ;; Preserved ANSI-style face on the colored span.
+        (should (or (eq red-face 'font-lock-warning-face)
+                    (and (listp red-face)
+                         (memq 'font-lock-warning-face red-face))))
+        ;; Fallback face applied to the plain span.
+        (should (or (eq plain-face 'emacs-jupyter-notebook-result-error-face)
+                    (and (listp plain-face)
+                         (memq 'emacs-jupyter-notebook-result-error-face
+                               plain-face))))))))
+
 (ert-deftest ejn-complete-at-point-strips-capf-metadata-before-calling-completion-in-region ()
   "Regression: the capf result includes `:exclusive 'no' as trailing
 plist properties, but `completion-in-region' accepts only (START END
