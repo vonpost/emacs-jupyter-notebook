@@ -803,7 +803,7 @@ Rows:
       entry, viewer failed to start.  Route viewer lifecycle events to the
       W6 log buffer.  ERT for the command dispatch + error branches (mock
       the viewer manager).
-- [~] owner=W8-agent claimed=2026-07-01 W8.6 Customization + README:
+- [x] sha=35a1ccd W8.6 Customization + README:
       `emacs-jupyter-notebook-local-python-command` (default "python3"),
       `emacs-jupyter-notebook-viewer-backend` (default `qt`, choice qt/tk),
       `emacs-jupyter-notebook-viewer-idle-timeout` (default 900),
