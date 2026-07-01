@@ -467,6 +467,32 @@ state-clearing `setq` at the bottom always runs.
 
 Precedent: **W1.10**.
 
+### capf return shape ≠ `completion-in-region` arg list
+
+`completion-at-point-functions` return `(START END COLLECTION . PROPS)`
+where PROPS is a plist including `:exclusive`, `:annotation-function`,
+`:company-doc-buffer`, etc. That's a valid list — the plist keys are
+just the 4th+ elements. `completion-in-region`, however, accepts only
+3-4 positional args (`START END COLLECTION [PREDICATE]`), so passing
+the full capf list via `(apply #'completion-in-region result)` throws
+"wrong number of arguments (5)". Strip the metadata via `(seq-take
+result 3)` before applying. Bit us on `complete-at-point`; test
+`ejn-complete-at-point-strips-capf-metadata-before-calling-completion-in-region`.
+
+### Evil visual state deactivates the region before command dispatch
+
+`(interactive "r")` reads `region-beginning` / `region-end` at
+dispatch time. Evil's visual state sometimes leaves the region
+inactive by the time the interactive form runs (e.g. when a command
+was bound in a non-visual keymap and Evil switches back to normal
+state before executing), and the interactive form raises "The mark
+is not set now, so there is no region". Evil exposes
+`evil-visual-beginning` / `evil-visual-end` markers that survive the
+state exit; prefer those in the interactive form, then fall back to
+`use-region-p`. See `--region-bounds` and tests
+`ejn-send-region-bounds-uses-evil-visual-markers` /
+`-uses-standard-region` / `-signals-when-no-region`.
+
 ### 35. `plist-put` is destructive on some plists
 
 `plist-put` may return a modified list that shares structure with the
