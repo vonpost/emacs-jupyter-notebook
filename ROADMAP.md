@@ -660,6 +660,28 @@ Per-row dependencies:
       `-p`); panel API tolerates late writes after the panel buffer is
       killed; the package source files do not require or depend on TRAMP
       (hard architecture constraint from AGENTS.md).
+- [~] owner=W7-fixup claimed=2026-07-01 W7.6 Remediation pass on codex review:
+      (a) HIGH: W7.2 marks the ENTIRE test as `:expected-result :failed',
+          so failures on the retry-phase or `phase 'error' assertions are
+          masked by the same xfail marker meant only for the CC1 leak
+          assertion.  Fix: split into two ERTs — one that asserts the
+          normal retry-exhaustion behavior (passes today), and one that
+          asserts the no-leak invariant (xfailed pending CC1).
+      (b) HIGH: W7.5 no-tramp static check does a raw regex scan, so
+          `(require 'tramp` inside a comment or docstring produces a false
+          positive.  Fix: strip Emacs-Lisp comments before searching, and
+          match `require' as a top-level form, not arbitrary text.
+      (c) MEDIUM: W7.3 `:owns-kernel t' case doesn't distinguish enough.
+          Add positive assertions that the tunnel process is disposed and
+          that no `--cleanup-remote-entry' or `--remove-registry-entry'
+          call fires (via mock+not-called check), so the test catches
+          future regressions where cancel starts terminating the kernel.
+      Deferred:
+      (d) MEDIUM: Doom e2e reconnect doesn't prove same-session
+          reattachment.  Adding a `:remote-connection-file' equality
+          assertion requires the e2e harness to expose the pre-shutdown
+          registry entry, which is not straightforward from batch mode.
+          Recorded as known e2e limitation.
 
 Hard rules: do not edit any package source from W7. If a test reveals a
 real bug, file a CC row in `## Cross-cutting changes` and stop.
