@@ -171,21 +171,26 @@ panel/fringe state set by the timeout or `cancel-operation' paths."
       ("execute_result"
        ,(lambda (msg)
           (condition-case nil
-              (when-let ((data (emacs-jupyter-notebook-jupyter--result-mime-data msg))
-                         (rendered (emacs-jupyter-notebook--render-mime-result data)))
-                (setq had-result t)
-                (if (get-text-property 0 'display rendered)
-                    (ejn-panel-set-image
-                     entry-handle (get-text-property 0 'display rendered))
-                  (ejn-panel-replace-text
-                   entry-handle
-                   (emacs-jupyter-notebook-jupyter--ansi rendered))))
+              (when-let ((data (emacs-jupyter-notebook-jupyter--result-mime-data msg)))
+                ;; W8.2: stash the matplotlib pickle payload (if any) before
+                ;; rendering the PNG thumbnail; the two are independent.
+                (emacs-jupyter-notebook--maybe-stash-pickle buffer entry-handle data)
+                (when-let ((rendered (emacs-jupyter-notebook--render-mime-result data)))
+                  (setq had-result t)
+                  (if (get-text-property 0 'display rendered)
+                      (ejn-panel-set-image
+                       entry-handle (get-text-property 0 'display rendered))
+                    (ejn-panel-replace-text
+                     entry-handle
+                     (emacs-jupyter-notebook-jupyter--ansi rendered)))))
             (error nil))))
       ("display_data"
        ,(lambda (msg)
           (condition-case nil
               (let ((data (emacs-jupyter-notebook-jupyter--result-mime-data msg)))
                 (when data
+                  ;; W8.2: stash the matplotlib pickle payload (if any).
+                  (emacs-jupyter-notebook--maybe-stash-pickle buffer entry-handle data)
                   (let ((rendered (emacs-jupyter-notebook--render-mime-result data)))
                     (setq had-result t)
                     (cond
@@ -205,6 +210,8 @@ panel/fringe state set by the timeout or `cancel-operation' paths."
           (condition-case nil
               (let ((data (emacs-jupyter-notebook-jupyter--result-mime-data msg)))
                 (when data
+                  ;; W8.2: refresh the stashed matplotlib pickle payload.
+                  (emacs-jupyter-notebook--maybe-stash-pickle buffer entry-handle data)
                   (let ((rendered (emacs-jupyter-notebook--render-mime-result data)))
                     (setq had-result t)
                     (cond

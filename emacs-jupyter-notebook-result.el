@@ -81,9 +81,20 @@
 
 ;;; MIME helpers (still used by callbacks)
 
+(defconst emacs-jupyter-notebook-mpl-pickle-mime-type
+  :application/x-ejn-mpl-pickle
+  "Keyword MIME key for the W8 matplotlib figure pickle payload.
+Emitted alongside `image/png' by the injected remote formatter (W8.1).")
+
 (defun emacs-jupyter-notebook--select-mime-type (data)
-  "Select the best MIME type from DATA plist.
-Return (cons mime-type content) or nil."
+  "Select the best DISPLAYABLE MIME type from DATA plist.
+Return (cons mime-type content) or nil.
+
+W8.2: the custom `application/x-ejn-mpl-pickle' MIME is deliberately NOT
+selected here — it is not a renderable thumbnail.  It rides alongside
+`image/png' and is stashed separately via
+`emacs-jupyter-notebook--select-mpl-pickle', so the PNG thumbnail path is
+completely unchanged whether or not a pickle is present."
   (cond
    ((plist-get data :image/png)
     (cons :image/png (plist-get data :image/png)))
@@ -92,6 +103,34 @@ Return (cons mime-type content) or nil."
    ((plist-get data :text/plain)
     (cons :text/plain (plist-get data :text/plain)))
    (t nil)))
+
+(defun emacs-jupyter-notebook--select-mpl-pickle (data)
+  "Return the base64 matplotlib-pickle payload from DATA plist, or nil.
+W8.2: recognizes the custom `application/x-ejn-mpl-pickle' MIME key so the
+interactive viewer (W8.5) can reopen the figure locally.  Only accepts a
+non-empty string payload."
+  (let ((payload (plist-get data emacs-jupyter-notebook-mpl-pickle-mime-type)))
+    (and (stringp payload)
+         (not (string-empty-p payload))
+         payload)))
+
+(declare-function emacs-jupyter-notebook-viewer-open-pickle "emacs-jupyter-notebook-viewer" (base64))
+
+(defun emacs-jupyter-notebook--maybe-stash-pickle (buffer handle data)
+  "Stash any matplotlib pickle in DATA onto HANDLE's entry.
+W8.2: extracts the `application/x-ejn-mpl-pickle' payload and stores it on
+the panel entry, leaving the PNG thumbnail path untouched.  W8.6: when
+`emacs-jupyter-notebook-viewer-auto-open' is non-nil and a pickle is
+present, also hand it to the local viewer.  BUFFER is the source buffer;
+best-effort, never raises out of a callback."
+  (when-let ((base64 (emacs-jupyter-notebook--select-mpl-pickle data)))
+    (ejn-panel-set-pickle handle base64)
+    (when (and (bound-and-true-p emacs-jupyter-notebook-viewer-auto-open)
+               (fboundp 'emacs-jupyter-notebook-viewer-open-pickle))
+      (ignore-errors
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (emacs-jupyter-notebook-viewer-open-pickle base64)))))))
 
 (defun emacs-jupyter-notebook--render-image-data (base64-data)
   "Decode BASE64-DATA and return an image spec."
@@ -540,6 +579,22 @@ If WAIT is non-nil, defer the clear until the next text arrives
          (setq entry (plist-put entry :image nil))
          (setq entry (plist-put entry :pending-clear nil))
          entry)))))
+
+(defun ejn-panel-set-pickle (handle base64)
+  "Stash BASE64 matplotlib-pickle payload on HANDLE's entry.
+W8.2: stored under `:mpl-pickle' independently of the rendered content or
+image, so the PNG thumbnail path is untouched.  The interactive viewer
+(W8.5) reads this field to reopen the figure locally.  A nil BASE64 is a
+no-op."
+  (when (and handle base64)
+    (emacs-jupyter-notebook-panel--update-entry
+     handle
+     (lambda (entry)
+       (plist-put entry :mpl-pickle base64)))))
+
+(defun ejn-panel-entry-pickle (handle)
+  "Return the base64 matplotlib-pickle payload stashed on HANDLE's entry, or nil."
+  (plist-get (ejn-panel-entry-snapshot handle) :mpl-pickle))
 
 (defun ejn-panel-entry-snapshot (handle)
   "Return the entry plist for HANDLE (debug/test introspection)."

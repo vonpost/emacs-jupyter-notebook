@@ -5999,6 +5999,79 @@ key never disturbs the existing PNG path."
       (should (equal (plist-get (ejn-panel-entry-snapshot handle) :image)
                      '(image :type png :data "imgdata"))))))
 
+;;; W8.2 — MIME recognition + pickle stash
+
+(ert-deftest ejn-w8.2-select-mime-type-ignores-pickle ()
+  "W8.2: the pickle MIME is never chosen as a renderable thumbnail."
+  (should (equal (emacs-jupyter-notebook--select-mime-type
+                  '(:application/x-ejn-mpl-pickle "cGts" :image/png "aW1n"))
+                 '(:image/png . "aW1n")))
+  (should (null (emacs-jupyter-notebook--select-mime-type
+                 '(:application/x-ejn-mpl-pickle "cGts")))))
+
+(ert-deftest ejn-w8.2-select-mpl-pickle-extracts-payload ()
+  "W8.2: the pickle selector returns the base64 payload or nil."
+  (should (equal (emacs-jupyter-notebook--select-mpl-pickle
+                  '(:image/png "aW1n" :application/x-ejn-mpl-pickle "cGts"))
+                 "cGts"))
+  (should (null (emacs-jupyter-notebook--select-mpl-pickle
+                 '(:image/png "aW1n"))))
+  (should (null (emacs-jupyter-notebook--select-mpl-pickle
+                 '(:application/x-ejn-mpl-pickle "")))))
+
+(ert-deftest ejn-w8.2-set-and-get-pickle-on-entry ()
+  "W8.2: `ejn-panel-set-pickle' stores under :mpl-pickle; getter reads it."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "")))
+      (should (null (ejn-panel-entry-pickle handle)))
+      (ejn-panel-set-pickle handle "cGlja2xl")
+      (should (equal (ejn-panel-entry-pickle handle) "cGlja2xl"))
+      (should (equal (plist-get (ejn-panel-entry-snapshot handle) :mpl-pickle)
+                     "cGlja2xl")))))
+
+(ert-deftest ejn-w8.2-display-data-stores-pickle-and-renders-png ()
+  "W8.2: a bundle with both PNG and pickle renders the PNG AND stashes the
+pickle on the entry."
+  (with-temp-buffer
+    (let* ((buffer (current-buffer))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
+           (display-fn (cadr (assoc "display_data" callbacks)))
+           (png (base64-encode-string "imgdata" t))
+           (pickle (base64-encode-string "pickle-bytes" t)))
+      (cl-letf (((symbol-function 'jupyter-message-content)
+                 (lambda (_msg)
+                   `(:data (:image/png ,png
+                            :application/x-ejn-mpl-pickle ,pickle))))
+                ((symbol-function 'create-image)
+                 (lambda (data &optional _type _data-p &rest _props)
+                   (list 'image :type 'png :data data))))
+        (funcall display-fn 'mock-msg))
+      (let ((e (ejn-panel-entry-snapshot handle)))
+        (should (equal (plist-get e :image) '(image :type png :data "imgdata")))
+        (should (equal (plist-get e :mpl-pickle) pickle))))))
+
+(ert-deftest ejn-w8.2-display-data-png-only-stores-no-pickle ()
+  "W8.2: a PNG-only bundle behaves exactly as before — no pickle stashed."
+  (with-temp-buffer
+    (let* ((buffer (current-buffer))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
+           (display-fn (cadr (assoc "display_data" callbacks)))
+           (png (base64-encode-string "imgdata" t)))
+      (cl-letf (((symbol-function 'jupyter-message-content)
+                 (lambda (_msg) `(:data (:image/png ,png))))
+                ((symbol-function 'create-image)
+                 (lambda (data &optional _type _data-p &rest _props)
+                   (list 'image :type 'png :data data))))
+        (funcall display-fn 'mock-msg))
+      (let ((e (ejn-panel-entry-snapshot handle)))
+        (should (equal (plist-get e :image) '(image :type png :data "imgdata")))
+        (should (null (plist-get e :mpl-pickle)))))))
+
 (provide 'emacs-jupyter-notebook-tests)
 
 ;;; emacs-jupyter-notebook-tests.el ends here
