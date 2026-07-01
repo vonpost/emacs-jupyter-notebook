@@ -1024,6 +1024,63 @@ leaves source-buffer text untouched."
                        (string-match-p "Evaluation failed: connect failed" c)))
                    emacs-jupyter-notebook-panel--entries)))))))
 
+(ert-deftest ejn-complete-at-point-strips-capf-metadata-before-calling-completion-in-region ()
+  "Regression: the capf result includes `:exclusive 'no' as trailing
+plist properties, but `completion-in-region' accepts only (START END
+COLLECTION).  Passing the full capf list via `apply' throws \"wrong
+number of arguments\".  The explicit `complete-at-point' command and
+the fallback UI refresh path must both strip the metadata."
+  (with-temp-buffer
+    (insert "np.arr")
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          captured-args)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--completion-result)
+                 (lambda ()
+                   ;; The real capf shape produced by
+                   ;; `--completion-result-from-reply'.
+                   (list 3 6 '("array" "arrange") :exclusive 'no)))
+                ((symbol-function 'completion-in-region)
+                 (lambda (&rest args) (setq captured-args args))))
+        (emacs-jupyter-notebook-complete-at-point)
+        (should captured-args)
+        (should (= (length captured-args) 3))
+        (should (equal (nth 0 captured-args) 3))
+        (should (equal (nth 1 captured-args) 6))
+        (should (equal (nth 2 captured-args) '("array" "arrange")))))))
+
+(ert-deftest ejn-send-region-bounds-uses-standard-region ()
+  "`--region-bounds' returns `region-beginning'/`region-end' when Evil
+is not involved and the standard Emacs region is active."
+  (with-temp-buffer
+    (insert "abcdef")
+    (goto-char 2)
+    (set-mark 5)
+    (activate-mark)
+    (let ((result (emacs-jupyter-notebook--region-bounds)))
+      (should (equal result '(2 5))))))
+
+(defvar evil-visual-beginning)
+(defvar evil-visual-end)
+
+(ert-deftest ejn-send-region-bounds-uses-evil-visual-markers ()
+  "`--region-bounds' prefers Evil's `evil-visual-beginning'/`-end' markers
+when Evil visual state is active — this covers the case where Evil has
+deactivated the standard region before the interactive form runs."
+  (with-temp-buffer
+    (insert "abcdef")
+    (let ((evil-visual-beginning (copy-marker 2))
+          (evil-visual-end (copy-marker 5)))
+      (cl-letf (((symbol-function 'evil-visual-state-p) (lambda () t)))
+        (let ((result (emacs-jupyter-notebook--region-bounds)))
+          (should (equal result '(2 5))))))))
+
+(ert-deftest ejn-send-region-bounds-signals-when-no-region ()
+  "`--region-bounds' raises a user-error when no region is available."
+  (with-temp-buffer
+    (insert "abcdef")
+    (deactivate-mark)
+    (should-error (emacs-jupyter-notebook--region-bounds) :type 'user-error)))
+
 (ert-deftest ejn-send-region-and-buffer-do-not-mutate-source ()
   "W2: region/buffer eval does not mutate source-buffer text and has cell-key nil."
   (ejn-test-with-temp-buffer "x = 1\ny = 2\n"

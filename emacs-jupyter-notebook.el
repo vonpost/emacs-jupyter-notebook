@@ -1599,7 +1599,11 @@ Behavior (W3.7):
    ((not (bound-and-true-p completion-in-region-mode))
     (let ((result (emacs-jupyter-notebook--completion-result)))
       (when result
-        (apply #'completion-in-region result))))))
+        ;; capf return shape is `(START END COLLECTION . CAPF-PROPS)'
+        ;; where CAPF-PROPS include `:exclusive', `:annotation-function',
+        ;; etc.  `completion-in-region' does NOT accept those trailing
+        ;; keywords, so strip them before calling.
+        (apply #'completion-in-region (seq-take result 3)))))))
 
 (defun emacs-jupyter-notebook--completion-on-reply (buffer key request-id show-results context-snapshot reply _error)
   "Cache REPLY for KEY under REQUEST-ID in BUFFER, optionally refreshing UI.
@@ -1699,7 +1703,9 @@ when the reply arrives."
     (user-error "No Jupyter kernel connected"))
   (let ((result (emacs-jupyter-notebook--completion-result)))
     (if result
-        (apply #'completion-in-region result)
+        ;; Strip capf metadata (`:exclusive' etc) before invoking
+        ;; `completion-in-region', which only accepts (START END COLL).
+        (apply #'completion-in-region (seq-take result 3))
       (emacs-jupyter-notebook--completion-schedule-request t))))
 
 (defun emacs-jupyter-notebook--completion-start-idle-timer ()
@@ -1966,11 +1972,33 @@ instead of using the default."
           (emacs-jupyter-notebook--evaluate-code code key))))))
 
 ;;;###autoload
+(defun emacs-jupyter-notebook--region-bounds ()
+  "Return `(BEG END)' for the current region, Evil-aware.
+Uses Evil's `evil-visual-beginning' / `evil-visual-end' markers when
+Evil visual state is active — Evil sometimes deactivates the standard
+Emacs region before an interactively-invoked command runs, which makes
+`(interactive \"r\")' error out with `The mark is not set now'.  Falls
+back to the standard `region-beginning' / `region-end' when Evil is
+not involved.  Signals a `user-error' when no meaningful region is
+available."
+  (cond
+   ((and (bound-and-true-p evil-visual-beginning)
+         (bound-and-true-p evil-visual-end)
+         (fboundp 'evil-visual-state-p)
+         (evil-visual-state-p))
+    (list (marker-position evil-visual-beginning)
+          (marker-position evil-visual-end)))
+   ((use-region-p)
+    (list (region-beginning) (region-end)))
+   (t
+    (user-error "No active region — mark a region first"))))
+
 (defun emacs-jupyter-notebook-send-region (beg end)
   "Send the active region from BEG to END.
 Region evaluations have no cell key and appear only in the history-log
-view of the panel."
-  (interactive "r")
+view of the panel.  Works with standard Emacs region and with Evil
+character-wise / line-wise visual state."
+  (interactive (emacs-jupyter-notebook--region-bounds))
   (emacs-jupyter-notebook--evaluate-code
    (buffer-substring-no-properties beg end) nil))
 
