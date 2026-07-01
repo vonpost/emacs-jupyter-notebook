@@ -42,6 +42,14 @@ These are binding for every workstream. Update only by appending a new entry.
   `clean-orphaned-kernels` housekeeping command) may terminate the remote
   kernel. No automatic cleanup of the remote kernel from `kill-buffer-hook`,
   `kill-emacs-hook`, mode-disable, or async failure paths.
+- **2026-07-01 / `retry-fresh-kernel` is also an allowed terminator.**
+  Supersedes the relevant clause of the 2026-06-28 entry above.  The
+  explicit user command `emacs-jupyter-notebook-retry-fresh-kernel`
+  replaces the buffer's current kernel with a fresh one — termination of
+  the old kernel is its whole purpose.  It is gated by a `y-or-n-p`
+  confirmation (W6.4), so it is just as explicit as `shutdown-kernel`.
+  The full allowed-terminators list is now: `shutdown-kernel`,
+  `clean-orphaned-kernels`, `retry-fresh-kernel`.
 - **2026-06-28 / Single buffer per kernel for now.** Multi-buffer sharing of a
   single remote kernel is out of scope. Each buffer owns its own tunnel and
   client. The registry entry is keyed per session-id; a second buffer
@@ -583,7 +591,7 @@ when the kernel is far away.
 - [x] sha=41ce4cd W6.9 Update `README.md`: new keymap table, panel description,
       completion behavior, eval surfaces (cell/region/paragraph/defun),
       removal of inline overlays.
-- [~] owner=W6-fixup claimed=2026-07-01 W6.10 Remediation pass:
+- [x] sha=990534b W6.10 Remediation pass:
       (a) CRITICAL: `retry-fresh-kernel` routes through `--cleanup-current-state`
           which terminates the remote kernel and removes the registry entry.
           The binding rule names only `shutdown-kernel` and `clean-orphaned-kernels`
