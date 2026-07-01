@@ -410,6 +410,8 @@ All command bindings live under `emacs-jupyter-notebook-prefix-key'
     (define-key map (kbd "x")    #'emacs-jupyter-notebook-cancel-operation)
     (define-key map (kbd "?")    #'emacs-jupyter-notebook-status)
     (define-key map (kbd "L")    #'emacs-jupyter-notebook-show-log-buffer)
+    ;; W6.10: `clear-results' was missing from the new prefix map.
+    (define-key map (kbd "l")    #'emacs-jupyter-notebook-clear-results)
     (define-key map (kbd "o")    #'emacs-jupyter-notebook-show-output-panel)
     (define-key map (kbd "t")    #'emacs-jupyter-notebook-toggle-panel-view)
     (define-key map (kbd ".")    #'emacs-jupyter-notebook-inspect-at-point)
@@ -743,9 +745,20 @@ SSH command is launched."
   "Return PROFILE-NAME profile, prompting for :host when missing.
 W6.7: missing host is filled by `--prompt-host', which loops until the
 user enters non-empty input and errors when the input contains
-whitespace."
-  (let ((profile (emacs-jupyter-notebook-ssh-profile profile-name)))
-    (unless (or (plist-get profile :host) (plist-get profile :remote-host))
+whitespace.
+
+W6.10: the whitespace check is also applied to the resolved host
+regardless of where it came from — a profile configured with a
+whitespace-containing `:host' / `:remote-host' is rejected before any
+SSH command can run."
+  (let* ((profile (emacs-jupyter-notebook-ssh-profile profile-name))
+         (host (or (plist-get profile :host)
+                   (plist-get profile :remote-host))))
+    (when (and host (string-match-p "[[:space:]]" host))
+      (user-error
+       "Profile %S has whitespace in its host (%S); refuse to launch SSH"
+       (or profile-name (plist-get profile :profile) "?") host))
+    (unless host
       (setq profile (plist-put profile :host
                                (emacs-jupyter-notebook--prompt-host))))
     profile))
@@ -2195,18 +2208,25 @@ buffer) and invokes the action's command there via `call-interactively'."
 (defun emacs-jupyter-notebook--status-tick ()
   "Refresh-tick body for the status buffer's live timer.
 Re-renders the snapshot if the status buffer is visible; otherwise
-cancels the timer so an off-screen status buffer doesn't keep ticking."
-  (let ((status-buffer (get-buffer emacs-jupyter-notebook--status-buffer-name)))
+cancels the timer so an off-screen status buffer doesn't keep ticking.
+W6.10: also cancels the timer when the originating source buffer is no
+longer live — without this the timer would fire forever after the
+source buffer was killed."
+  (let* ((status-buffer (get-buffer emacs-jupyter-notebook--status-buffer-name))
+         (source (and (buffer-live-p status-buffer)
+                      (buffer-local-value
+                       'emacs-jupyter-notebook--status-source-buffer
+                       status-buffer))))
     (cond
      ((not (buffer-live-p status-buffer)) nil)
+     ((not (buffer-live-p source))
+      (with-current-buffer status-buffer
+        (emacs-jupyter-notebook--status-cancel-refresh)))
      ((not (get-buffer-window status-buffer 'visible))
       (with-current-buffer status-buffer
         (emacs-jupyter-notebook--status-cancel-refresh)))
      (t
-      (emacs-jupyter-notebook--status-render
-       status-buffer
-       (buffer-local-value 'emacs-jupyter-notebook--status-source-buffer
-                           status-buffer))))))
+      (emacs-jupyter-notebook--status-render status-buffer source)))))
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-status ()

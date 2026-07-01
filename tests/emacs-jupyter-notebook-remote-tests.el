@@ -267,7 +267,7 @@
         (delete-file registry-file)))))
 
 (ert-deftest ejn-remote-evaluate-cell-command ()
-  "Test that the evaluate-current-cell command works with real evaluation."
+  "Test that the send-cell command works with real evaluation."
   :tags '(:remote :emacs-jupyter :evaluation)
   (unless (require 'jupyter nil t)
     (ert-skip "emacs-jupyter is not on load-path"))
@@ -291,7 +291,7 @@
             (goto-char (point-min))
             (forward-line 1)
             ;; Evaluate using the actual command; it should start the kernel.
-            (emacs-jupyter-notebook-evaluate-current-cell)
+            (emacs-jupyter-notebook-send-cell)
             (should (ejn-remote-tests--wait-for-result-text buffer "42" 80))))
       (ignore-errors
         (when (buffer-live-p buffer)
@@ -340,7 +340,7 @@
                    `((,(plist-get profile :profile) . ,profile)))
                   (emacs-jupyter-notebook-connection-retrieve-attempts 80)
                   (emacs-jupyter-notebook-connection-retrieve-delay 0.25))
-              (emacs-jupyter-notebook-evaluate-current-cell)
+              (emacs-jupyter-notebook-send-cell)
               (should (ejn-remote-tests--wait-for-result-text second-buffer "42" 80)))))
       (ignore-errors
         (when (buffer-live-p second-buffer)

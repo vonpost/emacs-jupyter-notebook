@@ -93,7 +93,7 @@ configured profile, which defaults to `mother' in the user's Doom config."
             (emacs-jupyter-notebook-mode 1)
             (goto-char (point-min))
             (forward-line 1)
-            (emacs-jupyter-notebook-evaluate-current-cell)
+            (emacs-jupyter-notebook-send-cell)
             (unless (ejn-doom-e2e--wait-for-result-image
                      buffer (ejn-doom-e2e--timeout))
               (error "Timed out waiting for plot result from %S" profile-name))))

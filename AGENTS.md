@@ -123,10 +123,14 @@ the load-bearing constraints every agent must respect.
 - No backwards compatibility. The package is not in external use; prefer the
   better shape over a compat shim. Do not add deprecation aliases.
 - The remote kernel outlives Emacs. Only the explicit user commands
-  `emacs-jupyter-notebook-shutdown-kernel` and
-  `emacs-jupyter-notebook-clean-orphaned-kernels` may terminate it. No
-  automatic cleanup from `kill-buffer-hook`, `kill-emacs-hook`, mode-disable,
-  or async failure paths.
+  `emacs-jupyter-notebook-shutdown-kernel`,
+  `emacs-jupyter-notebook-clean-orphaned-kernels`, and
+  `emacs-jupyter-notebook-retry-fresh-kernel` may terminate it.
+  `retry-fresh-kernel` is included because its whole purpose is to replace
+  the current kernel with a fresh one; it is an explicit user gesture
+  guarded by `y-or-n-p` (W6.4). No automatic cleanup from
+  `kill-buffer-hook`, `kill-emacs-hook`, mode-disable, or async failure
+  paths.
 - Single buffer per kernel for now. Multi-buffer sharing of a single remote
   kernel is out of scope until explicitly opened by a future workstream.
 - The registry is the durable truth. Local state may be freely torn down; the

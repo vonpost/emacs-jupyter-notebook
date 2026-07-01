@@ -5301,6 +5301,52 @@ Cleans up the status buffer (and its refresh timer) after BODY."
       (should-error
        (emacs-jupyter-notebook--prompt-host) :type 'user-error))))
 
+(ert-deftest ejn-w6.10-clear-results-bound-under-prefix ()
+  "W6.10: `clear-results' is reachable from the new `C-c j' prefix."
+  (let ((cmd (lookup-key
+              (emacs-jupyter-notebook--build-prefix-map) (kbd "l"))))
+    (should (eq cmd #'emacs-jupyter-notebook-clear-results))))
+
+(ert-deftest ejn-w6.10-read-host-profile-rejects-profile-with-bad-host ()
+  "W6.10: a profile whose stored `:host' contains whitespace fails fast,
+before any SSH command is constructed.  Bypassing the prompt branch must
+not bypass the whitespace check."
+  (let ((emacs-jupyter-notebook-remote-profiles
+         '(("dirty" . (:host "bad host with space"
+                       :remote-cwd "~" :kernelspec "python3")))))
+    (should-error (emacs-jupyter-notebook--read-host-profile "dirty")
+                  :type 'user-error)))
+
+(ert-deftest ejn-w6.10-read-host-profile-rejects-profile-with-bad-remote-host ()
+  "W6.10: `--read-host-profile' also checks `:remote-host' (the
+registry-entry shape) for whitespace."
+  (let ((emacs-jupyter-notebook-remote-profiles
+         '(("dirty2" . (:remote-host "with\ttab"
+                        :remote-cwd "~" :kernelspec "python3")))))
+    (should-error (emacs-jupyter-notebook--read-host-profile "dirty2")
+                  :type 'user-error)))
+
+(ert-deftest ejn-w6.10-status-tick-cancels-when-source-buffer-killed ()
+  "W6.10: `--status-tick' cancels the refresh timer when the source
+buffer that originated the status view has been killed.  Without this
+the timer would fire forever on a dead source."
+  (let* ((source (generate-new-buffer "ejn-w610-src"))
+         (status (get-buffer-create
+                  emacs-jupyter-notebook--status-buffer-name)))
+    (unwind-protect
+        (progn
+          (with-current-buffer status
+            (unless (derived-mode-p 'emacs-jupyter-notebook-status-mode)
+              (emacs-jupyter-notebook-status-mode))
+            (setq emacs-jupyter-notebook--status-source-buffer source)
+            (setq emacs-jupyter-notebook--status-refresh-timer
+                  (run-with-timer 1000 1000 #'ignore)))
+          (kill-buffer source)
+          (emacs-jupyter-notebook--status-tick)
+          (with-current-buffer status
+            (should-not emacs-jupyter-notebook--status-refresh-timer)))
+      (when (buffer-live-p status) (kill-buffer status)))))
+
 (ert-deftest ejn-w6.7-prompt-host-trims-surrounding-whitespace ()
   "W6.7: surrounding whitespace is trimmed; the trimmed value is accepted."
   (let ((answers '("  example.com  ")))
