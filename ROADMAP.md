@@ -785,7 +785,7 @@ Rows:
       MOCK viewer (a stub process + socket) exercising: lazy spawn once,
       reuse, async hand-off protocol, kill-emacs reap.  No real GUI needed
       for these tests.
-- [~] owner=W8-agent claimed=2026-07-01 W8.4 The viewer Python script (`viewer/ejn_viewer.py`): persistent
+- [x] sha=f17a069 W8.4 The viewer Python script (`viewer/ejn_viewer.py`): persistent
       process; select `QtAgg`, fall back to `TkAgg`; `plt.show(block=False)`
       with a socket listener pumped by a matplotlib canvas timer (not a
       blocking accept loop); on each incoming path, `pickle.loads`, reattach
