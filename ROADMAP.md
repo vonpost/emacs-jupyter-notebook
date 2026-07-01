@@ -645,7 +645,7 @@ Per-row dependencies:
       `error`, last-error captured in the snapshot, no leaked launch/scp
       processes or temp files. (Test currently `:expected-result :failed`
       because it uncovered CC1; flip to `:passed` when CC1 lands.)
-- [~] owner=W7-agent claimed=2026-07-01 W7.3 ERT: `cancel-operation` during tunnel phase tears down the
+- [x] sha=05d73e0 W7.3 ERT: `cancel-operation` during tunnel phase tears down the
       tunnel process and the registry remains untouched (or removed,
       depending on `:owns-kernel`); assert both branches.
 - [ ] W7.4 Doom e2e additions: after the existing image assertion, run a
