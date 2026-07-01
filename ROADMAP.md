@@ -653,6 +653,13 @@ Per-row dependencies:
       `shutdown-kernel`, kill the buffer, `find-file-noselect` again,
       `reconnect-remote-kernel`, and assert connection succeeds. Order so
       reconnect runs before any shutdown.
+- [~] owner=W7-agent claimed=2026-07-01 W7.5 Continuous coverage backfill:
+      spot-fill 3-6 regression ERTs on important paths surfaced by an
+      opencode audit — corrupt registry file loads gracefully; SSH profile
+      `:identity-file` + `:port` flow into argv (scp uses `-P`, ssh uses
+      `-p`); panel API tolerates late writes after the panel buffer is
+      killed; the package source files do not require or depend on TRAMP
+      (hard architecture constraint from AGENTS.md).
 
 Hard rules: do not edit any package source from W7. If a test reveals a
 real bug, file a CC row in `## Cross-cutting changes` and stop.
