@@ -660,7 +660,7 @@ Per-row dependencies:
       `-p`); panel API tolerates late writes after the panel buffer is
       killed; the package source files do not require or depend on TRAMP
       (hard architecture constraint from AGENTS.md).
-- [~] owner=W7-fixup claimed=2026-07-01 W7.6 Remediation pass on codex review:
+- [x] sha=1c1c2b6 W7.6 Remediation pass on codex review:
       (a) HIGH: W7.2 marks the ENTIRE test as `:expected-result :failed',
           so failures on the retry-phase or `phase 'error' assertions are
           masked by the same xfail marker meant only for the CC1 leak
