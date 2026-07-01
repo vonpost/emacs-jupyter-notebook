@@ -769,7 +769,7 @@ Rows:
       the PNG path.  (The Python snippet's correctness — exact IPython
       formatter API — is verified against a real IPython in the agent's own
       check; consult opencode for the precise registration form.)
-- [~] owner=W8-agent claimed=2026-07-01 W8.2 Emacs MIME recognition: teach the `display_data` /
+- [x] sha=f9735d7 W8.2 Emacs MIME recognition: teach the `display_data` /
       `execute_result` callbacks and `--select-mime-type` to recognize
       `application/x-ejn-mpl-pickle`, stash its base64 on the panel entry
       (new entry field, e.g. `:mpl-pickle`), and continue rendering the
