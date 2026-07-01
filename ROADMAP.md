@@ -776,7 +776,7 @@ Rows:
       `image/png` thumbnail exactly as today.  ERT: a bundle with both keys
       renders the PNG AND stores the pickle; a bundle with only PNG behaves
       unchanged.
-- [ ] W8.3 Local viewer process manager (`emacs-jupyter-notebook-viewer.el`):
+- [~] owner=W8-agent claimed=2026-07-01 W8.3 Local viewer process manager (`emacs-jupyter-notebook-viewer.el`):
       lazily spawn one PERSISTENT local Python running `viewer/ejn_viewer.py`;
       create a unix domain socket; hand a decoded-pickle temp-file path to
       the viewer asynchronously (never block Emacs); reuse the process across
