@@ -641,9 +641,10 @@ Per-row dependencies:
 - [x] sha=20c0c0a W7.1 ERT: launch sentinel firing on nonzero exit transitions the async
       context to phase `error` and reports the classified stderr from W4.3
       in the user-facing message.
-- [~] owner=W7-agent claimed=2026-07-01 W7.2 ERT: `--async-retrieve` exhausts its retries → context phase
+- [x] sha=2b9b2a0 W7.2 ERT: `--async-retrieve` exhausts its retries → context phase
       `error`, last-error captured in the snapshot, no leaked launch/scp
-      processes or temp files.
+      processes or temp files. (Test currently `:expected-result :failed`
+      because it uncovered CC1; flip to `:passed` when CC1 lands.)
 - [ ] W7.3 ERT: `cancel-operation` during tunnel phase tears down the
       tunnel process and the registry remains untouched (or removed,
       depending on `:owns-kernel`); assert both branches.
