@@ -5635,6 +5635,104 @@ the timer would fire forever on a dead source."
   (should-not (fboundp 'emacs-jupyter-notebook-evaluate-buffer))
   (should-not (fboundp 'emacs-jupyter-notebook-evaluate-current-cell-and-advance)))
 
+;;; W7.5 — Continuous coverage backfill
+
+(ert-deftest ejn-w7.5-registry-load-corrupt-file-returns-nil-with-warning ()
+  "W7.5: `registry-load' on a corrupt file must not raise; it returns nil
+and surfaces a warning.  The registry is durable truth — a garbled file
+must not brick the package's ability to start a fresh kernel."
+  (let ((file (make-temp-file "ejn-w75-corrupt-")))
+    (unwind-protect
+        (let (warned)
+          (with-temp-file file (insert "this is not (a valid) sexp"))
+          (cl-letf (((symbol-function 'display-warning)
+                     (lambda (&rest _) (setq warned t))))
+            (should-not (emacs-jupyter-notebook-registry-load file)))
+          (should warned))
+      (when (file-exists-p file) (delete-file file)))))
+
+(ert-deftest ejn-w7.5-ssh-command-honors-identity-file-and-port ()
+  "W7.5: profile `:identity-file' expands `~' and joins the ssh argv
+after `-p PORT'; ssh uses `-p'.  Regression: without this the identity
+knob silently disappears from the launch/probe argv."
+  (let ((emacs-jupyter-notebook-ssh-command "ssh")
+        (emacs-jupyter-notebook-ssh-options nil))
+    (let ((argv (emacs-jupyter-notebook-ssh-command
+                 '(:profile "p" :host "h" :user "u"
+                   :port 2222 :identity-file "~/.ssh/id_ed25519"))))
+      (should (member "-p" argv))
+      (should (member "2222" argv))
+      (should (member "-i" argv))
+      ;; ~ is expanded to an absolute path.
+      (should (cl-some (lambda (a)
+                         (and (stringp a)
+                              (string-suffix-p ".ssh/id_ed25519" a)
+                              (not (string-prefix-p "~" a))))
+                       argv)))))
+
+(ert-deftest ejn-w7.5-ssh-scp-from-command-honors-port-and-identity-file ()
+  "W7.5: `scp' uses `-P' (capital) not `-p' for the remote port; the
+`:identity-file' knob also propagates to scp.  Getting these wrong
+silently makes the retrieve step fail."
+  (let ((emacs-jupyter-notebook-scp-command "scp")
+        (emacs-jupyter-notebook-ssh-options nil))
+    (let ((argv (emacs-jupyter-notebook-ssh-scp-from-command
+                 '(:profile "p" :host "h"
+                   :port 2222 :identity-file "~/.ssh/id_ed25519")
+                 "~/.cache/ejn/k.json" "/tmp/k.json")))
+      (should (member "-P" argv))
+      (should-not (member "-p" argv))
+      (should (member "2222" argv))
+      (should (member "-i" argv))
+      (should (member "h:~/.cache/ejn/k.json" argv))
+      (should (equal (car (last argv)) "/tmp/k.json")))))
+
+(ert-deftest ejn-w7.5-panel-late-writes-after-panel-kill-are-safe ()
+  "W7.5: streaming/reply callbacks arriving after the panel buffer is
+killed must be no-ops, not raises.  Common race: user kills the panel
+while a slow evaluate is in flight."
+  (let ((buf (ejn-test--make-source-buffer)))
+    (unwind-protect
+        (let* ((panel (ejn-panel-ensure buf))
+               (handle (ejn-panel-start-entry panel nil "print('hi')")))
+          (kill-buffer panel)
+          (should-not (buffer-live-p panel))
+          ;; Every public writer must tolerate a dead panel silently.
+          (should (progn (ejn-panel-append-text handle "late stream") t))
+          (should (progn (ejn-panel-replace-text handle "late replace") t))
+          (should (progn (ejn-panel-set-image handle '(image :type png)) t))
+          (should (progn (ejn-panel-clear-entry handle) t))
+          (should (progn (ejn-panel-clear-entry handle t) t))
+          (should (progn (ejn-panel-finish-entry handle 'ok 1) t)))
+      (ejn-test--kill-source-buffer buf))))
+
+(ert-deftest ejn-w7.5-source-files-do-not-depend-on-tramp ()
+  "W7.5: the hard architecture rule (AGENTS.md) forbids TRAMP, `jupyter-tramp',
+and Emacs remote file handlers.  Static-scan every package `.el' file in
+the project root for `require' / `use-package' of a tramp module; the
+suite must fail if a future edit tries to sneak one in."
+  (let* ((root (or (locate-dominating-file
+                    (or (symbol-file 'emacs-jupyter-notebook-mode) default-directory)
+                    "emacs-jupyter-notebook.el")
+                   default-directory))
+         (files (directory-files root t "\\`emacs-jupyter-notebook.*\\.el\\'"))
+         offenders)
+    (should files)
+    (dolist (file files)
+      (with-temp-buffer
+        (insert-file-contents file)
+        (goto-char (point-min))
+        ;; Match forms like `(require 'tramp)', `(require 'jupyter-tramp)',
+        ;; `(use-package tramp ...)', or `tramp-file-name-p'.
+        (when (re-search-forward
+               "(\\(require\\|use-package\\)[[:space:]]+'?\\(tramp\\|jupyter-tramp\\)\\b"
+               nil t)
+          (push (file-name-nondirectory file) offenders))
+        (goto-char (point-min))
+        (when (re-search-forward "\\btramp-file-name-p\\|\\bjupyter-tramp-\\|\\btramp-tramp-file-p\\b" nil t)
+          (push (file-name-nondirectory file) offenders))))
+    (should-not offenders)))
+
 (provide 'emacs-jupyter-notebook-tests)
 
 ;;; emacs-jupyter-notebook-tests.el ends here
