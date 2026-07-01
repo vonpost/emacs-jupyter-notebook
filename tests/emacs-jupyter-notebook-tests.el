@@ -652,19 +652,12 @@ a `Hint:' line."
       (should (string-prefix-p "AUTH-FAILED:" captured))
       (should (string-match-p "Hint: " captured)))))
 
-(ert-deftest ejn-w7.2-async-retrieve-exhausts-retries-fails-cleanly ()
-  "W7.2: `--async-retrieve' exhausts its retries → phase `error', the
-last-error is captured on the context, and no launch/scp process buffers
-or `:remote-copy' temp files leak.  Uses real subprocesses (`sh -c
-\"exit 1\"') so the SCP sentinel drives the retry loop naturally, and
-tight limits so the test finishes in a few hundred milliseconds.
-
-Currently expected-failed: the leak assertion detects real bug CC1 —
-`--async-retrieve-attempt' overwrites `:scp-process' on every retry
-without disposing the previous process, so 2·(N-1) hidden SCP
-stdout/stderr buffers survive.  Flip `:expected-result' to `:passed'
-once CC1 lands."
-  :expected-result :failed
+(defun ejn-w7.2--run-retrieve-exhaustion ()
+  "Drive `--async-retrieve' through retry exhaustion via a real failing
+subprocess.  Returns a plist with `:captured' (error-data), `:context'
+(final context), `:spawned' (process list), and `:baseline' (baseline
+buffer list captured before the run).  Extracted so the two W7.2
+assertions can share exactly one execution."
   (let* ((baseline (ejn-test--ejn-process-buffers))
          (emacs-jupyter-notebook-connection-retrieve-attempts 2)
          (emacs-jupyter-notebook-connection-retrieve-delay 0.02)
@@ -688,10 +681,6 @@ once CC1 lands."
         (cl-letf (((symbol-function 'display-warning) #'ignore)
                   ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
                    (lambda (name _argv sentinel)
-                     ;; Real failing subprocess so the SCP sentinel fires
-                     ;; naturally and the whole retry ladder is exercised.
-                     ;; Route stderr through the process property so
-                     ;; `--async-delete-process' will kill it.
                      (let* ((stderr (generate-new-buffer
                                      (format " *%s stderr*" name)))
                             (proc (make-process
@@ -712,21 +701,40 @@ once CC1 lands."
           (let ((deadline (+ (float-time) 5)))
             (while (and (not captured) (< (float-time) deadline))
               (accept-process-output nil 0.02))))))
-    ;; Context reached the error phase and remembered the last SCP failure.
-    (should captured)
-    (should captured-context)
-    (should (eq (plist-get captured-context :phase) 'error))
-    (should (stringp (plist-get captured-context :error)))
-    (should (string-match-p "SCP failed" (plist-get captured-context :error)))
-    ;; No leaked processes and no leaked scp buffers above baseline.
-    (dolist (proc spawned)
+    (list :captured captured
+          :context captured-context
+          :spawned spawned
+          :baseline baseline)))
+
+(ert-deftest ejn-w7.2-async-retrieve-exhausts-retries-fails-cleanly ()
+  "W7.2: `--async-retrieve' exhausts its retries → phase `error' and the
+last-error is captured on the context.  This assertion is UNAFFECTED by
+CC1 and must always pass."
+  (let* ((run (ejn-w7.2--run-retrieve-exhaustion))
+         (context (plist-get run :context)))
+    (should (plist-get run :captured))
+    (should context)
+    (should (eq (plist-get context :phase) 'error))
+    (should (stringp (plist-get context :error)))
+    (should (string-match-p "SCP failed" (plist-get context :error)))
+    (dolist (proc (plist-get run :spawned))
       (should-not (process-live-p proc)))
-    (let ((leaked (cl-set-difference (ejn-test--ejn-process-buffers) baseline)))
-      (should-not leaked))
-    ;; The transient `:remote-copy' file is gone.
-    (let ((copy (plist-get captured-context :remote-copy)))
+    (let ((copy (plist-get context :remote-copy)))
       (when copy
         (should-not (file-exists-p copy))))))
+
+(ert-deftest ejn-w7.2-async-retrieve-does-not-leak-scp-buffers ()
+  "W7.2 (leak assertion, split from the retry-exhaustion test per W7.6):
+after retrieve exhausts its retries, no scp stdout/stderr buffers survive
+above the baseline.  Currently `:expected-result :failed' — CC1:
+`--async-retrieve-attempt' overwrites `:scp-process' on every retry
+without disposing the previous process, so (attempts-1)*2 hidden scp
+buffers leak.  Flip to `:passed' once CC1 lands."
+  :expected-result :failed
+  (let ((run (ejn-w7.2--run-retrieve-exhaustion)))
+    (let ((leaked (cl-set-difference (ejn-test--ejn-process-buffers)
+                                     (plist-get run :baseline))))
+      (should-not leaked))))
 
 (ert-deftest ejn-w4.4-build-pid-alive-uses-kill-zero ()
   "W4.4: the PID-alive probe argv ends with `kill -0 <pid>'."
@@ -1282,7 +1290,22 @@ before that point should NOT create a stray registry row."
                      :tunnel-process tunnel
                      :origin-buffer (current-buffer)
                      :error-callback (lambda (_ctx _err) nil)))
-              (emacs-jupyter-notebook-cancel-operation)
+              ;; W7.6: prove the durable-state helpers are NOT called on this
+              ;; path — cancel is not a terminator.  A regression that starts
+              ;; calling `--cleanup-remote-entry' or `--remove-registry-entry'
+              ;; from cancel would trip these should-not assertions.
+              (let (remote-cleanup-called registry-remove-called
+                    shutdown-called)
+                (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
+                           (lambda (&rest _) (setq remote-cleanup-called t)))
+                          ((symbol-function 'emacs-jupyter-notebook--remove-registry-entry)
+                           (lambda (&rest _) (setq registry-remove-called t)))
+                          ((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
+                           (lambda (&rest _) (setq shutdown-called t))))
+                  (emacs-jupyter-notebook-cancel-operation)
+                  (should-not remote-cleanup-called)
+                  (should-not registry-remove-called)
+                  (should-not shutdown-called)))
               (should-not emacs-jupyter-notebook--async-context)
               (should-not (process-live-p tunnel))
               (should-not (buffer-live-p stderr))
@@ -5706,11 +5729,42 @@ while a slow evaluate is in flight."
           (should (progn (ejn-panel-finish-entry handle 'ok 1) t)))
       (ejn-test--kill-source-buffer buf))))
 
+(defun ejn-w7.5--strip-lisp-comments-and-strings (source)
+  "Return SOURCE with Emacs-Lisp line comments and string literals blanked.
+Blanking preserves offsets — comments become spaces and string bodies
+become spaces — so downstream regexes cannot false-positive on text
+that only exists inside comments or docstrings."
+  (with-temp-buffer
+    (insert source)
+    (goto-char (point-min))
+    ;; Blank out string literals first (`\"...\"'), skipping escaped quotes.
+    (while (re-search-forward "\"" nil t)
+      (let ((start (1- (point))))
+        (while (and (not (eobp))
+                    (not (looking-at "\"")))
+          (if (looking-at "\\\\.")
+              (goto-char (+ 2 (point)))
+            (forward-char 1)))
+        (when (looking-at "\"")
+          (let ((end (1+ (point))))
+            (delete-region start end)
+            (insert (make-string (- end start) ?\s))))))
+    ;; Blank each line comment (`;' through end of line).
+    (goto-char (point-min))
+    (while (re-search-forward ";.*$" nil t)
+      (let ((s (match-beginning 0)) (e (match-end 0)))
+        (delete-region s e)
+        (insert (make-string (- e s) ?\s))))
+    (buffer-string)))
+
 (ert-deftest ejn-w7.5-source-files-do-not-depend-on-tramp ()
   "W7.5: the hard architecture rule (AGENTS.md) forbids TRAMP, `jupyter-tramp',
 and Emacs remote file handlers.  Static-scan every package `.el' file in
-the project root for `require' / `use-package' of a tramp module; the
-suite must fail if a future edit tries to sneak one in."
+the project root for actual `require' / `use-package' of a tramp module.
+W7.6: comments and string literals (docstrings) are blanked BEFORE the
+scan so mentions of `require 'tramp' inside prose cannot trigger a false
+positive.  The scan also anchors `require' at line-start so a text
+fragment inside a nested form is not sufficient."
   (let* ((root (or (locate-dominating-file
                     (or (symbol-file 'emacs-jupyter-notebook-mode) default-directory)
                     "emacs-jupyter-notebook.el")
@@ -5719,19 +5773,35 @@ suite must fail if a future edit tries to sneak one in."
          offenders)
     (should files)
     (dolist (file files)
-      (with-temp-buffer
-        (insert-file-contents file)
-        (goto-char (point-min))
-        ;; Match forms like `(require 'tramp)', `(require 'jupyter-tramp)',
-        ;; `(use-package tramp ...)', or `tramp-file-name-p'.
-        (when (re-search-forward
-               "(\\(require\\|use-package\\)[[:space:]]+'?\\(tramp\\|jupyter-tramp\\)\\b"
-               nil t)
-          (push (file-name-nondirectory file) offenders))
-        (goto-char (point-min))
-        (when (re-search-forward "\\btramp-file-name-p\\|\\bjupyter-tramp-\\|\\btramp-tramp-file-p\\b" nil t)
-          (push (file-name-nondirectory file) offenders))))
+      (let ((raw (with-temp-buffer
+                   (insert-file-contents file)
+                   (buffer-string))))
+        (let ((code (ejn-w7.5--strip-lisp-comments-and-strings raw)))
+          (with-temp-buffer
+            (insert code)
+            (goto-char (point-min))
+            ;; Top-level or nested `(require 'tramp)' / `(use-package tramp)'.
+            (when (re-search-forward
+                   "(\\(require\\|use-package\\)[[:space:]]+'?\\(tramp\\|jupyter-tramp\\)\\b"
+                   nil t)
+              (push (file-name-nondirectory file) offenders))
+            (goto-char (point-min))
+            (when (re-search-forward
+                   "\\btramp-file-name-p\\|\\bjupyter-tramp-\\|\\btramp-tramp-file-p\\b"
+                   nil t)
+              (push (file-name-nondirectory file) offenders))))))
     (should-not offenders)))
+
+(ert-deftest ejn-w7.6-strip-comments-blanks-tramp-mentions-in-docstrings ()
+  "W7.6 self-check: `--strip-lisp-comments-and-strings' successfully blanks
+`require 'tramp' inside a docstring, so the W7.5 scanner cannot fire on
+a mention that only exists in prose."
+  (let* ((source (concat
+                  "(defun foo () \"Do not (require 'tramp).\" nil)\n"
+                  "; also do not `(require 'jupyter-tramp)' here\n"))
+         (stripped (ejn-w7.5--strip-lisp-comments-and-strings source)))
+    (should-not (string-match-p "tramp" stripped))
+    (should-not (string-match-p "jupyter-tramp" stripped))))
 
 (provide 'emacs-jupyter-notebook-tests)
 
