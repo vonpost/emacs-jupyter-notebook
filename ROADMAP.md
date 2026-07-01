@@ -631,7 +631,7 @@ Per-row dependencies:
 - W7.2, W7.3 have no dependencies.
 - W7.4 benefits from W2 (panel) and W4.5 (heartbeat) being in.
 
-- [ ] W7.1 ERT: launch sentinel firing on nonzero exit transitions the async
+- [~] owner=W7-agent claimed=2026-07-01 W7.1 ERT: launch sentinel firing on nonzero exit transitions the async
       context to phase `error` and reports the classified stderr from W4.3
       in the user-facing message.
 - [ ] W7.2 ERT: `--async-retrieve` exhausts its retries → context phase
