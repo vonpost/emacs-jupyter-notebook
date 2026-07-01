@@ -333,6 +333,12 @@ panel/fringe state set by the timeout or `cancel-operation' paths."
   #'emacs-jupyter-notebook-jupyter--evaluate
   "Function used by `emacs-jupyter-notebook-jupyter-evaluate'.")
 
+(defvar emacs-jupyter-notebook-jupyter-execute-silent-function
+  #'emacs-jupyter-notebook-jupyter--execute-silent
+  "Function used by `emacs-jupyter-notebook-jupyter-execute-silent'.
+Called with CLIENT and CODE; sends a silent `execute_request' that
+produces no output and no panel entry.  Stubbed in W8.1 tests.")
+
 (defvar emacs-jupyter-notebook-jupyter-interrupt-function
   #'emacs-jupyter-notebook-jupyter--interrupt
   "Function used by `emacs-jupyter-notebook-jupyter-interrupt'.")
@@ -462,6 +468,28 @@ in the caller's surface."
         :handlers '("input_request"))
        callbacks)))))
 
+(defun emacs-jupyter-notebook-jupyter--execute-silent (client code)
+  "Send CODE to CLIENT as a silent `execute_request'.
+
+W8.1: used to inject the in-memory matplotlib pickle formatter on
+connect/restart.  The request sets `:silent t' and `:store-history nil'
+and subscribes no callbacks, so it produces no output, no execution
+count, and no panel entry.  This is the ONLY remote interaction the W8
+feature adds — it registers an in-memory formatter and writes nothing to
+the remote filesystem."
+  (emacs-jupyter-notebook-jupyter--ensure)
+  (require 'jupyter-client)
+  (require 'jupyter-messages)
+  (require 'jupyter-monads)
+  (jupyter-run-with-state
+   client
+   (jupyter-sent
+    (jupyter-execute-request
+     :code code
+     :silent t
+     :store-history nil
+     :handlers nil))))
+
 (defun emacs-jupyter-notebook-jupyter--interrupt (client)
   "Interrupt CLIENT's kernel."
   (emacs-jupyter-notebook-jupyter--ensure)
@@ -556,6 +584,10 @@ Call CALLBACK with the client on success, or nil on failure."
 (defun emacs-jupyter-notebook-jupyter-kernel-info (client callback)
   "Send a kernel-info request through the configured adapter."
   (funcall emacs-jupyter-notebook-jupyter-kernel-info-function client callback))
+
+(defun emacs-jupyter-notebook-jupyter-execute-silent (client code)
+  "Send CODE to CLIENT silently through the configured adapter."
+  (funcall emacs-jupyter-notebook-jupyter-execute-silent-function client code))
 
 (defun emacs-jupyter-notebook-jupyter-interrupt (client)
   "Interrupt CLIENT through the configured adapter."

@@ -5919,6 +5919,86 @@ a mention that only exists in prose."
     (should-not (string-match-p "tramp" stripped))
     (should-not (string-match-p "jupyter-tramp" stripped))))
 
+;;; W8 — local interactive matplotlib viewer
+
+;;; W8.1 — remote formatter-registration snippet injection
+
+(ert-deftest ejn-w8.1-inject-uses-silent-execute-adapter ()
+  "W8.1: the formatter injection routes the snippet through the silent
+execute adapter (no panel entry) and passes the actual snippet string."
+  (with-temp-buffer
+    (let ((calls nil)
+          (emacs-jupyter-notebook--client 'mock-client))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
+                 (lambda (client code) (push (list client code) calls))))
+        (emacs-jupyter-notebook--inject-viewer-formatter))
+      (should (= (length calls) 1))
+      (should (eq (caar calls) 'mock-client))
+      (should (equal (cadar calls)
+                     emacs-jupyter-notebook--viewer-formatter-snippet))
+      ;; The snippet must reference the custom MIME + the lazy registration
+      ;; API so a regression in the payload is caught here.
+      (should (string-match-p "application/x-ejn-mpl-pickle"
+                              emacs-jupyter-notebook--viewer-formatter-snippet))
+      (should (string-match-p "for_type_by_name"
+                              emacs-jupyter-notebook--viewer-formatter-snippet))
+      (should (string-match-p "get_ipython"
+                              emacs-jupyter-notebook--viewer-formatter-snippet)))))
+
+(ert-deftest ejn-w8.1-inject-noop-without-client ()
+  "W8.1: with no client the injection is a silent no-op (no adapter call)."
+  (with-temp-buffer
+    (let ((calls nil)
+          (emacs-jupyter-notebook--client nil))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
+                 (lambda (client code) (push (list client code) calls))))
+        (emacs-jupyter-notebook--inject-viewer-formatter))
+      (should (null calls)))))
+
+(ert-deftest ejn-w8.1-inject-swallows-adapter-errors ()
+  "W8.1: a raise from the adapter must not propagate out of injection —
+formatter injection may never break a connect or restart."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client 'mock-client))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
+                 (lambda (_client _code) (error "boom"))))
+        ;; Should not signal.
+        (should (progn (emacs-jupyter-notebook--inject-viewer-formatter) t))))))
+
+(ert-deftest ejn-w8.1-inject-produces-no-panel-entry ()
+  "W8.1: injecting the snippet creates no panel entry for the source buffer."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          (panel (ejn-panel-ensure (current-buffer))))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
+                 (lambda (_client _code) nil)))
+        (emacs-jupyter-notebook--inject-viewer-formatter))
+      (with-current-buffer panel
+        (should (null emacs-jupyter-notebook-panel--entries))))))
+
+(ert-deftest ejn-w8.1-png-plus-pickle-bundle-still-renders-png ()
+  "W8.1: a display_data bundle carrying BOTH image/png and the custom
+pickle MIME still renders the PNG through the callbacks — the extra MIME
+key never disturbs the existing PNG path."
+  (with-temp-buffer
+    (let* ((buffer (current-buffer))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
+           (display-fn (cadr (assoc "display_data" callbacks)))
+           (png (base64-encode-string "imgdata" t))
+           (pickle (base64-encode-string "pickle-bytes" t)))
+      (cl-letf (((symbol-function 'jupyter-message-content)
+                 (lambda (_msg)
+                   `(:data (:image/png ,png
+                            :application/x-ejn-mpl-pickle ,pickle))))
+                ((symbol-function 'create-image)
+                 (lambda (data &optional _type _data-p &rest _props)
+                   (list 'image :type 'png :data data))))
+        (funcall display-fn 'mock-msg))
+      (should (equal (plist-get (ejn-panel-entry-snapshot handle) :image)
+                     '(image :type png :data "imgdata"))))))
+
 (provide 'emacs-jupyter-notebook-tests)
 
 ;;; emacs-jupyter-notebook-tests.el ends here

@@ -25,6 +25,93 @@
 (require 'emacs-jupyter-notebook-result)
 (require 'emacs-jupyter-notebook-jupyter)
 
+;;; W8 — local interactive matplotlib viewer: remote formatter injection
+;;
+;; The remote kernel stays HEADLESS.  On connect (and re-run on restart)
+;; Emacs injects a one-time, in-memory IPython display-formatter that makes
+;; every inline-displayed `matplotlib.figure.Figure' ALSO emit a custom
+;; MIME `application/x-ejn-mpl-pickle' (base64 of `pickle.dumps(fig)')
+;; ALONGSIDE the normal `image/png'.  Nothing is written to the remote
+;; filesystem and nothing is pip-installed: the snippet only needs IPython +
+;; matplotlib + stdlib, all of which a Python Jupyter kernel with matplotlib
+;; already has.  The registration is lazy (`for_type_by_name' does not force
+;; a matplotlib import until a Figure is actually formatted) and idempotent.
+;;
+;; Design references (opencode probes, 2026-07-01): the concrete class for a
+;; brand-new MIME formatter is `IPython.core.formatters.BaseFormatter'; both
+;; IPython 7 and 8 expose `display_formatter.formatters',
+;; `BaseFormatter(parent=...)', and `for_type_by_name(module, name, func)'.
+
+(defconst emacs-jupyter-notebook--viewer-formatter-snippet
+  "\
+try:
+    _ejn_ip = get_ipython()
+except Exception:
+    _ejn_ip = None
+if _ejn_ip is not None:
+    try:
+        import base64 as _ejn_b64, pickle as _ejn_pkl
+        from IPython.core.formatters import BaseFormatter as _EjnBaseFormatter
+        _EJN_MIME = 'application/x-ejn-mpl-pickle'
+        _ejn_fmts = _ejn_ip.display_formatter.formatters
+        _ejn_fmt = _ejn_fmts.get(_EJN_MIME)
+        if _ejn_fmt is None:
+            try:
+                _ejn_fmt = _EjnBaseFormatter(parent=_ejn_ip.display_formatter)
+            except Exception:
+                _ejn_fmt = _EjnBaseFormatter()
+                _ejn_fmt.parent = _ejn_ip.display_formatter
+            _ejn_fmt.format_type = _EJN_MIME
+            _ejn_fmts[_EJN_MIME] = _ejn_fmt
+        def _ejn_figure_pickle(fig):
+            # Emit base64(pickle.dumps(fig)) alongside image/png.  Returning
+            # None (on any failure) tells IPython to omit this MIME entry, so
+            # the PNG path is never disturbed.  matplotlib's Figure.__getstate__
+            # already drops the live canvas/manager, so the dumped figure is
+            # backend-clean and can be reattached to a GUI canvas locally.
+            try:
+                import matplotlib
+                if fig.__class__.__module__.split('.')[0] != 'matplotlib':
+                    return None
+                return _ejn_b64.b64encode(
+                    _ejn_pkl.dumps(fig, protocol=_ejn_pkl.HIGHEST_PROTOCOL)
+                ).decode('ascii')
+            except Exception:
+                return None
+        _ejn_fmt.for_type_by_name('matplotlib.figure', 'Figure',
+                                  _ejn_figure_pickle)
+    except Exception:
+        pass
+"
+  "In-memory Python snippet registering the W8 matplotlib pickle formatter.
+Injected via a silent `execute_request' on connect and restart.  Registers
+a `matplotlib.figure.Figure' formatter for the custom MIME type
+`application/x-ejn-mpl-pickle' that returns base64-encoded
+`pickle.dumps(fig)' alongside the normal inline `image/png'.  Idempotent,
+lazy (no eager matplotlib import via `for_type_by_name'), and a graceful
+no-op when `get_ipython()' is unavailable or matplotlib is missing.")
+
+(defun emacs-jupyter-notebook--inject-viewer-formatter (&optional client)
+  "Inject the W8 matplotlib pickle formatter into the kernel session.
+Sends `emacs-jupyter-notebook--viewer-formatter-snippet' through the
+silent-execute adapter (no output, no panel entry, no history).  Uses
+CLIENT when given, else the buffer-local client.  A no-op when no client
+is present.  The snippet is idempotent, so re-running on restart is safe.
+Failures are swallowed and logged; formatter injection must never break a
+connect or restart."
+  (let ((client (or client emacs-jupyter-notebook--client)))
+    (when client
+      (condition-case err
+          (progn
+            (emacs-jupyter-notebook-jupyter-execute-silent
+             client emacs-jupyter-notebook--viewer-formatter-snippet)
+            (emacs-jupyter-notebook--log-append
+             'viewer-inject "injected matplotlib pickle formatter into kernel"))
+        (error
+         (emacs-jupyter-notebook--log-append
+          'viewer-inject "formatter injection failed: %s"
+          (error-message-string err)))))))
+
 (defvar-local emacs-jupyter-notebook--saved-imenu-create-index-function nil
   "Previous buffer-local value of `imenu-create-index-function'.")
 
@@ -1284,6 +1371,10 @@ underlying stderr matches a known SSH failure pattern."
           (setq emacs-jupyter-notebook--session-entry entry)
           ;; W4.5: arm the kernel-info heartbeat now that the client is live.
           (emacs-jupyter-notebook--heartbeat-start)
+          ;; W8.1: inject the in-memory matplotlib pickle formatter so inline
+          ;; figures carry the interactive-viewer payload.  No-op / graceful
+          ;; on kernels without matplotlib; never touches the remote FS.
+          (emacs-jupyter-notebook--inject-viewer-formatter client)
           (let ((ctx emacs-jupyter-notebook--async-context))
             (setq ctx (emacs-jupyter-notebook--async-put ctx :entry entry))
             (setq ctx (emacs-jupyter-notebook--async-put ctx :phase 'done))
@@ -2062,10 +2153,13 @@ before sending; a \\[universal-argument] FORCE prefix skips the prompt."
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-restart-kernel ()
-  "Restart the current kernel through emacs-jupyter."
+  "Restart the current kernel through emacs-jupyter.
+W8.1: after the restart request the kernel namespace is wiped, so the
+in-memory matplotlib pickle formatter is re-injected (idempotent)."
   (interactive)
-  (emacs-jupyter-notebook-jupyter-restart
-   (emacs-jupyter-notebook--ensure-client)))
+  (let ((client (emacs-jupyter-notebook--ensure-client)))
+    (emacs-jupyter-notebook-jupyter-restart client)
+    (emacs-jupyter-notebook--inject-viewer-formatter client)))
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-shutdown-kernel (&optional force)
