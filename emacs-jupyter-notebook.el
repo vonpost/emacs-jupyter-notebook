@@ -92,6 +92,11 @@ a `matplotlib.figure.Figure' formatter for the custom MIME type
 lazy (no eager matplotlib import via `for_type_by_name'), and a graceful
 no-op when `get_ipython()' is unavailable or matplotlib is missing.")
 
+;; Forward declaration: `--client' is declared `defvar-local' further down;
+;; the injection helper (defined here so it sits with the snippet) references
+;; it before that point.
+(defvar emacs-jupyter-notebook--client)
+
 (defun emacs-jupyter-notebook--inject-viewer-formatter (&optional client)
   "Inject the W8 matplotlib pickle formatter into the kernel session.
 Sends `emacs-jupyter-notebook--viewer-formatter-snippet' through the

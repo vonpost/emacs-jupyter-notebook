@@ -77,6 +77,7 @@ All commands live under a single prefix, `emacs-jupyter-notebook-prefix-key` (de
 | `C-c j L` | `show-log-buffer` |
 | `C-c j o` | `show-output-panel` |
 | `C-c j t` | `toggle-panel-view` (latest ↔ history) |
+| `C-c j I` | `open-figure-interactive` (open the current cell's figure in the local viewer) |
 | `C-c j .` | `inspect-at-point` |
 | `C-c j TAB` | `complete-at-point` (capf usually handles it) |
 | `C-c j v` | `fetch-remote-log` |
@@ -116,7 +117,40 @@ Evaluation output never appears in the source buffer. A dedicated side panel (`*
 - **Latest-per-cell** (default): one section per cell, indexed by cell marker. Re-running the same cell replaces its section in place.
 - **History log**: every evaluation, including region/paragraph/defun, appended in time order with timestamp, execution count, and status.
 
-Toggle the view inside the panel with `H`, or globally with `C-c j t`. `q` buries the panel. `RET` on an entry header jumps to its originating cell. `n` / `p` step between entries. Images render inline with native zoom keys (`+`, `-`, `=`).
+Toggle the view inside the panel with `H`, or globally with `C-c j t`. `q` buries the panel. `RET` on an entry header jumps to its originating cell. `n` / `p` step between entries. Images render inline with native zoom keys (`+`, `-`, `=`). `v` on a plot entry opens that figure in the interactive local viewer (see below).
+
+## Interactive matplotlib viewer
+
+Medical-imaging and array-heavy work needs a real interactive figure — pixel-value-under-cursor readout, zoom/pan, and linked-subplot crop — not just a static PNG thumbnail. `emacs-jupyter-notebook` provides one **without installing anything on any remote**.
+
+### How it works (zero per-remote install)
+
+The remote kernel stays completely headless (inline / Agg). On connect (and again after `restart-kernel`) Emacs injects a small, in-memory IPython display formatter into the running kernel session — a silent `execute_request` with `store_history` off that creates no panel entry and writes **nothing** to the remote filesystem. From then on, every inline-displayed `matplotlib.figure.Figure` automatically carries a custom MIME payload, `application/x-ejn-mpl-pickle` (base64 of `pickle.dumps(fig)`), **alongside** the normal `image/png`. The registration is lazy (it does not force a matplotlib import until a figure is actually displayed) and idempotent. Everything it needs — IPython, matplotlib, `pickle`/`base64` — is already present on any Python Jupyter kernel that can plot. There is no `pip install` and no per-remote provisioning: add a new remote and the feature just works.
+
+Emacs keeps rendering the PNG thumbnail in the panel exactly as before and stashes the pickle on the panel entry. When you open a figure interactively (`C-c j I` on a cell, or `v` on a panel plot entry), Emacs decodes the pickle to a local temp file and hands the path to a persistent **local** viewer process over a unix-domain socket. The viewer unpickles the figure, reattaches a GUI canvas, installs the enhancements, and shows the window:
+
+- **Hover readout**: over an `imshow` image the coordinate readout shows integer `row`/`col` and the pixel `value` under the cursor.
+- **Linked zoom/pan**: zooming or panning one `imshow` subplot crops all sibling `imshow` subplots to the same limits.
+
+If a pickle ever fails to load (for example a matplotlib version mismatch), the viewer prints a clear message and the PNG thumbnail in the panel is unaffected.
+
+### One-time LOCAL setup (never on the remotes)
+
+The viewer runs on the **local workstation** running Emacs and is **GUI-Emacs-only** (it needs a windowing system). The remote never gains any GUI dependency. You need, locally:
+
+- a Python with **matplotlib** and a GUI backend (**Qt** or **Tk**), and
+- that local matplotlib **pinned to the same version as your remote kernels**. Figures travel as pickles, and matplotlib figure pickles are not guaranteed to load across versions. Same-version on both ends is the supported configuration (the package is single-user by design).
+
+The local viewer is **Emacs-owned**: it is spawned lazily on first use, reused across figures, and reaped on `kill-emacs-hook` — the deliberate inverse of the remote-kernel rule (the remote kernel outlives Emacs; the local viewer does not). It also self-exits after an idle timeout so a hard Emacs crash cannot orphan it forever.
+
+### Customization
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `emacs-jupyter-notebook-local-python-command` | `"python3"` | Local Python that runs the viewer (absolute path or a command on `exec-path`). Must have matplotlib + a GUI backend, version-matched to the remote. |
+| `emacs-jupyter-notebook-viewer-backend` | `qt` | Preferred GUI backend, `qt` (QtAgg) or `tk` (TkAgg); falls back to the other automatically. |
+| `emacs-jupyter-notebook-viewer-idle-timeout` | `900` | Seconds the viewer stays alive with no open figures before self-exiting (0 disables). |
+| `emacs-jupyter-notebook-viewer-auto-open` | `nil` | When non-nil, pop the interactive window automatically for every inline figure instead of on demand. |
 
 A small fringe/margin indicator next to each cell marker reflects the cell's most recent state: blank (never run), `►` (running), `✓N` (ok with execution count `N`), `✗` (error), `…` (queued). The indicator is overlay-only and never modifies source text.
 
