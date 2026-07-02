@@ -191,11 +191,22 @@ def _reattach_canvas(fig):
     from matplotlib._pylab_helpers import Gcf
 
     # (1) Reuse a manager the unpickle already built for THIS figure.
+    #
+    # restore_to_pylab normally ALSO registers that manager in Gcf.  Do not
+    # gate reuse on Gcf membership, though: if we ever find a manager that
+    # owns FIG but is somehow unregistered, register it and reuse it rather
+    # than fall through and build a SECOND manager/window for the same figure
+    # -- that second window is exactly the split this function exists to fix,
+    # and the Gcf-blind cleanup in open_figure could never reap the orphan.
     mgr = getattr(fig.canvas, "manager", None)
     if (mgr is not None
             and getattr(mgr, "canvas", None) is not None
-            and mgr.canvas.figure is fig
-            and mgr in Gcf.figs.values()):
+            and mgr.canvas.figure is fig):
+        if mgr not in Gcf.figs.values():
+            try:
+                Gcf._set_new_active_manager(mgr)
+            except Exception:
+                pass
         return mgr
 
     # (2) Bind a fresh GUI manager directly to the existing figure.
@@ -441,11 +452,22 @@ def _run_tk_host(pump, server, socket_path):
     root = tk.Tk()
     root.withdraw()
 
+    tick_state = {"logged_error": False}
+
     def tick():
         try:
             keep_going = pump()
-        except Exception:
+        except Exception as exc:
+            # Keep the loop alive across a transient hiccup, but surface the
+            # cause once: pump() also owns the idle self-exit check, so a
+            # persistent throw would otherwise wedge a silent, never-exiting
+            # process.  One stderr line lets the Emacs manager report it.
             keep_going = True
+            if not tick_state["logged_error"]:
+                tick_state["logged_error"] = True
+                sys.stderr.write(
+                    "ejn_viewer: pump error (loop continues): %s\n" % exc)
+                sys.stderr.flush()
         if keep_going:
             root.after(50, tick)
         else:
