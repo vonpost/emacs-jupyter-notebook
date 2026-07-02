@@ -2261,6 +2261,58 @@ before that point should NOT create a stray registry row."
       (should (= captured-pos 5))
       (should (= captured-detail 0)))))
 
+(ert-deftest ejn-inspect-callback-not-found-displays-nothing ()
+  "Real `inspect_reply' for an unknown symbol is `(:status ok :found
+nil :data ())' — an EMPTY data plist.  The callback must display nothing
+(the `text/plain' guard handles it), not error or show an empty popup.
+Pins the real reply shape the happy-path test never exercises."
+  (ejn-test-with-temp-buffer "# %%\nnope\n"
+    (search-forward "nope")
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          displayed inspect-callback)
+      (cl-letf (((symbol-function 'display-message-or-buffer)
+                 (lambda (m &rest _) (setq displayed m))))
+        (let ((emacs-jupyter-notebook-jupyter-inspect-function
+               (lambda (_c _code _pos _detail cb) (setq inspect-callback cb))))
+          (emacs-jupyter-notebook-inspect-at-point)
+          (funcall inspect-callback '(:status "ok" :found nil :data ()) nil)))
+      (should-not displayed))))
+
+(ert-deftest ejn-completion-result-from-reply-handles-vector-matches ()
+  "Real emacs-jupyter delivers complete_reply `:matches' as a VECTOR
+(JSON array), not a list, and the bounds come from the cursor_start /
+cursor_end DELTA (token length), independent of absolute offsets.  Pins
+both so a regression in either is caught without a live kernel."
+  (with-temp-buffer
+    (insert "obj.attr")
+    (goto-char (point-max))
+    ;; Vector matches, and cursor_start/end describing the 4-char token
+    ;; `attr' at arbitrary absolute offsets (100..104).
+    (let ((r (emacs-jupyter-notebook--completion-result-from-reply
+              '(:matches ["attr" "attribute"] :cursor_start 100 :cursor_end 104))))
+      (should (= (nth 0 r) (- (point) 4)))           ; token start via delta
+      (should (= (nth 1 r) (point)))                 ; token end at point
+      (should (equal (nth 2 r) '("attr" "attribute"))) ; vector -> list
+      (should (eq (plist-get (cdddr r) :exclusive) 'no)))))
+
+(ert-deftest ejn-ssh-remote-launch-preserves-quoted-nix-command ()
+  "A profile `:jupyter-command' that is a full shell command with embedded
+single quotes and spaces (the real nix-shell form) must reach the remote
+command string INTACT and unquoted, so the remote shell interprets it.
+Regex-only happy-path tests use bare `uv run jupyter'; this pins the
+quoted case."
+  (let* ((nixcmd (concat "nix shell --impure --expr "
+                         "'with import <nixpkgs> {}; "
+                         "python3.withPackages (ps: [ ps.jupyter ])' -c jupyter"))
+         (launch (emacs-jupyter-notebook-ssh-build-remote-launch
+                  (list :profile "p" :host "mother" :remote-cwd "~"
+                        :remote-cache-dir "/tmp/ejn" :kernelspec "python3"
+                        :jupyter-command nixcmd)
+                  "session"))
+         (remote (plist-get launch :remote-command)))
+    (should (string-match-p (regexp-quote (concat "nohup " nixcmd " kernel"))
+                            remote))))
+
 (ert-deftest ejn-evaluate-cell-completeness-check-skips-incomplete-code-async ()
   (ejn-test-with-temp-buffer "# %%\nif True:\n"
     (let ((emacs-jupyter-notebook--client 'mock-client)
