@@ -123,14 +123,27 @@ the panel entry, leaving the PNG thumbnail path untouched.  W8.6: when
 `emacs-jupyter-notebook-viewer-auto-open' is non-nil and a pickle is
 present, also hand it to the local viewer.  BUFFER is the source buffer;
 best-effort, never raises out of a callback."
-  (when-let ((base64 (emacs-jupyter-notebook--select-mpl-pickle data)))
-    (ejn-panel-set-pickle handle base64)
-    (when (and (bound-and-true-p emacs-jupyter-notebook-viewer-auto-open)
-               (fboundp 'emacs-jupyter-notebook-viewer-open-pickle))
-      (ignore-errors
-        (when (buffer-live-p buffer)
-          (with-current-buffer buffer
-            (emacs-jupyter-notebook-viewer-open-pickle base64)))))))
+  (let ((base64 (emacs-jupyter-notebook--select-mpl-pickle data)))
+    (if base64
+        (progn
+          (ejn-panel-set-pickle handle base64)
+          (when (and (bound-and-true-p emacs-jupyter-notebook-viewer-auto-open)
+                     (fboundp 'emacs-jupyter-notebook-viewer-open-pickle))
+            ;; W8.7(a): NEVER decode base64 + write the temp file on the
+            ;; IOPub callback thread — a large figure pickle would freeze
+            ;; Emacs during ordinary result streaming.  Defer the whole
+            ;; hand-off to idle time so the callback returns immediately.
+            (run-with-idle-timer
+             0 nil
+             (lambda ()
+               (ignore-errors
+                 (when (buffer-live-p buffer)
+                   (with-current-buffer buffer
+                     (emacs-jupyter-notebook-viewer-open-pickle base64))))))))
+      ;; W8.7(d): a display with no pickle key replaces any prior figure on
+      ;; this entry — drop the stale pickle so `v'/`C-c j I' can't reopen a
+      ;; no-longer-visible figure.
+      (ejn-panel-clear-pickle handle))))
 
 (defun emacs-jupyter-notebook--render-image-data (base64-data)
   "Decode BASE64-DATA and return an image spec."
@@ -534,13 +547,16 @@ colours are preserved and uncoloured spans still get the fallback FACE."
            entry))))))
 
 (defun ejn-panel-replace-text (handle text)
-  "Replace HANDLE's entry content with TEXT."
+  "Replace HANDLE's entry content with TEXT.
+W8.7(d): also drops any stashed matplotlib pickle, since text has
+replaced whatever figure the entry previously showed."
   (when handle
     (emacs-jupyter-notebook-panel--update-entry
      handle
      (lambda (entry)
        (setq entry (plist-put entry :content (or text "")))
        (setq entry (plist-put entry :image nil))
+       (setq entry (plist-put entry :mpl-pickle nil))
        (setq entry (plist-put entry :pending-clear nil))
        entry))))
 
@@ -579,6 +595,8 @@ If WAIT is non-nil, defer the clear until the next text arrives
            (plist-put entry :pending-clear t)
          (setq entry (plist-put entry :content ""))
          (setq entry (plist-put entry :image nil))
+         ;; W8.7(d): clearing the entry drops the figure too.
+         (setq entry (plist-put entry :mpl-pickle nil))
          (setq entry (plist-put entry :pending-clear nil))
          entry)))))
 
@@ -593,6 +611,13 @@ no-op."
      handle
      (lambda (entry)
        (plist-put entry :mpl-pickle base64)))))
+
+(defun ejn-panel-clear-pickle (handle)
+  "Drop any stashed matplotlib pickle on HANDLE's entry (W8.7(d))."
+  (when handle
+    (emacs-jupyter-notebook-panel--update-entry
+     handle
+     (lambda (entry) (plist-put entry :mpl-pickle nil)))))
 
 (defun ejn-panel-entry-pickle (handle)
   "Return the base64 matplotlib-pickle payload stashed on HANDLE's entry, or nil."

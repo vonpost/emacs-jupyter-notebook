@@ -6072,6 +6072,77 @@ pickle on the entry."
         (should (equal (plist-get e :image) '(image :type png :data "imgdata")))
         (should (null (plist-get e :mpl-pickle)))))))
 
+(ert-deftest ejn-w8.7-display-without-pickle-clears-stale-pickle ()
+  "W8.7(d): a later display on the same entry that carries NO pickle drops
+any previously-stashed pickle, so the interactive open cannot reopen a
+figure that is no longer the entry's visible content."
+  (with-temp-buffer
+    (let* ((buffer (current-buffer))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
+           (display-fn (cadr (assoc "display_data" callbacks)))
+           (png (base64-encode-string "imgdata" t))
+           (pickle (base64-encode-string "pickle-bytes" t)))
+      (cl-letf (((symbol-function 'create-image)
+                 (lambda (data &optional _t _d &rest _p)
+                   (list 'image :data data))))
+        ;; First: a figure (png + pickle).
+        (cl-letf (((symbol-function 'jupyter-message-content)
+                   (lambda (_m) `(:data (:image/png ,png
+                                         :application/x-ejn-mpl-pickle ,pickle)))))
+          (funcall display-fn 'm))
+        (should (equal (plist-get (ejn-panel-entry-snapshot handle) :mpl-pickle)
+                       pickle))
+        ;; Then: a non-figure display on the same entry (png only).
+        (cl-letf (((symbol-function 'jupyter-message-content)
+                   (lambda (_m) `(:data (:image/png ,png)))))
+          (funcall display-fn 'm))
+        (should (null (plist-get (ejn-panel-entry-snapshot handle) :mpl-pickle)))))))
+
+(ert-deftest ejn-w8.7-replace-text-and-clear-entry-drop-pickle ()
+  "W8.7(d): `ejn-panel-replace-text' and `ejn-panel-clear-entry' both drop a
+stashed pickle."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (h1 (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (h2 (ejn-panel-start-entry panel '("x.py" . 2) "")))
+      (ejn-panel-set-pickle h1 "pk1")
+      (ejn-panel-replace-text h1 "now text")
+      (should (null (ejn-panel-entry-pickle h1)))
+      (ejn-panel-set-pickle h2 "pk2")
+      (ejn-panel-clear-entry h2)
+      (should (null (ejn-panel-entry-pickle h2))))))
+
+(ert-deftest ejn-w8.7-auto-open-defers-off-the-callback ()
+  "W8.7(a): when auto-open is enabled, the display callback does NOT call
+`viewer-open-pickle' synchronously — it schedules it on an idle timer so a
+large pickle decode/write never blocks the IOPub callback."
+  (with-temp-buffer
+    (let* ((buffer (current-buffer))
+           (panel (ejn-panel-ensure buffer))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
+           (display-fn (cadr (assoc "display_data" callbacks)))
+           (png (base64-encode-string "imgdata" t))
+           (pickle (base64-encode-string "pickle-bytes" t))
+           (emacs-jupyter-notebook-viewer-auto-open t)
+           (sync-called nil)
+           (scheduled nil))
+      (cl-letf (((symbol-function 'create-image)
+                 (lambda (data &optional _t _d &rest _p) (list 'image data)))
+                ((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
+                 (lambda (_b64) (setq sync-called t)))
+                ((symbol-function 'run-with-idle-timer)
+                 (lambda (&rest _args) (setq scheduled t) nil))
+                ((symbol-function 'jupyter-message-content)
+                 (lambda (_m) `(:data (:image/png ,png
+                                       :application/x-ejn-mpl-pickle ,pickle)))))
+        (funcall display-fn 'm))
+      ;; Deferred, not called inline.
+      (should scheduled)
+      (should-not sync-called))))
+
 ;;; W8.3 — local viewer process manager
 
 (defvar ejn-w8.3--received nil

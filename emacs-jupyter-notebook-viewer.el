@@ -114,12 +114,29 @@ is reaped explicitly on `kill-emacs-hook'."
      :sentinel #'emacs-jupyter-notebook-viewer--sentinel)))
 
 (defun emacs-jupyter-notebook-viewer--sentinel (proc event)
-  "Sentinel for the viewer PROC: log EVENT and clear state on exit."
+  "Sentinel for the viewer PROC: log EVENT (+ stderr tail) and clear state.
+W8.7(b): the socket hand-off is fire-and-forget, so an abnormal viewer
+exit (e.g. no working Qt/Tk backend, which exits 3) would otherwise be
+silent.  Surface the exit code and the last stderr line as a user
+message and in the log buffer."
   (when (memq (process-status proc) '(exit signal))
-    (emacs-jupyter-notebook-viewer--log
-     "viewer process exited: %s" (string-trim (or event "")))
-    (when (eq proc emacs-jupyter-notebook-viewer--process)
-      (setq emacs-jupyter-notebook-viewer--process nil))))
+    (let* ((code (process-exit-status proc))
+           (stderr (get-buffer " *emacs-jupyter-notebook-viewer-stderr*"))
+           (tail (and (buffer-live-p stderr)
+                      (with-current-buffer stderr
+                        (let ((s (string-trim (buffer-string))))
+                          (unless (string-empty-p s)
+                            (car (last (split-string s "\n" t)))))))))
+      (emacs-jupyter-notebook-viewer--log
+       "viewer process exited (%s%s)%s"
+       (string-trim (or event ""))
+       (if (integerp code) (format ", code %d" code) "")
+       (if tail (format ": %s" tail) ""))
+      (when (and (integerp code) (not (zerop code)))
+        (message "emacs-jupyter-notebook: figure viewer failed to start%s"
+                 (if tail (format " — %s" tail) "")))
+      (when (eq proc emacs-jupyter-notebook-viewer--process)
+        (setq emacs-jupyter-notebook-viewer--process nil)))))
 
 (defun emacs-jupyter-notebook-viewer-live-p ()
   "Return non-nil when the persistent viewer process is live."
@@ -170,7 +187,15 @@ connect (viewer socket not yet bound) reschedules on a timer up to
   (emacs-jupyter-notebook-viewer--send-path-attempt path 1))
 
 (defun emacs-jupyter-notebook-viewer--send-path-attempt (path attempt)
-  "Attempt number ATTEMPT to connect and send PATH to the viewer socket."
+  "Attempt number ATTEMPT to connect and send PATH to the viewer socket.
+W8.7(c): if the viewer is not live, respawn it (which allocates a fresh
+socket path) before connecting; catch any `error' — not just
+`file-error' — so a viewer death after connect (`process-send-string' /
+`process-send-eof' signalling) also triggers a retry rather than
+propagating.  W8.7(e): the one-shot connection process is disposed via a
+sentinel once it closes."
+  (unless (emacs-jupyter-notebook-viewer-live-p)
+    (ignore-errors (emacs-jupyter-notebook-viewer-ensure)))
   (let ((socket-path emacs-jupyter-notebook-viewer--socket-path))
     (if (null socket-path)
         (emacs-jupyter-notebook-viewer--log
@@ -182,16 +207,25 @@ connect (viewer socket not yet bound) reschedules on a timer up to
                        :service socket-path
                        :coding 'utf-8
                        :noquery t)))
+            (set-process-sentinel
+             conn
+             (lambda (p _e)
+               (when (memq (process-status p) '(closed failed exit signal))
+                 (ignore-errors (delete-process p)))))
             (process-send-string conn (concat path "\n"))
             (process-send-eof conn)
             (emacs-jupyter-notebook-viewer--log
              "handed figure %s to viewer (attempt %d)" path attempt)
             conn)
-        (file-error
+        (error
          (if (>= attempt emacs-jupyter-notebook-viewer-send-max-attempts)
              (emacs-jupyter-notebook-viewer--log
-              "failed to reach viewer socket after %d attempts: %s"
+              "failed to reach viewer after %d attempts: %s"
               attempt (error-message-string err))
+           ;; Invalidate a dead viewer so the next attempt respawns it.
+           (unless (emacs-jupyter-notebook-viewer-live-p)
+             (setq emacs-jupyter-notebook-viewer--process nil
+                   emacs-jupyter-notebook-viewer--socket-path nil))
            (run-at-time
             emacs-jupyter-notebook-viewer-send-retry-delay nil
             #'emacs-jupyter-notebook-viewer--send-path-attempt

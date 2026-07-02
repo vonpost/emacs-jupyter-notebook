@@ -159,10 +159,15 @@ def _select_backend(preferred):
         except Exception as exc:
             last_exc = exc
             continue
-    if last_exc is not None:
-        sys.stderr.write("ejn_viewer: no working GUI backend (%s)\n" % last_exc)
-        sys.stderr.flush()
-    return matplotlib.get_backend()
+    # W8.7(b): no GUI backend validated.  Do NOT return the current
+    # (non-interactive) backend and let run() crash later at plt.figure();
+    # exit now with a distinct code + message so the Emacs manager can
+    # surface a friendly "no Qt/Tk backend" failure from the stderr tail.
+    sys.stderr.write(
+        "ejn_viewer: no working GUI backend "
+        "(tried %s; last error: %s)\n" % (", ".join(order), last_exc))
+    sys.stderr.flush()
+    sys.exit(3)
 
 
 def _reattach_canvas(fig):
@@ -324,13 +329,16 @@ def run(socket_path, backend_pref, idle_timeout):
                 buf += chunk
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
-                    line = line.strip()
+                    # W8.7(f): the framing delimiter is the newline only.
+                    # Do NOT `.strip()` — a temp path with legitimate
+                    # leading/trailing spaces must survive intact.
+                    line = line.rstrip(b"\r")
                     if line:
                         state["last_activity"] = time.time()
                         open_figure(line.decode("utf-8", "replace"))
                 state["clients"][conn] = buf
             else:
-                leftover = buf.strip()
+                leftover = buf.rstrip(b"\r\n")
                 if leftover:
                     state["last_activity"] = time.time()
                     open_figure(leftover.decode("utf-8", "replace"))
