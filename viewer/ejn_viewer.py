@@ -171,26 +171,65 @@ def _select_backend(preferred):
 
 
 def _reattach_canvas(fig):
-    """Give an unpickled, canvas-less FIG a live GUI canvas/manager.
+    """Bind ONE live GUI manager (canvas + toolbar) to the unpickled FIG.
 
-    Recipe: create a throwaway pyplot figure to obtain a real backend manager,
-    then point that manager's canvas at FIG (and FIG's canvas back at it).  The
-    dummy figure object is discarded; its window now hosts FIG.
+    A figure that was managed by pyplot on the remote pickles with the
+    ``restore_to_pylab`` flag, so ``pickle.load`` alone already reconstructs a
+    real GUI manager for FIG under the active backend.  When that happened we
+    MUST reuse it: the old recipe created a *second*, throwaway canvas and
+    repointed it at FIG, which is exactly what split the toolbar + mouse events
+    (bound to the first canvas/window) from the rendered figure (drawn on the
+    second canvas/window).
+
+    If no manager was restored (headless pickle), bind a fresh one to this
+    exact figure via matplotlib's real API -- ``new_figure_manager_given_figure``
+    -- so canvas, toolbar and figure are one manager/window.  A last-resort
+    dummy-steal fallback keeps a window appearing if that private API ever
+    changes.
     """
     import matplotlib.pyplot as plt
+    from matplotlib._pylab_helpers import Gcf
 
-    dummy = plt.figure()
-    manager = dummy.canvas.manager
-    manager.canvas.figure = fig
-    fig.set_canvas(manager.canvas)
+    # (1) Reuse a manager the unpickle already built for THIS figure.
+    #
+    # restore_to_pylab normally ALSO registers that manager in Gcf.  Do not
+    # gate reuse on Gcf membership, though: if we ever find a manager that
+    # owns FIG but is somehow unregistered, register it and reuse it rather
+    # than fall through and build a SECOND manager/window for the same figure
+    # -- that second window is exactly the split this function exists to fix,
+    # and the Gcf-blind cleanup in open_figure could never reap the orphan.
+    mgr = getattr(fig.canvas, "manager", None)
+    if (mgr is not None
+            and getattr(mgr, "canvas", None) is not None
+            and mgr.canvas.figure is fig):
+        if mgr not in Gcf.figs.values():
+            try:
+                Gcf._set_new_active_manager(mgr)
+            except Exception:
+                pass
+        return mgr
+
+    # (2) Bind a fresh GUI manager directly to the existing figure.
+    allnums = plt.get_fignums()
+    num = (max(allnums) + 1) if allnums else 1
     try:
-        fig.number = dummy.number
-        from matplotlib._pylab_helpers import Gcf
-
-        Gcf.figs[dummy.number] = manager
+        get_mod = getattr(plt, "_get_backend_mod", None)
+        backend_mod = get_mod() if get_mod is not None else plt._backend_mod
+        manager = backend_mod.new_figure_manager_given_figure(num, fig)
+        Gcf._set_new_active_manager(manager)
+        return manager
     except Exception:
-        pass
-    return manager
+        # (3) Legacy dummy-steal fallback (kept only for resilience).
+        dummy = plt.figure()
+        manager = dummy.canvas.manager
+        manager.canvas.figure = fig
+        fig.set_canvas(manager.canvas)
+        try:
+            fig.number = dummy.number
+            Gcf.figs[dummy.number] = manager
+        except Exception:
+            pass
+        return manager
 
 
 def _install_enhancements(fig):
@@ -243,6 +282,8 @@ def open_figure(path):
     """
     import matplotlib.pyplot as plt
 
+    from matplotlib._pylab_helpers import Gcf
+
     fig = None
     try:
         with open(path, "rb") as handle:
@@ -253,34 +294,35 @@ def open_figure(path):
         _unlink(path)
         return None
 
-    # Replace any previously-shown figure so re-running a cell (or opening
-    # a figure repeatedly) does not pile up windows -- matches the panel's
-    # latest-per-cell behaviour.  The hidden anchor (socket-timer host) is
-    # tagged and preserved.
     try:
-        from matplotlib._pylab_helpers import Gcf
+        manager = _reattach_canvas(fig)
+        _install_enhancements(fig)
+
+        # Replace any previously-shown figure so re-running a cell (or opening
+        # a figure repeatedly) does not pile up windows -- matches the panel's
+        # latest-per-cell behaviour.  Close every managed figure EXCEPT the one
+        # we just bound and any tagged anchor (the Qt socket-timer host).  Note
+        # unpickling itself may already have registered MANAGER, so this must
+        # run after the reattach, keyed on the surviving manager -- not before.
+        keep_num = getattr(manager, "num", None)
         for num in list(plt.get_fignums()):
-            mgr = Gcf.figs.get(num)
-            if mgr is None:
+            if num == keep_num:
                 continue
-            if getattr(mgr.canvas.figure, "_ejn_is_anchor", False):
+            other = Gcf.figs.get(num)
+            if other is None or other is manager:
+                continue
+            if getattr(other.canvas.figure, "_ejn_is_anchor", False):
                 continue
             try:
-                plt.close(mgr.canvas.figure)
+                plt.close(other.canvas.figure)
             except Exception:
                 pass
-    except Exception:
-        pass
 
-    try:
-        _reattach_canvas(fig)
-        _install_enhancements(fig)
         fig.canvas.draw_idle()
         try:
-            fig.canvas.manager.show()
+            manager.show()
         except Exception:
             pass
-        plt.show(block=False)
     except Exception as exc:
         sys.stderr.write("ejn_viewer: failed to display figure: %s\n" % exc)
         sys.stderr.flush()
@@ -297,18 +339,33 @@ def _unlink(path):
         pass
 
 
-def _any_real_figures_open():
-    """Return True when a real (non-anchor) figure window is open."""
+def _real_figure_count():
+    """Number of real (non-anchor) figure windows currently open."""
     import matplotlib.pyplot as plt
+    from matplotlib._pylab_helpers import Gcf
 
-    # The hidden anchor figure that hosts the socket timer always counts 1.
-    return len(plt.get_fignums()) > 1
+    count = 0
+    for num in plt.get_fignums():
+        mgr = Gcf.figs.get(num)
+        if mgr is None:
+            continue
+        if getattr(mgr.canvas.figure, "_ejn_is_anchor", False):
+            continue
+        count += 1
+    return count
 
 
 def run(socket_path, backend_pref, idle_timeout):
-    """Bind SOCKET_PATH and run the GUI loop, opening figures as paths arrive."""
-    _select_backend(backend_pref)
-    import matplotlib.pyplot as plt
+    """Bind SOCKET_PATH and run the GUI loop, opening figures as paths arrive.
+
+    The socket is serviced by a periodic pump driven by the GUI event loop, so
+    the process stays responsive AND keeps that loop alive even when no figure
+    window is open.  For the Tk backend the host is a dedicated *hidden*
+    ``tkinter.Tk()`` root (created before any figure) so there is no blank
+    anchor window and figure windows remain fully interactive; for other
+    backends (Qt) a hidden matplotlib anchor figure hosts a canvas timer.
+    """
+    backend = _select_backend(backend_pref)
 
     try:
         os.unlink(socket_path)
@@ -322,16 +379,10 @@ def run(socket_path, backend_pref, idle_timeout):
     server.listen(8)
     server.setblocking(False)
 
-    state = {"clients": {}, "last_activity": time.time(),
-             "anchor": None, "anchor_hidden": False}
+    state = {"clients": {}, "last_activity": time.time()}
 
     def pump():
-        # Re-hide the anchor once the GUI mainloop is running: `plt.show()`
-        # calls `manager.show()` on every managed figure, which un-hides the
-        # anchor we withdrew before the loop started.  Do it once, here.
-        if state["anchor"] is not None and not state["anchor_hidden"]:
-            _hide_window(state["anchor"])
-            state["anchor_hidden"] = True
+        """Service the socket once.  Return False to request GUI-loop exit."""
         # Accept any pending connections.
         while True:
             try:
@@ -376,22 +427,100 @@ def run(socket_path, backend_pref, idle_timeout):
         # Idle self-exit: no traffic and no windows for the whole timeout.
         if idle_timeout and idle_timeout > 0:
             idle_for = time.time() - state["last_activity"]
-            if idle_for > idle_timeout and not _any_real_figures_open():
-                _shutdown(server, socket_path)
+            if idle_for > idle_timeout and _real_figure_count() == 0:
                 return False
         return True
 
+    if backend == "TkAgg":
+        return _run_tk_host(pump, server, socket_path)
+    return _run_mpl_host(pump, server, socket_path)
+
+
+def _run_tk_host(pump, server, socket_path):
+    """Drive PUMP from a hidden ``tkinter.Tk()`` root's event loop.
+
+    The root is created (and withdrawn) BEFORE any figure so it becomes the
+    default root while staying invisible.  matplotlib's Tk backend opens each
+    figure as its own top-level Tk window; the shared Tcl notifier that this
+    root's ``mainloop`` runs dispatches events to every one of them, so the
+    figure windows remain fully interactive.  Because the root is withdrawn and
+    is never a matplotlib manager, no blank window appears and figure-counting
+    stays clean.
+    """
+    import tkinter as tk
+
+    root = tk.Tk()
+    root.withdraw()
+
+    tick_state = {"logged_error": False}
+
+    def tick():
+        try:
+            keep_going = pump()
+        except Exception as exc:
+            # Keep the loop alive across a transient hiccup, but surface the
+            # cause once: pump() also owns the idle self-exit check, so a
+            # persistent throw would otherwise wedge a silent, never-exiting
+            # process.  One stderr line lets the Emacs manager report it.
+            keep_going = True
+            if not tick_state["logged_error"]:
+                tick_state["logged_error"] = True
+                sys.stderr.write(
+                    "ejn_viewer: pump error (loop continues): %s\n" % exc)
+                sys.stderr.flush()
+        if keep_going:
+            root.after(50, tick)
+        else:
+            try:
+                root.quit()
+            except Exception:
+                pass
+
+    root.after(50, tick)
+    try:
+        root.mainloop()
+    finally:
+        _shutdown(server, socket_path)
+        try:
+            root.destroy()
+        except Exception:
+            pass
+    return 0
+
+
+def _run_mpl_host(pump, server, socket_path):
+    """Fallback host for non-Tk backends: a hidden anchor figure + canvas timer.
+
+    The anchor is a real (tagged, hidden) matplotlib figure whose canvas timer
+    drives PUMP; ``plt.show()`` runs the backend mainloop.
+    """
+    import matplotlib.pyplot as plt
+
     anchor = plt.figure("ejn-viewer")
     anchor._ejn_is_anchor = True
-    state["anchor"] = anchor
     try:
         anchor.canvas.manager.set_window_title("ejn viewer (socket host)")
     except Exception:
         pass
     _hide_window(anchor)
 
+    hidden = {"done": False}
+
+    def pump_and_hide():
+        # `plt.show()` un-hides every managed figure once, including the anchor
+        # withdrawn above; re-hide it once after the loop is running.
+        if not hidden["done"]:
+            _hide_window(anchor)
+            hidden["done"] = True
+        if pump() is False:
+            _shutdown(server, socket_path)
+            try:
+                plt.close("all")
+            except Exception:
+                pass
+
     timer = anchor.canvas.new_timer(interval=50)
-    timer.add_callback(pump)
+    timer.add_callback(pump_and_hide)
     timer.start()
     try:
         plt.show()
