@@ -219,16 +219,21 @@ def _reattach_canvas(fig):
         Gcf._set_new_active_manager(manager)
         return manager
     except Exception:
-        # (3) Legacy dummy-steal fallback (kept only for resilience).
+        # (3) Legacy dummy-steal fallback (kept only for resilience if the
+        # private new_figure_manager_given_figure API ever changes).  Reuse a
+        # freshly-managed figure's live canvas for FIG.
+        #
+        # Deliberately do NOT assign ``fig.number`` -- that setter is
+        # deprecated in matplotlib 3.10 and raises in 3.12, and it is
+        # unnecessary: ``plt.figure()`` already registered MANAGER in Gcf under
+        # its own num, and both ``plt.close(fig)`` and open_figure's cleanup
+        # match a figure by canvas identity (``manager.canvas.figure is fig``),
+        # never by ``fig.number``.  Setting it bought nothing and was the one
+        # 3.12-fatal call in this file.
         dummy = plt.figure()
         manager = dummy.canvas.manager
         manager.canvas.figure = fig
         fig.set_canvas(manager.canvas)
-        try:
-            fig.number = dummy.number
-            Gcf.figs[dummy.number] = manager
-        except Exception:
-            pass
         return manager
 
 

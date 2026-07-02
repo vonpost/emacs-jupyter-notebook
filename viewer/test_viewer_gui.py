@@ -195,6 +195,45 @@ def main():
     else:
         check("second-canvas-figure-is-fig2", False)
 
+    # ---- fallback path (branch 3) must stay 3.12-safe --------------------
+    # Force the primary new_figure_manager_given_figure path to raise so the
+    # legacy dummy-steal fallback runs, and assert it (a) yields one manager
+    # bound to the figure and (b) emits NO MatplotlibDeprecationWarning -- the
+    # old ``fig.number =`` assignment there raises outright on matplotlib 3.12.
+    import warnings
+    from matplotlib.figure import Figure as _Figure
+
+    plt.close("all")
+    fresh = _Figure()  # a bare figure with no pyplot-restored manager
+    fresh.add_subplot(1, 1, 1).imshow(np.arange(12).reshape(3, 4))
+
+    backend_mod = (plt._get_backend_mod() if hasattr(plt, "_get_backend_mod")
+                   else plt._backend_mod)
+    orig_nfmgf = backend_mod.new_figure_manager_given_figure
+
+    def _boom(*a, **k):
+        raise RuntimeError("forced failure to exercise the fallback path")
+
+    backend_mod.new_figure_manager_given_figure = _boom
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            fb_mgr = ejn_viewer._reattach_canvas(fresh)
+        deprecations = [w for w in caught
+                        if w.category.__name__ == "MatplotlibDeprecationWarning"
+                        or "Figure.number" in str(w.message)]
+        check("fallback-yields-manager-for-fig",
+              fb_mgr is not None
+              and getattr(fb_mgr, "canvas", None) is not None
+              and fb_mgr.canvas.figure is fresh)
+        check("fallback-no-deprecation-warning", len(deprecations) == 0)
+    finally:
+        backend_mod.new_figure_manager_given_figure = orig_nfmgf
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+
     # ---- cleanup: leave no windows on the user's screen ------------------
     try:
         plt.close("all")
