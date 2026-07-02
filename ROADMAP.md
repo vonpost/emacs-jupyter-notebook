@@ -893,6 +893,20 @@ Rows:
       user's `:0` (GUI 15/15, selfcheck 21, ERT 384/384).  Opencode (gpt-5.5
       xhigh) reviewed the fix; its orphaned-manager and silent-wedge findings
       are folded into this row.
+- [x] sha=07d39b7 W8.10 matplotlib-3.12 future-proofing — the dummy-steal
+      fallback assigned `fig.number` (deprecated in mpl 3.10, an ERROR in
+      3.12).  It was `try/except`-guarded so it would not crash on 3.12, but
+      the raise would skip the `Gcf` registration on the very next line,
+      leaving the fallback window unmanaged.  The assignment was also
+      unnecessary — `plt.figure()` already registers the manager, and both
+      `plt.close(fig)` and open_figure's cleanup match a figure by canvas
+      identity, never by `fig.number`.  Removed it.  No other
+      deprecated-to-error API remains; the private helpers (`_get_backend_mod`,
+      `_set_new_active_manager`, `Gcf.figs`) are underscore-prefixed but not on
+      any removal schedule and are guarded with a working fallback.  Guard
+      extended: `test_viewer_gui.py` now forces `new_figure_manager_given_figure`
+      to raise and asserts the fallback yields one manager bound to the figure
+      with zero `MatplotlibDeprecationWarning` (GUI 17/17 on `:0`).
 
 Hard rules for W8:
 - ZERO per-remote install.  No remote filesystem writes.  The only remote
