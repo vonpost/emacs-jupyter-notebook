@@ -299,12 +299,17 @@ the remote kernels.  Set to an absolute path or a command found on
   :type 'string
   :group 'emacs-jupyter-notebook)
 
-(defcustom emacs-jupyter-notebook-viewer-backend 'qt
+(defcustom emacs-jupyter-notebook-viewer-backend 'tk
   "Preferred GUI backend for the local matplotlib viewer.
-The viewer selects `QtAgg' for `qt' and `TkAgg' for `tk', falling back to
-the other automatically when the preferred one is unavailable."
-  :type '(choice (const :tag "Qt (QtAgg)" qt)
-                 (const :tag "Tk (TkAgg)" tk))
+The viewer selects `TkAgg' for `tk' and `QtAgg' for `qt', falling back to
+the other automatically when the preferred one is unavailable.
+
+Default is `tk': under a bare nix `python3.withPackages' env, PyQt5 cannot
+locate its Qt platform plugin (xcb) and aborts before matplotlib's
+fallback can run, whereas TkAgg inherits Emacs's DISPLAY and just works.
+Choose `qt' only if your local Python has a properly-wrapped PyQt5."
+  :type '(choice (const :tag "Tk (TkAgg)" tk)
+                 (const :tag "Qt (QtAgg)" qt))
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-viewer-idle-timeout 900

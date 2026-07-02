@@ -94,24 +94,33 @@ is reaped explicitly on `kill-emacs-hook'."
   (let* ((command emacs-jupyter-notebook-local-python-command)
          (python (emacs-jupyter-notebook-viewer--python-path command))
          (script (emacs-jupyter-notebook-viewer--script-path))
-         (backend (symbol-name (or emacs-jupyter-notebook-viewer-backend 'qt)))
+         (backend (symbol-name (or emacs-jupyter-notebook-viewer-backend 'tk)))
          (idle (number-to-string
                 (max 0 (or emacs-jupyter-notebook-viewer-idle-timeout 900)))))
     (unless python
       (error "Local Python command %S not found on `exec-path'" command))
     (unless script
       (error "Viewer script not found (expected viewer/ejn_viewer.py beside the package)"))
-    (make-process
-     :name "emacs-jupyter-notebook-viewer"
-     :command (list python "-u" script
-                    "--socket" socket-path
-                    "--backend" backend
-                    "--idle-timeout" idle)
-     :noquery t
-     :connection-type 'pipe
-     :buffer (get-buffer-create " *emacs-jupyter-notebook-viewer*")
-     :stderr (get-buffer-create " *emacs-jupyter-notebook-viewer-stderr*")
-     :sentinel #'emacs-jupyter-notebook-viewer--sentinel)))
+    ;; Log the exact command BEFORE launch so the log shows what ran even if
+    ;; the process aborts immediately (e.g. a GUI-backend failure).
+    (emacs-jupyter-notebook-viewer--log
+     "starting viewer: %s -u %s --backend %s --socket %s"
+     python script backend socket-path)
+    ;; Fresh stderr buffer per spawn so the sentinel reports THIS process's
+    ;; output, not stale text from a prior failed launch.
+    (let ((stderr (get-buffer-create " *emacs-jupyter-notebook-viewer-stderr*")))
+      (with-current-buffer stderr (erase-buffer))
+      (make-process
+       :name "emacs-jupyter-notebook-viewer"
+       :command (list python "-u" script
+                      "--socket" socket-path
+                      "--backend" backend
+                      "--idle-timeout" idle)
+       :noquery t
+       :connection-type 'pipe
+       :buffer (get-buffer-create " *emacs-jupyter-notebook-viewer*")
+       :stderr stderr
+       :sentinel #'emacs-jupyter-notebook-viewer--sentinel))))
 
 (defun emacs-jupyter-notebook-viewer--sentinel (proc event)
   "Sentinel for the viewer PROC: log EVENT (+ stderr tail) and clear state.
@@ -122,19 +131,23 @@ message and in the log buffer."
   (when (memq (process-status proc) '(exit signal))
     (let* ((code (process-exit-status proc))
            (stderr (get-buffer " *emacs-jupyter-notebook-viewer-stderr*"))
-           (tail (and (buffer-live-p stderr)
-                      (with-current-buffer stderr
-                        (let ((s (string-trim (buffer-string))))
-                          (unless (string-empty-p s)
-                            (car (last (split-string s "\n" t)))))))))
+           (lines (and (buffer-live-p stderr)
+                       (with-current-buffer stderr
+                         (split-string (string-trim (buffer-string)) "\n" t))))
+           ;; Log up to the last 8 non-empty stderr lines so a multi-line
+           ;; failure (e.g. a Qt/Tk backend traceback) is visible, not just
+           ;; its generic final sentence.
+           (excerpt (when lines
+                      (string-join (last lines 8) " | ")))
+           (headline (when lines (car (last lines)))))
       (emacs-jupyter-notebook-viewer--log
        "viewer process exited (%s%s)%s"
        (string-trim (or event ""))
        (if (integerp code) (format ", code %d" code) "")
-       (if tail (format ": %s" tail) ""))
+       (if excerpt (format "\n    stderr: %s" excerpt) ""))
       (when (and (integerp code) (not (zerop code)))
         (message "emacs-jupyter-notebook: figure viewer failed to start%s"
-                 (if tail (format " — %s" tail) "")))
+                 (if headline (format " — %s" headline) "")))
       (when (eq proc emacs-jupyter-notebook-viewer--process)
         (setq emacs-jupyter-notebook-viewer--process nil)))))
 
