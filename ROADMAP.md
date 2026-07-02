@@ -840,7 +840,7 @@ Rows:
       (f) LOW: the viewer trims received paths with `.strip()`, corrupting
           legitimate leading/trailing spaces in a temp path; trim the
           trailing newline only.
-- [x] sha=pending W8.8 CRITICAL field-bug fix — the injected formatter
+- [x] sha=43821a1 W8.8 CRITICAL field-bug fix — the injected formatter
       emitted the figure `__repr__` instead of base64 in real kernels, so
       the viewer never opened ("Invalid base64 data").  Root cause: the
       snippet registered an IPython display formatter for the Figure type
