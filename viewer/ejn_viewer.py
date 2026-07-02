@@ -253,6 +253,25 @@ def open_figure(path):
         _unlink(path)
         return None
 
+    # Replace any previously-shown figure so re-running a cell (or opening
+    # a figure repeatedly) does not pile up windows -- matches the panel's
+    # latest-per-cell behaviour.  The hidden anchor (socket-timer host) is
+    # tagged and preserved.
+    try:
+        from matplotlib._pylab_helpers import Gcf
+        for num in list(plt.get_fignums()):
+            mgr = Gcf.figs.get(num)
+            if mgr is None:
+                continue
+            if getattr(mgr.canvas.figure, "_ejn_is_anchor", False):
+                continue
+            try:
+                plt.close(mgr.canvas.figure)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     try:
         _reattach_canvas(fig)
         _install_enhancements(fig)
@@ -303,9 +322,16 @@ def run(socket_path, backend_pref, idle_timeout):
     server.listen(8)
     server.setblocking(False)
 
-    state = {"clients": {}, "last_activity": time.time()}
+    state = {"clients": {}, "last_activity": time.time(),
+             "anchor": None, "anchor_hidden": False}
 
     def pump():
+        # Re-hide the anchor once the GUI mainloop is running: `plt.show()`
+        # calls `manager.show()` on every managed figure, which un-hides the
+        # anchor we withdrew before the loop started.  Do it once, here.
+        if state["anchor"] is not None and not state["anchor_hidden"]:
+            _hide_window(state["anchor"])
+            state["anchor_hidden"] = True
         # Accept any pending connections.
         while True:
             try:
@@ -356,6 +382,8 @@ def run(socket_path, backend_pref, idle_timeout):
         return True
 
     anchor = plt.figure("ejn-viewer")
+    anchor._ejn_is_anchor = True
+    state["anchor"] = anchor
     try:
         anchor.canvas.manager.set_window_title("ejn viewer (socket host)")
     except Exception:
