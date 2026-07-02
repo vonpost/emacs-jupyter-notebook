@@ -17,6 +17,7 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'ansi-color)
 (require 'emacs-jupyter-notebook-vars)
 (require 'emacs-jupyter-notebook-cell)
 (require 'emacs-jupyter-notebook-registry)
@@ -1992,8 +1993,12 @@ in-flight invalidation contract."
        (when reply
          (let* ((data (plist-get reply :data))
                 (text (plist-get data :text/plain)))
-           (when text
-             (display-message-or-buffer text))))))))
+           (when (and text (not (string-empty-p text)))
+             ;; IPython colourises its inspector (`?') output with ANSI SGR
+             ;; escapes; decode them to faces instead of dumping literal
+             ;; `\e[0;31m...' into the echo area / *Message* buffer.
+             (display-message-or-buffer
+              (string-trim-right (ansi-color-apply text))))))))))
 
 ;;; Evaluation
 

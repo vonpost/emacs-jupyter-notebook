@@ -2261,6 +2261,32 @@ before that point should NOT create a stray registry row."
       (should (= captured-pos 5))
       (should (= captured-detail 0)))))
 
+(ert-deftest ejn-inspect-at-point-decodes-ansi-escapes ()
+  "IPython colourises its inspector (`?') output with ANSI SGR escapes.
+The displayed text must have them decoded (to faces) rather than dumped
+as literal `\\e[0;31m...' sequences into the echo area / *Message*."
+  (ejn-test-with-temp-buffer "# %%\nrange(5)\n"
+    (goto-char (point-min))
+    (search-forward "range")
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          displayed inspect-callback)
+      (cl-letf (((symbol-function 'display-message-or-buffer)
+                 (lambda (m &rest _) (setq displayed m))))
+        (let ((emacs-jupyter-notebook-jupyter-inspect-function
+               (lambda (_c _code _pos _detail cb) (setq inspect-callback cb))))
+          (emacs-jupyter-notebook-inspect-at-point)
+          (funcall inspect-callback
+                   (list :found t
+                         :data (list :text/plain
+                                     "\e[0;31mSignature:\e[0m range(stop)\n"))
+                   nil)))
+      ;; No raw escape sequence survived, the visible text is intact, and
+      ;; the trailing newline was trimmed.
+      (should displayed)
+      (should-not (string-match-p "\e\\[" displayed))
+      (should (equal (substring-no-properties displayed)
+                     "Signature: range(stop)")))))
+
 (ert-deftest ejn-inspect-callback-not-found-displays-nothing ()
   "Real `inspect_reply' for an unknown symbol is `(:status ok :found
 nil :data ())' — an EMPTY data plist.  The callback must display nothing
