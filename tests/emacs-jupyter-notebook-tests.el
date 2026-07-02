@@ -5936,12 +5936,21 @@ execute adapter (no panel entry) and passes the actual snippet string."
       (should (eq (caar calls) 'mock-client))
       (should (equal (cadar calls)
                      emacs-jupyter-notebook--viewer-formatter-snippet))
-      ;; The snippet must reference the custom MIME + the lazy registration
-      ;; API so a regression in the payload is caught here.
+      ;; The snippet must reference the custom MIME and patch the figure
+      ;; type's `_repr_mimebundle_'.  It must NOT use the old
+      ;; `for_type_by_name' display-formatter registration, which the
+      ;; matplotlib inline backend wipes on the first plot (the payload then
+      ;; silently degrades to the figure `__repr__').  See
+      ;; `viewer/test_formatter_kernel.py' for the real-kernel regression.
       (should (string-match-p "application/x-ejn-mpl-pickle"
                               emacs-jupyter-notebook--viewer-formatter-snippet))
-      (should (string-match-p "for_type_by_name"
+      (should (string-match-p "_repr_mimebundle_"
                               emacs-jupyter-notebook--viewer-formatter-snippet))
+      ;; Must not CALL the wipeable display-formatter registration API.
+      (should-not (string-match-p "\\.for_type_by_name("
+                                  emacs-jupyter-notebook--viewer-formatter-snippet))
+      (should-not (string-match-p "\\.for_type("
+                                  emacs-jupyter-notebook--viewer-formatter-snippet))
       (should (string-match-p "get_ipython"
                               emacs-jupyter-notebook--viewer-formatter-snippet)))))
 

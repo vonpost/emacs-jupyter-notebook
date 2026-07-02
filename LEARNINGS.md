@@ -479,6 +479,36 @@ the full capf list via `(apply #'completion-in-region result)` throws
 result 3)` before applying. Bit us on `complete-at-point`; test
 `ejn-complete-at-point-strips-capf-metadata-before-calling-completion-in-region`.
 
+### IPython display formatters get wiped by the matplotlib inline backend
+
+If you inject a custom IPython display formatter for a type via
+`formatters[mime].for_type(...)` / `for_type_by_name(...)`, matplotlib's
+**inline backend reconfigures IPython's display formatters on the first
+plot** and clears per-type registrations. After that, `BaseFormatter`
+falls back to `print_method='__repr__'`, so your custom MIME silently
+carries the object's `repr()` instead of your intended payload — no
+error, just wrong data downstream. Proven live: the registration is
+present (`deferred_printers` has 1 entry) right up until the first
+`plt.subplots()`, then it's `0`.
+
+**Fix:** don't use the display-formatter registry for this. Patch a
+`_repr_mimebundle_` method onto the *class* (e.g.
+`matplotlib.figure.Figure._repr_mimebundle_`) — a class method is not
+touched by the inline reconfiguration, chains cleanly to any existing
+bundle, and always runs. Patch eagerly when the module is importable and
+re-assert via a `pre_run_cell` event hook for late imports.
+
+**The QC lesson (this shipped a broken W8):** a formatter/display snippet
+MUST be tested against a real `ipykernel` **with the inline backend
+active** — not a bare `IPython.core.interactiveshell.InteractiveShell`,
+which is the one environment where the broken approach works. Mocking the
+MIME payload in ERTs and running the snippet in a plain shell both gave
+false greens. The regression guard is `viewer/test_formatter_kernel.py`:
+it spins a real kernel via `jupyter_client`, injects the snippet, runs the
+single-cell import+plot+return worst case, and asserts the emitted MIME
+base64-decodes and unpickles. Any kernel-side "emit a custom MIME"
+feature needs a test at that altitude.
+
 ### Evil visual state deactivates the region before command dispatch
 
 `(interactive "r")` reads `region-beginning` / `region-end` at

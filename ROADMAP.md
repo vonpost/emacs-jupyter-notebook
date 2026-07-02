@@ -840,6 +840,26 @@ Rows:
       (f) LOW: the viewer trims received paths with `.strip()`, corrupting
           legitimate leading/trailing spaces in a temp path; trim the
           trailing newline only.
+- [x] sha=pending W8.8 CRITICAL field-bug fix — the injected formatter
+      emitted the figure `__repr__` instead of base64 in real kernels, so
+      the viewer never opened ("Invalid base64 data").  Root cause: the
+      snippet registered an IPython display formatter for the Figure type
+      via `for_type_by_name`; matplotlib's inline backend reconfigures
+      IPython's formatters on the FIRST plot and WIPES per-type
+      registrations, after which `BaseFormatter` falls back to `__repr__`.
+      Proven with a real ipykernel (`deferred 1 → 0` on first plot).  Fix:
+      patch `matplotlib.figure.Figure._repr_mimebundle_` on the CLASS
+      (untouched by the inline reconfiguration; chains to any pre-existing
+      bundle), patch eagerly at connect when matplotlib is importable, and
+      re-assert via a `pre_run_cell` hook.
+      QC gap that let this ship: the W8.2 ERTs mocked the payload, and the
+      one "real" formatter test ran in a bare `InteractiveShell` WITHOUT the
+      inline backend — the single config where the old approach worked.
+      Guard added: `viewer/test_formatter_kernel.py` spins a real ipykernel
+      with inline active and asserts the emitted MIME base64-decodes and
+      unpickles (the single-cell import+plot+return worst case).  Also a
+      cheap ERT now asserts the snippet patches `_repr_mimebundle_` and does
+      not call the wipeable `for_type`/`for_type_by_name` API.
 
 Hard rules for W8:
 - ZERO per-remote install.  No remote filesystem writes.  The only remote

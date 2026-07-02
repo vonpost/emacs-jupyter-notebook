@@ -29,19 +29,21 @@
 ;;; W8 — local interactive matplotlib viewer: remote formatter injection
 ;;
 ;; The remote kernel stays HEADLESS.  On connect (and re-run on restart)
-;; Emacs injects a one-time, in-memory IPython display-formatter that makes
-;; every inline-displayed `matplotlib.figure.Figure' ALSO emit a custom
-;; MIME `application/x-ejn-mpl-pickle' (base64 of `pickle.dumps(fig)')
-;; ALONGSIDE the normal `image/png'.  Nothing is written to the remote
-;; filesystem and nothing is pip-installed: the snippet only needs IPython +
-;; matplotlib + stdlib, all of which a Python Jupyter kernel with matplotlib
-;; already has.  The registration is lazy (`for_type_by_name' does not force
-;; a matplotlib import until a Figure is actually formatted) and idempotent.
+;; Emacs injects a one-time, in-memory hook that makes every displayed
+;; `matplotlib.figure.Figure' ALSO emit a custom MIME
+;; `application/x-ejn-mpl-pickle' (base64 of `pickle.dumps(fig)') ALONGSIDE
+;; the normal `image/png'.  Nothing is written to the remote filesystem and
+;; nothing is pip-installed: the snippet only needs matplotlib + stdlib,
+;; which a Python Jupyter kernel with matplotlib already has.
 ;;
-;; Design references (opencode probes, 2026-07-01): the concrete class for a
-;; brand-new MIME formatter is `IPython.core.formatters.BaseFormatter'; both
-;; IPython 7 and 8 expose `display_formatter.formatters',
-;; `BaseFormatter(parent=...)', and `for_type_by_name(module, name, func)'.
+;; Implementation note (root cause of an earlier bug): we do NOT register an
+;; IPython display formatter for the Figure type.  matplotlib's inline
+;; backend reconfigures IPython's display formatters on the first plot and
+;; WIPES per-type registrations, which made a formatter degrade silently to
+;; the figure `__repr__' (emitting `<Figure ...>' instead of base64).
+;; Instead we patch `Figure._repr_mimebundle_' on the class, which the inline
+;; reconfiguration does not touch.  Verified against a real ipykernel with
+;; the inline backend active; see `viewer/test_formatter_kernel.py'.
 
 (defconst emacs-jupyter-notebook--viewer-formatter-snippet
   "\
@@ -52,45 +54,75 @@ except Exception:
 if _ejn_ip is not None:
     try:
         import base64 as _ejn_b64, pickle as _ejn_pkl
-        from IPython.core.formatters import BaseFormatter as _EjnBaseFormatter
         _EJN_MIME = 'application/x-ejn-mpl-pickle'
-        _ejn_fmts = _ejn_ip.display_formatter.formatters
-        _ejn_fmt = _ejn_fmts.get(_EJN_MIME)
-        if _ejn_fmt is None:
+        def _ejn_install():
+            # Patch Figure._repr_mimebundle_ on the TYPE.  This survives
+            # matplotlib's inline-backend reconfiguration, which clears
+            # IPython display-formatter per-type registrations on the first
+            # plot (a registered printer gets wiped and formatting falls back
+            # to __repr__).  A method on the class is not touched by that, so
+            # every figure reliably carries the pickle beside the inline PNG.
+            import matplotlib.figure as _ejn_mf
+            _EjnFigure = _ejn_mf.Figure
+            if getattr(_EjnFigure, '_ejn_patched', False):
+                return True
+            _ejn_orig = _EjnFigure.__dict__.get('_repr_mimebundle_', None)
+            def _ejn_repr_mimebundle_(self, include=None, exclude=None, **kwargs):
+                bundle = {}
+                if _ejn_orig is not None:
+                    try:
+                        _r = _ejn_orig(self, include=include, exclude=exclude,
+                                       **kwargs)
+                        if isinstance(_r, tuple):
+                            _r = _r[0]
+                        if isinstance(_r, dict):
+                            bundle.update(_r)
+                    except Exception:
+                        pass
+                try:
+                    bundle[_EJN_MIME] = _ejn_b64.b64encode(
+                        _ejn_pkl.dumps(self, protocol=_ejn_pkl.HIGHEST_PROTOCOL)
+                    ).decode('ascii')
+                except Exception:
+                    pass
+                return bundle
+            _EjnFigure._repr_mimebundle_ = _ejn_repr_mimebundle_
+            _EjnFigure._ejn_patched = True
+            return True
+        def _ejn_try_install(*_a, **_k):
             try:
-                _ejn_fmt = _EjnBaseFormatter(parent=_ejn_ip.display_formatter)
+                _ejn_install()
             except Exception:
-                _ejn_fmt = _EjnBaseFormatter()
-                _ejn_fmt.parent = _ejn_ip.display_formatter
-            _ejn_fmt.format_type = _EJN_MIME
-            _ejn_fmts[_EJN_MIME] = _ejn_fmt
-        def _ejn_figure_pickle(fig):
-            # Emit base64(pickle.dumps(fig)) alongside image/png.  Returning
-            # None (on any failure) tells IPython to omit this MIME entry, so
-            # the PNG path is never disturbed.  matplotlib's Figure.__getstate__
-            # already drops the live canvas/manager, so the dumped figure is
-            # backend-clean and can be reattached to a GUI canvas locally.
+                pass
+        # Patch now when matplotlib is importable (the common case: the
+        # kernel already has it); otherwise the per-cell hook patches as
+        # soon as matplotlib appears.
+        _ejn_try_install()
+        # Re-assert before every cell.  Idempotent (guarded by the
+        # `_ejn_patched' flag) and registered once per kernel session.
+        if not getattr(_ejn_ip, '_ejn_hook_installed', False):
             try:
-                import matplotlib
-                if fig.__class__.__module__.split('.')[0] != 'matplotlib':
-                    return None
-                return _ejn_b64.b64encode(
-                    _ejn_pkl.dumps(fig, protocol=_ejn_pkl.HIGHEST_PROTOCOL)
-                ).decode('ascii')
+                _ejn_ip.events.register('pre_run_cell', _ejn_try_install)
+                _ejn_ip._ejn_hook_installed = True
             except Exception:
-                return None
-        _ejn_fmt.for_type_by_name('matplotlib.figure', 'Figure',
-                                  _ejn_figure_pickle)
+                pass
     except Exception:
         pass
 "
-  "In-memory Python snippet registering the W8 matplotlib pickle formatter.
-Injected via a silent `execute_request' on connect and restart.  Registers
-a `matplotlib.figure.Figure' formatter for the custom MIME type
-`application/x-ejn-mpl-pickle' that returns base64-encoded
-`pickle.dumps(fig)' alongside the normal inline `image/png'.  Idempotent,
-lazy (no eager matplotlib import via `for_type_by_name'), and a graceful
-no-op when `get_ipython()' is unavailable or matplotlib is missing.")
+  "In-memory Python snippet installing the W8 matplotlib pickle emitter.
+Injected via a silent `execute_request' on connect and restart.  Patches
+`matplotlib.figure.Figure._repr_mimebundle_' so every displayed figure
+carries a base64-encoded `pickle.dumps(fig)' under the custom MIME type
+`application/x-ejn-mpl-pickle', alongside the normal inline `image/png'.
+
+Patching the TYPE (rather than registering an IPython display formatter)
+is deliberate: matplotlib's inline backend reconfigures IPython's
+display formatters on the first plot and wipes per-type formatter
+registrations, so the earlier `for_type_by_name' approach silently
+degraded to the figure `__repr__'.  A `_repr_mimebundle_' method on the
+class is not affected.  Idempotent (guarded by `_ejn_patched'), chains to
+any pre-existing `_repr_mimebundle_', and a graceful no-op when
+`get_ipython()' is unavailable or matplotlib cannot be imported.")
 
 ;; Forward declaration: `--client' is declared `defvar-local' further down;
 ;; the injection helper (defined here so it sits with the snippet) references
