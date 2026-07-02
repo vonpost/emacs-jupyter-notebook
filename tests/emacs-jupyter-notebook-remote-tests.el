@@ -38,42 +38,6 @@
   "Return a unique session id for a remote smoke test."
   (format "ert-%s-%s" (emacs-pid) (format-time-string "%Y%m%d%H%M%S")))
 
-(defun ejn-remote-tests--remote-python-exec-command (connection-file)
-  "Return a remote shell command that executes code via CONNECTION-FILE."
-  (let ((python-command (or (getenv "EJN_REMOTE_TEST_PYTHON_COMMAND") "python3"))
-        (python-code
-          (string-join
-           '("import sys, time"
-            "from queue import Empty"
-            "from jupyter_client import BlockingKernelClient"
-            "kc = BlockingKernelClient(connection_file=sys.argv[1])"
-            "kc.load_connection_file()"
-            "kc.start_channels()"
-            "kc.wait_for_ready(timeout=20)"
-            "msg_id = kc.execute('print(6 * 7)')"
-            "deadline = time.time() + 20"
-            "seen = False"
-            "while time.time() < deadline:"
-            "    try:"
-            "        msg = kc.get_iopub_msg(timeout=1)"
-            "    except Empty:"
-            "        continue"
-            "    if msg.get('parent_header', {}).get('msg_id') != msg_id:"
-            "        continue"
-            "    msg_type = msg['header']['msg_type']"
-            "    content = msg['content']"
-            "    if msg_type == 'stream' and content.get('text', '').strip() == '42':"
-            "        seen = True"
-            "    if msg_type == 'status' and content.get('execution_state') == 'idle':"
-            "        break"
-            "kc.stop_channels()"
-            "raise SystemExit(0 if seen else 1)")
-          "\n")))
-    (format "%s -c %s %s"
-            python-command
-            (shell-quote-argument python-code)
-            (emacs-jupyter-notebook-ssh--quote-remote-path connection-file))))
-
 (defun ejn-remote-tests--wait-for-local-port (port timeout)
   "Return non-nil when PORT accepts a local TCP connection within TIMEOUT."
   (let ((deadline (+ (float-time) timeout))
@@ -102,20 +66,23 @@
     (eq current phase)))
 
 (defun ejn-remote-tests--wait-for-result-text (buffer text timeout)
-  "Return non-nil when BUFFER has an inline result containing TEXT."
+  "Return non-nil when BUFFER's output panel has an entry containing TEXT.
+W2+: results live in the side-panel buffer's entries, not in source-buffer
+overlays."
   (let ((deadline (+ (float-time) timeout))
         found)
     (while (and (not found) (< (float-time) deadline))
       (accept-process-output nil 0.1)
-      (with-current-buffer buffer
-        (setq found
-              (cl-some
-               (lambda (ov)
-                 (let ((content (overlay-get ov 'emacs-jupyter-notebook-content))
-                       (display (overlay-get ov 'after-string)))
-                   (or (and content (string-match-p (regexp-quote text) content))
-                       (and display (string-match-p (regexp-quote text) display)))))
-               (emacs-jupyter-notebook-result--all-overlays)))))
+      (let ((panel (emacs-jupyter-notebook-panel-buffer buffer)))
+        (when (buffer-live-p panel)
+          (with-current-buffer panel
+            (setq found
+                  (cl-some
+                   (lambda (entry)
+                     (let ((content (plist-get (cdr entry) :content)))
+                       (and content
+                            (string-match-p (regexp-quote text) content))))
+                   emacs-jupyter-notebook-panel--entries))))))
     found))
 
 (ert-deftest ejn-remote-start-retrieve-and-tunnel-smoke ()
@@ -134,15 +101,22 @@
                      (emacs-jupyter-notebook-ssh-run-command
                       (plist-get launch :argv))))
           (should (integerp pid))
-          (setq connection
-                (emacs-jupyter-notebook--retrieve-connection-file
-                 profile remote-file local-copy))
+          ;; W4.7 removed the sync `--retrieve-connection-file'; retrieve
+          ;; inline via scp + read, polling until the kernel has written it.
+          (let ((deadline (+ (float-time) 30)))
+            (while (and (not connection) (< (float-time) deadline))
+              (ignore-errors
+                (emacs-jupyter-notebook-ssh-run-command
+                 (emacs-jupyter-notebook-ssh-scp-from-command
+                  profile remote-file local-copy))
+                (setq connection
+                      (emacs-jupyter-notebook-connection-read-file local-copy)))
+              (unless connection (sleep-for 0.25))))
           (should (equal (plist-get connection :transport) "tcp"))
           (should (plist-get connection :shell_port))
-          (emacs-jupyter-notebook-ssh-run-command
-           (emacs-jupyter-notebook-ssh-command
-            profile
-            (ejn-remote-tests--remote-python-exec-command remote-file)))
+          ;; The kernel binds all ZMQ ports at startup, so the tunnel/port
+          ;; checks below need no remote-side poke (which would require a
+          ;; bare `python3' on the remote PATH — not present under nix).
           (setq remote-ports
                 (emacs-jupyter-notebook-connection-ports connection))
           (setq local-ports
@@ -168,67 +142,6 @@
                   (emacs-jupyter-notebook-ssh--quote-remote-path remote-log)))))
       (when (file-exists-p local-copy)
         (delete-file local-copy)))))
-
-(ert-deftest ejn-remote-emacs-jupyter-connect-and-evaluate ()
-  "Connect to a remote kernel with emacs-jupyter and evaluate code."
-  :tags '(:remote :emacs-jupyter)
-  (unless (require 'jupyter nil t)
-    (ert-skip "emacs-jupyter is not on load-path"))
-  (require 'jupyter-client)
-  (let* ((profile (ejn-remote-tests--profile))
-         (session-id (ejn-remote-tests--session-id))
-         (launch (emacs-jupyter-notebook-ssh-build-remote-launch profile session-id))
-         (remote-file (plist-get launch :connection-file))
-         (remote-log (plist-get launch :log-file))
-         (registry-file (let ((file (make-temp-file "ejn-registry-")))
-                          (delete-file file)
-                          file))
-         (entry (list :profile (plist-get profile :profile)
-                      :remote-host (emacs-jupyter-notebook-ssh-destination profile)
-                      :remote-cwd (plist-get profile :remote-cwd)
-                      :kernelspec (plist-get profile :kernelspec)
-                      :remote-connection-file remote-file
-                      :remote-pid nil
-                      :created-at (format-time-string "%Y-%m-%dT%H:%M:%S%z")
-                      :tunnel-ports nil
-                      :display-name (format "%s:%s"
-                                            (emacs-jupyter-notebook-ssh-destination profile)
-                                            (plist-get profile :kernelspec))
-                      :session-id session-id))
-          (buffer (generate-new-buffer " *ejn-remote-emacs-jupyter*"))
-          (emacs-jupyter-notebook-registry-file registry-file)
-          pid)
-     (unwind-protect
-         (with-current-buffer buffer
-           (let ((emacs-jupyter-notebook-connection-retrieve-attempts 80)
-                 (emacs-jupyter-notebook-connection-retrieve-delay 0.25))
-            (setq pid (emacs-jupyter-notebook--parse-pid
-                       (emacs-jupyter-notebook-ssh-run-command
-                        (plist-get launch :argv))))
-            (setq entry (plist-put entry :remote-pid pid))
-            (emacs-jupyter-notebook--connect-entry entry profile)
-            (let ((jupyter-current-client emacs-jupyter-notebook--client)
-                  (jupyter-default-timeout 30))
-              (should (equal (string-trim (jupyter-eval "6 * 7")) "42")))))
-      (ignore-errors
-        (when (buffer-live-p buffer)
-          (with-current-buffer buffer
-            (emacs-jupyter-notebook-shutdown-kernel))))
-      (when (buffer-live-p buffer)
-        (kill-buffer buffer))
-      (when (integerp pid)
-        (ignore-errors
-          (emacs-jupyter-notebook-ssh-run-command
-           (emacs-jupyter-notebook-ssh-build-remote-kill profile pid))))
-      (ignore-errors
-        (emacs-jupyter-notebook-ssh-run-command
-         (emacs-jupyter-notebook-ssh-command
-          profile
-          (format "rm -f %s %s"
-                  (emacs-jupyter-notebook-ssh--quote-remote-path remote-file)
-                  (emacs-jupyter-notebook-ssh--quote-remote-path remote-log)))))
-      (when (file-exists-p registry-file)
-        (delete-file registry-file)))))
 
 (ert-deftest ejn-remote-async-start-connect-and-evaluate ()
   "Start, connect, and evaluate through the interactive async command path."
