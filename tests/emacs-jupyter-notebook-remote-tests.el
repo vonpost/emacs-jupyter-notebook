@@ -355,6 +355,76 @@
       (when (file-exists-p source-file)
         (delete-file source-file)))))
 
+(ert-deftest ejn-remote-default-adapters-parse-real-replies ()
+  "Exercise the DEFAULT complete/inspect/is-complete/kernel-info adapter
+impls against a REAL kernel, with NO adapter-var stubs.  Guards the seam
+every unit test mocks: the real `jupyter-*-request' construction, the
+reply-type strings, and the `jupyter-message-content' shapes.  This is the
+W8-class coverage — the adapters that PRODUCE the parsed replies are never
+run in the deterministic suite."
+  :tags '(:remote :emacs-jupyter :adapters)
+  (unless (require 'jupyter nil t)
+    (ert-skip "emacs-jupyter is not on load-path"))
+  (require 'jupyter-client)
+  (let* ((profile (ejn-remote-tests--profile))
+         (registry-file (let ((f (make-temp-file "ejn-registry-"))) (delete-file f) f))
+         (buffer (generate-new-buffer " *ejn-remote-adapters*"))
+         (emacs-jupyter-notebook-registry-file registry-file))
+    (unwind-protect
+        (with-current-buffer buffer
+          (let ((emacs-jupyter-notebook-default-profile (plist-get profile :profile))
+                (emacs-jupyter-notebook-remote-profiles
+                 `((,(plist-get profile :profile) . ,profile)))
+                (emacs-jupyter-notebook-connection-retrieve-attempts 120)
+                (emacs-jupyter-notebook-connection-retrieve-delay 0.25))
+            (setq buffer-file-name "/tmp/ejn-remote-adapters.py")
+            (emacs-jupyter-notebook-start-remote-kernel (plist-get profile :profile))
+            (should (ejn-remote-tests--wait-for-phase buffer 'done 120))
+            (let ((client emacs-jupyter-notebook--client)
+                  reply done)
+              (should client)
+              (cl-flet ((await (fn)
+                          (setq reply nil done nil)
+                          (funcall fn (lambda (r _e) (setq reply r done t)))
+                          (let ((deadline (+ (float-time) 30)))
+                            (while (and (not done) (< (float-time) deadline))
+                              (accept-process-output nil 0.1)))
+                          (should done)))
+                ;; kernel_info_reply — the heartbeat's dependency.
+                (await (lambda (cb)
+                         (emacs-jupyter-notebook-jupyter-kernel-info client cb)))
+                (should reply)
+                (should (or (plist-get reply :implementation)
+                            (plist-get reply :language_info)))
+                ;; complete_reply — real :matches (a vector), real offsets.
+                (await (lambda (cb)
+                         (emacs-jupyter-notebook-jupyter-complete client "prin" 4 cb)))
+                (should reply)
+                (should (member "print" (append (plist-get reply :matches) nil)))
+                (should (integerp (plist-get reply :cursor_start)))
+                (should (integerp (plist-get reply :cursor_end)))
+                ;; inspect_reply — found symbol has non-empty text/plain.
+                (await (lambda (cb)
+                         (emacs-jupyter-notebook-jupyter-inspect client "print" 5 0 cb)))
+                (should reply)
+                (should (eq (plist-get reply :found) t))
+                (should (plist-get (plist-get reply :data) :text/plain))
+                ;; is_complete_reply — incomplete vs complete.
+                (await (lambda (cb)
+                         (emacs-jupyter-notebook-jupyter-is-complete client "if True:" cb)))
+                (should reply)
+                (should (member (plist-get reply :status) '("incomplete" "invalid")))
+                (await (lambda (cb)
+                         (emacs-jupyter-notebook-jupyter-is-complete client "1 + 1" cb)))
+                (should reply)
+                (should (equal (plist-get reply :status) "complete"))))))
+      (ignore-errors
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (emacs-jupyter-notebook-shutdown-kernel))))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
+      (when (file-exists-p registry-file) (delete-file registry-file)))))
+
 (provide 'emacs-jupyter-notebook-remote-tests)
 
 ;;; emacs-jupyter-notebook-remote-tests.el ends here
