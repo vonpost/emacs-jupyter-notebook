@@ -811,7 +811,7 @@ Rows:
       README section documenting the zero-remote-install model, the
       one-time LOCAL setup, the version-pinning requirement, and the
       GUI-Emacs-only constraint.
-- [~] owner=W8-fixup claimed=2026-07-02 W8.7 Remediation pass on codex review:
+- [x] sha=dcdcdfb W8.7 Remediation pass on codex review:
       (a) HIGH: the auto-open path decodes base64 + writes the temp file
           synchronously inside the Jupyter IOPub callback; a large figure
           pickle can freeze Emacs during ordinary result streaming.  Defer
