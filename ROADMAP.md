@@ -860,6 +860,39 @@ Rows:
       unpickles (the single-cell import+plot+return worst case).  Also a
       cheap ERT now asserts the snippet patches `_repr_mimebundle_` and does
       not call the wipeable `for_type`/`for_type_by_name` API.
+- [x] sha=f34729e W8.9 GUI field-bug fix — opening a figure showed THREE Tk
+      windows (one blank, one with the zoom-triangle cursor + index readout,
+      a third where the zoom actually rendered) instead of one interactive
+      window.  Root cause: a pyplot-managed figure pickles with
+      `restore_to_pylab`, so `pickle.load` ALONE already reconstructs a full
+      GUI manager (toolbar + canvas + events) for the figure under the active
+      backend; the old `_reattach_canvas` was blind to this and did a
+      "dummy-steal" (created a *second* pyplot figure and repointed its canvas
+      at the figure), splitting toolbar/events (canvas #1) from the rendered
+      figure (canvas #2), plus the blank `plt.figure("ejn-viewer")` anchor =
+      3 windows.  The earlier c6dd0a7 "withdraw the anchor" attempt made it
+      worse — the anchor was the Tk root running the mainloop.
+      Fix: `_reattach_canvas` reuses the manager the unpickle already built
+      (registering it in Gcf if the restore left it orphaned — else a second
+      manager/window, the exact split, would slip past the Gcf-blind cleanup),
+      or, for a headless pickle, binds one fresh manager to the *existing*
+      figure via `new_figure_manager_given_figure` + `Gcf._set_new_active_manager`
+      (dummy-steal kept only as a guarded last-resort fallback).  `open_figure`
+      closes prior figures AFTER the reattach, keyed on the surviving
+      manager's num (unpickle may register it, so close-first would kill the
+      new figure).  For TkAgg the socket pump now runs on a dedicated hidden
+      `tkinter.Tk()` root (no blank anchor; the shared Tcl notifier keeps the
+      separate figure windows interactive); non-Tk backends keep the hidden
+      anchor-figure + canvas-timer host.  `_run_tk_host` now surfaces a
+      persistent `pump()` exception once on stderr (pump owns the idle
+      self-exit, so a silent throw would wedge a never-exiting process).
+      Guard added: `viewer/test_viewer_gui.py` — 15 assertions on DISPLAY=:0
+      (exactly one non-anchor manager, toolbar present, `format_coord` returns
+      `row=/col=` on all axes, one mapped window + withdrawn host root, zoom
+      crops siblings, reopen replaces the window).  Verified live on the
+      user's `:0` (GUI 15/15, selfcheck 21, ERT 384/384).  Opencode (gpt-5.5
+      xhigh) reviewed the fix; its orphaned-manager and silent-wedge findings
+      are folded into this row.
 
 Hard rules for W8:
 - ZERO per-remote install.  No remote filesystem writes.  The only remote
