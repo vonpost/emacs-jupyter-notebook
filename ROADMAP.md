@@ -811,6 +811,35 @@ Rows:
       README section documenting the zero-remote-install model, the
       one-time LOCAL setup, the version-pinning requirement, and the
       GUI-Emacs-only constraint.
+- [~] owner=W8-fixup claimed=2026-07-02 W8.7 Remediation pass on codex review:
+      (a) HIGH: the auto-open path decodes base64 + writes the temp file
+          synchronously inside the Jupyter IOPub callback; a large figure
+          pickle can freeze Emacs during ordinary result streaming.  Defer
+          the auto-open hand-off to `run-with-idle-timer 0` so the callback
+          returns immediately.
+      (b) HIGH: the viewer's `_select_backend` returns
+          `matplotlib.get_backend()` when neither Qt nor Tk validates, so
+          `run()` proceeds and crashes later at `plt.figure()`, and Emacs
+          never surfaces the promised friendly failure.  Fix: the viewer
+          exits non-zero with a distinct message when no GUI backend works;
+          the manager installs a sentinel that surfaces early viewer death
+          (with its stderr tail) to the W6 log buffer + a user message.
+      (c) MEDIUM: viewer death mid-hand-off is not robust — only
+          `file-error` from connect is caught; `process-send-string/-eof`
+          can signal after connect, and retries reuse the stale socket
+          without respawning.  Broaden the catch to `error`, invalidate the
+          dead viewer, and re-ensure (respawn) once on failure.
+      (d) MEDIUM: `:mpl-pickle` is not cleared when the entry is replaced by
+          text/image or cleared, so `v` can open a stale, no-longer-visible
+          figure.  Clear it in `--stash-mpl-pickle` when a display arrives
+          with no pickle key, and in `ejn-panel-replace-text` /
+          `ejn-panel-clear-entry`.
+      (e) LOW: the transient socket connection process is never disposed —
+          add a sentinel that deletes it on close so opens don't accumulate
+          dead process objects.
+      (f) LOW: the viewer trims received paths with `.strip()`, corrupting
+          legitimate leading/trailing spaces in a temp path; trim the
+          trailing newline only.
 
 Hard rules for W8:
 - ZERO per-remote install.  No remote filesystem writes.  The only remote
