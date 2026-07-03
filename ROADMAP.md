@@ -925,6 +925,53 @@ subplot crops all siblings, killing Emacs reaps the viewer.
 
 ---
 
+## W9 — Explicit / empty-prefix attribute completion
+
+- [x] sha=bb135d0 W9 object-attribute completion (`df.` / `obj.`)
+      produced nothing under corfu+orderless.  ROOT CAUSE: the capf
+      `emacs-jupyter-notebook-completion-at-point' only scheduled an async
+      kernel request on a cache MISS when `this-command' was one of
+      self-insert/delete/yank.  Corfu-auto has a min prefix length (>= 2),
+      so after `obj.' the attribute prefix is EMPTY and corfu-auto never
+      fires; the user invokes completion MANUALLY, where `this-command' is
+      the frontend/`completion-at-point' command — EXCLUDED by the gate — so
+      the capf returned nil and NEVER sent a request.  Word prefixes worked
+      only because self-insert pre-filled the LRU cache.  FIX: widened the
+      miss gate to also fire on an explicit invocation via a new predicate
+      `emacs-jupyter-notebook--completion-explicit-command-p' — matches the
+      vanilla `completion-at-point', this package's
+      `emacs-jupyter-notebook-complete-at-point', and popup frontends whose
+      command symbols embed `complet'/`company'/`corfu' (name-matched, so no
+      per-frontend enumeration).  Navigation commands (`next-line', ...)
+      deliberately do NOT match, preserving the W3 rule that cursor motion
+      never sends a request.  GUARD (why it can't spam the kernel):
+      `--completion-schedule-request' is debounced (each call cancels the
+      prior idle timer and clears pending key/id) and `--request-completion'
+      de-dups on the pending key, so repeated capf calls for one stable
+      context collapse to at most one request.  The reply path was already
+      correct and UNCHANGED: `--completion-result-from-reply' uses the
+      delta START = (- (point) (- cursor_end cursor_start)) (delta 0 for an
+      empty prefix -> START == END == point), and `--completion-refresh-ui'
+      already reopens the popup via `completion-in-region' when
+      `completion-in-region-mode' is inactive (the corfu-dismissed-after-
+      empty-prefix case).  The explicit command was already bound to
+      `C-c j TAB' (namespaced under the `C-c j' prefix, so no bare-TAB
+      shadowing risk); retained.  TESTS (+3, all deterministic): explicit
+      `completion-at-point' on a miss arms the timer AND a direct
+      `--request-completion' then hits the adapter; a regression pin that
+      `completion-at-point'/`corfu-complete'/`company-complete'/the package
+      command all schedule while `next-line' does not; and the real `d.'
+      reply shape (`:cursor_start 9 :cursor_end 9', matches
+      ["clear" "copy" "get"]) through `--completion-result-from-reply'
+      yields (START END COLLECTION . PROPS) with START == END == point and
+      the bare names.  VERIFICATION: `Ran 388 tests, 388 as expected,
+      0 unexpected, 1 expected failure' (CC1); byte-compile adds no new
+      warnings (only the two pre-existing evil-visual-* free-variable refs);
+      live ipykernel smoke reconfirmed `d.' -> cursor_start==cursor_end==9
+      with bare attribute names `['clear','copy','fromkeys','get',...]`.
+
+---
+
 ## Future workstreams (not yet scheduled)
 
 - **Multi-buffer sharing one kernel.** Registry refcount + buffer set per
