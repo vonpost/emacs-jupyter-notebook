@@ -411,18 +411,32 @@ the synchronous emacs-jupyter connect blocks the event loop."
   (run-at-time
    0 nil
    (lambda ()
-     (condition-case err
-         (let ((client (catch 'timeout
-                         (emacs-jupyter-notebook-jupyter--connect connection-file))))
-           (if (eq client 'timeout)
-               (progn
-                 (message "Timed out connecting to Jupyter kernel")
-                 (funcall callback nil))
-             (message "Connected to Jupyter kernel")
-             (funcall callback client)))
-       (error
-        (message "Failed to connect to Jupyter kernel: %s" (error-message-string err))
-        (funcall callback nil))))))
+     ;; W10: obtain the client under `condition-case', but invoke CALLBACK
+     ;; strictly OUTSIDE it and exactly ONCE.  CALLBACK runs the connect
+     ;; finalize, which stores the client, arms the heartbeat, injects the
+     ;; viewer formatter, and drains any queued evaluation callbacks.  When
+     ;; the callback was wrapped by the `condition-case' (the old shape), a
+     ;; raise from ANY of that downstream work was misread as a connect
+     ;; failure and re-entered CALLBACK a second time with a nil client —
+     ;; silently corrupting the async phase and swallowing the real error
+     ;; even though a live client had already been obtained.  That is the
+     ;; silent half-connect seam behind the client-less-debris wedge (W10):
+     ;; queued evals that never completed while no error surfaced.
+     (let ((client
+            (condition-case err
+                (let ((c (catch 'timeout
+                           (emacs-jupyter-notebook-jupyter--connect connection-file))))
+                  (if (eq c 'timeout)
+                      (progn
+                        (message "Timed out connecting to Jupyter kernel")
+                        nil)
+                    (message "Connected to Jupyter kernel")
+                    c))
+              (error
+               (message "Failed to connect to Jupyter kernel: %s"
+                        (error-message-string err))
+               nil))))
+       (funcall callback client)))))
 
 (defun emacs-jupyter-notebook-jupyter--evaluate (client code entry-handle)
   "Evaluate CODE through CLIENT, sending callbacks driving ENTRY-HANDLE.

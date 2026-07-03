@@ -925,6 +925,73 @@ subplot crops all siblings, killing Emacs reaps the viewer.
 
 ---
 
+## W10 — Recover client-less sessions (dangling entry/tunnel is reapable debris)
+
+- [x] sha=__SHA__ W10 Connection-lifecycle field-bug fix — a source buffer was
+      observed live in a WEDGED state that no non-destructive command could
+      recover: the remote kernel was ALIVE, the SSH `--tunnel-process` was
+      LIVE, and `--session-entry` was populated, but `--client` was nil (the
+      Jupyter client had dropped) and `--async-context` sat at `:phase done`
+      (so `--async-in-progress-p` was nil).  Root cause: `--active-session-p`
+      returned non-nil whenever there was a session-entry OR a live tunnel,
+      WITHOUT checking for a live client, so `--ensure-clean-before-start`
+      (called by both `start-remote-kernel` and `reconnect-remote-kernel`)
+      raised `user-error "A kernel is already active; shut it down or retry
+      fresh first"`.  `cancel-operation` also refused (phase done →
+      `--async-in-progress-p` nil, and `--evaluation-request` nil).  Only the
+      destructive `retry-fresh-kernel` / `shutdown-kernel` escaped, orphaning
+      the live kernel.  A client-less buffer with a lingering entry/tunnel is
+      recoverable DEBRIS, not an active session.
+      Fix: split the guard's semantics.  New `--live-client-p` (a present
+      `--client`) is the ONLY state that blocks a fresh start/reconnect —
+      preserving the original leak-prevention (a running emacs-jupyter client
+      must never be leaked).  New `--clientless-debris-p` (NO live client, but
+      a `--session-entry` and/or a live `--tunnel-process`) flags reapable
+      debris.  `--active-session-p` now means live-client-only.
+      `--ensure-clean-before-start` still `user-error`s on a live client, but
+      when it sees client-less debris it reaps LOCAL resources via
+      `--release-local-resources` (disposes the stale tunnel + stderr buffer,
+      cancels timers, drops the async context and client) and additionally
+      clears the buffer-local `--session-entry` (the registry keeps the
+      durable copy) — NEVER shutting down the remote kernel — then continues,
+      so start/reconnect recover the wedged buffer.  Reconnect is THE recovery
+      path and is no longer blocked.
+      Silent half-connect finding (secondary): the finalize nil-client →
+      ERROR transition already works when `--async-context` is at `:phase
+      connect` (`--async-connect-finalize` calls `--async-fail`; pinned by
+      `ejn-async-connect-finalize-fails-on-nil-client`), so the observed
+      `:phase done` + nil client cannot be produced by finalize alone.  The
+      real swallow seam was in the adapter
+      `emacs-jupyter-notebook-jupyter--connect-async`
+      (emacs-jupyter-notebook-jupyter.el ~405): the success `(funcall callback
+      client)` was INSIDE the connect `condition-case`, so a raise from the
+      downstream finalize/eval work (`--inject-viewer-formatter`, a queued
+      evaluation callback, heartbeat arming) was misread as a connect failure
+      and re-entered `callback` a SECOND time with a nil client — silently
+      corrupting the async phase and swallowing the real error while a live
+      client had already been obtained (matching "queued evaluation callbacks
+      that never ran and no error surfaced").  Fixed minimally: the client is
+      still obtained under `condition-case`, but `callback` is now invoked
+      strictly OUTSIDE it and exactly once, so finalize/eval raises propagate
+      instead of masquerading as a nil-client connect failure.
+      Tests (tests/emacs-jupyter-notebook-tests.el): converted the stale
+      `reconnect-refuses-existing-session` test into
+      `ejn-w10-reconnect-remote-kernel-proceeds-from-clientless-debris`; added
+      `ejn-w10-clientless-debris-not-active-session`,
+      `ejn-w10-ensure-clean-before-start-reaps-clientless-debris` (asserts
+      tunnel + stderr disposed, buffer-local session state cleared, remote
+      kernel NOT touched), `ejn-w10-ensure-clean-before-start-still-refuses-live-client`
+      (no-regression on the leak guard), `ejn-w10-connect-async-invokes-callback-once-despite-finalize-error`
+      (adapter calls the callback exactly once, raise propagates), and
+      `ejn-w10-connect-nil-client-transitions-context-to-error` (end-to-end
+      `--async-connect` → adapter callback(nil) → ERROR, never silently done).
+      Verification: `Ran 390 tests, 390 results as expected, 0 unexpected`
+      (1 expected failure, CC1).  Byte-compile: no NEW warnings (only the
+      pre-existing `evil-visual-beginning`/`-end` free-variable warnings,
+      shifted to ~2264/2265 by the added lines).
+
+---
+
 ## Future workstreams (not yet scheduled)
 
 - **Multi-buffer sharing one kernel.** Registry refcount + buffer set per
