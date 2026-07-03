@@ -1902,22 +1902,55 @@ older reply is dropped (W3.3)."
                             (not (eq emacs-jupyter-notebook--kernel-status 'busy)))
                    (emacs-jupyter-notebook--request-completion show-results)))))))))
 
+(defun emacs-jupyter-notebook--completion-explicit-command-p ()
+  "Return non-nil when `this-command' is an explicit completion invocation.
+Covers the vanilla `completion-at-point' (\\[completion-at-point] / M-TAB),
+this package's own `emacs-jupyter-notebook-complete-at-point', and the
+popup frontends (Corfu, Company, consult) whose command symbols embed
+`complet'/`company'/`corfu'.  Detected by name so we need not enumerate
+every frontend's ever-growing command set (W9).  Navigation commands
+(`next-line', `forward-char', mouse events, ...) deliberately do NOT
+match, so cursor motion never schedules a kernel request (W3)."
+  (let ((cmd this-command))
+    (and (symbolp cmd)
+         (or (memq cmd '(completion-at-point
+                         emacs-jupyter-notebook-complete-at-point))
+             (string-match-p "\\(?:complet\\|company\\|corfu\\)"
+                             (symbol-name cmd))))))
+
 (defun emacs-jupyter-notebook-completion-at-point ()
   "CAPF function: return cached completions immediately; schedule async fill.
-W3.4 contract: this function never blocks.  When the cache misses and the
-user just typed, an idle-delayed async request is scheduled; the kernel
-reply (whenever it arrives) populates the cache and refreshes the
-frontend so subsequent capf calls hit."
+W3.4 contract: this function never blocks.  When the cache misses we
+schedule an idle-delayed async request; the kernel reply (whenever it
+arrives) populates the cache and refreshes the frontend so subsequent
+capf calls hit.
+
+The miss gate fires for two disjoint situations (W9):
+- the user just edited (typed / deleted / yanked), the corfu-auto path;
+- completion was invoked EXPLICITLY (M-TAB, a Corfu/Company manual
+  trigger, or `emacs-jupyter-notebook-complete-at-point').  This is the
+  case that matters for object-attribute completion: after `obj.' the
+  attribute prefix is EMPTY, so corfu-auto (min prefix >= 2) never fires
+  and the ONLY entry point is a manual invocation.  The narrower
+  edit-only gate returned nil here and never sent a request, so `obj.'
+  completion silently produced nothing.
+
+Broadening the gate cannot spam the kernel: `--completion-schedule-request'
+is debounced (each call cancels the prior idle timer and clears the
+pending key/id) and `--request-completion' de-dups on the pending key, so
+repeated capf calls for one stable context collapse to at most one
+request."
   (when (and emacs-jupyter-notebook--client
              (not (eq emacs-jupyter-notebook--kernel-status 'busy)))
     (let ((result (emacs-jupyter-notebook--completion-result)))
       (if result
           result
-        (when (memq this-command
-                    '(self-insert-command
-                      delete-backward-char
-                      backward-delete-char-untabify
-                      yank))
+        (when (or (memq this-command
+                        '(self-insert-command
+                          delete-backward-char
+                          backward-delete-char-untabify
+                          yank))
+                  (emacs-jupyter-notebook--completion-explicit-command-p))
           (emacs-jupyter-notebook--completion-schedule-request t))
         nil))))
 
