@@ -404,24 +404,39 @@ W4.4 dead-PID probe test); production code must not."
                       :type 'user-error)
         (should-not retrieved)))))
 
-(ert-deftest ejn-reconnect-remote-kernel-refuses-existing-session-noninteractive ()
+(ert-deftest ejn-w10-reconnect-remote-kernel-proceeds-from-clientless-debris ()
+  "W10: reconnect is THE recovery path.  A buffer with a lingering
+`--session-entry' but NO live client is reapable DEBRIS, not an active
+session, so reconnect must NOT be blocked by the guard — it reaps the
+stale buffer-local entry and proceeds to probe/retrieve the target entry.
+Pre-W10 this signalled `user-error \"A kernel is already active\"' and the
+wedged buffer could only be recovered by nuking the live kernel."
   (let ((entry '(:profile "p"
                  :remote-host "example.com"
                  :remote-cwd "~"
                  :kernelspec "python3"
+                 :remote-pid 4242
                  :remote-connection-file "~/.cache/ejn/kernel.json"
                  :session-id "session"))
         retrieved)
     (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
                #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook--async-probe-pid-alive)
+               (lambda (context)
+                 (emacs-jupyter-notebook--async-retrieve context)))
               ((symbol-function 'emacs-jupyter-notebook--async-retrieve)
-               (lambda (&rest _)
-                 (setq retrieved t))))
+               (lambda (context)
+                 (setq retrieved t)
+                 context)))
       (with-temp-buffer
         (setq emacs-jupyter-notebook--session-entry '(:profile "p" :session-id "old"))
-        (should-error (emacs-jupyter-notebook-reconnect-remote-kernel entry)
-                      :type 'user-error)
-        (should-not retrieved)))))
+        (let ((context (emacs-jupyter-notebook-reconnect-remote-kernel entry)))
+          ;; Not blocked: the reconnect pipeline advanced to retrieve.
+          (should retrieved)
+          (should (eq (plist-get context :phase) 'retrieve))
+          ;; The stale buffer-local debris entry was reaped before the new
+          ;; reconnect context took over.
+          (should (equal (plist-get context :entry) entry)))))))
 
 (ert-deftest ejn-read-registry-entry-prefers-current-file ()
   "W6.8: chooser ALWAYS runs, but the current-file entry is the default initial-input.
@@ -5256,6 +5271,139 @@ command, which is the contract a user actually depends on."
     (setq emacs-jupyter-notebook--async-last-error t)
     (emacs-jupyter-notebook--ensure-clean-before-start)
     (should-not emacs-jupyter-notebook--async-last-error)))
+
+;;; W10 — client-less debris is reapable, not an active session
+
+(ert-deftest ejn-w10-clientless-debris-not-active-session ()
+  "W10: a buffer with a `--session-entry' and a live tunnel but NO client
+is DEBRIS, not an active session.  `--active-session-p' must classify it
+as non-blocking, and `--clientless-debris-p' must flag it as reapable.
+Adding a live `--client' flips both predicates."
+  (with-temp-buffer
+    (let* ((tunnel (emacs-jupyter-notebook-ssh-start-process
+                    "emacs-jupyter-notebook-tunnel-w10-debris"
+                    '("sleep" "60"))))
+      (unwind-protect
+          (progn
+            (setq emacs-jupyter-notebook--client nil)
+            (setq emacs-jupyter-notebook--session-entry
+                  '(:profile "p" :session-id "wedged"))
+            (setq emacs-jupyter-notebook--tunnel-process tunnel)
+            ;; No live client -> not active, IS debris.
+            (should-not (emacs-jupyter-notebook--active-session-p))
+            (should (emacs-jupyter-notebook--clientless-debris-p))
+            ;; A live client flips it: active, NOT debris.
+            (setq emacs-jupyter-notebook--client 'mock-client)
+            (should (emacs-jupyter-notebook--active-session-p))
+            (should-not (emacs-jupyter-notebook--clientless-debris-p)))
+        (when (process-live-p tunnel)
+          (delete-process tunnel))))))
+
+(ert-deftest ejn-w10-ensure-clean-before-start-reaps-clientless-debris ()
+  "W10: `--ensure-clean-before-start' must NOT signal on a client-less
+debris buffer; it reaps the LOCAL resources (disposes the stale tunnel and
+its stderr buffer, clears the buffer-local session state) WITHOUT shutting
+down the remote kernel, then lets the fresh start proceed."
+  (with-temp-buffer
+    (let* ((tunnel (emacs-jupyter-notebook-ssh-start-process
+                    "emacs-jupyter-notebook-tunnel-w10-reap"
+                    '("sleep" "60")))
+           (stderr (process-get tunnel
+                                'emacs-jupyter-notebook-stderr-buffer))
+           remote-shutdown-called)
+      (unwind-protect
+          (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
+                     (lambda (&rest _) (setq remote-shutdown-called t)))
+                    ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
+                     (lambda (&rest _) (setq remote-shutdown-called t))))
+            (setq emacs-jupyter-notebook--client nil)
+            (setq emacs-jupyter-notebook--session-entry
+                  '(:profile "p" :session-id "wedged"))
+            (setq emacs-jupyter-notebook--tunnel-process tunnel)
+            (setq emacs-jupyter-notebook--async-context
+                  (emacs-jupyter-notebook--async-new-context
+                   :phase 'done
+                   :origin-buffer (current-buffer)))
+            ;; Does not raise.
+            (emacs-jupyter-notebook--ensure-clean-before-start)
+            ;; Debris reaped: tunnel disposed, buffer-local session state cleared.
+            (should-not (process-live-p tunnel))
+            (should-not (buffer-live-p stderr))
+            (should-not emacs-jupyter-notebook--tunnel-process)
+            (should-not emacs-jupyter-notebook--session-entry)
+            (should-not emacs-jupyter-notebook--async-context)
+            (should-not emacs-jupyter-notebook--client)
+            ;; The remote kernel was NEVER touched during the reap.
+            (should-not remote-shutdown-called))
+        (when (process-live-p tunnel)
+          (delete-process tunnel))))))
+
+(ert-deftest ejn-w10-ensure-clean-before-start-still-refuses-live-client ()
+  "W10 no-regression: a genuinely LIVE client must still block a fresh
+start — the guard's original leak-prevention is preserved.  A present
+`--client' is the one state `--ensure-clean-before-start' refuses."
+  (with-temp-buffer
+    (setq emacs-jupyter-notebook--client 'mock-client)
+    (setq emacs-jupyter-notebook--session-entry
+          '(:profile "p" :session-id "live"))
+    (should-error (emacs-jupyter-notebook--ensure-clean-before-start)
+                  :type 'user-error)
+    ;; Nothing was reaped: the live client and its entry are untouched.
+    (should (eq emacs-jupyter-notebook--client 'mock-client))
+    (should emacs-jupyter-notebook--session-entry)))
+
+(ert-deftest ejn-w10-connect-async-invokes-callback-once-despite-finalize-error ()
+  "W10 silent half-connect: `--connect-async' must invoke CALLBACK exactly
+ONCE, with CALLBACK strictly outside the connect `condition-case'.  A raise
+from the downstream finalize/eval work must propagate — it must NOT be
+misread as a connect failure and re-enter CALLBACK with a nil client (the
+swallow-and-misreport seam that hid errors while a live client existed)."
+  (let ((calls 0)
+        captured)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--connect)
+               (lambda (_file) 'mock-client))
+              ((symbol-function 'run-at-time)
+               (lambda (_secs _rep fn &rest args) (apply fn args) nil))
+              ((symbol-function 'message) (lambda (&rest _) nil)))
+      ;; The finalize raise propagates out (proof the callback is NOT wrapped).
+      (should-error
+       (emacs-jupyter-notebook-jupyter--connect-async
+        "/tmp/kernel.json"
+        (lambda (client)
+          (cl-incf calls)
+          (setq captured client)
+          (error "finalize boom"))))
+      (should (= calls 1))
+      (should (eq captured 'mock-client)))))
+
+(ert-deftest ejn-w10-connect-nil-client-transitions-context-to-error ()
+  "W10 secondary: a connect whose adapter yields a nil client must move the
+async context to ERROR (surfacing the failure via `--async-fail'), never
+silently to `done'.  Drives the full `--async-connect' -> adapter
+callback(nil) -> `--async-connect-finalize' seam."
+  (with-temp-buffer
+    (let ((err-surfaced nil))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--install-tunnel-sentinel)
+                 #'ignore)
+                ((symbol-function 'emacs-jupyter-notebook-jupyter-connect-async)
+                 (lambda (_file callback)
+                   ;; Adapter reports a failed connect: nil client.
+                   (funcall callback nil))))
+        (let ((context (emacs-jupyter-notebook--async-new-context
+                        :phase 'tunnel
+                        :entry '(:profile "p" :session-id "session")
+                        :local-ports '(:shell_port 1001)
+                        :local-file "/tmp/kernel.json"
+                        :tunnel-process 'mock-process
+                        :origin-buffer (current-buffer)
+                        :error-callback (lambda (_ctx _err)
+                                          (setq err-surfaced t)))))
+          (setq emacs-jupyter-notebook--async-context context)
+          (emacs-jupyter-notebook--async-connect context)
+          (should (eq (plist-get emacs-jupyter-notebook--async-context :phase)
+                      'error))
+          (should-not emacs-jupyter-notebook--client)
+          (should err-surfaced))))))
 
 ;;; W6.3 — Friendly first-evaluate
 

@@ -1166,17 +1166,60 @@ the user can confirm or pick another."
     (user-error
      "A Jupyter operation is already in progress; use M-x emacs-jupyter-notebook-cancel-operation to cancel it")))
 
+(defun emacs-jupyter-notebook--live-client-p ()
+  "Return non-nil when the current buffer owns a live Jupyter client.
+W10: a live `--client' is the ONLY state that must block a fresh start or
+reconnect — leaving it in place would leak a running emacs-jupyter client.
+A dangling `--session-entry' or SSH `--tunnel-process' with NO client is
+recoverable DEBRIS (see `--clientless-debris-p'), never a live session."
+  (and emacs-jupyter-notebook--client t))
+
+(defun emacs-jupyter-notebook--clientless-debris-p ()
+  "Return non-nil when the buffer carries reapable connection debris.
+W10 bug: a source buffer was observed live where the remote kernel and
+its SSH tunnel were both alive and `--session-entry' was populated, but
+`--client' was nil (the Jupyter client had dropped) and `--async-context'
+sat at `:phase done'.  The old `--active-session-p' predicate classified
+that state as an active session, so every non-destructive recovery command
+refused it and the buffer was unrecoverable except by nuking the live
+kernel.  Debris = NO live client, but a `--session-entry' and/or a live
+`--tunnel-process' still lingering; it must be reaped, not defended."
+  (and (not (emacs-jupyter-notebook--live-client-p))
+       (or emacs-jupyter-notebook--session-entry
+           (and (processp emacs-jupyter-notebook--tunnel-process)
+                (process-live-p emacs-jupyter-notebook--tunnel-process)))))
+
 (defun emacs-jupyter-notebook--active-session-p ()
-  "Return non-nil when the current buffer already owns connection state."
-  (or emacs-jupyter-notebook--client
-      emacs-jupyter-notebook--session-entry
-      (and (processp emacs-jupyter-notebook--tunnel-process)
-           (process-live-p emacs-jupyter-notebook--tunnel-process))))
+  "Return non-nil when the current buffer owns a genuinely LIVE session.
+W10: only a live `--client' counts.  A lingering `--session-entry' or SSH
+tunnel with NO client is recoverable DEBRIS (see `--clientless-debris-p'
+and `--ensure-clean-before-start', which reap it) — NOT an active session,
+so it must not block the non-destructive recovery commands."
+  (emacs-jupyter-notebook--live-client-p))
 
 (defun emacs-jupyter-notebook--ensure-clean-before-start ()
-  "Ensure the current buffer can start or reconnect a kernel without leaking one."
+  "Ensure the current buffer can start or reconnect a kernel without leaking one.
+W10 recovery contract: only a genuinely LIVE client blocks — it must be
+shut down (or superseded via `retry-fresh-kernel') first so a running
+emacs-jupyter client is never leaked.  A client-less buffer that still
+carries a dangling `--session-entry' and/or a live SSH tunnel is reapable
+DEBRIS (the wedged state seen live: `--client' nil while entry and tunnel
+linger); reap the LOCAL resources — disposing the stale tunnel and
+clearing the buffer-local session state via `--release-local-resources' —
+and continue so the fresh start / reconnect can proceed.  Per the binding
+rule the remote kernel is NEVER shut down here; only LOCAL handles go."
   (when (emacs-jupyter-notebook--active-session-p)
     (user-error "A kernel is already active; shut it down or retry fresh first"))
+  ;; W10: reap client-less debris so start/reconnect can recover a wedged
+  ;; buffer.  `--release-local-resources' disposes the stale tunnel process
+  ;; (and its stderr buffer), cancels timers, drops the async context, and
+  ;; nils the client — WITHOUT touching the remote kernel.  It intentionally
+  ;; preserves `--session-entry' (the durable reconnect surface on kill /
+  ;; mode-disable); here we additionally clear the buffer-local entry because
+  ;; its LOCAL tunnel is gone and the registry keeps the durable copy.
+  (when (emacs-jupyter-notebook--clientless-debris-p)
+    (emacs-jupyter-notebook--release-local-resources)
+    (setq emacs-jupyter-notebook--session-entry nil))
   ;; W6.2: a brand-new operation clears the lingering ` EJN✗' state.
   (setq emacs-jupyter-notebook--async-last-error nil)
   (force-mode-line-update t))
