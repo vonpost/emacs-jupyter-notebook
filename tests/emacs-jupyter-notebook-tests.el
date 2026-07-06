@@ -1835,15 +1835,27 @@ before that point should NOT create a stray registry row."
           (should-not (emacs-jupyter-notebook-completion-at-point))
           (should (timerp emacs-jupyter-notebook--completion-idle-timer))
           (cancel-timer emacs-jupyter-notebook--completion-idle-timer)))))
-  ;; And the negative half of the gate: a navigation command must NOT arm it.
-  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
-    (search-forward "my_obj.met")
-    (let ((emacs-jupyter-notebook--client 'mock-client)
-          (emacs-jupyter-notebook--completion-cache nil)
-          (emacs-jupyter-notebook--completion-idle-timer nil)
-          (this-command 'next-line))
-      (should-not (emacs-jupyter-notebook-completion-at-point))
-      (should-not (timerp emacs-jupyter-notebook--completion-idle-timer)))))
+  ;; And the negative half of the gate: cursor motion AND popup
+  ;; navigation/dismissal commands must NOT arm it.  The popup commands
+  ;; (`corfu-next', `company-abort', ...) embed a frontend prefix but not
+  ;; the `complet' verb, so keying on the verb correctly excludes them —
+  ;; re-entering the capf while merely scrolling or aborting a popup must
+  ;; never fire a kernel request (W3 contract; opencode W9 review).
+  (dolist (cmd '(next-line
+                 forward-char
+                 corfu-next
+                 corfu-previous
+                 corfu-quit
+                 company-select-next
+                 company-abort))
+    (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
+      (search-forward "my_obj.met")
+      (let ((emacs-jupyter-notebook--client 'mock-client)
+            (emacs-jupyter-notebook--completion-cache nil)
+            (emacs-jupyter-notebook--completion-idle-timer nil)
+            (this-command cmd))
+        (should-not (emacs-jupyter-notebook-completion-at-point))
+        (should-not (timerp emacs-jupyter-notebook--completion-idle-timer))))))
 
 (ert-deftest ejn-w9-empty-prefix-attribute-reply-yields-usable-capf-result ()
   ;; Real `d.' complete_reply shape from a live ipykernel: cursor_start ==

@@ -1905,18 +1905,25 @@ older reply is dropped (W3.3)."
 (defun emacs-jupyter-notebook--completion-explicit-command-p ()
   "Return non-nil when `this-command' is an explicit completion invocation.
 Covers the vanilla `completion-at-point' (\\[completion-at-point] / M-TAB),
-this package's own `emacs-jupyter-notebook-complete-at-point', and the
-popup frontends (Corfu, Company, consult) whose command symbols embed
-`complet'/`company'/`corfu'.  Detected by name so we need not enumerate
-every frontend's ever-growing command set (W9).  Navigation commands
-(`next-line', `forward-char', mouse events, ...) deliberately do NOT
-match, so cursor motion never schedules a kernel request (W3)."
+this package's own `emacs-jupyter-notebook-complete-at-point', Company's
+`company-manual-begin', and any command whose symbol name contains the
+completion verb `complet' (the corfu/company/comint completion TRIGGERS
+all do: `corfu-complete', `company-complete', `company-complete-common',
+`completion-at-point', ...).
+
+Keying on the `complet' verb rather than a frontend prefix is deliberate
+(W9): popup NAVIGATION and dismissal commands — `corfu-next',
+`corfu-previous', `corfu-quit', `company-select-next', `company-abort' —
+do NOT contain `complet', so they never match and never schedule a kernel
+request even if the capf is re-entered under them.  Cursor-motion commands
+(`next-line', `forward-char', mouse events, ...) likewise never match,
+honoring the W3 \"motion must not request\" contract."
   (let ((cmd this-command))
     (and (symbolp cmd)
          (or (memq cmd '(completion-at-point
-                         emacs-jupyter-notebook-complete-at-point))
-             (string-match-p "\\(?:complet\\|company\\|corfu\\)"
-                             (symbol-name cmd))))))
+                         emacs-jupyter-notebook-complete-at-point
+                         company-manual-begin))
+             (string-match-p "complet" (symbol-name cmd))))))
 
 (defun emacs-jupyter-notebook-completion-at-point ()
   "CAPF function: return cached completions immediately; schedule async fill.
