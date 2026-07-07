@@ -1793,6 +1793,104 @@ before that point should NOT create a stray registry row."
         (should (timerp emacs-jupyter-notebook--completion-idle-timer))
         (cancel-timer emacs-jupyter-notebook--completion-idle-timer)))))
 
+(ert-deftest ejn-w9-capf-explicit-invocation-schedules-request-on-miss ()
+  ;; W9: the capf is invoked EXPLICITLY (this-command = `completion-at-point',
+  ;; i.e. M-TAB / a manual frontend trigger), NOT via self-insert.  On a cache
+  ;; miss it must now schedule the idle async request (the timer is the proxy
+  ;; for the pending kernel fetch).  Letting the timer fire drives the adapter,
+  ;; confirming a request is actually sent.
+  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
+    (search-forward "my_obj.met")
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook--completion-cache nil)
+          (emacs-jupyter-notebook--completion-cache-order nil)
+          (emacs-jupyter-notebook--completion-pending-key nil)
+          (emacs-jupyter-notebook--completion-pending-id nil)
+          (emacs-jupyter-notebook--completion-idle-timer nil)
+          (this-command 'completion-at-point)
+          adapter-called)
+      (let ((emacs-jupyter-notebook-jupyter-complete-function
+             (lambda (_client _code _pos _callback)
+               (setq adapter-called t))))
+        ;; capf returns nil (cache miss) but must arm the idle timer.
+        (should-not (emacs-jupyter-notebook-completion-at-point))
+        (should-not adapter-called)          ; never synchronous
+        (should (timerp emacs-jupyter-notebook--completion-idle-timer))
+        (cancel-timer emacs-jupyter-notebook--completion-idle-timer)
+        ;; Draining that scheduled work (what the timer would do) actually
+        ;; sends the request through the adapter -- proving it is a real
+        ;; pending kernel fetch, not just a dangling timer.  Called directly
+        ;; (as ejn-completion-callback-triggers-completion-in-region does) to
+        ;; avoid timer/mode-guard flakiness.
+        (setq emacs-jupyter-notebook--completion-pending-key nil
+              emacs-jupyter-notebook--completion-pending-id nil)
+        (emacs-jupyter-notebook--request-completion t)
+        (should adapter-called)))))
+
+(ert-deftest ejn-w9-capf-explicit-invocation-regression-old-gate-fixed ()
+  ;; Regression pin: the OLD gate only scheduled for self-insert/delete/yank,
+  ;; so an explicit completion command on a miss scheduled NOTHING.  It now
+  ;; must schedule for both the vanilla `completion-at-point' and popup
+  ;; frontend commands (name-matched: corfu/company), while cursor motion
+  ;; still schedules nothing (see the -does-not-request-on-cursor-motion test).
+  (dolist (cmd '(completion-at-point
+                 corfu-complete
+                 company-complete
+                 emacs-jupyter-notebook-complete-at-point))
+    (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
+      (search-forward "my_obj.met")
+      (let ((emacs-jupyter-notebook--client 'mock-client)
+            (emacs-jupyter-notebook--completion-cache nil)
+            (emacs-jupyter-notebook--completion-cache-order nil)
+            (emacs-jupyter-notebook--completion-pending-key nil)
+            (emacs-jupyter-notebook--completion-idle-timer nil)
+            (this-command cmd))
+        (let ((emacs-jupyter-notebook-jupyter-complete-function
+               (lambda (&rest _) nil)))
+          (should-not (emacs-jupyter-notebook-completion-at-point))
+          (should (timerp emacs-jupyter-notebook--completion-idle-timer))
+          (cancel-timer emacs-jupyter-notebook--completion-idle-timer)))))
+  ;; And the negative half of the gate: cursor motion AND popup
+  ;; navigation/dismissal commands must NOT arm it.  The popup commands
+  ;; (`corfu-next', `company-abort', ...) embed a frontend prefix but not
+  ;; the `complet' verb, so keying on the verb correctly excludes them —
+  ;; re-entering the capf while merely scrolling or aborting a popup must
+  ;; never fire a kernel request (W3 contract; opencode W9 review).
+  (dolist (cmd '(next-line
+                 forward-char
+                 corfu-next
+                 corfu-previous
+                 corfu-quit
+                 company-select-next
+                 company-abort))
+    (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
+      (search-forward "my_obj.met")
+      (let ((emacs-jupyter-notebook--client 'mock-client)
+            (emacs-jupyter-notebook--completion-cache nil)
+            (emacs-jupyter-notebook--completion-idle-timer nil)
+            (this-command cmd))
+        (should-not (emacs-jupyter-notebook-completion-at-point))
+        (should-not (timerp emacs-jupyter-notebook--completion-idle-timer))))))
+
+(ert-deftest ejn-w9-empty-prefix-attribute-reply-yields-usable-capf-result ()
+  ;; Real `d.' complete_reply shape from a live ipykernel: cursor_start ==
+  ;; cursor_end (EMPTY prefix) with BARE attribute-name matches.  The capf
+  ;; result must be (START END COLLECTION . PROPS) with START == END == point
+  ;; (delta 0) and COLLECTION holding the bare names, so corfu can insert one
+  ;; after `d.'.
+  (with-temp-buffer
+    (insert "d.")
+    (goto-char (point-max))
+    (let ((r (emacs-jupyter-notebook--completion-result-from-reply
+              '(:status "ok" :matches ["clear" "copy" "get"]
+                        :cursor_start 9 :cursor_end 9))))
+      (should r)
+      (should (= (nth 0 r) (point)))                 ; START == point (delta 0)
+      (should (= (nth 1 r) (point)))                 ; END == point
+      (should (= (nth 0 r) (nth 1 r)))               ; empty prefix span
+      (should (equal (nth 2 r) '("clear" "copy" "get")))
+      (should (eq (plist-get (cdddr r) :exclusive) 'no)))))
+
 (ert-deftest ejn-completion-idle-timer-set-up-on-mode-enable ()
   (with-temp-buffer
     (emacs-jupyter-notebook-mode 1)
