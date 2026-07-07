@@ -47,12 +47,18 @@ def main():
     import numpy as np
 
     # --- build a remote-style pickle: subplots(1,3) of imshow under Agg ----
+    # DIFFERENT matrix sizes per subplot on purpose: this is what exposes the
+    # linked-zoom reset bug (a reset used to leave a sibling at another axis'
+    # extent, i.e. the wrong matrix size).
+    shapes = [(3, 4), (5, 6), (7, 8)]
+
     def make_pickle(seed):
         matplotlib.use("Agg", force=True)
         import matplotlib.pyplot as plt
         fig, axes = plt.subplots(1, 3)
         for i, ax in enumerate(axes):
-            ax.imshow(np.arange(12).reshape(3, 4) + seed * 100 + i)
+            nr, nc = shapes[i]
+            ax.imshow(np.arange(nr * nc).reshape(nr, nc) + seed * 100 + i)
         blob = pickle.dumps(fig)
         plt.close("all")
         fd, path = tempfile.mkstemp(suffix=".pkl", prefix="ejn_gui_")
@@ -150,29 +156,58 @@ def main():
         check("host-root-not-visible",
               host_state == "withdrawn" and not host.winfo_ismapped())
 
-        # Zoom proof: render + toolbar share one canvas, LinkGroup crops siblings.
+        # Zoom proof: render + toolbar share one canvas, and LinkGroup crops
+        # siblings to the same RELATIVE region of their OWN extent (not the
+        # zoomed axis' absolute limits — the subplots have different sizes).
+        bases = [(ax.get_xlim(), ax.get_ylim()) for ax in axes]
+
+        def frac(base, cur):
+            span = base[1] - base[0]
+            return ((cur[0] - base[0]) / span, (cur[1] - base[0]) / span) \
+                if span else (0.0, 1.0)
+
+        def close(a, b):
+            return abs(a[0] - b[0]) < 1e-6 and abs(a[1] - b[1]) < 1e-6
+
         zoom_ok = True
         try:
-            axes[0].set_xlim((-0.5, 1.5))
-            axes[0].set_ylim((1.5, -0.5))
+            # Zoom axis 0 to its top-left quarter.
+            bx0, by0 = bases[0]
+            axes[0].set_xlim((bx0[0], (bx0[0] + bx0[1]) / 2.0))
+            axes[0].set_ylim(((by0[0] + by0[1]) / 2.0, by0[1]))
             manager.canvas.draw()
-            x0 = axes[0].get_xlim()
-            y0 = axes[0].get_ylim()
-            for sib in axes[1:]:
-                if (abs(sib.get_xlim()[0] - x0[0]) > 1e-6
-                        or abs(sib.get_xlim()[1] - x0[1]) > 1e-6
-                        or abs(sib.get_ylim()[0] - y0[0]) > 1e-6
-                        or abs(sib.get_ylim()[1] - y0[1]) > 1e-6):
+            fx = frac(bx0, axes[0].get_xlim())
+            fy = frac(by0, axes[0].get_ylim())
+            for sib, (bx, by) in zip(axes[1:], bases[1:]):
+                if not (close(frac(bx, sib.get_xlim()), fx)
+                        and close(frac(by, sib.get_ylim()), fy)):
                     zoom_ok = False
         except Exception as exc:
             sys.stdout.write("zoom exception: %s\n" % exc)
             zoom_ok = False
-        check("zoom-links-siblings-no-exception", zoom_ok)
+        check("zoom-links-siblings-relative", zoom_ok)
+
+        # RESET proof (the reported bug): resetting the zoomed axis to its own
+        # full extent must return EVERY sibling to ITS OWN full extent, not
+        # leave it cropped to axis 0's (wrong) matrix size.
+        reset_ok = True
+        try:
+            axes[0].set_xlim(bases[0][0])
+            axes[0].set_ylim(bases[0][1])
+            manager.canvas.draw()
+            for ax, (bx, by) in zip(axes, bases):
+                if not (close(ax.get_xlim(), bx) and close(ax.get_ylim(), by)):
+                    reset_ok = False
+        except Exception as exc:
+            sys.stdout.write("reset exception: %s\n" % exc)
+            reset_ok = False
+        check("zoom-reset-restores-each-own-extent", reset_ok)
     else:
         for name in ("manager-has-toolbar", "canvas-figure-is-fig",
                      "three-axes", "format_coord-row-col-all-axes",
                      "one-visible-figure-window", "host-root-not-visible",
-                     "zoom-links-siblings-no-exception"):
+                     "zoom-links-siblings-relative",
+                     "zoom-reset-restores-each-own-extent"):
             check(name, False)
 
     # ---- open a SECOND figure: it must REPLACE the first -----------------

@@ -101,30 +101,70 @@ class LinkGroup(object):
     ``on_lim_changed`` makes a zoom/pan on any member crop every sibling.
     ``set_xlim(..., emit=False)`` plus the ``_busy`` guard prevent the
     callback storm / infinite recursion that naive linking causes.
+
+    Propagation is RELATIVE, not absolute: each axis' full (base) data
+    limits are captured at construction, and a change is mapped to the same
+    *fraction* of every sibling's OWN base range.  This matters when the
+    subplots hold images of DIFFERENT matrix sizes (hence different
+    extents): copying absolute data limits would crop a 100-row sibling to a
+    64-row axis' range, and -- worse -- the toolbar Home/reset fires this
+    callback per axis, so an absolute copy made every subplot inherit the
+    last-reset axis' extent (displayed at the wrong matrix size).  With
+    relative mapping a zoom to "the top-left quarter of A" becomes the
+    top-left quarter of each sibling, and a reset (A back to its full base ->
+    fraction 0..1) returns every sibling to ITS OWN full base.
     """
 
     def __init__(self, axes):
         self.axes = list(axes)
         self._busy = False
+        # Base (full) limits per axis, keyed by id(); the fraction reference
+        # and the reset target.  Captured now, before any user zoom, so it is
+        # the original extent-derived view (== the toolbar's Home view).
+        self._base = {}
+        for ax in self.axes:
+            self._base[id(ax)] = (ax.get_xlim(), ax.get_ylim())
+
+    @staticmethod
+    def _fractions(base, cur):
+        """Return CUR as (lo, hi) fractions of the BASE (b0, b1) range."""
+        b0, b1 = base
+        span = b1 - b0
+        if span == 0:
+            return (0.0, 1.0)
+        return ((cur[0] - b0) / span, (cur[1] - b0) / span)
+
+    @staticmethod
+    def _apply(base, frac):
+        """Map FRAC (lo, hi) back onto the BASE (b0, b1) range."""
+        b0, b1 = base
+        span = b1 - b0
+        return (b0 + frac[0] * span, b0 + frac[1] * span)
 
     def on_lim_changed(self, changed_ax):
-        """Copy CHANGED_AX's limits onto every sibling; return those siblings.
+        """Crop every sibling to CHANGED_AX's RELATIVE view; return them.
 
         A re-entrant call (while a propagation is in flight) is a no-op that
         returns ``[]`` -- this is the recursion guard.
         """
         if self._busy:
             return []
+        src_base = self._base.get(id(changed_ax))
+        if src_base is None:
+            return []
         self._busy = True
         propagated = []
         try:
-            xlim = changed_ax.get_xlim()
-            ylim = changed_ax.get_ylim()
+            fx = self._fractions(src_base[0], changed_ax.get_xlim())
+            fy = self._fractions(src_base[1], changed_ax.get_ylim())
             for ax in self.axes:
                 if ax is changed_ax:
                     continue
-                ax.set_xlim(xlim, emit=False)
-                ax.set_ylim(ylim, emit=False)
+                base = self._base.get(id(ax))
+                if base is None:
+                    continue
+                ax.set_xlim(self._apply(base[0], fx), emit=False)
+                ax.set_ylim(self._apply(base[1], fy), emit=False)
                 propagated.append(ax)
         finally:
             self._busy = False
@@ -627,23 +667,40 @@ def _selfcheck():
             self.calls.append(("y", lim, emit))
             self.yl = lim
 
-    a = FakeAx(xl=(5, 10), yl=(2, 8))
-    b = FakeAx()
-    c = FakeAx()
-    group = LinkGroup([a, b, c])
+    # Linked zoom across subplots of DIFFERENT matrix sizes (the bug):
+    # `a' spans 0..64 (a 64-wide/high image), `b' spans 0..100 (a 100-wide/
+    # high image), y inverted for origin='upper'.  Propagation must be
+    # RELATIVE to each axis' own base, and a reset must return each sibling
+    # to ITS OWN base -- not inherit the reset axis' extent.
+    a = FakeAx(xl=(0.0, 64.0), yl=(64.0, 0.0))
+    b = FakeAx(xl=(0.0, 100.0), yl=(100.0, 0.0))
+    group = LinkGroup([a, b])                 # captures per-axis base here
+    # Zoom `a' to its top-left quarter: cols 0..16, rows 0..16 of 64.
+    a.xl = (0.0, 16.0)
+    a.yl = (16.0, 0.0)
     propagated = group.on_lim_changed(a)
-    check("link-siblings", set(id(x) for x in propagated) == set([id(b), id(c)]))
+    check("link-siblings", propagated == [b])
     check("link-not-self", a not in propagated)
-    check("link-copies", b.xl == (5, 10) and b.yl == (2, 8))
+    # `b' must crop to the SAME RELATIVE region of ITS base: 0..25 of 100.
+    check("link-relative-x", b.xl == (0.0, 25.0))
+    check("link-relative-y", b.yl == (25.0, 0.0))
     check("link-emit-false", all(call[2] is False for call in b.calls))
     check("link-no-self-mutation", a.calls == [])
+    # Reset `a' to its full base -> `b' must return to ITS OWN full base
+    # (0..100), NOT to `a''s 0..64.  This is the zoom-then-reset bug.
+    b.calls = []
+    a.xl = (0.0, 64.0)
+    a.yl = (64.0, 0.0)
+    group.on_lim_changed(a)
+    check("link-reset-own-base-x", b.xl == (0.0, 100.0))
+    check("link-reset-own-base-y", b.yl == (100.0, 0.0))
 
     # Recursion guard: a re-entrant call is a no-op returning [].
     group._busy = True
     check("link-guard", group.on_lim_changed(a) == [])
     group._busy = False
 
-    total = 21
+    total = 22
     if failures:
         sys.stderr.write("SELFCHECK FAILED (%d/%d): %s\n"
                          % (len(failures), total, ", ".join(failures)))

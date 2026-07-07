@@ -934,6 +934,24 @@ Rows:
       extended: `test_viewer_gui.py` now forces `new_figure_manager_given_figure`
       to raise and asserts the fallback yields one manager bound to the figure
       with zero `MatplotlibDeprecationWarning` (GUI 17/17 on `:0`).
+- [x] sha=1490a8b W8.11 linked-zoom field-bug fix — when subplots held
+      images of DIFFERENT matrix sizes, zooming then RESETting (toolbar Home)
+      left a subplot displayed at the wrong matrix size.  Root cause:
+      `LinkGroup` propagated ABSOLUTE data limits (`ax.set_xlim(xlim)`) across
+      siblings.  On reset, matplotlib restores each axis and each restore fires
+      the linked callback, so siblings were clobbered with the reset axis'
+      limits instead of their own — with the per-axis callback storm the
+      last-reset axis' extent won for every subplot.  Invisible for equal-sized
+      subplots (all bases identical); for a different-sized one it showed the
+      wrong extent.  Fix: `LinkGroup` now captures each axis' full base limits
+      at construction and propagates RELATIVE (fractional) views — a zoom to a
+      fraction of the changed axis maps to the same fraction of every sibling's
+      OWN base, so a reset (fraction 0..1) returns each sibling to its own full
+      extent.  Guards: headless `--selfcheck` LinkGroup case rewritten to
+      different-size axes asserting relative crop AND own-base reset (22
+      checks); `test_viewer_gui.py` now builds subplots of shapes
+      (3,4)/(5,6)/(7,8) and asserts `zoom-links-siblings-relative` +
+      `zoom-reset-restores-each-own-extent` (GUI 18/18 on `:0`).  ERT 405/405.
 
 Hard rules for W8:
 - ZERO per-remote install.  No remote filesystem writes.  The only remote
