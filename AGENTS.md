@@ -131,18 +131,17 @@ the load-bearing constraints every agent must respect.
   better shape over a compat shim. Do not add deprecation aliases.
 - The remote kernel outlives Emacs. Only the explicit user commands
   `emacs-jupyter-notebook-shutdown-kernel`,
-  `emacs-jupyter-notebook-cleanup-remote-cache` (the destructive
-  per-profile nuke, renamed from the former `clean-orphaned-kernels` in
-  W11), and `emacs-jupyter-notebook-retry-fresh-kernel` may terminate it
-  from Emacs. `retry-fresh-kernel` is included because its whole purpose is
-  to replace the current kernel with a fresh one; it is an explicit user
-  gesture guarded by `y-or-n-p` (W6.4). No automatic cleanup from
+  `emacs-jupyter-notebook-clean-orphaned-kernels`, and
+  `emacs-jupyter-notebook-retry-fresh-kernel` may terminate it.
+  `retry-fresh-kernel` is included because its whole purpose is to replace
+  the current kernel with a fresh one; it is an explicit user gesture
+  guarded by `y-or-n-p` (W6.4). No automatic cleanup from
   `kill-buffer-hook`, `kill-emacs-hook`, mode-disable, or async failure
-  paths. W11 exception (user-approved): each kernel carries an injected
-  in-memory idle watchdog that self-reaps the kernel after
+  paths. W11 exception (user-approved): each kernel also carries an
+  injected in-memory idle watchdog that self-reaps the kernel after
   `emacs-jupyter-notebook-kernel-idle-timeout` of inactivity (never while
-  busy); `clean-orphaned-kernels` is now the NON-DESTRUCTIVE registry prune
-  (drops entries for confirmed-dead kernels; never kills a live one).
+  busy). `emacs-jupyter-notebook-prune-dead-kernels` only removes registry
+  entries for confirmed-dead kernels and never kills a live one.
 - Single buffer per kernel for now. Multi-buffer sharing of a single remote
   kernel is out of scope until explicitly opened by a future workstream.
 - The registry is the durable truth. Local state may be freely torn down; the

@@ -1512,10 +1512,7 @@ before that point should NOT create a stray registry row."
       (should (equal displayed '("*ejn-remote-processes*" "ps output")))
       (should (string-match-p "ps -eo" (car (last argv)))))))
 
-(ert-deftest ejn-cleanup-remote-cache-runs-cleanup-all-command ()
-  ;; W11: the destructive per-profile nuke was renamed from the former
-  ;; `clean-orphaned-kernels' to `cleanup-remote-cache'; the old name now
-  ;; performs the non-destructive registry prune.
+(ert-deftest ejn-clean-orphaned-kernels-runs-cleanup-all-command ()
   (let (argv message-text)
     (cl-letf (((symbol-function 'emacs-jupyter-notebook--read-host-profile)
                (lambda (_profile)
@@ -1527,7 +1524,7 @@ before that point should NOT create a stray registry row."
               ((symbol-function 'message)
                (lambda (format-string &rest args)
                  (setq message-text (apply #'format format-string args)))))
-      (emacs-jupyter-notebook-cleanup-remote-cache "p")
+      (emacs-jupyter-notebook-clean-orphaned-kernels "p")
       (should (string-match-p "pkill -f" (car (last argv))))
       (should (string-match-p "requested remote orphan cleanup" message-text)))))
 
@@ -5151,8 +5148,8 @@ and the existing ExitOnForwardFailure option must still be present."
                 #'emacs-jupyter-notebook-list-remote-processes))
     (should (eq (lookup-key map (kbd "w"))
                 #'emacs-jupyter-notebook-clean-orphaned-kernels))
-    (should (eq (lookup-key map (kbd "W"))
-                #'emacs-jupyter-notebook-cleanup-remote-cache))
+    (should (eq (lookup-key map (kbd "P"))
+                #'emacs-jupyter-notebook-prune-dead-kernels))
     (should (eq (lookup-key map (kbd "n"))
                 #'emacs-jupyter-notebook-forward-cell))
     (should (eq (lookup-key map (kbd "p"))
@@ -5707,8 +5704,8 @@ callback(nil) -> `--async-connect-finalize' seam."
       (should-not cleanup-called)
       (should-not start-called))))
 
-(ert-deftest ejn-w6.4-cleanup-remote-cache-interactive-prompts ()
-  "W6.4: interactive `cleanup-remote-cache' prompts and aborts on no."
+(ert-deftest ejn-w6.4-clean-orphaned-kernels-interactive-prompts ()
+  "W6.4: interactive `clean-orphaned-kernels' prompts and aborts on no."
   (let (asked ran)
     (cl-letf (((symbol-function 'emacs-jupyter-notebook--read-profile-name)
                (lambda () "p"))
@@ -5719,12 +5716,12 @@ callback(nil) -> `--async-connect-finalize' seam."
                (lambda (_p) (setq asked t) nil))
               ((symbol-function 'emacs-jupyter-notebook-ssh-run-command)
                (lambda (_argv) (setq ran t) "")))
-      (call-interactively #'emacs-jupyter-notebook-cleanup-remote-cache)
+      (call-interactively #'emacs-jupyter-notebook-clean-orphaned-kernels)
       (should asked)
       (should-not ran))))
 
-(ert-deftest ejn-w6.4-cleanup-remote-cache-with-c-u-skips-prompt ()
-  "W6.4: interactive `cleanup-remote-cache' with C-u skips the prompt."
+(ert-deftest ejn-w6.4-clean-orphaned-kernels-with-c-u-skips-prompt ()
+  "W6.4: interactive `clean-orphaned-kernels' with C-u skips the prompt."
   (let (asked ran)
     (cl-letf (((symbol-function 'emacs-jupyter-notebook--read-profile-name)
                (lambda () "p"))
@@ -5736,7 +5733,7 @@ callback(nil) -> `--async-connect-finalize' seam."
               ((symbol-function 'emacs-jupyter-notebook-ssh-run-command)
                (lambda (_argv) (setq ran t) "")))
       (let ((current-prefix-arg '(4)))
-        (call-interactively #'emacs-jupyter-notebook-cleanup-remote-cache))
+        (call-interactively #'emacs-jupyter-notebook-clean-orphaned-kernels))
       (should-not asked)
       (should ran))))
 
@@ -6940,7 +6937,7 @@ prune."
         ;; No dead entries → the file is never rewritten.
         (should-not save-called)))))
 
-(ert-deftest ejn-w11-clean-orphaned-kernels-messages-summary ()
+(ert-deftest ejn-w11-prune-dead-kernels-messages-summary ()
   "W11: the command prunes and reports pruned/live counts."
   (let* ((live (ejn-w11--entry "live" "100" "up.example"))
          (dead (ejn-w11--entry "dead" "200" "up.example"))
@@ -6957,18 +6954,18 @@ prune."
                  (lambda (_kept &optional _file) nil))
                 ((symbol-function 'message)
                  (lambda (fmt &rest args) (setq msg (apply #'format fmt args)))))
-        (call-interactively #'emacs-jupyter-notebook-clean-orphaned-kernels)
+        (call-interactively #'emacs-jupyter-notebook-prune-dead-kernels)
         (should (string-match-p "pruned 1 dead" msg))
         (should (string-match-p "1 live remain" msg))))))
 
-(ert-deftest ejn-w11-clean-orphaned-kernels-empty-registry ()
+(ert-deftest ejn-w11-prune-dead-kernels-empty-registry ()
   "W11: with an empty registry the command reports nothing to prune."
   (let ((msg nil))
     (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
                (lambda (&optional _file) nil))
               ((symbol-function 'message)
                (lambda (fmt &rest args) (setq msg (apply #'format fmt args)))))
-      (call-interactively #'emacs-jupyter-notebook-clean-orphaned-kernels)
+      (call-interactively #'emacs-jupyter-notebook-prune-dead-kernels)
       (should (string-match-p "registry is empty" msg)))))
 
 (ert-deftest ejn-w11-picker-excludes-dead-entries ()

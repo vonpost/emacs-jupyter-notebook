@@ -103,19 +103,20 @@ These are binding for every workstream. Update only by appending a new entry.
   `executing` flag stays True for the whole duration of a cell — even one that
   runs for hours — so a long-running computation can never trip the idle test.
   So abandoned kernels reap themselves even if Emacs crashed.
-- **2026-07-07 / `clean-orphaned-kernels` is a non-destructive registry prune
-  (W11).** Supersedes the naming in the 2026-06-28 / 2026-07-01 terminator
-  entries.  `clean-orphaned-kernels` and the reconnect picker now prune
-  registry entries whose remote kernel is CONFIRMED DEAD (one bounded ssh per
-  host reporting which recorded PIDs are still alive); they are NON-DESTRUCTIVE
-  toward live kernels in this workstream — an unreachable host, a probe error,
-  or an entry without a recorded PID is treated as UNKNOWN and is never pruned,
-  and no running kernel is ever killed.  The former destructive per-profile
-  nuke (kill every kernel in a profile's cache dir + delete its files) was
-  renamed to `emacs-jupyter-notebook-cleanup-remote-cache`, which remains an
-  explicit allowed terminator.  The full allowed-terminators list is now:
-  `shutdown-kernel`, `cleanup-remote-cache`, `retry-fresh-kernel`, plus the
-  injected idle watchdog's self-shutdown.
+- **2026-07-07 / `prune-dead-kernels` prunes dead registry entries
+  (W11).** A NEW, non-destructive command
+  `emacs-jupyter-notebook-prune-dead-kernels` (and the reconnect picker)
+  prune registry entries whose remote kernel is CONFIRMED DEAD (one bounded ssh
+  per host reporting which recorded PIDs are still alive).  NON-DESTRUCTIVE
+  toward live kernels — an unreachable host, a probe error, or an entry without
+  a recorded PID is treated as UNKNOWN and is never pruned, and no running
+  kernel is ever killed.  This is additive: `clean-orphaned-kernels` is
+  UNCHANGED — it remains the destructive per-profile remote nuke (kill every
+  kernel in a profile's cache dir + delete its files) and stays an explicit
+  allowed terminator (`shutdown-kernel`, `clean-orphaned-kernels`,
+  `retry-fresh-kernel`, plus the injected idle watchdog's self-shutdown).
+  `prune-dead-kernels` is bound to `P` in the prefix map (`p` is already
+  `backward-cell`); `w` still runs `clean-orphaned-kernels`.
 
 ## Cross-cutting changes
 
@@ -995,15 +996,15 @@ subplot crops all siblings, killing Emacs reaps the viewer.
       kernel is never killed.  Wired into the reconnect picker
       (`--read-registry-entry` drops confirmed-dead entries from both the choices
       and the durable registry, guarded so a flaky probe falls back to showing
-      all entries) and the interactive `clean-orphaned-kernels`, which is now
-      the NON-DESTRUCTIVE prune ("pruned N dead kernel entries; M live remain").
-      The former destructive per-profile nuke was RENAMED to
-      `emacs-jupyter-notebook-cleanup-remote-cache` (still an explicit allowed
-      terminator; `w` now runs the prune, `W` the nuke).  Per the "no backwards
-      compatibility" rule, no alias is kept.  DESIGN DECISIONS appended
+      all entries) and a NEW interactive command
+      `emacs-jupyter-notebook-prune-dead-kernels` ("pruned N dead kernel
+      entries; M live remain"), bound to `P` (`p` is already `backward-cell`).
+      The existing destructive `clean-orphaned-kernels` (per-profile nuke on
+      `w`) is UNCHANGED and remains an explicit allowed terminator — the prune
+      is purely additive.  DESIGN DECISIONS appended
       (2026-07-07): the idle self-reap as a user-approved exception to "remote
-      kernel outlives Emacs"; and `clean-orphaned-kernels` as a non-destructive
-      registry prune with the terminator list updated.  Async note: the picker/
+      kernel outlives Emacs"; and `prune-dead-kernels` as a non-destructive
+      dead-entry prune.  Async note: the picker/
       command run a bounded, per-host synchronous ssh probe — acceptable because
       it is one ssh per host with a hard ConnectTimeout, matching the existing
       reconnect flow's synchronous-ish ssh; the timeout caps worst-case stall.
@@ -1017,8 +1018,9 @@ subplot crops all siblings, killing Emacs reaps the viewer.
       prune); unreachable-only host prunes nothing and never rewrites the file;
       command messages the pruned/live summary; empty registry reports nothing
       to prune; picker excludes dead ghosts and drops them from the registry.
-      The three former destructive-command tests were repointed to
-      `cleanup-remote-cache`; the keymap test pins `w`→prune and `W`→nuke.
+      The existing destructive-command tests are unchanged (still
+      `clean-orphaned-kernels`); the keymap test pins `w`→clean-orphaned-kernels
+      and `P`→prune-dead-kernels.
       VERIFICATION: `Ran 405 tests, 405 results as expected, 0 unexpected,
       1 expected failures` (CC1); byte-compile adds no new warnings (only the
       two pre-existing `evil-visual-beginning`/`-end` free-variable refs).

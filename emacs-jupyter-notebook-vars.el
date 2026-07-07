@@ -338,7 +338,7 @@ entirely (nothing is injected)."
 
 (defcustom emacs-jupyter-notebook-prune-ssh-timeout 5
   "Bounded SSH `ConnectTimeout' (seconds) for the W11 liveness probe.
-The non-destructive registry prune (`clean-orphaned-kernels' and the
+The non-destructive registry prune (`prune-dead-kernels' and the
 reconnect picker) runs ONE ssh per host to ask which recorded kernel PIDs
 are still alive.  This caps how long an unreachable host can stall Emacs;
 a host that does not answer within the timeout is treated as UNKNOWN and

@@ -778,10 +778,10 @@ All command bindings live under `emacs-jupyter-notebook-prefix-key'
     (define-key map (kbd "TAB")  #'emacs-jupyter-notebook-complete-at-point)
     (define-key map (kbd "v")    #'emacs-jupyter-notebook-fetch-remote-log)
     (define-key map (kbd "q")    #'emacs-jupyter-notebook-list-remote-processes)
-    ;; W11: `w' now prunes dead registry entries (non-destructive); the
-    ;; destructive per-profile remote nuke moved to `W'.
     (define-key map (kbd "w")    #'emacs-jupyter-notebook-clean-orphaned-kernels)
-    (define-key map (kbd "W")    #'emacs-jupyter-notebook-cleanup-remote-cache)
+    ;; W11: non-destructive prune of dead registry entries.  (`p' is already
+    ;; taken by `backward-cell', so the prune lives on `P'.)
+    (define-key map (kbd "P")    #'emacs-jupyter-notebook-prune-dead-kernels)
     (define-key map (kbd "n")    #'emacs-jupyter-notebook-forward-cell)
     (define-key map (kbd "p")    #'emacs-jupyter-notebook-backward-cell)
     (define-key map (kbd "%")    emacs-jupyter-notebook-cell-map)
@@ -2033,9 +2033,8 @@ On failure, call ERROR-CALLBACK with (context error-data)."
    (t
     ;; W4.8: when reconnect to a known registry entry fails (including the
     ;; W4.4 dead-PID case) we MUST NOT auto-remove the entry or auto-start
-    ;; a fresh kernel — only the explicit user commands `shutdown-kernel' /
-    ;; `cleanup-remote-cache' may terminate and only the explicit
-    ;; `clean-orphaned-kernels' prune (W11) may deregister.  Surface
+    ;; a fresh kernel — only the explicit user commands `shutdown-kernel'
+    ;; and `clean-orphaned-kernels' may terminate / deregister.  Surface
     ;; the error to the caller; the message produced by `--async-fail'
     ;; (W4.3 / W4.4) already points the user at `start-remote-kernel'.
     (if-let ((entry (emacs-jupyter-notebook--current-file-registry-entry)))
@@ -2993,17 +2992,16 @@ After each append the buffer is truncated to
      (emacs-jupyter-notebook-ssh-run-command
       (emacs-jupyter-notebook-ssh-build-remote-ps-command profile)))))
 
-(defun emacs-jupyter-notebook-clean-orphaned-kernels ()
+(defun emacs-jupyter-notebook-prune-dead-kernels ()
   "Prune registry entries whose remote kernel is confirmed DEAD.  W11(B).
 NON-DESTRUCTIVE: this NEVER terminates a running kernel.  It loads the
 durable registry, probes liveness one ssh per host (bounded — an
 unreachable host is treated as UNKNOWN and left alone), removes only the
 entries whose PID a host positively reported gone, and messages a summary.
 
-For the destructive per-profile remote nuke (kill every kernel in a
-profile's cache dir and delete its files), see
-`emacs-jupyter-notebook-cleanup-remote-cache' — that command remains the
-explicit terminator; this one only tidies the local registry."
+This only tidies the local registry.  For the destructive per-profile
+remote nuke (kill every kernel in a profile's cache dir and delete its
+files) see `emacs-jupyter-notebook-clean-orphaned-kernels'."
   (interactive)
   (let ((entries (emacs-jupyter-notebook-registry-load)))
     (if (not entries)
@@ -3016,14 +3014,8 @@ explicit terminator; this one only tidies the local registry."
                  pruned (if (= pruned 1) "y" "ies") alive
                  (if (> unknown 0) (format " (%d unverified)" unknown) ""))))))
 
-(defun emacs-jupyter-notebook-cleanup-remote-cache (&optional profile-name force)
+(defun emacs-jupyter-notebook-clean-orphaned-kernels (&optional profile-name force)
   "Clean all EJN kernel files and processes in PROFILE-NAME's remote cache.
-This is DESTRUCTIVE: it `pkill's every kernel launched into the profile's
-cache dir and deletes the cache files, so it is one of the explicit
-allowed terminators of the remote kernel.  (Renamed from the former
-`clean-orphaned-kernels', which W11 repurposed for the non-destructive
-registry prune.)
-
 W6.4: when called interactively, ask `y-or-n-p' before issuing the
 remote cleanup; a \\[universal-argument] FORCE prefix skips the prompt.
 Lisp callers do not see the prompt and proceed unconditionally."
