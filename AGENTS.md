@@ -137,7 +137,11 @@ the load-bearing constraints every agent must respect.
   the current kernel with a fresh one; it is an explicit user gesture
   guarded by `y-or-n-p` (W6.4). No automatic cleanup from
   `kill-buffer-hook`, `kill-emacs-hook`, mode-disable, or async failure
-  paths.
+  paths. W11 exception (user-approved): each kernel also carries an
+  injected in-memory idle watchdog that self-reaps the kernel after
+  `emacs-jupyter-notebook-kernel-idle-timeout` of inactivity (never while
+  busy). `emacs-jupyter-notebook-prune-dead-kernels` only removes registry
+  entries for confirmed-dead kernels and never kills a live one.
 - Single buffer per kernel for now. Multi-buffer sharing of a single remote
   kernel is out of scope until explicitly opened by a future workstream.
 - The registry is the durable truth. Local state may be freely torn down; the

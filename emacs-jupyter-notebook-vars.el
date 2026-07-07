@@ -320,6 +320,32 @@ forever.  Set to 0 to disable the idle self-exit."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
+(defcustom emacs-jupyter-notebook-kernel-idle-timeout 14400
+  "Seconds a remote kernel may sit idle before it self-reaps (W11).
+On connect (and re-run on restart) Emacs injects an in-memory idle
+watchdog into the kernel: a daemon thread that shuts the kernel down once
+it has been idle for longer than this many seconds.  This is the
+self-reaping half of the W11 kernel-lifecycle work — abandoned kernels
+reap themselves even if Emacs crashed, so remote kernels stop
+accumulating.
+
+The watchdog NEVER reaps a busy kernel: a cell that runs for hours keeps
+the kernel marked executing for its whole duration and is not counted as
+idle.  The default is 14400 (4 hours).  Set to 0 to disable the watchdog
+entirely (nothing is injected)."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-prune-ssh-timeout 5
+  "Bounded SSH `ConnectTimeout' (seconds) for the W11 liveness probe.
+The non-destructive registry prune (`prune-dead-kernels' and the
+reconnect picker) runs ONE ssh per host to ask which recorded kernel PIDs
+are still alive.  This caps how long an unreachable host can stall Emacs;
+a host that does not answer within the timeout is treated as UNKNOWN and
+its entries are NEVER pruned."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
 (defcustom emacs-jupyter-notebook-viewer-auto-open nil
   "When non-nil, automatically open every pickled figure in the local viewer.
 By default figures open on demand (`C-c j I', or `v' on a panel entry).
