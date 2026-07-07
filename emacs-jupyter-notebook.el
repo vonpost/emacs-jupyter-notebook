@@ -151,6 +151,142 @@ connect or restart."
           'viewer-inject "formatter injection failed: %s"
           (error-message-string err)))))))
 
+;;; W11 — self-reaping idle kernels (injected in-memory watchdog)
+;;
+;; Motivation: remote kernels are `nohup'-ed and deliberately outlive Emacs,
+;; so an Emacs crash or a forgotten buffer leaves a kernel running forever.
+;; Over time these accumulate.  W11(A) injects a ZERO-INSTALL idle watchdog
+;; (nothing written to the remote FS, only stdlib + get_ipython) that shuts
+;; the kernel down after `emacs-jupyter-notebook-kernel-idle-timeout' seconds
+;; of inactivity, so abandoned kernels reap themselves.
+;;
+;; Injection mirrors the W8 formatter exactly: a defconst Python template
+;; sent through the mockable silent-execute adapter at the same two sites
+;; (connect-finalize and restart-kernel), idempotency-guarded so reconnect /
+;; restart never stacks a second watchdog thread.
+;;
+;; CRITICAL correctness point (a long-running cell must NOT be reaped):
+;; the watchdog flips an `executing' flag True on `pre_run_cell' and back to
+;; False on `post_run_cell'.  Because that flag stays True for the whole
+;; duration of a cell — even one that runs for hours — the "not currently
+;; executing" guard in the poll loop means a busy kernel can never trip the
+;; idle test.  Only after the cell finishes does the idle clock (bumped at
+;; both edges) start counting toward the timeout.
+
+(defconst emacs-jupyter-notebook--kernel-idle-watchdog-snippet
+  "\
+try:
+    import threading as _ejn_wd_th, time as _ejn_wd_time, os as _ejn_wd_os, signal as _ejn_wd_sig
+    _ejn_wd_ip = get_ipython()
+except Exception:
+    _ejn_wd_ip = None
+if _ejn_wd_ip is not None:
+    try:
+        _EJN_WD_TIMEOUT = %d
+        # Idempotency guard: never stack a second watchdog thread when this
+        # snippet is re-injected on reconnect.  The flag lives on the
+        # IPython instance, so a restart (which builds a fresh instance and
+        # wipes the namespace) correctly re-installs a new watchdog.
+        if _EJN_WD_TIMEOUT > 0 and not getattr(_ejn_wd_ip, '_ejn_watchdog_installed', False):
+            # Shared state.  `executing' is True ONLY between a cell's
+            # pre_run_cell and its post_run_cell; a cell that runs for hours
+            # keeps it True the whole time, so the loop below can never reap a
+            # busy kernel.  `last' (last activity) is bumped at both edges so
+            # the idle clock only starts once the last cell has finished.
+            _ejn_wd_state = {'last': _ejn_wd_time.time(), 'executing': False}
+            def _ejn_wd_pre(*_a, **_k):
+                _ejn_wd_state['executing'] = True
+                _ejn_wd_state['last'] = _ejn_wd_time.time()
+            def _ejn_wd_post(*_a, **_k):
+                _ejn_wd_state['executing'] = False
+                _ejn_wd_state['last'] = _ejn_wd_time.time()
+            try:
+                _ejn_wd_ip.events.register('pre_run_cell', _ejn_wd_pre)
+                _ejn_wd_ip.events.register('post_run_cell', _ejn_wd_post)
+            except Exception:
+                pass
+            # Wake ~10x per idle window, clamped to [1s, 60s].  For the 4h
+            # default this polls once a minute; a tiny timeout (tests / smoke)
+            # polls about once a second.
+            _ejn_wd_interval = min(60.0, max(1.0, _EJN_WD_TIMEOUT / 10.0))
+            def _ejn_wd_loop():
+                while True:
+                    _ejn_wd_time.sleep(_ejn_wd_interval)
+                    try:
+                        # Never reap a busy kernel: skip while a cell runs.
+                        if _ejn_wd_state['executing']:
+                            continue
+                        if (_ejn_wd_time.time() - _ejn_wd_state['last']) > _EJN_WD_TIMEOUT:
+                            try:
+                                _ejn_wd_os.write(
+                                    2,
+                                    b'[ejn] idle watchdog: kernel idle beyond timeout; self-shutting down\\n')
+                            except Exception:
+                                pass
+                            # Prefer a clean termination via SIGTERM so the
+                            # kernel process exits normally.  os._exit(0) is a
+                            # last resort if the signal was swallowed.
+                            try:
+                                _ejn_wd_os.kill(_ejn_wd_os.getpid(), _ejn_wd_sig.SIGTERM)
+                            except Exception:
+                                pass
+                            _ejn_wd_time.sleep(5.0)
+                            try:
+                                _ejn_wd_os._exit(0)
+                            except Exception:
+                                pass
+                            return
+                    except Exception:
+                        # A transient error in the loop must never crash the
+                        # kernel; keep polling.
+                        pass
+            _ejn_wd_thread = _ejn_wd_th.Thread(
+                target=_ejn_wd_loop, name='ejn-idle-watchdog', daemon=True)
+            _ejn_wd_thread.start()
+            _ejn_wd_ip._ejn_watchdog_installed = True
+    except Exception:
+        pass
+"
+  "In-memory Python template for the W11 self-reaping idle watchdog.
+Contains a single `%d' placeholder for the configured idle timeout in
+seconds; `emacs-jupyter-notebook--inject-idle-watchdog' formats the value
+in before sending it through the silent-execute adapter.
+
+Starts ONE daemon thread that periodically checks whether the kernel has
+been idle longer than the timeout AND is not currently executing a cell,
+and if so shuts the kernel down with `os.kill(getpid, SIGTERM)' (with
+`os._exit(0)' as a last-resort fallback).  Activity and executing-state
+are tracked via the IPython `pre_run_cell' / `post_run_cell' events, so a
+long-running cell is never reaped.  Idempotent (guarded by the
+`_ejn_watchdog_installed' flag on the IPython instance) and fully wrapped
+so any failure to install is a silent no-op that never breaks the user's
+session.  Imports only stdlib (threading, time, os, signal) plus
+`get_ipython'; writes nothing to the remote filesystem.")
+
+(defun emacs-jupyter-notebook--inject-idle-watchdog (&optional client)
+  "Inject the W11 self-reaping idle watchdog into the kernel session.
+Sends `emacs-jupyter-notebook--kernel-idle-watchdog-snippet' (with the
+configured `emacs-jupyter-notebook-kernel-idle-timeout' formatted in)
+through the silent-execute adapter.  Uses CLIENT when given, else the
+buffer-local client.  A no-op when there is no client OR when the timeout
+is 0 (the watchdog is disabled: nothing is injected).  The snippet is
+idempotent, so re-running on restart is safe.  Failures are swallowed and
+logged; watchdog injection must never break a connect or restart."
+  (let ((client (or client emacs-jupyter-notebook--client))
+        (timeout emacs-jupyter-notebook-kernel-idle-timeout))
+    (when (and client (integerp timeout) (> timeout 0))
+      (condition-case err
+          (progn
+            (emacs-jupyter-notebook-jupyter-execute-silent
+             client
+             (format emacs-jupyter-notebook--kernel-idle-watchdog-snippet timeout))
+            (emacs-jupyter-notebook--log-append
+             'kernel-watchdog "injected idle watchdog (timeout=%ss)" timeout))
+        (error
+         (emacs-jupyter-notebook--log-append
+          'kernel-watchdog "idle watchdog injection failed: %s"
+          (error-message-string err)))))))
+
 ;;; W8.5 — open a stashed figure interactively in the local viewer
 
 (defvar emacs-jupyter-notebook--viewer-support-cache nil
@@ -642,7 +778,10 @@ All command bindings live under `emacs-jupyter-notebook-prefix-key'
     (define-key map (kbd "TAB")  #'emacs-jupyter-notebook-complete-at-point)
     (define-key map (kbd "v")    #'emacs-jupyter-notebook-fetch-remote-log)
     (define-key map (kbd "q")    #'emacs-jupyter-notebook-list-remote-processes)
+    ;; W11: `w' now prunes dead registry entries (non-destructive); the
+    ;; destructive per-profile remote nuke moved to `W'.
     (define-key map (kbd "w")    #'emacs-jupyter-notebook-clean-orphaned-kernels)
+    (define-key map (kbd "W")    #'emacs-jupyter-notebook-cleanup-remote-cache)
     (define-key map (kbd "n")    #'emacs-jupyter-notebook-forward-cell)
     (define-key map (kbd "p")    #'emacs-jupyter-notebook-backward-cell)
     (define-key map (kbd "%")    emacs-jupyter-notebook-cell-map)
@@ -1025,29 +1164,181 @@ spurious numbers in an SSH banner or MOTD cannot poison the parse."
           (or (plist-get entry :profile) "")
           (or (plist-get entry :session-id) "")))
 
+;;; W11 (B) — non-destructive prune of dead registry entries
+;;
+;; Ghost kernels: the reconnect picker used to list every registry entry,
+;; including ones whose remote kernel is long gone.  W11(B) probes liveness
+;; per host and drops entries whose PID a host CONFIRMED dead.  It is strictly
+;; NON-DESTRUCTIVE: it never kills a live kernel and never prunes an entry the
+;; host could not vouch for.  An entry is only removed on a positive "this PID
+;; is gone" answer; an unreachable host, a probe error, or a pre-W4.2 entry
+;; without a recorded PID all stay UNKNOWN and are kept.
+
+(defun emacs-jupyter-notebook--probe-host-alive-pids (profile pids)
+  "Run ONE bounded ssh on PROFILE's host to learn which of PIDS are alive.
+Return a plist (:answered BOOL :alive (PID...)).  The default backing the
+W11 liveness probe (see `emacs-jupyter-notebook--liveness-probe-function').
+An unreachable host, a timeout, or any ssh error yields
+`(:answered nil :alive nil)' so its entries are treated as UNKNOWN — the
+prune never removes an entry a host did not positively disown."
+  (condition-case _err
+      (let* ((argv (emacs-jupyter-notebook-ssh-build-batch-pid-alive profile pids))
+             (output (emacs-jupyter-notebook-ssh-run-command argv)))
+        (if (not (string-match-p "__EJN_DONE__" output))
+            ;; No sentinel: the host did not really answer the probe.
+            (list :answered nil :alive nil)
+          (let ((alive nil))
+            (dolist (pid pids)
+              (when (string-match-p
+                     (format "^%s$" (regexp-quote (format "%s" pid)))
+                     output)
+                (push pid alive)))
+            (list :answered t :alive (nreverse alive)))))
+    (error (list :answered nil :alive nil))))
+
+(defvar emacs-jupyter-notebook--liveness-probe-function
+  #'emacs-jupyter-notebook--probe-host-alive-pids
+  "Function (PROFILE PIDS) -> plist for the W11 per-host liveness probe.
+The plist is (:answered BOOL :alive (PID...)): `:answered' nil means the
+host did not respond (connection failure / timeout) so ALL its PIDs are
+UNKNOWN and must not be pruned; when `:answered' is t, `:alive' lists the
+PIDs the host confirmed still running.  Overridable so tests can supply a
+deterministic mock without any real ssh.")
+
+(defun emacs-jupyter-notebook--classify-registry-liveness (entries &optional probe-fn)
+  "Classify ENTRIES by remote-kernel liveness.  W11.
+Return an alist mapping each ENTRY (by `eq') to a status symbol: `alive',
+`dead', or `unknown'.  Entries are grouped by ssh-destination so each host
+is probed with a SINGLE ssh via PROBE-FN (default
+`emacs-jupyter-notebook--liveness-probe-function').  Entries without a
+recorded `:remote-pid', entries whose profile has no resolvable
+destination, and every entry on a host that did not answer are `unknown'
+and are never pruned; only a host-confirmed-gone PID yields `dead'."
+  (let ((probe-fn (or probe-fn emacs-jupyter-notebook--liveness-probe-function))
+        (groups nil)          ; alist: destination -> (profile entries...)
+        (result nil))
+    ;; Partition entries; ones without a PID or destination are UNKNOWN
+    ;; up front and never reach a probe.
+    (dolist (entry entries)
+      (let ((pid (plist-get entry :remote-pid)))
+        (if (not pid)
+            (push (cons entry 'unknown) result)
+          (let* ((profile (emacs-jupyter-notebook--entry-profile entry))
+                 (dest (condition-case nil
+                           (emacs-jupyter-notebook-ssh-destination profile)
+                         (error nil))))
+            (if (not dest)
+                (push (cons entry 'unknown) result)
+              (let ((cell (assoc dest groups)))
+                (if cell
+                    (setcdr (cdr cell) (cons entry (cddr cell)))
+                  (push (cons dest (cons profile (list entry))) groups))))))))
+    ;; One probe per host.
+    (dolist (group groups)
+      (let* ((profile (cadr group))
+             (host-entries (cddr group))
+             (pids (mapcar (lambda (e) (plist-get e :remote-pid)) host-entries))
+             (probe (condition-case nil
+                        (funcall probe-fn profile pids)
+                      (error (list :answered nil :alive nil))))
+             (answered (plist-get probe :answered))
+             (alive (mapcar (lambda (p) (format "%s" p))
+                            (plist-get probe :alive))))
+        (dolist (entry host-entries)
+          (let ((pid (format "%s" (plist-get entry :remote-pid))))
+            (push (cons entry
+                        (cond ((not answered) 'unknown)
+                              ((member pid alive) 'alive)
+                              (t 'dead)))
+                  result)))))
+    result))
+
+(defun emacs-jupyter-notebook--liveness-status (entry classification)
+  "Return the W11 liveness status of ENTRY within CLASSIFICATION (by `eq')."
+  (cdr (cl-assoc entry classification :test #'eq)))
+
+(defun emacs-jupyter-notebook--prune-dead-registry-entries (&optional file probe-fn)
+  "Prune registry entries whose remote kernel is confirmed DEAD.  W11(B).
+Load the registry from FILE, classify liveness via PROBE-FN, and rewrite
+the registry without the confirmed-dead entries.  NON-DESTRUCTIVE: never
+kills a live kernel; keeps every `alive' AND `unknown' entry (an
+unreachable host cannot cause a false prune).  The file is only rewritten
+when at least one entry is actually pruned.  Return a plist
+\(:pruned N :alive A :unknown U :kept-entries (...) :pruned-entries (...))."
+  (let* ((entries (emacs-jupyter-notebook-registry-load file))
+         (classification (emacs-jupyter-notebook--classify-registry-liveness
+                          entries probe-fn))
+         (dead nil) (alive 0) (unknown 0) (kept nil))
+    (dolist (entry entries)
+      (pcase (emacs-jupyter-notebook--liveness-status entry classification)
+        ('dead (push entry dead))
+        ('alive (setq alive (1+ alive)) (push entry kept))
+        (_ (setq unknown (1+ unknown)) (push entry kept))))
+    (setq kept (nreverse kept))
+    (setq dead (nreverse dead))
+    (when dead
+      (emacs-jupyter-notebook-registry-save kept file))
+    (list :pruned (length dead)
+          :alive alive
+          :unknown unknown
+          :kept-entries kept
+          :pruned-entries dead)))
+
 (defun emacs-jupyter-notebook--read-registry-entry ()
   "Read and return a registry entry for reconnect.
 W6.8: always offer a chooser interactively, with the current file's
 entry pre-selected as the default initial-input.  If the registry has
 exactly one entry, that entry is the default; the chooser still runs so
-the user can confirm or pick another."
+the user can confirm or pick another.
+
+W11(B): before presenting choices, probe liveness and DROP entries whose
+remote kernel a host confirmed dead — those ghosts are also removed from
+the durable registry, so only live/unknown entries are offered.  The
+whole probe is guarded: any failure falls back to showing every entry
+unchanged, so a flaky probe can never block reconnect."
   (let ((entries (emacs-jupyter-notebook-registry-load)))
     (unless entries
       (user-error "No kernel sessions found in registry"))
-    (let* ((choices (mapcar (lambda (entry)
-                              (cons (emacs-jupyter-notebook--registry-entry-label
-                                     entry)
-                                    entry))
-                            entries))
-           (current (emacs-jupyter-notebook--current-file-registry-entry))
-           (default (and current
-                         (emacs-jupyter-notebook--registry-entry-label current)))
-           (prompt (if default
-                       (format "Reconnect kernel (default %s): " default)
-                     "Reconnect kernel: "))
-           (choice (completing-read prompt choices nil t nil nil default)))
-      (or (cdr (assoc choice choices))
-          (error "No registry entry selected")))))
+    (let* ((classification
+            (condition-case _err
+                (emacs-jupyter-notebook--classify-registry-liveness entries)
+              (error nil)))
+           (dead (cl-remove-if-not
+                  (lambda (e)
+                    (eq 'dead (emacs-jupyter-notebook--liveness-status
+                               e classification)))
+                  entries))
+           (survivors (cl-remove-if (lambda (e) (memq e dead)) entries)))
+      ;; Drop confirmed-dead ghosts from the durable registry too.
+      (when dead
+        (emacs-jupyter-notebook-registry-save survivors)
+        (message "emacs-jupyter-notebook: pruned %d dead kernel entr%s from picker"
+                 (length dead) (if (= (length dead) 1) "y" "ies")))
+      (unless survivors
+        (user-error "All registered kernels are dead; start a fresh one"))
+      (let* ((choices (mapcar (lambda (entry)
+                                (cons (emacs-jupyter-notebook--registry-entry-label
+                                       entry)
+                                      entry))
+                              survivors))
+             (current (emacs-jupyter-notebook--current-file-registry-entry))
+             (current-key (and current
+                               (or (plist-get current :session-id)
+                                   (plist-get current :profile))))
+             (default-entry (and current-key
+                                 (cl-find-if
+                                  (lambda (e)
+                                    (equal current-key
+                                           (or (plist-get e :session-id)
+                                               (plist-get e :profile))))
+                                  survivors)))
+             (default (and default-entry (car (rassq default-entry choices))))
+             (prompt (if default
+                         (format "Reconnect kernel (default %s): " default)
+                       "Reconnect kernel: "))
+             (choice (completing-read prompt choices nil t nil nil default)))
+        (or (cdr (assoc choice choices))
+            (error "No registry entry selected"))))))
 
 ;; W4.7: the synchronous `--retrieve-connection-file' that polled with
 ;; `sleep-for' has been removed.  The async retrieve in
@@ -1555,6 +1846,11 @@ underlying stderr matches a known SSH failure pattern."
           ;; figures carry the interactive-viewer payload.  No-op / graceful
           ;; on kernels without matplotlib; never touches the remote FS.
           (emacs-jupyter-notebook--inject-viewer-formatter client)
+          ;; W11: inject the self-reaping idle watchdog so an abandoned or
+          ;; crashed-out session's kernel eventually reaps itself.  No-op
+          ;; when the timeout is 0; idempotent on reconnect; never touches
+          ;; the remote FS.
+          (emacs-jupyter-notebook--inject-idle-watchdog client)
           (let ((ctx emacs-jupyter-notebook--async-context))
             (setq ctx (emacs-jupyter-notebook--async-put ctx :entry entry))
             (setq ctx (emacs-jupyter-notebook--async-put ctx :phase 'done))
@@ -1737,8 +2033,9 @@ On failure, call ERROR-CALLBACK with (context error-data)."
    (t
     ;; W4.8: when reconnect to a known registry entry fails (including the
     ;; W4.4 dead-PID case) we MUST NOT auto-remove the entry or auto-start
-    ;; a fresh kernel — only the explicit user commands `shutdown-kernel'
-    ;; and `clean-orphaned-kernels' may terminate / deregister.  Surface
+    ;; a fresh kernel — only the explicit user commands `shutdown-kernel' /
+    ;; `cleanup-remote-cache' may terminate and only the explicit
+    ;; `clean-orphaned-kernels' prune (W11) may deregister.  Surface
     ;; the error to the caller; the message produced by `--async-fail'
     ;; (W4.3 / W4.4) already points the user at `start-remote-kernel'.
     (if-let ((entry (emacs-jupyter-notebook--current-file-registry-entry)))
@@ -2379,11 +2676,14 @@ before sending; a \\[universal-argument] FORCE prefix skips the prompt."
 (defun emacs-jupyter-notebook-restart-kernel ()
   "Restart the current kernel through emacs-jupyter.
 W8.1: after the restart request the kernel namespace is wiped, so the
-in-memory matplotlib pickle formatter is re-injected (idempotent)."
+in-memory matplotlib pickle formatter is re-injected (idempotent).
+W11: the idle watchdog is likewise re-injected — the restart builds a
+fresh IPython instance, so a new watchdog thread is installed."
   (interactive)
   (let ((client (emacs-jupyter-notebook--ensure-client)))
     (emacs-jupyter-notebook-jupyter-restart client)
-    (emacs-jupyter-notebook--inject-viewer-formatter client)))
+    (emacs-jupyter-notebook--inject-viewer-formatter client)
+    (emacs-jupyter-notebook--inject-idle-watchdog client)))
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-shutdown-kernel (&optional force)
@@ -2693,8 +2993,37 @@ After each append the buffer is truncated to
      (emacs-jupyter-notebook-ssh-run-command
       (emacs-jupyter-notebook-ssh-build-remote-ps-command profile)))))
 
-(defun emacs-jupyter-notebook-clean-orphaned-kernels (&optional profile-name force)
+(defun emacs-jupyter-notebook-clean-orphaned-kernels ()
+  "Prune registry entries whose remote kernel is confirmed DEAD.  W11(B).
+NON-DESTRUCTIVE: this NEVER terminates a running kernel.  It loads the
+durable registry, probes liveness one ssh per host (bounded — an
+unreachable host is treated as UNKNOWN and left alone), removes only the
+entries whose PID a host positively reported gone, and messages a summary.
+
+For the destructive per-profile remote nuke (kill every kernel in a
+profile's cache dir and delete its files), see
+`emacs-jupyter-notebook-cleanup-remote-cache' — that command remains the
+explicit terminator; this one only tidies the local registry."
+  (interactive)
+  (let ((entries (emacs-jupyter-notebook-registry-load)))
+    (if (not entries)
+        (message "emacs-jupyter-notebook: registry is empty; nothing to prune")
+      (let* ((result (emacs-jupyter-notebook--prune-dead-registry-entries))
+             (pruned (plist-get result :pruned))
+             (alive (plist-get result :alive))
+             (unknown (plist-get result :unknown)))
+        (message "emacs-jupyter-notebook: pruned %d dead kernel entr%s; %d live remain%s"
+                 pruned (if (= pruned 1) "y" "ies") alive
+                 (if (> unknown 0) (format " (%d unverified)" unknown) ""))))))
+
+(defun emacs-jupyter-notebook-cleanup-remote-cache (&optional profile-name force)
   "Clean all EJN kernel files and processes in PROFILE-NAME's remote cache.
+This is DESTRUCTIVE: it `pkill's every kernel launched into the profile's
+cache dir and deletes the cache files, so it is one of the explicit
+allowed terminators of the remote kernel.  (Renamed from the former
+`clean-orphaned-kernels', which W11 repurposed for the non-destructive
+registry prune.)
+
 W6.4: when called interactively, ask `y-or-n-p' before issuing the
 remote cleanup; a \\[universal-argument] FORCE prefix skips the prompt.
 Lisp callers do not see the prompt and proceed unconditionally."

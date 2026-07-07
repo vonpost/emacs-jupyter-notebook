@@ -90,6 +90,32 @@ These are binding for every workstream. Update only by appending a new entry.
   (needs a windowing system + a local Python/matplotlib at a version
   matching the remote). The remote stays headless (inline/Agg) and is never
   given a GUI dependency.
+- **2026-07-07 / Kernels self-reap after an idle timeout (W11).** A deliberate,
+  user-approved exception to the absolute "remote kernel outlives Emacs" rule,
+  motivated by kernels accumulating and never being cleaned up.  On connect
+  (and re-run on restart) Emacs injects a ZERO-INSTALL in-memory idle watchdog
+  into the kernel (a daemon thread; writes nothing to the remote filesystem,
+  imports only stdlib + `get_ipython`).  When the kernel has been idle longer
+  than `emacs-jupyter-notebook-kernel-idle-timeout` (default 14400 s = 4 h; 0
+  disables — nothing is injected) AND is not currently executing a cell, the
+  watchdog shuts the kernel down (`os.kill(getpid, SIGTERM)`, with
+  `os._exit(0)` as a last-resort fallback).  It NEVER reaps a busy kernel: the
+  `executing` flag stays True for the whole duration of a cell — even one that
+  runs for hours — so a long-running computation can never trip the idle test.
+  So abandoned kernels reap themselves even if Emacs crashed.
+- **2026-07-07 / `clean-orphaned-kernels` is a non-destructive registry prune
+  (W11).** Supersedes the naming in the 2026-06-28 / 2026-07-01 terminator
+  entries.  `clean-orphaned-kernels` and the reconnect picker now prune
+  registry entries whose remote kernel is CONFIRMED DEAD (one bounded ssh per
+  host reporting which recorded PIDs are still alive); they are NON-DESTRUCTIVE
+  toward live kernels in this workstream — an unreachable host, a probe error,
+  or an entry without a recorded PID is treated as UNKNOWN and is never pruned,
+  and no running kernel is ever killed.  The former destructive per-profile
+  nuke (kill every kernel in a profile's cache dir + delete its files) was
+  renamed to `emacs-jupyter-notebook-cleanup-remote-cache`, which remains an
+  explicit allowed terminator.  The full allowed-terminators list is now:
+  `shutdown-kernel`, `cleanup-remote-cache`, `retry-fresh-kernel`, plus the
+  injected idle watchdog's self-shutdown.
 
 ## Cross-cutting changes
 
@@ -924,6 +950,78 @@ hit `C-c j I`, a local window opens, hover shows `row/col/value`, zoom on one
 subplot crops all siblings, killing Emacs reaps the viewer.
 
 ---
+
+## W11 — Kernel lifecycle / GC (self-reaping idle kernels + prune dead entries)
+
+- [x] sha=PENDING W11 kernel lifecycle / GC.  MOTIVATION: remote kernels are
+      `nohup`-ed and deliberately outlive Emacs, so a crash or a forgotten
+      buffer leaves kernels running forever; over time they accumulate, and the
+      reconnect picker listed dead "ghost" entries.  The user chose TWO
+      complementary, user-approved mechanisms (explicitly NOT a kill-manager
+      command nor a shutdown-on-exit toggle).
+      (A) SELF-REAPING IDLE KERNELS — a zero-install idle watchdog injected
+      in-memory into each kernel (mirrors the W8 formatter injection exactly:
+      a defconst Python template `--kernel-idle-watchdog-snippet` sent through
+      the mockable silent-execute adapter by `--inject-idle-watchdog` at the
+      SAME two sites, connect-finalize and restart-kernel, idempotency-guarded
+      by a `_ejn_watchdog_installed` flag on the IPython instance so reconnect
+      never stacks a second thread).  The snippet starts ONE daemon thread that
+      wakes periodically (interval = clamp(timeout/10, [1s,60s])) and, once the
+      kernel has been idle beyond `emacs-jupyter-notebook-kernel-idle-timeout`
+      (default 14400 s = 4 h; 0 disables → nothing injected) AND is not
+      currently executing a cell, shuts the kernel down.  Activity + executing-
+      state are tracked via IPython `pre_run_cell` (executing=True, bump last)
+      and `post_run_cell` (executing=False, bump last).  BUSY KERNEL IS NEVER
+      REAPED: `executing` stays True for a cell's whole duration — even one
+      running for hours — so the "not currently executing" guard means a long
+      computation can never trip the idle test; only after it finishes does the
+      idle clock start.  SHUTDOWN MECHANISM: `os.kill(os.getpid(), SIGTERM)`
+      for a clean process termination, logging one line to stderr (lands in the
+      remote kernel log) first, with `os._exit(0)` as a last-resort fallback
+      after a 5 s grace.  Imports only stdlib (threading, time, os, signal) +
+      `get_ipython`; writes NOTHING to the remote FS; fully wrapped so any
+      install failure is a silent no-op that never breaks the user's session.
+      (B) AUTO-PRUNE DEAD ENTRIES (NON-DESTRUCTIVE) — a per-host batched
+      liveness probe (`ssh-build-batch-pid-alive`: one ssh runs
+      `for p in ...; do kill -0 "$p" && echo "$p"; done; echo __EJN_DONE__`,
+      BOUNDED by `-o ConnectTimeout=N` (`emacs-jupyter-notebook-prune-ssh-timeout`
+      default 5) + `BatchMode=yes`).  `--classify-registry-liveness` groups
+      entries by ssh-destination, probes once per host through the mockable
+      `--liveness-probe-function`, and classifies each entry alive/dead/unknown.
+      NON-DESTRUCTIVE / no false prune: an entry is `dead` ONLY when the host
+      ANSWERED (sentinel present) and its PID was not in the alive set; an
+      unreachable host (no sentinel / ssh error / timeout), a probe error, or a
+      pre-W4.2 entry without a `:remote-pid` is UNKNOWN and is KEPT.  A live
+      kernel is never killed.  Wired into the reconnect picker
+      (`--read-registry-entry` drops confirmed-dead entries from both the choices
+      and the durable registry, guarded so a flaky probe falls back to showing
+      all entries) and the interactive `clean-orphaned-kernels`, which is now
+      the NON-DESTRUCTIVE prune ("pruned N dead kernel entries; M live remain").
+      The former destructive per-profile nuke was RENAMED to
+      `emacs-jupyter-notebook-cleanup-remote-cache` (still an explicit allowed
+      terminator; `w` now runs the prune, `W` the nuke).  Per the "no backwards
+      compatibility" rule, no alias is kept.  DESIGN DECISIONS appended
+      (2026-07-07): the idle self-reap as a user-approved exception to "remote
+      kernel outlives Emacs"; and `clean-orphaned-kernels` as a non-destructive
+      registry prune with the terminator list updated.  Async note: the picker/
+      command run a bounded, per-host synchronous ssh probe — acceptable because
+      it is one ssh per host with a hard ConnectTimeout, matching the existing
+      reconnect flow's synchronous-ish ssh; the timeout caps worst-case stall.
+      TESTS (+13 deterministic ERT): watchdog snippet shape (idempotency guard,
+      embeds `%d` timeout, pre_run_cell AND post_run_cell, daemon thread,
+      SIGTERM + `os._exit(0)`, stdlib-only, no matplotlib); injection embeds the
+      configured timeout + routes through the adapter; 0-timeout injects
+      nothing; no-op without client; swallows adapter errors; injected on
+      connect-finalize AND on restart carrying the timeout; prune removes only
+      confirmed-dead and keeps alive+unknown (unreachable host → no false
+      prune); unreachable-only host prunes nothing and never rewrites the file;
+      command messages the pruned/live summary; empty registry reports nothing
+      to prune; picker excludes dead ghosts and drops them from the registry.
+      The three former destructive-command tests were repointed to
+      `cleanup-remote-cache`; the keymap test pins `w`→prune and `W`→nuke.
+      VERIFICATION: `Ran 405 tests, 405 results as expected, 0 unexpected,
+      1 expected failures` (CC1); byte-compile adds no new warnings (only the
+      two pre-existing `evil-visual-beginning`/`-end` free-variable refs).
 
 ## W10 — Recover client-less sessions (dangling entry/tunnel is reapable debris)
 

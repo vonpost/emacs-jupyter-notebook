@@ -1512,7 +1512,10 @@ before that point should NOT create a stray registry row."
       (should (equal displayed '("*ejn-remote-processes*" "ps output")))
       (should (string-match-p "ps -eo" (car (last argv)))))))
 
-(ert-deftest ejn-clean-orphaned-kernels-runs-cleanup-all-command ()
+(ert-deftest ejn-cleanup-remote-cache-runs-cleanup-all-command ()
+  ;; W11: the destructive per-profile nuke was renamed from the former
+  ;; `clean-orphaned-kernels' to `cleanup-remote-cache'; the old name now
+  ;; performs the non-destructive registry prune.
   (let (argv message-text)
     (cl-letf (((symbol-function 'emacs-jupyter-notebook--read-host-profile)
                (lambda (_profile)
@@ -1524,7 +1527,7 @@ before that point should NOT create a stray registry row."
               ((symbol-function 'message)
                (lambda (format-string &rest args)
                  (setq message-text (apply #'format format-string args)))))
-      (emacs-jupyter-notebook-clean-orphaned-kernels "p")
+      (emacs-jupyter-notebook-cleanup-remote-cache "p")
       (should (string-match-p "pkill -f" (car (last argv))))
       (should (string-match-p "requested remote orphan cleanup" message-text)))))
 
@@ -5148,6 +5151,8 @@ and the existing ExitOnForwardFailure option must still be present."
                 #'emacs-jupyter-notebook-list-remote-processes))
     (should (eq (lookup-key map (kbd "w"))
                 #'emacs-jupyter-notebook-clean-orphaned-kernels))
+    (should (eq (lookup-key map (kbd "W"))
+                #'emacs-jupyter-notebook-cleanup-remote-cache))
     (should (eq (lookup-key map (kbd "n"))
                 #'emacs-jupyter-notebook-forward-cell))
     (should (eq (lookup-key map (kbd "p"))
@@ -5702,8 +5707,8 @@ callback(nil) -> `--async-connect-finalize' seam."
       (should-not cleanup-called)
       (should-not start-called))))
 
-(ert-deftest ejn-w6.4-clean-orphaned-kernels-interactive-prompts ()
-  "W6.4: interactive `clean-orphaned-kernels' prompts and aborts on no."
+(ert-deftest ejn-w6.4-cleanup-remote-cache-interactive-prompts ()
+  "W6.4: interactive `cleanup-remote-cache' prompts and aborts on no."
   (let (asked ran)
     (cl-letf (((symbol-function 'emacs-jupyter-notebook--read-profile-name)
                (lambda () "p"))
@@ -5714,12 +5719,12 @@ callback(nil) -> `--async-connect-finalize' seam."
                (lambda (_p) (setq asked t) nil))
               ((symbol-function 'emacs-jupyter-notebook-ssh-run-command)
                (lambda (_argv) (setq ran t) "")))
-      (call-interactively #'emacs-jupyter-notebook-clean-orphaned-kernels)
+      (call-interactively #'emacs-jupyter-notebook-cleanup-remote-cache)
       (should asked)
       (should-not ran))))
 
-(ert-deftest ejn-w6.4-clean-orphaned-kernels-with-c-u-skips-prompt ()
-  "W6.4: interactive `clean-orphaned-kernels' with C-u skips the prompt."
+(ert-deftest ejn-w6.4-cleanup-remote-cache-with-c-u-skips-prompt ()
+  "W6.4: interactive `cleanup-remote-cache' with C-u skips the prompt."
   (let (asked ran)
     (cl-letf (((symbol-function 'emacs-jupyter-notebook--read-profile-name)
                (lambda () "p"))
@@ -5731,7 +5736,7 @@ callback(nil) -> `--async-connect-finalize' seam."
               ((symbol-function 'emacs-jupyter-notebook-ssh-run-command)
                (lambda (_argv) (setq ran t) "")))
       (let ((current-prefix-arg '(4)))
-        (call-interactively #'emacs-jupyter-notebook-clean-orphaned-kernels))
+        (call-interactively #'emacs-jupyter-notebook-cleanup-remote-cache))
       (should-not asked)
       (should ran))))
 
@@ -6751,6 +6756,254 @@ support cache unset.  Uses `/bin/false' as a stand-in Python that exits 1."
                    (lambda (b64) (setq dispatched b64))))
           (emacs-jupyter-notebook-panel-open-figure)))
       (should (equal dispatched "ENTRY64")))))
+
+;;; W11 — kernel lifecycle / GC
+
+;;; W11(A) — self-reaping idle watchdog snippet + injection
+
+(ert-deftest ejn-w11-watchdog-snippet-shape ()
+  "W11: the idle-watchdog template has the required, load-bearing shape."
+  (let ((s emacs-jupyter-notebook--kernel-idle-watchdog-snippet))
+    ;; Idempotency guard so re-injection on reconnect never stacks a
+    ;; second watchdog thread.
+    (should (string-match-p "_ejn_watchdog_installed" s))
+    ;; Embeds the configured timeout via a single %d placeholder.
+    (should (string-match-p "%d" s))
+    (should (string-match-p "_EJN_WD_TIMEOUT = %d" s))
+    ;; Tracks activity + executing-state via BOTH IPython cell events.
+    (should (string-match-p "register('pre_run_cell'" s))
+    (should (string-match-p "register('post_run_cell'" s))
+    ;; Starts ONE daemon thread.
+    (should (string-match-p "daemon=True" s))
+    (should (string-match-p "\\.start()" s))
+    ;; The busy-guard that makes a long-running cell un-reapable.
+    (should (string-match-p "if _ejn_wd_state\\['executing'\\]:" s))
+    ;; Clean self-shutdown via SIGTERM, with os._exit(0) as last resort.
+    (should (string-match-p "os.kill\\|_ejn_wd_os.kill" s))
+    (should (string-match-p "SIGTERM\\|_ejn_wd_sig.SIGTERM" s))
+    (should (string-match-p "_ejn_wd_os._exit(0)" s))
+    ;; Imports only stdlib + get_ipython — no matplotlib/numpy/etc.
+    (should (string-match-p "import threading" s))
+    (should (string-match-p "get_ipython" s))
+    (should-not (string-match-p "matplotlib" s))
+    (should-not (string-match-p "import numpy" s))))
+
+(ert-deftest ejn-w11-watchdog-injection-embeds-timeout ()
+  "W11: injection routes through the silent adapter and embeds the timeout."
+  (with-temp-buffer
+    (let ((calls nil)
+          (emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook-kernel-idle-timeout 1234))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
+                 (lambda (client code) (push (list client code) calls))))
+        (emacs-jupyter-notebook--inject-idle-watchdog))
+      (should (= (length calls) 1))
+      (should (eq (caar calls) 'mock-client))
+      (should (string-match-p "_EJN_WD_TIMEOUT = 1234" (cadar calls)))
+      ;; The formatted code must carry both cell events and the shutdown.
+      (should (string-match-p "register('pre_run_cell'" (cadar calls)))
+      (should (string-match-p "register('post_run_cell'" (cadar calls)))
+      (should (string-match-p "SIGTERM" (cadar calls))))))
+
+(ert-deftest ejn-w11-watchdog-noop-when-timeout-zero ()
+  "W11: a 0 idle timeout disables the watchdog — nothing is injected."
+  (with-temp-buffer
+    (let ((calls nil)
+          (emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook-kernel-idle-timeout 0))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
+                 (lambda (client code) (push (list client code) calls))))
+        (emacs-jupyter-notebook--inject-idle-watchdog))
+      (should (null calls)))))
+
+(ert-deftest ejn-w11-watchdog-noop-without-client ()
+  "W11: with no client the watchdog injection is a silent no-op."
+  (with-temp-buffer
+    (let ((calls nil)
+          (emacs-jupyter-notebook--client nil)
+          (emacs-jupyter-notebook-kernel-idle-timeout 3600))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
+                 (lambda (client code) (push (list client code) calls))))
+        (emacs-jupyter-notebook--inject-idle-watchdog))
+      (should (null calls)))))
+
+(ert-deftest ejn-w11-watchdog-swallows-adapter-errors ()
+  "W11: a raise from the adapter must not propagate out of injection."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook-kernel-idle-timeout 3600))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
+                 (lambda (_client _code) (error "boom"))))
+        (should (progn (emacs-jupyter-notebook--inject-idle-watchdog) t))))))
+
+(ert-deftest ejn-w11-watchdog-injected-on-connect-finalize ()
+  "W11: connect-finalize injects the watchdog carrying the configured timeout."
+  (let ((entry '(:profile "p" :session-id "session"))
+        (local-ports '(:shell_port 1001))
+        (local-file "/tmp/test.json")
+        (emacs-jupyter-notebook--client nil)
+        (emacs-jupyter-notebook--session-entry nil)
+        (emacs-jupyter-notebook-kernel-idle-timeout 7200)
+        (codes nil))
+    (with-temp-buffer
+      (let ((buffer (current-buffer))
+            (context (emacs-jupyter-notebook--async-new-context
+                      :phase 'connect
+                      :entry entry
+                      :origin-buffer (current-buffer))))
+        (setq emacs-jupyter-notebook--async-context context)
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
+                   (lambda (_entry &optional _file) nil))
+                  ((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
+                   (lambda (_client code) (push code codes))))
+          (emacs-jupyter-notebook--async-connect-finalize
+           buffer entry local-ports local-file 'mock-client))
+        ;; A watchdog snippet carrying the configured timeout was sent.
+        (should (cl-some (lambda (c) (string-match-p "_EJN_WD_TIMEOUT = 7200" c))
+                         codes))))))
+
+(ert-deftest ejn-w11-watchdog-injected-on-restart ()
+  "W11: restart-kernel re-injects the watchdog carrying the configured timeout."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook-kernel-idle-timeout 5400)
+          (codes nil))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-restart)
+                 (lambda (_client) nil))
+                ((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
+                 (lambda (_client code) (push code codes))))
+        (call-interactively #'emacs-jupyter-notebook-restart-kernel))
+      (should (cl-some (lambda (c) (string-match-p "_EJN_WD_TIMEOUT = 5400" c))
+                       codes)))))
+
+;;; W11(B) — non-destructive prune of dead registry entries
+
+(defun ejn-w11--entry (session pid host)
+  "Build a registry ENTRY fixture with SESSION, PID, and HOST."
+  (list :profile "p" :session-id session :remote-pid pid :remote-host host
+        :remote-connection-file (format "/cache/kernel-%s.json" session)))
+
+(ert-deftest ejn-w11-prune-removes-only-confirmed-dead ()
+  "W11: prune drops confirmed-dead entries, keeps alive AND unknown ones.
+A dead PID on a host that ANSWERED is pruned; an unreachable host's
+entries (UNKNOWN) are kept — an unreachable host must never cause a false
+prune."
+  (let* ((live   (ejn-w11--entry "live"    "100" "up.example"))
+         (dead   (ejn-w11--entry "dead"    "200" "up.example"))
+         (ghost  (ejn-w11--entry "ghost"   "300" "down.example"))
+         (nopid  (list :profile "p" :session-id "nopid" :remote-host "up.example"))
+         (entries (list live dead ghost nopid))
+         (saved nil)
+         ;; Mock probe: host "up.example" answers (100 alive, 200 dead);
+         ;; host "down.example" is unreachable (:answered nil).
+         (probe (lambda (profile pids)
+                  (let ((host (plist-get profile :host)))
+                    (cond
+                     ((equal host "up.example")
+                      (list :answered t
+                            :alive (cl-remove-if-not
+                                    (lambda (p) (equal (format "%s" p) "100"))
+                                    pids)))
+                     (t (list :answered nil :alive nil)))))))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
+               (lambda (&optional _file) entries))
+              ((symbol-function 'emacs-jupyter-notebook-registry-save)
+               (lambda (kept &optional _file) (setq saved kept))))
+      (let ((res (emacs-jupyter-notebook--prune-dead-registry-entries
+                  nil probe)))
+        (should (= (plist-get res :pruned) 1))
+        (should (= (plist-get res :alive) 1))
+        ;; ghost (unreachable) + nopid (no pid) are both UNKNOWN, kept.
+        (should (= (plist-get res :unknown) 2))
+        ;; Exactly the dead entry was pruned.
+        (should (equal (plist-get res :pruned-entries) (list dead)))
+        ;; The saved registry keeps live + ghost + nopid, drops dead.
+        (should (member live saved))
+        (should (member ghost saved))
+        (should (member nopid saved))
+        (should-not (member dead saved))))))
+
+(ert-deftest ejn-w11-prune-unreachable-host-keeps-entries ()
+  "W11: when every host is unreachable, nothing is pruned and no save runs."
+  (let* ((a (ejn-w11--entry "a" "10" "down.example"))
+         (b (ejn-w11--entry "b" "20" "down.example"))
+         (entries (list a b))
+         (save-called nil)
+         (probe (lambda (_profile _pids) (list :answered nil :alive nil))))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
+               (lambda (&optional _file) entries))
+              ((symbol-function 'emacs-jupyter-notebook-registry-save)
+               (lambda (_kept &optional _file) (setq save-called t))))
+      (let ((res (emacs-jupyter-notebook--prune-dead-registry-entries nil probe)))
+        (should (= (plist-get res :pruned) 0))
+        (should (= (plist-get res :unknown) 2))
+        ;; No dead entries → the file is never rewritten.
+        (should-not save-called)))))
+
+(ert-deftest ejn-w11-clean-orphaned-kernels-messages-summary ()
+  "W11: the command prunes and reports pruned/live counts."
+  (let* ((live (ejn-w11--entry "live" "100" "up.example"))
+         (dead (ejn-w11--entry "dead" "200" "up.example"))
+         (entries (list live dead))
+         (msg nil)
+         (probe (lambda (_profile pids)
+                  (list :answered t
+                        :alive (cl-remove-if-not
+                                (lambda (p) (equal (format "%s" p) "100")) pids)))))
+    (let ((emacs-jupyter-notebook--liveness-probe-function probe))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
+                 (lambda (&optional _file) entries))
+                ((symbol-function 'emacs-jupyter-notebook-registry-save)
+                 (lambda (_kept &optional _file) nil))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq msg (apply #'format fmt args)))))
+        (call-interactively #'emacs-jupyter-notebook-clean-orphaned-kernels)
+        (should (string-match-p "pruned 1 dead" msg))
+        (should (string-match-p "1 live remain" msg))))))
+
+(ert-deftest ejn-w11-clean-orphaned-kernels-empty-registry ()
+  "W11: with an empty registry the command reports nothing to prune."
+  (let ((msg nil))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
+               (lambda (&optional _file) nil))
+              ((symbol-function 'message)
+               (lambda (fmt &rest args) (setq msg (apply #'format fmt args)))))
+      (call-interactively #'emacs-jupyter-notebook-clean-orphaned-kernels)
+      (should (string-match-p "registry is empty" msg)))))
+
+(ert-deftest ejn-w11-picker-excludes-dead-entries ()
+  "W11: the reconnect picker drops confirmed-dead entries and only offers
+alive/unknown ones; the dead ghost is removed from the registry too."
+  (let* ((live  (ejn-w11--entry "live"  "100" "up.example"))
+         (dead  (ejn-w11--entry "dead"  "200" "up.example"))
+         (entries (list live dead))
+         (saved nil)
+         (offered nil)
+         (probe (lambda (_profile pids)
+                  (list :answered t
+                        :alive (cl-remove-if-not
+                                (lambda (p) (equal (format "%s" p) "100")) pids))))
+         (emacs-jupyter-notebook--liveness-probe-function probe))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
+               (lambda (&optional _file) entries))
+              ((symbol-function 'emacs-jupyter-notebook-registry-save)
+               (lambda (kept &optional _file) (setq saved kept)))
+              ((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
+               (lambda () nil))
+              ((symbol-function 'completing-read)
+               (lambda (_prompt collection &rest _)
+                 (setq offered collection)
+                 ;; Pick the first (only surviving) choice.
+                 (caar collection))))
+      (with-temp-buffer
+        (let ((selected (emacs-jupyter-notebook--read-registry-entry)))
+          ;; Only the live entry survived and was selectable.
+          (should (equal selected live))
+          (should (= (length offered) 1))
+          (should (string-match-p "live" (caar offered)))
+          ;; The dead ghost was pruned from the durable registry.
+          (should (member live saved))
+          (should-not (member dead saved)))))))
 
 (provide 'emacs-jupyter-notebook-tests)
 

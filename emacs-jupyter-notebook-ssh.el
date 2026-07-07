@@ -192,6 +192,35 @@ liveness probe."
    profile
    (format "kill -0 %s" (shell-quote-argument (format "%s" pid)))))
 
+(defun emacs-jupyter-notebook-ssh-build-batch-pid-alive (profile pids &optional connect-timeout)
+  "Return an SSH argv reporting which of PIDS are alive on PROFILE's host.
+W11: the batched, per-host liveness probe behind the non-destructive
+registry prune.  One ssh runs a shell loop that echoes each PID that
+`kill -0' confirms alive (no signal is sent), then prints the sentinel
+`__EJN_DONE__' so callers can tell a genuine \"host answered, these are
+dead\" reply apart from a connection failure (which yields no sentinel and
+a non-zero ssh exit).  The loop always exits 0 because of the trailing
+sentinel `echo', so it does not trip a non-zero-exit error path.
+
+A bounded `ConnectTimeout' (CONNECT-TIMEOUT, default
+`emacs-jupyter-notebook-prune-ssh-timeout') plus `BatchMode=yes' guarantee
+an unreachable or auth-prompting host cannot hang Emacs — it fails fast
+and its PIDs stay UNKNOWN (never pruned)."
+  (let* ((timeout (or connect-timeout emacs-jupyter-notebook-prune-ssh-timeout 5))
+         (pid-list (mapconcat (lambda (p) (shell-quote-argument (format "%s" p)))
+                              pids " "))
+         (remote (format
+                  "for p in %s; do kill -0 \"$p\" 2>/dev/null && echo \"$p\"; done; echo __EJN_DONE__"
+                  pid-list))
+         (argv (emacs-jupyter-notebook-ssh-command profile remote)))
+    ;; Splice the bounding options in right after the ssh program name so
+    ;; they apply to this one-shot probe without touching the shared
+    ;; `ssh-options' customization.
+    (append (list (car argv)
+                  "-o" (format "ConnectTimeout=%d" timeout)
+                  "-o" "BatchMode=yes")
+            (cdr argv))))
+
 (defun emacs-jupyter-notebook-ssh-build-remote-cleanup (profile connection-file)
   "Return an SSH argv list that cleans remote processes for CONNECTION-FILE."
   (let ((remote-file (emacs-jupyter-notebook-ssh--quote-remote-path connection-file))
