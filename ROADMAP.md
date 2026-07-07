@@ -953,7 +953,7 @@ subplot crops all siblings, killing Emacs reaps the viewer.
 
 ## W11 — Kernel lifecycle / GC (self-reaping idle kernels + prune dead entries)
 
-- [x] sha=PENDING W11 kernel lifecycle / GC.  MOTIVATION: remote kernels are
+- [x] sha=44d1a7d W11 kernel lifecycle / GC.  MOTIVATION: remote kernels are
       `nohup`-ed and deliberately outlive Emacs, so a crash or a forgotten
       buffer leaves kernels running forever; over time they accumulate, and the
       reconnect picker listed dead "ghost" entries.  The user chose TWO
