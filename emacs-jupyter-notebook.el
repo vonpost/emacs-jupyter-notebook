@@ -1183,15 +1183,19 @@ An unreachable host, a timeout, or any ssh error yields
 prune never removes an entry a host did not positively disown."
   (condition-case _err
       (let* ((argv (emacs-jupyter-notebook-ssh-build-batch-pid-alive profile pids))
-             (output (emacs-jupyter-notebook-ssh-run-command argv)))
-        (if (not (string-match-p "__EJN_DONE__" output))
-            ;; No sentinel: the host did not really answer the probe.
+             (output (emacs-jupyter-notebook-ssh-run-command argv))
+             ;; Split into trimmed non-empty lines and match EXACTLY.  A bare
+             ;; substring test would (a) accept a stray `__EJN_DONE__' inside a
+             ;; login banner / MOTD as a real answer, and (b) let a PID match a
+             ;; longer number (123 in 1234) or survive a `\r' from CRLF output.
+             ;; Exact per-line membership rules all three out.
+             (lines (split-string output "[\r\n]+" t "[ \t]+")))
+        (if (not (member "__EJN_DONE__" lines))
+            ;; No sentinel line: the host did not really answer the probe.
             (list :answered nil :alive nil)
           (let ((alive nil))
             (dolist (pid pids)
-              (when (string-match-p
-                     (format "^%s$" (regexp-quote (format "%s" pid)))
-                     output)
+              (when (member (format "%s" pid) lines)
                 (push pid alive)))
             (list :answered t :alive (nreverse alive)))))
     (error (list :answered nil :alive nil))))
