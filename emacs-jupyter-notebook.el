@@ -891,14 +891,29 @@ completion idle timer, and drops the buffer-local Jupyter client handle.
 
 This is the disposer used by `kill-buffer-hook' and by the mode-disable
 cleanup.  It does not call `jupyter-shutdown', does not call
-`--cleanup-remote-entry', does not remove the registry entry, does not delete
-the local connection file, and does not touch the remote kernel.  The registry
-entry and the remote kernel are the durable reconnect surface and must survive
-buffer kill and mode disable.
+`--cleanup-remote-entry', does not remove the registry entry, and does not
+delete the local connection file.  A CONNECTED kernel and its registry
+entry are the durable reconnect surface and survive buffer kill and mode
+disable; only the kernel of an in-progress start attempt (which has no
+registry entry yet) is killed here — see the W12 note below.
+
+W12: an in-progress start attempt has already launched a remote kernel
+that never finished connecting and holds NO registry entry — abandoning
+the buffer (kill or mode-disable) must kill that kernel rather than
+orphan it.  A *connected* kernel (async phase `done') is a durable
+reconnect surface and is SPARED: the guard fires only while an attempt is
+genuinely in flight, and `--async-kill-remote-kernel' is itself a no-op
+unless the context `:owns-kernel' (a reconnect attempt targets a
+pre-existing kernel and never triggers a kill).
 
 Each disposer is independently best-effort: a raise from one does not prevent
 the remaining disposers from running, and the final state-clearing setq always
 executes."
+  (ignore-errors
+    (when (and emacs-jupyter-notebook--async-context
+               (emacs-jupyter-notebook--async-in-progress-p))
+      (emacs-jupyter-notebook--async-kill-remote-kernel
+       emacs-jupyter-notebook--async-context)))
   (ignore-errors
     (emacs-jupyter-notebook--cancel-async-context-locally
      emacs-jupyter-notebook--async-context))
@@ -926,9 +941,11 @@ executes."
 Releases the buffer's LOCAL kernel handles via `--release-local-resources':
 cancels the in-flight async context, clears buffer-local timers, disposes
 the SSH tunnel process and its stderr buffer, and drops the buffer-local
-client handle.  Does NOT touch the session entry, the registry, the remote
-kernel, or the local connection file — those are durable reconnect surfaces
-and survive mode disable.  Errors are swallowed so disable cannot raise."
+client handle.  Does NOT touch the session entry, the registry, a
+CONNECTED remote kernel, or the local connection file — those are durable
+reconnect surfaces and survive mode disable.  It DOES kill the kernel of
+an in-progress start attempt (which has no registry entry yet) so it is
+not orphaned.  Errors are swallowed so disable cannot raise."
   (condition-case err
       (emacs-jupyter-notebook--release-local-resources)
     (error
@@ -1375,6 +1392,12 @@ unchanged, so a flaky probe can never block reconnect."
 ;; `--async-wait-tunnel-tick' is the only path; it reschedules itself via
 ;; `run-with-timer' until all ports open or the timeout expires.
 
+(defun emacs-jupyter-notebook--last-lines (text n)
+  "Return at most the last N lines of TEXT (trimmed), or nil when TEXT is empty."
+  (when (and (stringp text) (not (string-empty-p (string-trim text))))
+    (let ((lines (split-string (string-trim-right text) "\n")))
+      (string-join (last lines (min n (length lines))) "\n"))))
+
 (defun emacs-jupyter-notebook--process-output (process)
   "Return PROCESS output buffer contents."
   (string-join
@@ -1455,11 +1478,40 @@ unchanged, so a flaky probe can never block reconnect."
        (not (memq (plist-get emacs-jupyter-notebook--async-context :phase)
                   '(done error nil)))))
 
+(defun emacs-jupyter-notebook--async-context-live-p (context)
+  "Return non-nil when CONTEXT is its origin buffer's ACTIVE in-flight attempt.
+False once CONTEXT was cancelled/failed (its buffer-local phase is now
+`error'/`done'/nil) or superseded by a newer attempt (a different context
+object now occupies the buffer's `--async-context').
+
+W12/A2: a process sentinel or retry timer belonging to a dead attempt may
+still fire after `--cancel-async-operation'/`--async-fail' — either
+synchronously while `--async-fail' is deleting the attempt's own processes,
+or asynchronously after a superseding attempt has taken the buffer slot.
+Without this gate `--async-put' from that stale sentinel would resurrect the
+dead context into the buffer, re-arm an SCP retry against a just-killed
+kernel, and clobber the newer attempt.  Mirrors the identity check the
+W4.4 PID-probe sentinel already performs."
+  (let ((buffer (plist-get context :origin-buffer)))
+    (and (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (and (eq emacs-jupyter-notebook--async-context context)
+                (emacs-jupyter-notebook--async-in-progress-p))))))
+
 (defun emacs-jupyter-notebook--ensure-no-async-operation ()
-  "Signal when the current buffer already has an async operation running."
+  "Ensure the current buffer holds no in-flight connection attempt.
+A single buffer owns a single connection — two attempts must never run
+in parallel.  When an attempt is already in progress, prompt to cancel
+it: on `y' abort it via `--cancel-async-operation' (which also kills any
+kernel a start attempt launched, so nothing is left running behind the
+new one) and return so the caller may proceed; on `n' signal a
+`user-error' and leave the running attempt untouched."
   (when (emacs-jupyter-notebook--async-in-progress-p)
-    (user-error
-     "A Jupyter operation is already in progress; use M-x emacs-jupyter-notebook-cancel-operation to cancel it")))
+    (if (y-or-n-p "A Jupyter connection attempt is already in progress; cancel it and start a new one? ")
+        (emacs-jupyter-notebook--cancel-async-operation
+         emacs-jupyter-notebook--async-context
+         "Superseded by a new connection attempt")
+      (user-error "Kept the in-progress Jupyter connection attempt"))))
 
 (defun emacs-jupyter-notebook--live-client-p ()
   "Return non-nil when the current buffer owns a live Jupyter client.
@@ -1662,6 +1714,27 @@ underlying stderr matches a known SSH failure pattern."
                        (format "%s" error-data)))
     context))
 
+(defun emacs-jupyter-notebook--cancel-async-operation (context &optional reason)
+  "Abort in-flight CONTEXT and clear the buffer-local async slot.
+Shared by the interactive `cancel-operation' and the supersede branch of
+`--ensure-no-async-operation'.
+
+Kills the remote kernel the attempt launched IFF the context
+`:owns-kernel' — a start attempt spawns a kernel that never finished
+connecting and holds NO registry entry, so aborting it must not leave
+that kernel orphaned.  `--async-kill-remote-kernel' is itself a no-op for
+reconnect attempts (`:owns-kernel' nil), whose kernel pre-exists and is a
+durable reconnect surface that cancel must never terminate.
+
+Then fails CONTEXT with REASON (default \"Operation cancelled\") — which
+releases its local processes, timers, and temp files — and nils
+`--async-context'.  Never calls `jupyter-shutdown',
+`--cleanup-remote-entry', or the registry: those terminate a *connected*
+session, which cancel is not."
+  (emacs-jupyter-notebook--async-kill-remote-kernel context)
+  (emacs-jupyter-notebook--async-fail context (or reason "Operation cancelled"))
+  (setq emacs-jupyter-notebook--async-context nil))
+
 (defun emacs-jupyter-notebook--async-process-failed-p (process)
   "Return non-nil when PROCESS exited unsuccessfully."
   (or (eq (process-status process) 'signal)
@@ -1683,8 +1756,12 @@ underlying stderr matches a known SSH failure pattern."
     context))
 
 (defun emacs-jupyter-notebook--async-launch-sentinel (context process)
-  "Advance CONTEXT after remote launch PROCESS exits."
-  (when (memq (process-status process) '(exit signal))
+  "Advance CONTEXT after remote launch PROCESS exits.
+A2: no-op when CONTEXT is no longer the buffer's active attempt (cancelled,
+failed, or superseded) so a stale launch process cannot re-enter the
+pipeline or double-invoke the error callback."
+  (when (and (memq (process-status process) '(exit signal))
+             (emacs-jupyter-notebook--async-context-live-p context))
     (if (emacs-jupyter-notebook--async-process-failed-p process)
         (emacs-jupyter-notebook--async-fail
          context (format "Remote kernel launch failed: %s"
@@ -1714,12 +1791,57 @@ underlying stderr matches a known SSH failure pattern."
   (setq context (emacs-jupyter-notebook--async-put context :phase 'retrieve))
   (emacs-jupyter-notebook--async-retrieve-attempt context))
 
+(defun emacs-jupyter-notebook--async-retrieve-timeout (context &optional scp-reason)
+  "Fail CONTEXT after retrieval exhaustion, enriched with the remote launch log.
+SCP-REASON, when given, is the last retrieve error (e.g. \"SCP failed: …\").
+
+A8: the connection file never appeared, which almost always means the
+remote kernel process failed to start (`jupyter' not on the non-interactive
+SSH PATH, a bad kernelspec, a `docker run' TTY/mount/network misstep, …).
+That cause lives ONLY in the remote launch log, so fetch its tail
+best-effort and surface it in the failure message instead of leaving the
+user to SSH in and read the log by hand.  The fetch is asynchronous and
+guarded by `--async-context-live-p' so a cancel/supersede mid-fetch is a
+no-op; if the log is unavailable the base timeout message is still raised."
+  (let* ((entry (plist-get context :entry))
+         (connection-file (plist-get entry :remote-connection-file))
+         (base (concat "Timed out retrieving the remote Jupyter connection "
+                       "file; the remote kernel likely failed to start"))
+         (header (if scp-reason (format "%s.\nLast retrieve error: %s" base scp-reason)
+                   (concat base ".")))
+         (finish
+          (lambda (log-tail)
+            (when (emacs-jupyter-notebook--async-context-live-p context)
+              (emacs-jupyter-notebook--async-fail
+               context
+               (if log-tail
+                   (format "%s\nRemote launch log (tail):\n%s" header log-tail)
+                 (concat header
+                         "\n(Remote launch log empty or unavailable — check"
+                         " `:jupyter-command' / the remote PATH.)")))))))
+    (if (not connection-file)
+        (funcall finish nil)
+      (let ((process
+             (ignore-errors
+               (emacs-jupyter-notebook-ssh-start-process
+                (format "emacs-jupyter-notebook-launchlog-%s"
+                        (or (plist-get context :session-id) "kernel"))
+                (emacs-jupyter-notebook-ssh-build-remote-cat-log
+                 (plist-get context :profile) connection-file)
+                (lambda (proc _event)
+                  (when (memq (process-status proc) '(exit signal))
+                    (let ((out (emacs-jupyter-notebook--process-output proc)))
+                      (emacs-jupyter-notebook--async-delete-process proc)
+                      (funcall finish
+                               (emacs-jupyter-notebook--last-lines out 30)))))))))
+        (unless process
+          (funcall finish nil))))))
+
 (defun emacs-jupyter-notebook--async-retrieve-attempt (context)
   "Start one asynchronous SCP attempt for CONTEXT."
   (let ((attempt (1+ (or (plist-get context :scp-attempt) 0))))
     (if (> attempt emacs-jupyter-notebook-connection-retrieve-attempts)
-        (emacs-jupyter-notebook--async-fail
-         context "Timed out retrieving remote Jupyter connection file")
+        (emacs-jupyter-notebook--async-retrieve-timeout context)
       (let* ((entry (plist-get context :entry))
              (argv (emacs-jupyter-notebook-ssh-scp-from-command
                     (plist-get context :profile)
@@ -1741,18 +1863,28 @@ underlying stderr matches a known SSH failure pattern."
         context))))
 
 (defun emacs-jupyter-notebook--async-retrieve-retry (context reason)
-  "Schedule another connection-file retrieval for CONTEXT because of REASON."
+  "Schedule another connection-file retrieval for CONTEXT because of REASON.
+On exhaustion the failure is routed through `--async-retrieve-timeout' so
+the remote launch log is fetched and surfaced (A8): the connection file
+never arriving almost always means the kernel failed to launch, and the
+reason lives in that log, not in the SCP-level REASON."
   (if (>= (or (plist-get context :scp-attempt) 0)
           emacs-jupyter-notebook-connection-retrieve-attempts)
-      (emacs-jupyter-notebook--async-fail context reason)
+      (emacs-jupyter-notebook--async-retrieve-timeout context reason)
     (let ((timer (run-at-time
                   emacs-jupyter-notebook-connection-retrieve-delay nil
                   #'emacs-jupyter-notebook--async-retrieve-attempt context)))
       (emacs-jupyter-notebook--async-put context :timer timer))))
 
 (defun emacs-jupyter-notebook--async-scp-sentinel (context process)
-  "Advance CONTEXT after SCP PROCESS exits."
-  (when (memq (process-status process) '(exit signal))
+  "Advance CONTEXT after SCP PROCESS exits.
+A2: no-op when CONTEXT is no longer the buffer's active attempt.  Without
+this gate, cancelling/superseding an attempt (W12) — which deletes its SCP
+process — makes the deleted process's sentinel fire, take the retry path,
+and `--async-put' the dead context back into the buffer, resurrecting it and
+clobbering any newer attempt while re-issuing SCP against a killed kernel."
+  (when (and (memq (process-status process) '(exit signal))
+             (emacs-jupyter-notebook--async-context-live-p context))
     (cond
      ((emacs-jupyter-notebook--async-process-failed-p process)
       (emacs-jupyter-notebook--async-retrieve-retry
@@ -2707,8 +2839,12 @@ Lisp caller passing a string is treated as the profile name to start.
 
 W6.4: when called interactively, ask `y-or-n-p' before destroying the
 current session and starting fresh; a \\[universal-argument] FORCE prefix
-skips the prompt.  The remote kernel that is currently registered is left
-running per the binding rule that the remote kernel outlives Emacs."
+skips the prompt.  Unlike buffer kill / mode disable, this command is an
+explicit ROADMAP W6.4 kernel terminator: `--cleanup-current-state' kills
+the currently-registered remote kernel and removes its registry entry
+before launching the replacement (that is the whole point — replace the
+current kernel with a fresh one).  Only the in-band `jupyter-shutdown' is
+skipped; the out-of-band remote `pkill' and deregistration still run."
   (interactive "P")
   (let* ((profile-name (and (stringp force-or-profile) force-or-profile))
          (force (and (not profile-name) force-or-profile))
@@ -3052,9 +3188,11 @@ Lisp callers do not see the prompt and proceed unconditionally."
 
 W5.3: two branches.
 - If an async context is in progress (launch / retrieve / tunnel /
-  connect), cancel it via `--async-fail' exactly as before — the
-  evaluation branch is NOT taken because there is no live kernel to
-  interrupt.
+  connect), cancel it via `--cancel-async-operation' — the evaluation
+  branch is NOT taken because there is no live kernel to interrupt.  A
+  start attempt (`:owns-kernel') also has the remote kernel it launched
+  killed so it is not orphaned; a reconnect attempt leaves its
+  pre-existing kernel alone.
 - Otherwise, if an evaluation is in flight (`--evaluation-request' is
   set), fire-and-forget an interrupt through the adapter and clear the
   request, the timer, and the panel/fringe state for that entry.  This
@@ -3069,9 +3207,8 @@ If neither is in progress, signal a `user-error'."
    ;; `done', which previously caused cancel-during-evaluation to take the
    ;; wrong branch and never interrupt the kernel.
    ((emacs-jupyter-notebook--async-in-progress-p)
-    (emacs-jupyter-notebook--async-fail
-     emacs-jupyter-notebook--async-context "Operation cancelled")
-    (setq emacs-jupyter-notebook--async-context nil))
+    (emacs-jupyter-notebook--cancel-async-operation
+     emacs-jupyter-notebook--async-context "Operation cancelled"))
    (emacs-jupyter-notebook--evaluation-request
     (emacs-jupyter-notebook--cancel-evaluation))
    (t
