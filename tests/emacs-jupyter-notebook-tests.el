@@ -2204,25 +2204,29 @@ client) never kills the remote kernel — it is the durable reconnect surface."
         (emacs-jupyter-notebook--request-completion)
         (should-not call-count)))))
 
-(ert-deftest ejn-completion-explicit-command-schedules-request-when-empty ()
-  ;; Explicit `complete-at-point' with no cached candidates schedules the
-  ;; idle async request rather than calling the adapter synchronously.
+(ert-deftest ejn-w14-explicit-complete-fetches-now-and-shows ()
+  "W14: explicit `complete-at-point' with no cached candidates fetches
+IMMEDIATELY (not via the debounced idle timer) and drives
+`completion-in-region' when the reply arrives, so a single invocation
+reliably shows candidates instead of silently requiring a second press."
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
     (search-forward "my_obj.met")
     (let ((emacs-jupyter-notebook--client 'mock-client)
-          (emacs-jupyter-notebook--completion-pending-key nil)
-          (emacs-jupyter-notebook--completion-pending-id nil)
           (emacs-jupyter-notebook--completion-cache nil)
           (emacs-jupyter-notebook--completion-cache-order nil)
-          (emacs-jupyter-notebook--completion-idle-timer nil)
-          adapter-called)
-      (let ((emacs-jupyter-notebook-jupyter-complete-function
-             (lambda (_client _code _pos _callback)
-               (setq adapter-called t))))
-        (emacs-jupyter-notebook-complete-at-point)
-        (should-not adapter-called)
-        (should (timerp emacs-jupyter-notebook--completion-idle-timer))
-        (cancel-timer emacs-jupyter-notebook--completion-idle-timer)))))
+          adapter-code shown)
+      (cl-letf (((symbol-function 'completion-in-region)
+                 (lambda (&rest args) (setq shown args))))
+        (let ((emacs-jupyter-notebook-jupyter-complete-function
+               (lambda (_client code _pos callback)
+                 (setq adapter-code code)
+                 (funcall callback '(:matches ["method" "meta"]
+                                     :cursor_start 7 :cursor_end 10)
+                          nil))))
+          (emacs-jupyter-notebook-complete-at-point))
+        (should adapter-code)
+        (should shown)
+        (should (member "method" (nth 2 shown)))))))
 
 (ert-deftest ejn-w9-capf-explicit-invocation-schedules-request-on-miss ()
   ;; W9: the capf is invoked EXPLICITLY (this-command = `completion-at-point',
@@ -6962,6 +6966,58 @@ older ones are pruned so an image-heavy session's memory stays bounded."
       (should (null (ejn-panel-entry-pickle (cdr (assq 2 handles)))))
       (should (null (ejn-panel-entry-pickle (cdr (assq 1 handles)))))
       (should (null (ejn-panel-entry-pickle (cdr (assq 0 handles))))))))
+
+(ert-deftest ejn-w14-apply-carriage-returns-collapses-progress ()
+  "W14: tqdm-style `\\r' progress collapses to the final frame; `\\r\\n'
+becomes `\\n'; plain multi-line text is untouched."
+  (should (equal (emacs-jupyter-notebook--apply-carriage-returns "10%\r20%\r30%")
+                 "30%"))
+  (should (equal (emacs-jupyter-notebook--apply-carriage-returns "a\r\nb") "a\nb"))
+  (should (equal (emacs-jupyter-notebook--apply-carriage-returns "l1\nl2") "l1\nl2"))
+  (should (equal (emacs-jupyter-notebook--apply-carriage-returns "x\r100%\nnext")
+                 "100%\nnext")))
+
+(ert-deftest ejn-w14-append-text-collapses-tqdm-across-messages ()
+  "W14: `\\r' progress arriving as separate stream messages collapses to the
+latest frame in the stored entry content (no dumped intermediate frames)."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (h (ejn-panel-start-entry panel '("x.py" . 1) "")))
+      (ejn-panel-append-text h "\r 10%")
+      (ejn-panel-append-text h "\r 55%")
+      (ejn-panel-append-text h "\r100%")
+      (should (equal (plist-get (ejn-panel-entry-snapshot h) :content) "100%")))))
+
+(ert-deftest ejn-w14-image-zoom-tolerates-default-scale ()
+  "W14: the panel zoom keys must not signal (wrong-type-argument
+number-or-marker-p default) when `:scale' is the symbol `default' (Emacs
+29+), and must leave a numeric scale behind."
+  (with-temp-buffer
+    (insert (propertize " " 'display (list 'image :type 'png :scale 'default)))
+    (goto-char (point-min))
+    (emacs-jupyter-notebook-panel--scale-image-at-point 1.2)
+    (let ((img (get-text-property (point-min) 'display)))
+      (should (numberp (image-property img :scale))))))
+
+(ert-deftest ejn-w14-panel-open-figure-finds-pickle-off-header ()
+  "W14: `v' / open-figure finds the entry's pickle when point is on the
+image line, not just the header — the entry-id lives on the header, so the
+section lookup must resolve the enclosing entry."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (h (ejn-panel-start-entry panel '("x.py" . 1) "plot()")))
+      (ejn-panel-set-image h (list 'image :type 'png))
+      (ejn-panel-set-pickle h "cGlja2xl")
+      (with-current-buffer panel
+        (emacs-jupyter-notebook-panel--render panel)
+        ;; Jump to the image (first char carrying a `display' property).
+        (let ((img-pos (next-single-property-change (point-min) 'display)))
+          (should img-pos)
+          (goto-char img-pos)
+          ;; Point is NOT on the header line here.
+          (should-not (get-text-property (point) 'emacs-jupyter-notebook-entry-id))
+          (should (equal (emacs-jupyter-notebook-panel--entry-pickle-at-point)
+                         "cGlja2xl")))))))
 
 (ert-deftest ejn-w8.2-display-data-stores-pickle-and-renders-png ()
   "W8.2: a bundle with both PNG and pickle renders the PNG AND stashes the

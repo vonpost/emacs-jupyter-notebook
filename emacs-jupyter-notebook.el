@@ -2495,20 +2495,50 @@ request."
           (emacs-jupyter-notebook--completion-schedule-request t))
         nil))))
 
+(defun emacs-jupyter-notebook--complete-explicit-now ()
+  "Fetch completions immediately and display them when the reply arrives.
+Unlike the debounced auto path (which just primes the cache and relies on
+the frontend re-invoking capf on the next keystroke), an EXPLICIT
+invocation fires the request now and drives `completion-in-region' on
+arrival — so a single \\[emacs-jupyter-notebook-complete-at-point] reliably
+shows candidates after the round trip regardless of the active frontend,
+and reports `No completions' rather than doing nothing."
+  (let* ((context (emacs-jupyter-notebook--completion-context))
+         (key (plist-get context :key))
+         (code (plist-get context :code))
+         (cursor-pos (plist-get context :cursor-pos))
+         (buffer (current-buffer))
+         (origin-point (point)))
+    (message "Requesting completions…")
+    (emacs-jupyter-notebook-jupyter-complete
+     emacs-jupyter-notebook--client code cursor-pos
+     (lambda (reply _error)
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (if (not (and reply (= (point) origin-point)))
+               (message "No completions")
+             (emacs-jupyter-notebook--completion-cache-put key reply)
+             (let ((result (emacs-jupyter-notebook--completion-result-from-reply
+                            reply)))
+               (if (and result (nth 2 result) (> (length (nth 2 result)) 0))
+                   (apply #'completion-in-region (seq-take result 3))
+                 (message "No completions"))))))))))
+
 (defun emacs-jupyter-notebook-complete-at-point ()
   "Explicit completion command.
-Returns cached candidates immediately if any are present; otherwise
-schedules an idle-delayed async request and lets the frontend refresh
-when the reply arrives."
+Shows cached candidates immediately when present; otherwise fetches now and
+displays them when the reply lands (see `--complete-explicit-now')."
   (interactive)
   (unless emacs-jupyter-notebook--client
     (user-error "No Jupyter kernel connected"))
+  (when (eq emacs-jupyter-notebook--kernel-status 'busy)
+    (user-error "Kernel is busy; completion is unavailable until it is idle"))
   (let ((result (emacs-jupyter-notebook--completion-result)))
     (if result
         ;; Strip capf metadata (`:exclusive' etc) before invoking
         ;; `completion-in-region', which only accepts (START END COLL).
         (apply #'completion-in-region (seq-take result 3))
-      (emacs-jupyter-notebook--completion-schedule-request t))))
+      (emacs-jupyter-notebook--complete-explicit-now))))
 
 (defun emacs-jupyter-notebook--completion-start-idle-timer ()
   "Start the completion cache idle timer (one-shot rescheduled on each tick).

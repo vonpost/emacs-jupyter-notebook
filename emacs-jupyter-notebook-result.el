@@ -522,6 +522,24 @@ state appears in place."
       (emacs-jupyter-notebook-panel--schedule-render panel)
       (emacs-jupyter-notebook-panel--handle panel id cell-key))))
 
+(defun emacs-jupyter-notebook--apply-carriage-returns (text)
+  "Resolve carriage returns in TEXT like a terminal / notebook cell.
+`\\r\\n' collapses to `\\n'; within a line a bare `\\r' returns to column 0,
+so only the text after the LAST `\\r' on that line survives.  This collapses
+tqdm-style progress bars — which repaint a single line via `\\r' — to their
+final frame instead of dumping every intermediate update into the panel.
+Text properties (ANSI-coloured spans) are preserved."
+  (if (not (string-search "\r" text))
+      text
+    (let ((text (replace-regexp-in-string "\r\n" "\n" text)))
+      (mapconcat
+       (lambda (line)
+         (if (string-search "\r" line)
+             (car (last (split-string line "\r")))
+           line))
+       (split-string text "\n")
+       "\n"))))
+
 (defun ejn-panel-append-text (handle text &optional face)
   "Append TEXT (optionally propertized with FACE) to HANDLE's entry.
 When TEXT already carries `face' text-properties (e.g. from
@@ -539,6 +557,11 @@ colours are preserved and uncoloured spans still get the fallback FACE."
                 (current (or (plist-get entry :content) ""))
                 (new (if pending display-text (concat current display-text)))
                 (max-bytes emacs-jupyter-notebook-result-max-bytes))
+           ;; Collapse carriage-return progress repaints (tqdm) so the panel
+           ;; shows the latest frame, not every intermediate one.  Only when
+           ;; the incoming chunk carries a `\r' — plain output skips the work.
+           (when (string-search "\r" display-text)
+             (setq new (emacs-jupyter-notebook--apply-carriage-returns new)))
            (when (> (string-bytes new) max-bytes)
              (setq new (emacs-jupyter-notebook--last-bytes new max-bytes)))
            (setq entry (plist-put entry :content new))
@@ -748,7 +771,12 @@ above it yields an `equal' key."
   "Scale the image at point in the panel by FACTOR (multiplicative)."
   (let ((image (emacs-jupyter-notebook-panel--image-at-point)))
     (when (and image (consp image) (eq (car image) 'image))
-      (let* ((scale (or (image-property image :scale) 1.0))
+      ;; Emacs 29+ returns the symbol `default' (not nil) for an unset
+      ;; `:scale', so coerce any non-number to 1.0 before multiplying —
+      ;; otherwise the zoom keys signal (wrong-type-argument number-or-marker-p
+      ;; default).
+      (let* ((raw (image-property image :scale))
+             (scale (if (numberp raw) raw 1.0))
              (new-scale (max 0.05 (* scale factor))))
         (setf (image-property image :scale) new-scale)
         (force-window-update (current-buffer))))))
@@ -766,11 +794,12 @@ above it yields an `equal' key."
 (defun emacs-jupyter-notebook-panel-visit-source ()
   "Visit the source cell associated with the entry at point."
   (interactive)
-  (let* ((id (get-text-property (point) 'emacs-jupyter-notebook-entry-id))
-         (key (get-text-property (point) 'emacs-jupyter-notebook-cell-key))
+  (let* ((id (emacs-jupyter-notebook-panel--entry-id-at-point))
+         (entry (and id (emacs-jupyter-notebook-panel--entry (current-buffer) id)))
+         (key (plist-get entry :cell-key))
          (source emacs-jupyter-notebook-panel--source-buffer))
     (unless id
-      (user-error "Point is not on an entry header"))
+      (user-error "Point is not on an entry"))
     (unless (and key (buffer-live-p source))
       (user-error "Entry has no source cell"))
     (let ((id (cdr key)))
@@ -917,9 +946,22 @@ The fringe values silently fall back to `left-margin'."
 (declare-function emacs-jupyter-notebook-open-figure-with-pickle
                   "emacs-jupyter-notebook" (base64))
 
+(defun emacs-jupyter-notebook-panel--entry-id-at-point ()
+  "Return the id of the panel entry whose SECTION contains point.
+The `entry-id' text property lives on the header line only, so a point on
+the image or content below the header carries none.  Fall back to the
+nearest header at or before point, so `v' / RET / navigation work anywhere
+inside an entry's section — not only when point sits on the header line."
+  (or (get-text-property (point) 'emacs-jupyter-notebook-entry-id)
+      (let* ((positions (emacs-jupyter-notebook-panel--header-positions))
+             (header (cl-find-if (lambda (p) (<= p (point)))
+                                 (reverse positions))))
+        (and header
+             (get-text-property header 'emacs-jupyter-notebook-entry-id)))))
+
 (defun emacs-jupyter-notebook-panel--entry-pickle-at-point ()
   "Return the matplotlib pickle stashed on the panel entry at point, or nil."
-  (let ((id (get-text-property (point) 'emacs-jupyter-notebook-entry-id)))
+  (let ((id (emacs-jupyter-notebook-panel--entry-id-at-point)))
     (when id
       (plist-get (emacs-jupyter-notebook-panel--entry (current-buffer) id)
                  :mpl-pickle))))
