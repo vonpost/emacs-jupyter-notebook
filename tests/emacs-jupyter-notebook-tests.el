@@ -183,6 +183,48 @@
       (should (equal (emacs-jupyter-notebook-registry-load file) (list entry)))
       (should (= (logand (file-modes file) #o777) #o600)))))
 
+(ert-deftest ejn-a6-corrupt-registry-backed-up-not-silently-wiped ()
+  "A6: saving into a corrupt registry preserves the old bytes as a
+`.corrupt-*' backup and still lands the new entry, rather than silently
+discarding every prior host's reconnect entry."
+  (ejn-test-with-temp-file file
+    (emacs-jupyter-notebook-registry-save
+     '((:profile "keep" :session-id "old")) file)
+    ;; Corrupt the file on disk (unbalanced form → `read' fails).
+    (with-temp-file file (insert "(:profile \"broken\" this is not"))
+    (cl-letf (((symbol-function 'display-warning) #'ignore))
+      (emacs-jupyter-notebook-registry-save-entry
+       '(:profile "new" :session-id "new") file))
+    ;; New entry present after the rewrite.
+    (should (emacs-jupyter-notebook-registry-find
+             "new" (emacs-jupyter-notebook-registry-load file)))
+    ;; Corrupt bytes preserved in a backup, so nothing is silently lost.
+    (let ((backups (directory-files
+                    (file-name-directory file) t
+                    (concat (regexp-quote (file-name-nondirectory file))
+                            "\\.corrupt-"))))
+      (should backups)
+      (should (string-match-p
+               "not" (with-temp-buffer
+                       (insert-file-contents (car backups))
+                       (buffer-string)))))))
+
+(ert-deftest ejn-a6-valid-registry-save-makes-no-backup ()
+  "A6: the corrupt-backup path never triggers on a healthy registry."
+  (ejn-test-with-temp-file file
+    (emacs-jupyter-notebook-registry-save
+     '((:profile "a" :session-id "a")) file)
+    (emacs-jupyter-notebook-registry-save-entry
+     '(:profile "b" :session-id "b") file)
+    (should (emacs-jupyter-notebook-registry-find
+             "a" (emacs-jupyter-notebook-registry-load file)))
+    (should (emacs-jupyter-notebook-registry-find
+             "b" (emacs-jupyter-notebook-registry-load file)))
+    (should-not (directory-files
+                 (file-name-directory file) nil
+                 (concat (regexp-quote (file-name-nondirectory file))
+                         "\\.corrupt-")))))
+
 (ert-deftest ejn-registry-save-creates-parent-directory ()
   (let* ((dir (make-temp-file "ejn-registry-dir-" t))
          (file (expand-file-name "missing/registry.el" dir)))
@@ -313,12 +355,16 @@ W4.4 dead-PID probe test); production code must not."
         (should-error (emacs-jupyter-notebook-start-remote-kernel "p")
                       :type 'user-error)))))
 
-(ert-deftest ejn-start-remote-kernel-refuses-duplicate-operation ()
+(ert-deftest ejn-start-remote-kernel-declining-cancel-refuses-duplicate-operation ()
+  "W12: starting while an attempt is in flight prompts to cancel it; declining
+the prompt (`n') refuses the new start with a `user-error' and launches
+nothing, so the buffer keeps its single in-progress attempt."
   (let ((emacs-jupyter-notebook-remote-profiles
           '(("p" . (:host "example.com" :remote-cwd "~" :kernelspec "python3"))))
         started)
     (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
                #'ignore)
+              ((symbol-function 'y-or-n-p) (lambda (&rest _) nil))
               ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
                (lambda (&rest _)
                  (setq started t)
@@ -332,6 +378,33 @@ W4.4 dead-PID probe test); production code must not."
         (should-error (emacs-jupyter-notebook-start-remote-kernel "p")
                       :type 'user-error)
         (should-not started)))))
+
+(ert-deftest ejn-start-remote-kernel-accepting-cancel-supersedes-attempt ()
+  "W12: accepting the cancel prompt (`y') aborts the in-progress attempt
+via `--cancel-async-operation' and proceeds with the new start."
+  (let ((emacs-jupyter-notebook-remote-profiles
+          '(("p" . (:host "example.com" :remote-cwd "~" :kernelspec "python3"))))
+        started superseded)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+               #'ignore)
+              ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+              ((symbol-function 'emacs-jupyter-notebook--cancel-async-operation)
+               (lambda (&rest _)
+                 (setq superseded t)
+                 (setq emacs-jupyter-notebook--async-context nil)))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
+               (lambda (&rest _)
+                 (setq started t)
+                 'mock-process)))
+      (with-temp-buffer
+        (setq buffer-file-name "/tmp/example-notebook.py")
+        (setq emacs-jupyter-notebook--async-context
+              (emacs-jupyter-notebook--async-new-context
+               :phase 'retrieve
+               :origin-buffer (current-buffer)))
+        (emacs-jupyter-notebook-start-remote-kernel "p")
+        (should superseded)
+        (should started)))))
 
 (ert-deftest ejn-start-remote-kernel-refuses-existing-client-noninteractive ()
   (let ((emacs-jupyter-notebook-remote-profiles
@@ -382,7 +455,10 @@ W4.4 dead-PID probe test); production code must not."
           (should (eq (plist-get context :phase) 'retrieve))
           (should-not (plist-get context :owns-kernel)))))))
 
-(ert-deftest ejn-reconnect-remote-kernel-refuses-duplicate-operation ()
+(ert-deftest ejn-reconnect-remote-kernel-declining-cancel-refuses-duplicate-operation ()
+  "W12: reconnecting while an attempt is in flight prompts to cancel it;
+declining (`n') refuses the reconnect with a `user-error' and never begins
+retrieval, so the buffer keeps its single in-progress attempt."
   (let ((entry '(:profile "p"
                  :remote-host "example.com"
                  :remote-cwd "~"
@@ -392,6 +468,7 @@ W4.4 dead-PID probe test); production code must not."
         retrieved)
     (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
                #'ignore)
+              ((symbol-function 'y-or-n-p) (lambda (&rest _) nil))
               ((symbol-function 'emacs-jupyter-notebook--async-retrieve)
                (lambda (&rest _)
                  (setq retrieved t))))
@@ -465,10 +542,63 @@ Pressing RET on the chooser with no edit returns the current-file entry."
 
 (ert-deftest ejn-ssh-basic-command-with-user-port-and-options ()
   (let ((emacs-jupyter-notebook-ssh-command "ssh")
-        (emacs-jupyter-notebook-ssh-options '("-o" "BatchMode=yes")))
+        (emacs-jupyter-notebook-ssh-options '("-o" "BatchMode=yes"))
+        ;; Isolate the core argv shape from the A3/A4 global options, which
+        ;; have their own dedicated tests below.
+        (emacs-jupyter-notebook-ssh-connect-timeout nil)
+        (emacs-jupyter-notebook-ssh-batch-mode nil)
+        (emacs-jupyter-notebook-ssh-control-master nil))
     (should (equal (emacs-jupyter-notebook-ssh-command
                     '(:profile "p" :host "example.com" :user "alice" :port 2222))
                    '("ssh" "-o" "BatchMode=yes" "-p" "2222" "alice@example.com")))))
+
+(ert-deftest ejn-a3a4-ssh-command-carries-connect-timeout-and-control-master ()
+  "A4: every ssh command carries `ConnectTimeout' (bounded handshake).
+A3: it also carries multiplexing options so short commands share a master."
+  (let ((emacs-jupyter-notebook-ssh-connect-timeout 10)
+        (emacs-jupyter-notebook-ssh-batch-mode nil)
+        (emacs-jupyter-notebook-ssh-control-master t)
+        (emacs-jupyter-notebook-ssh-control-persist "60")
+        (emacs-jupyter-notebook-ssh-control-path "/tmp/ejn-ssh-%i-%C"))
+    (let ((cmd (emacs-jupyter-notebook-ssh-command
+                '(:profile "p" :host "example.com") "true")))
+      (should (member "ConnectTimeout=10" cmd))
+      (should (member "ControlMaster=auto" cmd))
+      (should (member "ControlPath=/tmp/ejn-ssh-%i-%C" cmd))
+      (should (member "ControlPersist=60" cmd))
+      (should-not (member "BatchMode=yes" cmd)))))
+
+(ert-deftest ejn-a3a4-batch-mode-opt-in ()
+  "A4: `BatchMode=yes' appears only when the defcustom is enabled."
+  (let ((emacs-jupyter-notebook-ssh-control-master nil)
+        (emacs-jupyter-notebook-ssh-connect-timeout nil))
+    (let ((emacs-jupyter-notebook-ssh-batch-mode t))
+      (should (member "BatchMode=yes"
+                      (emacs-jupyter-notebook-ssh-command
+                       '(:profile "p" :host "h") "true"))))
+    (let ((emacs-jupyter-notebook-ssh-batch-mode nil))
+      (should-not (member "BatchMode=yes"
+                          (emacs-jupyter-notebook-ssh-command
+                           '(:profile "p" :host "h") "true"))))))
+
+(ert-deftest ejn-a3-tunnel-opts-out-of-multiplexing ()
+  "A3: the persistent tunnel must own its own connection — it carries
+`ControlPath=none' and never a shared master, so liveness stays detectable."
+  (let ((emacs-jupyter-notebook-ssh-control-master t)
+        (emacs-jupyter-notebook-ssh-control-path "/tmp/ejn-ssh-%i-%C"))
+    (let ((cmd (emacs-jupyter-notebook-ssh-tunnel-command
+                '(:profile "p" :host "example.com")
+                '(:shell_port 1) '(:shell_port 1001))))
+      (should (member "ControlPath=none" cmd))
+      (should-not (member "ControlMaster=auto" cmd))
+      (should-not (member "ControlPath=/tmp/ejn-ssh-%i-%C" cmd))))
+  ;; Disabled: no multiplexing options anywhere on the tunnel.
+  (let ((emacs-jupyter-notebook-ssh-control-master nil))
+    (let ((cmd (emacs-jupyter-notebook-ssh-tunnel-command
+                '(:profile "p" :host "example.com")
+                '(:shell_port 1) '(:shell_port 1001))))
+      (should-not (member "ControlPath=none" cmd))
+      (should-not (member "ControlMaster=auto" cmd)))))
 
 (ert-deftest ejn-ssh-tunnel-command-multiple-ports ()
   (let ((cmd (emacs-jupyter-notebook-ssh-tunnel-command
@@ -480,13 +610,55 @@ Pressing RET on the chooser with no edit returns the current-file entry."
     (should (member "1005:127.0.0.1:5" cmd))
     (should (equal (car (last cmd)) "example.com"))))
 
-(ert-deftest ejn-ssh-scp-preserves-home-expansion ()
-  (should (equal (emacs-jupyter-notebook-ssh-scp-from-command
-                  '(:profile "p" :host "example.com")
-                  "~/.cache/ejn/kernel.json" "/tmp/kernel.json")
-                 (list emacs-jupyter-notebook-scp-command
-                       "example.com:~/.cache/ejn/kernel.json"
-                       "/tmp/kernel.json"))))
+(ert-deftest ejn-ssh-scp-rewrites-tilde-to-home-relative ()
+  "A `~'-anchored remote path is handed to scp as a home-RELATIVE path.
+scp does not run through the remote shell, and OpenSSH 9+ scp (SFTP
+protocol) treats a leading `~' as a literal directory name — so
+`host:~/.cache/...' fails even though the launch created the dir.  The
+home-relative form resolves against the login home on both the SFTP and
+legacy SCP protocols."
+  ;; Isolate the path-rewrite behavior from the A3/A4 global options.
+  (let ((emacs-jupyter-notebook-ssh-connect-timeout nil)
+        (emacs-jupyter-notebook-ssh-batch-mode nil)
+        (emacs-jupyter-notebook-ssh-control-master nil))
+    (should (equal (emacs-jupyter-notebook-ssh-scp-from-command
+                    '(:profile "p" :host "example.com")
+                    "~/.cache/ejn/kernel.json" "/tmp/kernel.json")
+                   (list emacs-jupyter-notebook-scp-command
+                         "example.com:.cache/ejn/kernel.json"
+                         "/tmp/kernel.json")))))
+
+(ert-deftest ejn-ssh-scp-passes-absolute-remote-path-unchanged ()
+  "An absolute remote path is forwarded to scp verbatim — no rewriting."
+  (let ((emacs-jupyter-notebook-ssh-connect-timeout nil)
+        (emacs-jupyter-notebook-ssh-batch-mode nil)
+        (emacs-jupyter-notebook-ssh-control-master nil))
+    (should (equal (emacs-jupyter-notebook-ssh-scp-from-command
+                    '(:profile "p" :host "example.com")
+                    "/home/alice/.cache/ejn/kernel.json" "/tmp/kernel.json")
+                   (list emacs-jupyter-notebook-scp-command
+                         "example.com:/home/alice/.cache/ejn/kernel.json"
+                         "/tmp/kernel.json")))))
+
+(ert-deftest ejn-a3-scp-carries-multiplexing-when-enabled ()
+  "A3: scp rides the shared master too (its many connection-file polls are
+the biggest handshake cost)."
+  (let ((emacs-jupyter-notebook-ssh-control-master t)
+        (emacs-jupyter-notebook-ssh-control-path "/tmp/ejn-ssh-%i-%C"))
+    (let ((cmd (emacs-jupyter-notebook-ssh-scp-from-command
+                '(:profile "p" :host "example.com")
+                "~/.cache/ejn/kernel.json" "/tmp/kernel.json")))
+      (should (member "ControlMaster=auto" cmd))
+      (should (member "ControlPath=/tmp/ejn-ssh-%i-%C" cmd)))))
+
+(ert-deftest ejn-ssh-scp-remote-path-helper-cases ()
+  "`--scp-remote-path' strips a `~/' anchor, maps bare `~' to `.', and
+leaves absolute paths untouched."
+  (should (equal (emacs-jupyter-notebook-ssh--scp-remote-path "~/.cache/k.json")
+                 ".cache/k.json"))
+  (should (equal (emacs-jupyter-notebook-ssh--scp-remote-path "~") "."))
+  (should (equal (emacs-jupyter-notebook-ssh--scp-remote-path "/abs/k.json")
+                 "/abs/k.json")))
 
 (ert-deftest ejn-ssh-remote-cleanup-targets-connection-file ()
   (let* ((cmd (emacs-jupyter-notebook-ssh-build-remote-cleanup
@@ -513,7 +685,9 @@ Pressing RET on the chooser with no edit returns the current-file entry."
                '(:profile "p" :host "example.com" :remote-cache-dir "/tmp/ejn")))
          (remote-command (car (last cmd))))
     (should (string-match-p "ps -eo pid,ppid,stat,etime,args" remote-command))
-    (should (string-match-p "KernelManager.connection_file\\\\=/tmp/ejn/kernel-"
+    ;; A1: pattern is double-quoted (not double-shell-quoted, so `=' is not
+    ;; escaped) and self-excluding (`[K]') so `grep' never lists itself.
+    (should (string-match-p "\\[K\\]ernelManager.connection_file=/tmp/ejn/kernel-"
                             remote-command))))
 
 (ert-deftest ejn-ssh-remote-cleanup-all-targets-cache-dir ()
@@ -521,10 +695,31 @@ Pressing RET on the chooser with no edit returns the current-file entry."
                '(:profile "p" :host "example.com" :remote-cache-dir "/tmp/ejn")))
          (remote-command (car (last cmd))))
     (should (string-match-p "pkill -f" remote-command))
-    (should (string-match-p "KernelManager.connection_file\\\\=/tmp/ejn/kernel-"
+    (should (string-match-p "\\[K\\]ernelManager.connection_file=/tmp/ejn/kernel-"
                             remote-command))
     (should (string-match-p "rm -f /tmp/ejn/kernel-\\*.json /tmp/ejn/kernel-\\*.log"
                             remote-command))))
+
+(ert-deftest ejn-ssh-remote-cleanup-all-default-cache-matches-expanded-home ()
+  "A1 regression: with the default `~'-anchored cache dir the pkill pattern
+must carry an UNESCAPED `$HOME' (so the remote shell expands it and it
+matches the kernel's expanded argv), not the old double-`shell-quote-argument'
+`\\$HOME' literal that matched nothing.  It must also be self-excluding and
+must not embed the raw self-matching substring."
+  (let* ((cmd (emacs-jupyter-notebook-ssh-build-remote-cleanup-all
+               '(:profile "p" :host "example.com"
+                 :remote-cache-dir "~/.cache/emacs-jupyter-notebook")))
+         (remote-command (car (last cmd))))
+    ;; Unescaped, shell-expandable $HOME inside the double-quoted pattern.
+    (should (string-match-p
+             "pkill -f \"\\[K\\]ernelManager.connection_file=\\$HOME/.cache/emacs-jupyter-notebook/kernel-\""
+             remote-command))
+    ;; No escaped `\\$' that the remote shell would keep literal.
+    (should-not (string-match-p "\\\\\\$HOME" remote-command))
+    ;; Self-exclusion: the raw unbracketed pattern text is absent, so `pkill'
+    ;; cannot match its own shell and kill it before the `rm' runs.
+    (should-not (string-match-p "KernelManager.connection_file=\\$HOME"
+                                remote-command))))
 
 (ert-deftest ejn-ssh-remote-launch-command-is-detached ()
   (let* ((launch (emacs-jupyter-notebook-ssh-build-remote-launch
@@ -667,6 +862,60 @@ a `Hint:' line."
       (should (string-prefix-p "AUTH-FAILED:" captured))
       (should (string-match-p "Hint: " captured)))))
 
+(ert-deftest ejn-a2-context-live-p-distinguishes-active-dead-superseded ()
+  "A2: `--async-context-live-p' is true only for the buffer's current,
+in-progress attempt; false once the context is failed/superseded."
+  (with-temp-buffer
+    (let* ((buffer (current-buffer))
+           (ctx-a (emacs-jupyter-notebook--async-new-context
+                   :phase 'retrieve :origin-buffer buffer))
+           (ctx-b (emacs-jupyter-notebook--async-new-context
+                   :phase 'retrieve :origin-buffer buffer)))
+      ;; A is the active in-flight attempt.
+      (setq emacs-jupyter-notebook--async-context ctx-a)
+      (should (emacs-jupyter-notebook--async-context-live-p ctx-a))
+      ;; A superseded by B: A is no longer live, B is.
+      (setq emacs-jupyter-notebook--async-context ctx-b)
+      (should-not (emacs-jupyter-notebook--async-context-live-p ctx-a))
+      (should (emacs-jupyter-notebook--async-context-live-p ctx-b))
+      ;; A terminal phase in the slot is not in-progress, so not live.
+      (setq emacs-jupyter-notebook--async-context
+            (emacs-jupyter-notebook--async-put ctx-b :phase 'error))
+      (should-not (emacs-jupyter-notebook--async-context-live-p ctx-b)))))
+
+(ert-deftest ejn-a2-scp-sentinel-noop-when-context-superseded ()
+  "A2: a killed SCP process from a superseded attempt must not resurrect its
+context nor schedule a retry.  Without the identity guard the deleted
+process's sentinel would take the failure/retry path and `--async-put' the
+dead context back into the buffer, clobbering the newer attempt."
+  (with-temp-buffer
+    (let* ((origin (current-buffer))
+           (ctx-a (emacs-jupyter-notebook--async-new-context
+                   :phase 'retrieve :session-id "a"
+                   :scp-attempt 1 :origin-buffer origin))
+           (ctx-b (emacs-jupyter-notebook--async-new-context
+                   :phase 'retrieve :session-id "b" :origin-buffer origin))
+           retried)
+      ;; B currently owns the buffer's async slot; A was superseded.
+      (setq emacs-jupyter-notebook--async-context ctx-b)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-retrieve-retry)
+                 (lambda (&rest _) (setq retried t))))
+        (let ((process (emacs-jupyter-notebook-ssh-start-process
+                        "ejn-test-a2-scp-superseded"
+                        '("sh" "-c" "exit 1")
+                        (lambda (proc _event)
+                          (emacs-jupyter-notebook--async-scp-sentinel
+                           ctx-a proc)))))
+          (let ((deadline (+ (float-time) 5)))
+            (while (and (memq (process-status process) '(run open))
+                        (< (float-time) deadline))
+              (accept-process-output process 0.05)))
+          ;; Give the sentinel a chance to run after exit.
+          (accept-process-output nil 0.05)))
+      (should-not retried)
+      ;; The buffer's active attempt is untouched — B, not the resurrected A.
+      (should (eq emacs-jupyter-notebook--async-context ctx-b)))))
+
 (defun ejn-w7.2--run-retrieve-exhaustion ()
   "Drive `--async-retrieve' through retry exhaustion via a real failing
 subprocess.  Returns a plist with `:captured' (error-data), `:context'
@@ -750,6 +999,50 @@ buffers leak.  Flip to `:passed' once CC1 lands."
     (let ((leaked (cl-set-difference (ejn-test--ejn-process-buffers)
                                      (plist-get run :baseline))))
       (should-not leaked))))
+
+(ert-deftest ejn-a8-retrieve-timeout-surfaces-launch-log ()
+  "A8: when the connection file never arrives, the failure surfaced in Emacs
+includes the remote launch log tail, so the real cause (e.g. `jupyter'
+missing) is visible without SSHing in to read the log by hand."
+  (let ((emacs-jupyter-notebook-connection-retrieve-attempts 1)
+        (emacs-jupyter-notebook-connection-retrieve-delay 0.02)
+        captured)
+    (with-temp-buffer
+      (let* ((origin (current-buffer))
+             (context (emacs-jupyter-notebook--async-new-context
+                       :phase 'retrieve :session-id "a8"
+                       :profile '(:profile "p" :host "h")
+                       :entry '(:profile "p" :session-id "a8" :remote-host "h"
+                                :remote-connection-file "/remote/kernel-a8.json")
+                       :origin-buffer origin
+                       :error-callback (lambda (_ctx err) (setq captured err)))))
+        (setq emacs-jupyter-notebook--async-context context)
+        (cl-letf (((symbol-function 'display-warning) #'ignore)
+                  ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
+                   (lambda (name _argv sentinel)
+                     ;; scp attempts fail; the launch-log fetch returns the log.
+                     (let* ((script (if (string-match-p "launchlog" name)
+                                        "printf 'jupyter: command not found\\n'; exit 0"
+                                      "printf 'scp: no such file\\n' 1>&2; exit 1"))
+                            (stderr (generate-new-buffer
+                                     (format " *%s stderr*" name)))
+                            (proc (make-process
+                                   :name name
+                                   :buffer (generate-new-buffer
+                                            (format " *%s*" name))
+                                   :command (list "sh" "-c" script)
+                                   :connection-type 'pipe :noquery t
+                                   :sentinel sentinel :stderr stderr)))
+                       (process-put proc 'emacs-jupyter-notebook-stderr-buffer
+                                    stderr)
+                       proc))))
+          (emacs-jupyter-notebook--async-retrieve context)
+          (let ((deadline (+ (float-time) 5)))
+            (while (and (not captured) (< (float-time) deadline))
+              (accept-process-output nil 0.02))))))
+    (should captured)
+    (should (string-match-p "Remote launch log" captured))
+    (should (string-match-p "jupyter: command not found" captured))))
 
 (ert-deftest ejn-w4.4-build-pid-alive-uses-kill-zero ()
   "W4.4: the PID-alive probe argv ends with `kill -0 <pid>'."
@@ -1394,7 +1687,13 @@ is the durable reconnect key)."
 tunnel phase kills the live tunnel process, clears the async context,
 and leaves the registry file untouched.  In the fresh-start flow the
 entry is only written by `--async-connect-finalize', so cancelling
-before that point should NOT create a stray registry row."
+before that point should NOT create a stray registry row.
+
+W12: because the attempt already launched a remote kernel that never
+finished connecting and has no registry entry, cancelling MUST kill that
+kernel (via `--async-kill-remote-kernel') so it is not orphaned — while
+still never calling the connected-session terminators
+(`jupyter-shutdown', `--cleanup-remote-entry', `--remove-registry-entry')."
   (let* ((registry-dir (make-temp-file "ejn-w73-reg-" t))
          (registry-file (expand-file-name "registry.eld" registry-dir))
          (emacs-jupyter-notebook-registry-file registry-file))
@@ -1421,19 +1720,22 @@ before that point should NOT create a stray registry row."
                      :tunnel-process tunnel
                      :origin-buffer (current-buffer)
                      :error-callback (lambda (_ctx _err) nil)))
-              ;; W7.6: prove the durable-state helpers are NOT called on this
-              ;; path — cancel is not a terminator.  A regression that starts
-              ;; calling `--cleanup-remote-entry' or `--remove-registry-entry'
-              ;; from cancel would trip these should-not assertions.
+              ;; W7.6: prove the durable-session terminators are NOT called on
+              ;; this path — cancel does not shut down / deregister a connected
+              ;; session.  W12: the attempt's own launched kernel IS killed via
+              ;; `--async-kill-remote-kernel' so it is not orphaned.
               (let (remote-cleanup-called registry-remove-called
-                    shutdown-called)
+                    shutdown-called kernel-killed)
                 (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
                            (lambda (&rest _) (setq remote-cleanup-called t)))
                           ((symbol-function 'emacs-jupyter-notebook--remove-registry-entry)
                            (lambda (&rest _) (setq registry-remove-called t)))
                           ((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
-                           (lambda (&rest _) (setq shutdown-called t))))
+                           (lambda (&rest _) (setq shutdown-called t)))
+                          ((symbol-function 'emacs-jupyter-notebook--async-kill-remote-kernel)
+                           (lambda (&rest _) (setq kernel-killed t))))
                   (emacs-jupyter-notebook-cancel-operation)
+                  (should kernel-killed)
                   (should-not remote-cleanup-called)
                   (should-not registry-remove-called)
                   (should-not shutdown-called)))
@@ -1444,6 +1746,86 @@ before that point should NOT create a stray registry row."
               (should-not (file-exists-p registry-file))
               (should-not emacs-jupyter-notebook--session-entry))))
       (delete-directory registry-dir t))))
+
+(ert-deftest ejn-w12-ensure-no-async-operation-prompts-and-cancels-on-yes ()
+  "W12: starting/reconnecting while an attempt is in flight prompts; answering
+yes cancels the in-progress attempt (via `--cancel-async-operation') so the
+caller may proceed — a single buffer never runs two attempts in parallel."
+  (with-temp-buffer
+    (let (cancelled prompted)
+      (setq emacs-jupyter-notebook--async-context
+            (emacs-jupyter-notebook--async-new-context
+             :phase 'tunnel
+             :owns-kernel t
+             :origin-buffer (current-buffer)))
+      (cl-letf (((symbol-function 'y-or-n-p)
+                 (lambda (&rest _) (setq prompted t) t))
+                ((symbol-function 'emacs-jupyter-notebook--cancel-async-operation)
+                 (lambda (&rest _) (setq cancelled t))))
+        (emacs-jupyter-notebook--ensure-no-async-operation))
+      (should prompted)
+      (should cancelled))))
+
+(ert-deftest ejn-w12-ensure-no-async-operation-aborts-on-no ()
+  "W12: answering no to the cancel prompt signals a `user-error' and leaves the
+in-progress attempt untouched."
+  (with-temp-buffer
+    (let ((ctx (emacs-jupyter-notebook--async-new-context
+                :phase 'tunnel
+                :origin-buffer (current-buffer))))
+      (setq emacs-jupyter-notebook--async-context ctx)
+      (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) nil)))
+        (should-error (emacs-jupyter-notebook--ensure-no-async-operation)
+                      :type 'user-error))
+      (should (eq emacs-jupyter-notebook--async-context ctx)))))
+
+(ert-deftest ejn-w12-ensure-no-async-operation-noop-when-idle ()
+  "W12: with no attempt in flight the guard neither prompts nor errors."
+  (with-temp-buffer
+    (setq emacs-jupyter-notebook--async-context nil)
+    (cl-letf (((symbol-function 'y-or-n-p)
+               (lambda (&rest _) (error "must not prompt when idle"))))
+      (should-not (emacs-jupyter-notebook--ensure-no-async-operation)))))
+
+(ert-deftest ejn-w12-kill-buffer-during-attempt-kills-launched-kernel ()
+  "W12: killing a buffer mid-start-attempt kills the kernel the attempt
+launched (owns-kernel, no registry entry yet) so it is not orphaned."
+  (let (kernel-killed)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-kill-remote-kernel)
+               (lambda (_ctx) (setq kernel-killed t)))
+              ((symbol-function 'emacs-jupyter-notebook-jupyter--ensure) #'ignore))
+      (let ((buffer (generate-new-buffer "ejn-w12-kill")))
+        (with-current-buffer buffer
+          (emacs-jupyter-notebook-mode 1)
+          (setq emacs-jupyter-notebook--async-context
+                (emacs-jupyter-notebook--async-new-context
+                 :phase 'tunnel
+                 :owns-kernel t
+                 :origin-buffer buffer
+                 :entry '(:profile "p"
+                          :session-id "w12"
+                          :remote-connection-file "/remote/k.json"))))
+        (kill-buffer buffer))
+      (should kernel-killed))))
+
+(ert-deftest ejn-w12-kill-buffer-with-connected-kernel-spares-it ()
+  "W12: killing a buffer with a CONNECTED kernel (async phase `done', a live
+client) never kills the remote kernel — it is the durable reconnect surface."
+  (let (kernel-killed)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-kill-remote-kernel)
+               (lambda (_ctx) (setq kernel-killed t)))
+              ((symbol-function 'emacs-jupyter-notebook-jupyter--ensure) #'ignore))
+      (let ((buffer (generate-new-buffer "ejn-w12-connected")))
+        (with-current-buffer buffer
+          (emacs-jupyter-notebook-mode 1)
+          (setq emacs-jupyter-notebook--client 'mock-client)
+          (setq emacs-jupyter-notebook--async-context
+                (emacs-jupyter-notebook--async-new-context
+                 :phase 'done
+                 :owns-kernel t
+                 :origin-buffer buffer)))
+        (kill-buffer buffer))
+      (should-not kernel-killed))))
 
 (ert-deftest ejn-retry-fresh-kernel-cleans-state-and-starts-profile ()
   (let ((entry '(:profile "p" :session-id "old"))
@@ -6149,7 +6531,10 @@ silently makes the retrieve step fail."
       (should-not (member "-p" argv))
       (should (member "2222" argv))
       (should (member "-i" argv))
-      (should (member "h:~/.cache/ejn/k.json" argv))
+      ;; The `~'-anchored source is rewritten to a home-relative path so
+      ;; SFTP-protocol scp (OpenSSH 9+) can resolve it — see
+      ;; `ejn-ssh-scp-rewrites-tilde-to-home-relative'.
+      (should (member "h:.cache/ejn/k.json" argv))
       (should (equal (car (last argv)) "/tmp/k.json")))))
 
 (ert-deftest ejn-w7.5-panel-late-writes-after-panel-kill-are-safe ()
@@ -6364,6 +6749,25 @@ key never disturbs the existing PNG path."
       (should (equal (ejn-panel-entry-pickle handle) "cGlja2xl"))
       (should (equal (plist-get (ejn-panel-entry-snapshot handle) :mpl-pickle)
                      "cGlja2xl")))))
+
+(ert-deftest ejn-a5-panel-caps-retained-pickles ()
+  "A5: only the newest `panel-max-pickles' entries keep their pickle payload;
+older ones are pruned so an image-heavy session's memory stays bounded."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook-panel-max-pickles 2)
+          (panel (ejn-panel-ensure (current-buffer)))
+          handles)
+      (dotimes (i 5)
+        (let ((h (ejn-panel-start-entry panel (cons "x.py" (1+ i)) "")))
+          (ejn-panel-set-pickle h (format "pickle-%d" i))
+          (push (cons i h) handles)))
+      (setq handles (nreverse handles))
+      ;; Newest two (i=3,4) retain their pickle; older ones were pruned.
+      (should (equal (ejn-panel-entry-pickle (cdr (assq 4 handles))) "pickle-4"))
+      (should (equal (ejn-panel-entry-pickle (cdr (assq 3 handles))) "pickle-3"))
+      (should (null (ejn-panel-entry-pickle (cdr (assq 2 handles)))))
+      (should (null (ejn-panel-entry-pickle (cdr (assq 1 handles)))))
+      (should (null (ejn-panel-entry-pickle (cdr (assq 0 handles))))))))
 
 (ert-deftest ejn-w8.2-display-data-stores-pickle-and-renders-png ()
   "W8.2: a bundle with both PNG and pickle renders the PNG AND stashes the
@@ -6607,6 +7011,39 @@ and returns nil for a bogus command."
     (should path)
     (should (string-suffix-p "viewer/ejn_viewer.py" path))
     (should (file-exists-p path))))
+
+(ert-deftest ejn-a9-viewer-script-resolves-through-build-symlink ()
+  "A9: under a straight.el-style layout — a build dir holding a byte-compiled
+`.elc' plus a SYMLINK to the `.el' source, while `viewer/' lives only in the
+symlinked-to repo — the resolver still finds `viewer/ejn_viewer.py' by
+following the `.el' symlink.  Regression for the fresh-machine failure where
+the viewer was reported missing though the `.py' was present in the repo."
+  (let* ((repo (make-temp-file "ejn-a9-repo-" t))
+         (build (make-temp-file "ejn-a9-build-" t)))
+    (unwind-protect
+        (let ((repo-el (expand-file-name "emacs-jupyter-notebook-viewer.el" repo))
+              (repo-viewer-dir (expand-file-name "viewer" repo))
+              (build-el (expand-file-name "emacs-jupyter-notebook-viewer.el" build))
+              (build-elc (expand-file-name "emacs-jupyter-notebook-viewer.elc" build)))
+          ;; Repo: real source file + viewer/ejn_viewer.py.
+          (with-temp-file repo-el (insert ";; source\n"))
+          (make-directory repo-viewer-dir t)
+          (with-temp-file (expand-file-name "ejn_viewer.py" repo-viewer-dir)
+            (insert "# viewer\n"))
+          ;; Build: real .elc (what `load' loads) + symlink to the .el source.
+          ;; No viewer/ here, exactly as straight builds it.
+          (with-temp-file build-elc (insert ";; compiled\n"))
+          (make-symbolic-link repo-el build-el)
+          ;; Loaded file is the build .elc.
+          (let ((emacs-jupyter-notebook-viewer--load-file build-elc))
+            (let ((path (emacs-jupyter-notebook-viewer--script-path)))
+              (should path)
+              (should (file-exists-p path))
+              (should (string-suffix-p "viewer/ejn_viewer.py" path))
+              (should (string-prefix-p (file-truename repo)
+                                       (file-truename path))))))
+      (delete-directory repo t)
+      (delete-directory build t))))
 
 (ert-deftest ejn-w8.4-viewer-selfcheck-passes ()
   "W8.4: the viewer script's headless non-GUI self-check passes.
