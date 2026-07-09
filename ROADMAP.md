@@ -970,6 +970,52 @@ subplot crops all siblings, killing Emacs reaps the viewer.
 
 ---
 
+## W13 — Async-ordering races + macOS/Docker dogfooding fixes
+
+- [x] sha=PENDING W13 async-ordering hardening.  MOTIVATION: the deferred
+      Tier-3 items from the 2026-07-09 review (REVIEW_ACTION_PLAN.md) plus two
+      regressions/bugs found live while dogfooding on a fresh macOS + Docker
+      host.  All land with deterministic ERT coverage (433 tests green).
+      - H2 SINGLE ATTEMPT: `--ensure-client-async' now checks
+        `--async-in-progress-p' BEFORE the `--tunnel-dead' branch, so a send
+        mid-reconnect attaches to the running attempt instead of spawning a
+        duplicate probe/tunnel that clobbers the context.
+      - M1 NO SILENT WEDGE: `--async-delete-process' clears a process's
+        sentinel before deleting it, so a deliberately torn-down tunnel can no
+        longer fire its death sentinel AFTER cleanup and re-set `--tunnel-dead'
+        t on an entry-less buffer (which wedged every later send into a silent
+        no-op).  A stale `--tunnel-dead' with no session entry is also cleared
+        and falls through to a normal start/reconnect.
+      - H3 CONNECT IDENTITY: `--async-connect-finalize' / `-timeout' guard on
+        CONTEXT IDENTITY (`eq --async-context context'), not just the buffer's
+        phase, so a superseded attempt's uncancellable `run-at-time 0' connect
+        closure cannot install a stale client on — or fail — a healthy newer
+        attempt sitting at phase `connect'.
+      - M2 NO STUCK FRINGE: the `execute_reply' handler finalizes a reply's
+        OWN panel entry/fringe whenever it is still running, so a reply
+        superseded by a send to a DIFFERENT cell no longer leaves that cell
+        stuck at "running" forever.  A newer in-flight run of the SAME cell
+        still owns the entry/fringe (stale same-cell reply dropped, W5.5
+        preserved), and an entry already finalized by cancel/timeout is never
+        overwritten.
+      - Viewer3 RESTART INJECTION: `restart-kernel' re-injects the viewer
+        formatter + idle watchdog only after the restarted kernel answers a
+        `kernel_info_request', so the silent injects cannot race the async
+        relaunch and be dropped (which silently disabled interactive figures
+        until a full reconnect).
+      - macOS ControlPath (A3 regression): the `ControlMaster' socket default
+        moved off `temporary-file-directory' (macOS `/var/folders/…' + the
+        40-char `%C' overflowed the ~104-byte unix-socket limit → "path too
+        long", breaking every ssh incl. launch) to `/tmp/ejn-%i-%C'.
+      - Probe cannot cry "dead" on ssh failure: `ssh-build-pid-alive' now
+        always exits 0 and prints `__EJN_ALIVE__'/`__EJN_DONE__'; the reconnect
+        probe sentinel reads stdout — alive → retrieve, answered-without-alive
+        → confirmed `kernel-dead', NEITHER → `probe-unreachable' (ssh/infra
+        failure, advises retry, never deregisters).  Fixes the false "kernel
+        is dead" on a provably-live Docker kernel.
+
+---
+
 ## W12 — Single connection per buffer (interruptible attempts, no parallel/orphan)
 
 - [ ] sha=PENDING W12 single connection per buffer.  MOTIVATION: a

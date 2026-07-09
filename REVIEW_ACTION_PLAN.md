@@ -190,27 +190,28 @@ The Tier 3 items remain deferred to W13.
 
 ---
 
-## Deferred — real, but need careful async redesign (NEXT WORKSTREAM: W13)
+## W13 — LANDED (was deferred; see ROADMAP W13)
 
-These are genuine (verified or high-confidence) but touch the fragile
-connect/reconnect ordering; they deserve their own workstream with dedicated
-tests rather than being bundled into this pass.
+All of the below shipped with deterministic ERT coverage (433 tests green,
+byte-compile clean).  Two extra dogfooding fixes landed alongside: the macOS
+`ControlPath` length regression and the reconnect probe no longer reporting a
+live kernel as dead on an ssh/infra failure.
 
-- [~] **H2 — parallel reconnects.** The tunnel-dead branch in
+- [x] **H2 — parallel reconnects.** The tunnel-dead branch in
   `--ensure-client-async` runs before the async-in-progress check, so a second
   send during reconnect spins up a duplicate context/tunnel.
   `emacs-jupyter-notebook.el:2069`.
-- [~] **H3 — ghost attempt kills the live one.** `--async-connect-finalize`/
+- [x] **H3 — ghost attempt kills the live one.** `--async-connect-finalize`/
   `-timeout` guard on *phase*, not context identity; a superseded attempt's
   uncancellable connect closure can `--async-fail` the healthy new attempt.
   Same class as A2, but on the connect path. `:1878`.
-- [~] **M1 — silent wedge.** After a failed start that reached the tunnel
+- [x] **M1 — silent wedge.** After a failed start that reached the tunnel
   phase, the deferred death-sentinel re-sets `--tunnel-dead t` post-cleanup and
   `send-cell` then silently no-ops forever. `:1409`, `:1992`.
-- [~] **M2 — fringe stuck "running".** Two quick sends: cell A's
+- [x] **M2 — fringe stuck "running".** Two quick sends: cell A's
   `execute_reply` is dropped by the request-id gate, so its spinner never
   finishes. `emacs-jupyter-notebook-jupyter.el:249`.
-- [~] **Viewer-3 — restart re-injection race.** The formatter/watchdog
+- [x] **Viewer-3 — restart re-injection race.** The formatter/watchdog
   injection runs synchronously against a kernel mid-relaunch, so figures can
   silently stop carrying the pickle payload until a full reconnect.
   `emacs-jupyter-notebook.el:2734`.

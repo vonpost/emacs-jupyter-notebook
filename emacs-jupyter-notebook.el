@@ -1969,11 +1969,19 @@ clobbering any newer attempt while re-issuing SCP against a killed kernel."
                       #'emacs-jupyter-notebook--async-wait-tunnel-tick context)))
           (emacs-jupyter-notebook--async-put context :timer timer)))))))
 
-(defun emacs-jupyter-notebook--async-connect-finalize (buffer entry local-ports local-file client)
-  "Finalize the async connect for BUFFER with CLIENT."
+(defun emacs-jupyter-notebook--async-connect-finalize (context buffer entry local-ports local-file client)
+  "Finalize the async connect for CONTEXT in BUFFER with CLIENT.
+W13-H3: guard on CONTEXT IDENTITY, not merely the buffer's current phase.
+`jupyter-connect-async' schedules this via a `run-at-time 0' closure that
+cannot be cancelled, so a superseded attempt's finalize can still fire.
+Without the identity check it would act on whatever context now occupies
+the buffer — installing a stale client on, or `--async-fail'-ing, a HEALTHY
+newer attempt that happens to also be at phase `connect'.  The check makes a
+stale finalize a no-op."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (when (eq (plist-get emacs-jupyter-notebook--async-context :phase) 'connect)
+      (when (and (eq emacs-jupyter-notebook--async-context context)
+                 (eq (plist-get context :phase) 'connect))
         (emacs-jupyter-notebook--async-cancel-timer
          emacs-jupyter-notebook--async-context)
         (if (not client)
@@ -2007,11 +2015,14 @@ clobbering any newer attempt while re-issuing SCP against a killed kernel."
               (when cb
                 (funcall cb ctx)))))))))
 
-(defun emacs-jupyter-notebook--async-connect-timeout (buffer)
-  "Check if async connect for BUFFER has timed out."
+(defun emacs-jupyter-notebook--async-connect-timeout (context buffer)
+  "Fail CONTEXT in BUFFER when its connect has timed out.
+W13-H3: identity-guarded so a superseded attempt's timeout timer cannot
+fail a healthy newer attempt sitting at phase `connect'."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (when (eq (plist-get emacs-jupyter-notebook--async-context :phase) 'connect)
+      (when (and (eq emacs-jupyter-notebook--async-context context)
+                 (eq (plist-get context :phase) 'connect))
         (emacs-jupyter-notebook--async-fail
          emacs-jupyter-notebook--async-context
          "Timed out waiting for kernel_info_reply")))))
@@ -2034,16 +2045,19 @@ clobbering any newer attempt while re-issuing SCP against a killed kernel."
                   (plist-get context :tunnel-process))
             (emacs-jupyter-notebook--install-tunnel-sentinel
               emacs-jupyter-notebook--tunnel-process buffer)
-            (let ((timer (run-at-time
-                          emacs-jupyter-notebook-jupyter-connect-timeout nil
-                          #'emacs-jupyter-notebook--async-connect-timeout
-                          buffer)))
-              (setq context (emacs-jupyter-notebook--async-put context :timer timer)))
-            (emacs-jupyter-notebook-jupyter-connect-async
-             local-file
-             (lambda (client)
-               (emacs-jupyter-notebook--async-connect-finalize
-                buffer entry local-ports local-file client)))
+            ;; W13-H3: capture the stable context object so the (uncancellable)
+            ;; connect closure and the timeout timer act only on THIS attempt.
+            (let ((ctx context))
+              (let ((timer (run-at-time
+                            emacs-jupyter-notebook-jupyter-connect-timeout nil
+                            #'emacs-jupyter-notebook--async-connect-timeout
+                            ctx buffer)))
+                (setq context (emacs-jupyter-notebook--async-put context :timer timer)))
+              (emacs-jupyter-notebook-jupyter-connect-async
+               local-file
+               (lambda (client)
+                 (emacs-jupyter-notebook--async-connect-finalize
+                  ctx buffer entry local-ports local-file client))))
             context)
         (error
          (emacs-jupyter-notebook--async-fail
@@ -2853,17 +2867,36 @@ before sending; a \\[universal-argument] FORCE prefix skips the prompt."
    (emacs-jupyter-notebook--ensure-client)))
 
 ;;;###autoload
+(defun emacs-jupyter-notebook--reinject-after-restart (client)
+  "Re-inject the viewer formatter and idle watchdog once CLIENT's kernel is back.
+W13-Viewer3: `jupyter-restart-kernel' relaunches the kernel asynchronously,
+so firing the silent formatter/watchdog `execute_request's synchronously
+right after the restart call races the teardown — they can be dropped
+against the dying kernel, after which inline figures silently stop carrying
+the interactive-viewer pickle until a full reconnect.  Gate the
+re-injection on a `kernel_info_reply', which only arrives once the FRESH
+kernel is up and its channels are live.  If the kernel never answers (a
+failed restart) nothing is injected, which is correct — there is no live
+kernel to patch, and the heartbeat will surface the death."
+  (when client
+    (emacs-jupyter-notebook-jupyter-kernel-info
+     client
+     (lambda (reply _error)
+       (when reply
+         (emacs-jupyter-notebook--inject-viewer-formatter client)
+         (emacs-jupyter-notebook--inject-idle-watchdog client))))))
+
 (defun emacs-jupyter-notebook-restart-kernel ()
   "Restart the current kernel through emacs-jupyter.
-W8.1: after the restart request the kernel namespace is wiped, so the
-in-memory matplotlib pickle formatter is re-injected (idempotent).
-W11: the idle watchdog is likewise re-injected — the restart builds a
-fresh IPython instance, so a new watchdog thread is installed."
+W8.1: after the restart the kernel namespace is wiped, so the in-memory
+matplotlib pickle formatter is re-injected (idempotent).  W11: the idle
+watchdog is likewise re-injected.  W13-Viewer3: both are re-injected only
+once the restarted kernel answers a `kernel_info_request', so the injection
+cannot race the async relaunch and be lost."
   (interactive)
   (let ((client (emacs-jupyter-notebook--ensure-client)))
     (emacs-jupyter-notebook-jupyter-restart client)
-    (emacs-jupyter-notebook--inject-viewer-formatter client)
-    (emacs-jupyter-notebook--inject-idle-watchdog client)))
+    (emacs-jupyter-notebook--reinject-after-restart client)))
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-shutdown-kernel (&optional force)

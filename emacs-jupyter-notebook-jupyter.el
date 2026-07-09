@@ -249,25 +249,38 @@ panel/fringe state set by the timeout or `cancel-operation' paths."
       ("execute_reply"
        ,(lambda (msg)
           (condition-case nil
-              ;; W5.5: only act when this reply belongs to the current
-              ;; in-flight request.  A late reply from a superseded
-              ;; evaluation, or any reply arriving after timeout/cancel
-              ;; cleared the slot, is dropped silently — we do NOT clear
-              ;; the timer or overwrite the panel/fringe error state set
-              ;; by the cancel/timeout paths.
-              (let ((current-id
-                     (and (buffer-live-p buffer)
-                          (with-current-buffer buffer
-                            (plist-get emacs-jupyter-notebook--evaluation-request
-                                       :request-id)))))
-                (when (or (null request-id)
-                          (and current-id (equal current-id request-id)))
+              ;; W5.5 + W13-M2: correlate this reply with the buffer's current
+              ;; in-flight request.  Clearing the SHARED eval slot/timer stays
+              ;; gated on `is-current' — only the current reply owns them.  But
+              ;; a reply's OWN panel entry is finalized whenever it is still
+              ;; running, so a reply superseded by a send to a DIFFERENT cell no
+              ;; longer leaves that cell's entry/fringe stuck at "running"
+              ;; forever (the W13-M2 bug).  Two cases are still left alone: a
+              ;; newer in-flight run of the SAME cell (it owns the entry/fringe,
+              ;; so a stale same-cell reply is dropped as before), and an entry
+              ;; already finalized abnormally by cancel/timeout (its terminal
+              ;; status must not be overwritten by a late reply).
+              (let* ((cur (and (buffer-live-p buffer)
+                               (with-current-buffer buffer
+                                 emacs-jupyter-notebook--evaluation-request)))
+                     (current-id (plist-get cur :request-id))
+                     (current-key (plist-get cur :cell-key))
+                     (cell-key (plist-get entry-handle :cell-key))
+                     (is-current (or (null request-id)
+                                     (and current-id (equal current-id request-id))))
+                     (superseded-same-cell
+                      (and (not is-current) current-key (equal current-key cell-key)))
+                     (was-running
+                      (eq (plist-get (ejn-panel-entry-snapshot entry-handle) :status)
+                          'running)))
+                (when is-current
                   (when (buffer-live-p buffer)
                     (with-current-buffer buffer
                       (when (timerp emacs-jupyter-notebook--evaluation-timer)
                         (cancel-timer emacs-jupyter-notebook--evaluation-timer))
                       (setq emacs-jupyter-notebook--evaluation-timer nil)
-                      (setq emacs-jupyter-notebook--evaluation-request nil)))
+                      (setq emacs-jupyter-notebook--evaluation-request nil))))
+                (when (and was-running (not superseded-same-cell))
                   (let* ((status-s (emacs-jupyter-notebook-jupyter--message-content-value
                                     msg :status))
                          (count (emacs-jupyter-notebook-jupyter--message-content-value
@@ -293,12 +306,10 @@ panel/fringe state set by the timeout or `cancel-operation' paths."
                                        msg :evalue) "")))
                          'emacs-jupyter-notebook-result-error-face)))
                     (ejn-panel-finish-entry entry-handle status-sym count)
-                    (when (buffer-live-p buffer)
+                    (when (and cell-key (buffer-live-p buffer))
                       (with-current-buffer buffer
-                        (let ((cell-key (plist-get entry-handle :cell-key)))
-                          (when cell-key
-                            (emacs-jupyter-notebook-fringe-set
-                             cell-key status-sym count))))))))
+                        (emacs-jupyter-notebook-fringe-set
+                         cell-key status-sym count))))))
             (error nil))))
       ("status"
        ,(lambda (msg)

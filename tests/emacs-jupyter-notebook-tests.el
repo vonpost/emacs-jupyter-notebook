@@ -3945,6 +3945,10 @@ client."
 `emacs-jupyter-notebook-jupyter-restart-function'."
   (with-temp-buffer
     (let ((emacs-jupyter-notebook--client 'mock-client)
+          ;; W13-Viewer3: re-injection is gated on kernel_info; stub the
+          ;; adapter so it does not reach the real (unloaded) emacs-jupyter.
+          (emacs-jupyter-notebook-jupyter-kernel-info-function
+           (lambda (_client _callback) nil))
           captured)
       (let ((emacs-jupyter-notebook-jupyter-restart-function
              (lambda (client) (setq captured client))))
@@ -4000,13 +4004,14 @@ falling into the async-fail branch."
       (should-not emacs-jupyter-notebook--evaluation-request))))
 
 (ert-deftest ejn-w5.5-execute-reply-drops-stale-request-id ()
-  "W5.5: an execute_reply whose request-id does NOT match the current
-`--evaluation-request' is dropped — the timer stays armed, the request
-slot stays populated, and the panel/fringe are not touched."
+  "W5.5/W13-M2: an execute_reply superseded by a newer run of the SAME cell is
+dropped — the newer run owns the entry/fringe.  The timer stays armed, the
+request slot stays populated, and the panel/fringe are not touched."
   (with-temp-buffer
     (let* ((panel (ejn-panel-ensure (current-buffer)))
            (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
            (buffer (current-buffer)))
+      ;; Current in-flight request is a NEWER run of the same cell '("x.py" . 1).
       (setq emacs-jupyter-notebook--evaluation-request
             (list :request-id 42 :panel-entry handle :cell-key '("x.py" . 1)
                   :started-at (float-time)))
@@ -4028,6 +4033,64 @@ slot stays populated, and the panel/fringe are not touched."
         (cancel-timer emacs-jupyter-notebook--evaluation-timer))
       (setq emacs-jupyter-notebook--evaluation-timer nil
             emacs-jupyter-notebook--evaluation-request nil))))
+
+(ert-deftest ejn-w13-m2-superseded-different-cell-reply-finalizes-its-entry ()
+  "W13-M2: a reply superseded by a send to a DIFFERENT cell must still finalize
+its OWN entry and fringe — otherwise that cell is stuck at `running' forever.
+The current slot/timer (belonging to the other cell) stay untouched."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle-a (ejn-panel-start-entry panel '("x.py" . 1) "a = 1"))
+           (buffer (current-buffer))
+           finished fringe-key fringe-status)
+      ;; The current in-flight request is for a DIFFERENT cell (id 2).
+      (setq emacs-jupyter-notebook--evaluation-request
+            (list :request-id 2 :panel-entry 'other :cell-key '("x.py" . 9)
+                  :started-at (float-time)))
+      (setq emacs-jupyter-notebook--evaluation-timer (run-at-time 1000 nil #'ignore))
+      (let* ((callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle-a nil 1))
+             (reply-fn (cadr (assoc "execute_reply" callbacks))))
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--message-content-value)
+                   (lambda (_msg key)
+                     (pcase key (:status "ok") (:execution_count 5) (_ nil))))
+                  ((symbol-function 'ejn-panel-finish-entry)
+                   (lambda (h status _c)
+                     (when (eq h handle-a) (setq finished status))))
+                  ((symbol-function 'emacs-jupyter-notebook-fringe-set)
+                   (lambda (key status _c)
+                     (setq fringe-key key fringe-status status))))
+          (funcall reply-fn 'mock-msg)))
+      ;; Cell A's own entry/fringe are finalized as ok...
+      (should (eq finished 'ok))
+      (should (equal fringe-key '("x.py" . 1)))
+      (should (eq fringe-status 'ok))
+      ;; ...while the OTHER cell's in-flight slot/timer are left intact.
+      (should (equal (plist-get emacs-jupyter-notebook--evaluation-request :request-id) 2))
+      (should (timerp emacs-jupyter-notebook--evaluation-timer))
+      (when (timerp emacs-jupyter-notebook--evaluation-timer)
+        (cancel-timer emacs-jupyter-notebook--evaluation-timer))
+      (setq emacs-jupyter-notebook--evaluation-timer nil
+            emacs-jupyter-notebook--evaluation-request nil))))
+
+(ert-deftest ejn-w13-m2-late-reply-does-not-overwrite-cancelled-entry ()
+  "W13-M2: a late reply for an entry already finalized abnormally (cancel or
+timeout set a terminal status) must NOT overwrite it back to ok/error."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
+           (buffer (current-buffer)))
+      ;; Entry was already finalized (e.g. cancel marked it error).
+      (ejn-panel-finish-entry handle 'error nil)
+      (setq emacs-jupyter-notebook--evaluation-request nil)
+      (let* ((callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle nil 7))
+             (reply-fn (cadr (assoc "execute_reply" callbacks))))
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--message-content-value)
+                   (lambda (_msg key) (pcase key (:status "ok") (_ nil))))
+                  ((symbol-function 'ejn-panel-finish-entry)
+                   (lambda (&rest _) (ert-fail "must not re-finalize a terminal entry")))
+                  ((symbol-function 'emacs-jupyter-notebook-fringe-set)
+                   (lambda (&rest _) (ert-fail "must not re-set fringe on a terminal entry"))))
+          (funcall reply-fn 'mock-msg))))))
 
 (ert-deftest ejn-w5.5-status-idle-with-stale-id-does-not-cancel-timer ()
   "W5.5: a `status=idle' message whose request-id does not match the
@@ -4256,7 +4319,7 @@ Mock interrupt to a no-op; the interactive cancel path must not block."
                    (lambda (entry &optional _file)
                      (setq saved-entry entry))))
           (emacs-jupyter-notebook--async-connect-finalize
-           buffer entry local-ports local-file 'mock-client))
+           context buffer entry local-ports local-file 'mock-client))
         (should (eq emacs-jupyter-notebook--client 'mock-client))
         (should (eq (plist-get emacs-jupyter-notebook--async-context :phase) 'done))
         (should (equal (plist-get saved-entry :session-id) "session"))
@@ -4277,7 +4340,7 @@ Mock interrupt to a no-op; the interactive cancel path must not block."
                       :error-callback (lambda (_ctx _err) nil))))
         (setq emacs-jupyter-notebook--async-context context)
         (emacs-jupyter-notebook--async-connect-finalize
-         buffer entry local-ports local-file nil)
+         context buffer entry local-ports local-file nil)
         (should-not emacs-jupyter-notebook--client)
         (should (eq (plist-get emacs-jupyter-notebook--async-context :phase) 'error))))))
 
@@ -4290,7 +4353,7 @@ Mock interrupt to a no-op; the interactive cancel path must not block."
                     :origin-buffer (current-buffer)
                     :error-callback (lambda (_ctx _err) nil))))
       (setq emacs-jupyter-notebook--async-context context)
-      (emacs-jupyter-notebook--async-connect-timeout buffer)
+      (emacs-jupyter-notebook--async-connect-timeout context buffer)
       (should (eq (plist-get emacs-jupyter-notebook--async-context :phase) 'error)))))
 
 (ert-deftest ejn-async-connect-timeout-noop-when-not-connecting ()
@@ -4301,8 +4364,38 @@ Mock interrupt to a no-op; the interactive cancel path must not block."
                     :entry '(:profile "p" :session-id "session")
                     :origin-buffer (current-buffer))))
       (setq emacs-jupyter-notebook--async-context context)
-      (emacs-jupyter-notebook--async-connect-timeout buffer)
+      (emacs-jupyter-notebook--async-connect-timeout context buffer)
       (should (eq (plist-get emacs-jupyter-notebook--async-context :phase) 'done)))))
+
+(ert-deftest ejn-w13-h3-stale-connect-finalize-spares-newer-attempt ()
+  "W13-H3: a superseded attempt's connect callback must not touch the newer
+attempt that now occupies the buffer.  Finalizing with the OLD context while
+context B (also at phase `connect') is active is a no-op: B is neither failed
+nor given the stale client."
+  (with-temp-buffer
+    (let* ((buffer (current-buffer))
+           (ctx-a (emacs-jupyter-notebook--async-new-context
+                   :phase 'connect :entry '(:profile "p" :session-id "a")
+                   :origin-buffer buffer
+                   :error-callback (lambda (&rest _) nil)))
+           (ctx-b (emacs-jupyter-notebook--async-new-context
+                   :phase 'connect :entry '(:profile "p" :session-id "b")
+                   :origin-buffer buffer
+                   :error-callback (lambda (&rest _) nil))))
+      ;; B is the active attempt; A was superseded.
+      (setq emacs-jupyter-notebook--async-context ctx-b)
+      ;; A's stale connect callback fires (nil client would normally fail).
+      (emacs-jupyter-notebook--async-connect-finalize
+       ctx-a buffer '(:profile "p" :session-id "a") '(:shell_port 1) "/tmp/a.json" nil)
+      ;; B untouched: still connecting, no client installed.
+      (should (eq emacs-jupyter-notebook--async-context ctx-b))
+      (should (eq (plist-get ctx-b :phase) 'connect))
+      (should-not emacs-jupyter-notebook--client)
+      ;; A's stale success client is also refused.
+      (emacs-jupyter-notebook--async-connect-finalize
+       ctx-a buffer '(:profile "p" :session-id "a") '(:shell_port 1) "/tmp/a.json" 'stale-client)
+      (should-not emacs-jupyter-notebook--client)
+      (should (eq (plist-get ctx-b :phase) 'connect)))))
 
 (ert-deftest ejn-mode-disable-does-not-install-source-change-hooks ()
   "W2: with the panel design the source buffer needs no before/after-change
@@ -7392,24 +7485,49 @@ support cache unset.  Uses `/bin/false' as a stand-in Python that exits 1."
                   ((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
                    (lambda (_client code) (push code codes))))
           (emacs-jupyter-notebook--async-connect-finalize
-           buffer entry local-ports local-file 'mock-client))
+           context buffer entry local-ports local-file 'mock-client))
         ;; A watchdog snippet carrying the configured timeout was sent.
         (should (cl-some (lambda (c) (string-match-p "_EJN_WD_TIMEOUT = 7200" c))
                          codes))))))
 
 (ert-deftest ejn-w11-watchdog-injected-on-restart ()
-  "W11: restart-kernel re-injects the watchdog carrying the configured timeout."
+  "W11/W13-Viewer3: restart-kernel re-injects the watchdog carrying the
+configured timeout — but only after the restarted kernel answers a
+`kernel_info_request' (mocked here to reply immediately)."
   (with-temp-buffer
     (let ((emacs-jupyter-notebook--client 'mock-client)
           (emacs-jupyter-notebook-kernel-idle-timeout 5400)
           (codes nil))
       (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-restart)
                  (lambda (_client) nil))
+                ((symbol-function 'emacs-jupyter-notebook-jupyter-kernel-info)
+                 (lambda (_client callback) (funcall callback '(:status "ok") nil)))
                 ((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
                  (lambda (_client code) (push code codes))))
         (call-interactively #'emacs-jupyter-notebook-restart-kernel))
       (should (cl-some (lambda (c) (string-match-p "_EJN_WD_TIMEOUT = 5400" c))
                        codes)))))
+
+(ert-deftest ejn-w13-viewer3-restart-reinjection-waits-for-kernel-info ()
+  "W13-Viewer3: the post-restart re-injection is gated on a kernel_info reply.
+No reply (kernel still coming up / failed restart) means NO injection race —
+nothing is sent; a reply triggers both formatter and watchdog injection."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook-kernel-idle-timeout 900)
+          info-cb sent)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-restart)
+                 (lambda (_client) nil))
+                ((symbol-function 'emacs-jupyter-notebook-jupyter-kernel-info)
+                 (lambda (_client callback) (setq info-cb callback)))
+                ((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
+                 (lambda (_client _code) (setq sent t))))
+        (call-interactively #'emacs-jupyter-notebook-restart-kernel)
+        ;; Kernel has not answered yet: nothing injected (no race).
+        (should-not sent)
+        ;; Kernel comes up and answers kernel_info: injection fires.
+        (funcall info-cb '(:status "ok") nil)
+        (should sent)))))
 
 ;;; W11(B) — non-destructive prune of dead registry entries
 
