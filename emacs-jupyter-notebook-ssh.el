@@ -74,17 +74,44 @@ When SCP is non-nil, translate :port to scp's -P option."
         args)
     (setq args (append args emacs-jupyter-notebook-ssh-options))
     (setq args (append args (plist-get profile :ssh-options)))
+    (let ((timeout emacs-jupyter-notebook-ssh-connect-timeout))
+      (when (and (integerp timeout) (> timeout 0))
+        (setq args (append args (list "-o" (format "ConnectTimeout=%d" timeout))))))
+    (when emacs-jupyter-notebook-ssh-batch-mode
+      (setq args (append args (list "-o" "BatchMode=yes"))))
     (when-let ((port (plist-get profile :port)))
       (setq args (append args (list (if scp "-P" "-p") (format "%s" port)))))
     (when-let ((identity (plist-get profile :identity-file)))
       (setq args (append args (list "-i" (expand-file-name identity)))))
     args))
 
+(defun emacs-jupyter-notebook-ssh--control-args ()
+  "Return SSH connection-multiplexing option args, or nil when disabled.
+Shared by the short one-shot commands (launch, connection-file retrieval,
+PID probe, remote cleanup) so they ride a single master connection instead
+of re-handshaking each time.  The persistent tunnel does NOT use these;
+see `--no-control-args'."
+  (when emacs-jupyter-notebook-ssh-control-master
+    (list "-o" "ControlMaster=auto"
+          "-o" (format "ControlPath=%s" emacs-jupyter-notebook-ssh-control-path)
+          "-o" (format "ControlPersist=%s"
+                       emacs-jupyter-notebook-ssh-control-persist))))
+
+(defun emacs-jupyter-notebook-ssh--no-control-args ()
+  "Return SSH option args that force this connection to stand alone.
+When multiplexing is enabled globally, the persistent tunnel must still own
+its own SSH connection so a dropped link is visible to the tunnel
+sentinel/heartbeat; `ControlPath=none' opts it out of any shared master
+(including one configured in the user's ssh_config)."
+  (when emacs-jupyter-notebook-ssh-control-master
+    (list "-o" "ControlPath=none")))
+
 (defun emacs-jupyter-notebook-ssh-command (profile &optional remote-command)
   "Return an SSH argv list for PROFILE.
 When REMOTE-COMMAND is non-nil, append it as the remote shell command."
   (append (list emacs-jupyter-notebook-ssh-command)
           (emacs-jupyter-notebook-ssh--option-args profile)
+          (emacs-jupyter-notebook-ssh--control-args)
           (list (emacs-jupyter-notebook-ssh-destination profile))
           (when remote-command (list remote-command))))
 
@@ -104,6 +131,7 @@ REMOTE-PORTS and LOCAL-PORTS are plists keyed by Jupyter channel
 port keys."
   (append (list emacs-jupyter-notebook-ssh-command)
           (emacs-jupyter-notebook-ssh--option-args profile)
+          (emacs-jupyter-notebook-ssh--no-control-args)
           (list "-N" "-T" "-o" "ExitOnForwardFailure=yes")
           (emacs-jupyter-notebook-ssh--keepalive-args)
           (cl-loop for key in emacs-jupyter-notebook-connection-port-keys
@@ -113,13 +141,32 @@ port keys."
                    append (list "-L" (format "%d:127.0.0.1:%d" local remote)))
           (list (emacs-jupyter-notebook-ssh-destination profile))))
 
+(defun emacs-jupyter-notebook-ssh--scp-remote-path (path)
+  "Return PATH rewritten for scp's remote-file argument.
+Unlike the remote-launch / cleanup commands, scp does NOT run through the
+remote login shell, so a leading `~' is never shell-expanded here.  Worse,
+scp on OpenSSH 9+ speaks the SFTP protocol by default, whose server treats
+a leading `~' as a LITERAL directory name rather than the home directory —
+so `host:~/.cache/...' fails with \"No such file or directory\" even though
+the launch created the directory (there `~'/`$HOME' DID expand, via the
+shell).  Convert a `~'-anchored PATH to the equivalent home-RELATIVE path:
+both the SFTP server and the legacy SCP-protocol remote shell resolve a
+bare relative path against the login user's home directory, so retrieval
+works identically across OpenSSH versions.  Absolute paths (and any path
+without a `~' anchor) are returned unchanged."
+  (cond
+   ((equal path "~") ".")
+   ((string-prefix-p "~/" path) (substring path 2))
+   (t path)))
+
 (defun emacs-jupyter-notebook-ssh-scp-from-command (profile remote-file local-file)
   "Return an SCP argv list copying REMOTE-FILE from PROFILE to LOCAL-FILE."
   (append (list emacs-jupyter-notebook-scp-command)
           (emacs-jupyter-notebook-ssh--option-args profile t)
+          (emacs-jupyter-notebook-ssh--control-args)
           (list (format "%s:%s"
                         (emacs-jupyter-notebook-ssh-destination profile)
-                        remote-file)
+                        (emacs-jupyter-notebook-ssh--scp-remote-path remote-file))
                 local-file)))
 
 (defun emacs-jupyter-notebook-ssh--remote-join (directory file)
@@ -237,29 +284,52 @@ and its PIDs stay UNKNOWN (never pruned)."
                      (replace-regexp-in-string "\\.json\\'" ".log" connection-file))))
     (emacs-jupyter-notebook-ssh-command profile (format "cat %s" remote-log))))
 
+(defun emacs-jupyter-notebook-ssh--self-excluding-pattern (pattern)
+  "Return PATTERN with its first character bracketed for pkill/grep self-exclusion.
+A `pkill -f' / `grep' invocation embeds its own PATTERN in the running
+shell's command line, so an unbracketed pattern matches — and kills — that
+shell too.  Bracketing the first character (`Kfoo' -> `[K]foo') keeps the
+regex matching the target kernel processes while ensuring the literal
+pattern text can never match the pkill/grep process itself.  A nil or empty
+PATTERN is returned unchanged."
+  (if (and (stringp pattern) (> (length pattern) 0))
+      (format "[%c]%s" (aref pattern 0) (substring pattern 1))
+    pattern))
+
 (defun emacs-jupyter-notebook-ssh-build-remote-ps-command (profile)
-  "Return an SSH argv list that lists likely remote EJN kernel processes."
+  "Return an SSH argv list that lists likely remote EJN kernel processes.
+The `KernelManager.connection_file=' match pattern is emitted inside double
+quotes so a `~'-anchored cache dir's `$HOME' still expands in the remote
+shell (it must, to match the kernel's expanded argv) while glob/whitespace
+metacharacters stay inert, and its first character is bracketed so the
+`grep' does not list itself (see `--self-excluding-pattern')."
   (let* ((profile (emacs-jupyter-notebook-ssh-profile profile))
          (cache-dir (emacs-jupyter-notebook-ssh--quote-remote-path
-                     (plist-get profile :remote-cache-dir))))
+                     (plist-get profile :remote-cache-dir)))
+         (pattern (emacs-jupyter-notebook-ssh--self-excluding-pattern
+                   (format "KernelManager.connection_file=%s/kernel-" cache-dir))))
     (emacs-jupyter-notebook-ssh-command
      profile
-     (format "ps -eo pid,ppid,stat,etime,args | grep %s | grep -v grep || true"
-             (shell-quote-argument (format "KernelManager.connection_file=%s/kernel-"
-                                           cache-dir))))))
+     (format "ps -eo pid,ppid,stat,etime,args | grep \"%s\" || true" pattern))))
 
 (defun emacs-jupyter-notebook-ssh-build-remote-cleanup-all (profile)
-  "Return an SSH argv list that cleans all EJN cache-dir kernels for PROFILE."
+  "Return an SSH argv list that cleans all EJN cache-dir kernels for PROFILE.
+The `pkill -f' pattern is double-quoted (so a `~' cache dir's `$HOME'
+expands to match the kernel's expanded argv, unlike the previous
+double-`shell-quote-argument' form that escaped the `$' to a literal that
+matched nothing) and its first character is bracketed so the running shell
+is not itself killed before the `rm' half runs (see
+`--self-excluding-pattern')."
   (let* ((profile (emacs-jupyter-notebook-ssh-profile profile))
          (cache-dir (emacs-jupyter-notebook-ssh--quote-remote-path
-                     (plist-get profile :remote-cache-dir))))
+                     (plist-get profile :remote-cache-dir)))
+         (pattern (emacs-jupyter-notebook-ssh--self-excluding-pattern
+                   (format "KernelManager.connection_file=%s/kernel-" cache-dir))))
     (emacs-jupyter-notebook-ssh-command
      profile
-     (format (concat "{ pkill -f %s 2>/dev/null || true; "
+     (format (concat "{ pkill -f \"%s\" 2>/dev/null || true; "
                      "rm -f %s/kernel-*.json %s/kernel-*.log; }")
-             (shell-quote-argument (format "KernelManager.connection_file=%s/kernel-"
-                                           cache-dir))
-             cache-dir cache-dir))))
+             pattern cache-dir cache-dir))))
 
 (defun emacs-jupyter-notebook-ssh-classify-stderr (stderr)
   "Classify SSH STDERR into a (:kind SYMBOL :hint STRING) plist.
