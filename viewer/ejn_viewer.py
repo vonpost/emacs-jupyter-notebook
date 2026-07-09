@@ -319,6 +319,76 @@ def _install_enhancements(fig):
     return imshow_axes
 
 
+_COMPAT_SHIMS_INSTALLED = False
+
+
+def _install_compat_shims():
+    """Install best-effort cross-matplotlib-version unpickle shims (idempotent).
+
+    Matplotlib figure pickles embed version-specific internals and are not
+    guaranteed to load across versions.  The single most common breakage is
+    ``matplotlib.cbook.Grouper`` (used for shared-axes groups), which gained a
+    ``_ordering`` attribute in matplotlib 3.8: a figure pickled on an OLDER
+    matplotlib fails on a NEWER one with "Grouper object has no attribute
+    _ordering".  Install a targeted ``__getattr__`` that synthesises the
+    missing attribute from ``_mapping`` so such figures load instead of
+    crashing.  Only fires when the attribute is genuinely absent (matched
+    versions are untouched), and any residual breakage is still caught by
+    ``open_figure``'s fallback, which keeps the panel PNG intact.
+    """
+    global _COMPAT_SHIMS_INSTALLED
+    if _COMPAT_SHIMS_INSTALLED:
+        return
+    _COMPAT_SHIMS_INSTALLED = True
+    try:
+        from matplotlib import cbook
+
+        grouper = getattr(cbook, "Grouper", None)
+        if grouper is None or getattr(grouper, "_ejn_compat", False):
+            return
+        _orig_getattr = grouper.__dict__.get("__getattr__")
+
+        def _compat_getattr(self, name):
+            # Invoked only when normal attribute lookup fails.
+            if name in ("_ordering", "_mapping"):
+                mapping = self.__dict__.get("_mapping", {})
+                if name == "_mapping":
+                    object.__setattr__(self, "_mapping", mapping)
+                    return mapping
+                # Rebuild a stable ordering covering every key AND sibling in
+                # the group so newer matplotlib's _ordering lookups resolve.
+                ordering = {}
+                index = 0
+                for key, siblings in mapping.items():
+                    if key not in ordering:
+                        ordering[key] = index
+                        index += 1
+                    for sib in (siblings or []):
+                        if sib not in ordering:
+                            ordering[sib] = index
+                            index += 1
+                object.__setattr__(self, "_ordering", ordering)
+                return ordering
+            if _orig_getattr is not None:
+                return _orig_getattr(self, name)
+            raise AttributeError(name)
+
+        grouper.__getattr__ = _compat_getattr
+        grouper._ejn_compat = True
+    except Exception as exc:  # never let a shim failure break loading
+        sys.stderr.write("ejn_viewer: could not install compat shims: %s\n" % exc)
+        sys.stderr.flush()
+
+
+def _local_mpl_version():
+    try:
+        import matplotlib
+
+        return matplotlib.__version__
+    except Exception:
+        return "unknown"
+
+
 def open_figure(path):
     """Unpickle the figure at PATH, enhance it, and show it non-blocking.
 
@@ -329,12 +399,21 @@ def open_figure(path):
 
     from matplotlib._pylab_helpers import Gcf
 
+    _install_compat_shims()
+
     fig = None
     try:
         with open(path, "rb") as handle:
             fig = pickle.load(handle)
     except Exception as exc:
-        sys.stderr.write("ejn_viewer: failed to unpickle %s: %s\n" % (path, exc))
+        sys.stderr.write(
+            "ejn_viewer: failed to unpickle %s: %s\n"
+            "  This is almost always a matplotlib version mismatch between the\n"
+            "  remote kernel (which pickled the figure) and this local viewer\n"
+            "  (matplotlib %s). Pin both to the same matplotlib version. The\n"
+            "  panel PNG thumbnail is unaffected.\n"
+            % (path, exc, _local_mpl_version())
+        )
         sys.stderr.flush()
         _unlink(path)
         return None
@@ -369,7 +448,12 @@ def open_figure(path):
         except Exception:
             pass
     except Exception as exc:
-        sys.stderr.write("ejn_viewer: failed to display figure: %s\n" % exc)
+        sys.stderr.write(
+            "ejn_viewer: failed to display figure: %s\n"
+            "  If this looks version-related, pin the remote and local\n"
+            "  matplotlib (local is %s) to the same version. The panel PNG\n"
+            "  thumbnail is unaffected.\n" % (exc, _local_mpl_version())
+        )
         sys.stderr.flush()
         fig = None
     finally:
@@ -711,7 +795,35 @@ def _selfcheck():
     check("link-guard", group.on_lim_changed(a) == [])
     group._busy = False
 
-    total = 22
+    # Grouper cross-version unpickle shim: a Grouper missing `_ordering'
+    # (an older-matplotlib pickle) resolves it from `_mapping' rather than
+    # raising "Grouper object has no attribute _ordering".  Skipped when
+    # matplotlib is not installed (the pure checks above need no GUI stack).
+    grouper_checks = 0
+    try:
+        import matplotlib.cbook  # noqa: F401
+    except Exception:
+        pass
+    else:
+        grouper_checks = 2
+        try:
+            _install_compat_shims()
+            from matplotlib.cbook import Grouper
+
+            class _Obj:  # weakref-able (unlike object())
+                pass
+
+            o1, o2 = _Obj(), _Obj()
+            grp = Grouper()
+            grp.join(o1, o2)
+            grp.__dict__.pop("_ordering", None)  # simulate an old pickle
+            ordering = grp._ordering  # must synthesise, not raise
+            check("grouper-shim-dict", isinstance(ordering, dict))
+            check("grouper-shim-nonempty", len(ordering) >= 1)
+        except Exception as exc:
+            failures.append("grouper-shim(%s)" % exc)
+
+    total = 22 + grouper_checks
     if failures:
         sys.stderr.write("SELFCHECK FAILED (%d/%d): %s\n"
                          % (len(failures), total, ", ".join(failures)))

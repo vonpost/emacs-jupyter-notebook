@@ -161,7 +161,7 @@ If a pickle ever fails to load (for example a matplotlib version mismatch), the 
 The viewer runs on the **local workstation** running Emacs and is **GUI-Emacs-only** (it needs a windowing system). The remote never gains any GUI dependency. You need, locally:
 
 - a Python with **matplotlib** and a GUI backend (**Qt** or **Tk**), and
-- that local matplotlib **pinned to the same version as your remote kernels**. Figures travel as pickles, and matplotlib figure pickles are not guaranteed to load across versions. Same-version on both ends is the supported configuration (the package is single-user by design).
+- ideally that local matplotlib **matched to your remote kernels' version**. Figures travel as pickles, and matplotlib figure pickles are not guaranteed to load across versions. Matching both ends is the most reliable configuration. **Cross-version loading is now best-effort:** the viewer installs a compatibility shim for the common `Grouper._ordering` mismatch (matplotlib ≥3.8), so a slightly-older remote often still loads locally. If a pickle still fails, the viewer keeps the panel PNG thumbnail and prints a message naming the local matplotlib version so you know what to match.
 
 The local viewer is **Emacs-owned**: it is spawned lazily on first use, reused across figures, and reaped on `kill-emacs-hook` — the deliberate inverse of the remote-kernel rule (the remote kernel outlives Emacs; the local viewer does not). It also self-exits after an idle timeout so a hard Emacs crash cannot orphan it forever.
 

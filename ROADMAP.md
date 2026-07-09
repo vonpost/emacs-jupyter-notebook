@@ -970,6 +970,41 @@ subplot crops all siblings, killing Emacs reaps the viewer.
 
 ---
 
+## W14 — Panel/completion/viewer dogfooding fixes
+
+- [x] sha=PENDING W14 dogfooding fixes (live UX bugs found while using the
+      package against a real Docker remote).
+      - tqdm PROGRESS: stream output now resolves carriage returns
+        (`--apply-carriage-returns`), so a `\r`-repainted progress bar
+        collapses to its latest frame instead of dumping every intermediate
+        line into the panel.
+      - IMAGE ZOOM: the panel `+`/`-`/`=` keys coerce a non-numeric
+        `:scale' (Emacs 29+ returns the symbol `default') to 1.0, fixing
+        `(wrong-type-argument number-or-marker-p default)'.
+      - PANEL `v` / RET OFF-HEADER: the entry-id text property lives on the
+        header line only, so `v`/RET on the image or content line found no
+        entry.  `--entry-id-at-point' now resolves the enclosing section via
+        the nearest preceding header, so opening a figure / visiting source
+        works anywhere in an entry.
+      - EXPLICIT COMPLETION: `complete-at-point' with an empty cache now
+        fetches immediately and drives `completion-in-region' on reply (or
+        reports "No completions"), so a single invocation shows candidates
+        instead of silently priming the cache for a second press.
+      - VIEWER CROSS-VERSION: the local viewer installs a best-effort
+        `matplotlib.cbook.Grouper' shim (synthesises the `_ordering'
+        attribute added in mpl 3.8 from `_mapping'), so a figure pickled on a
+        slightly-older remote often loads instead of raising "Grouper object
+        has no attribute _ordering".  On any residual failure the panel PNG
+        is kept and the message names the local matplotlib version.
+      - KNOWN/OPEN: kernel tunnel drops+reconnects roughly every ~5 min on
+        the dogfooding host (recovers cleanly).  Likely an absolute-age
+        NAT/firewall/ProxyJump session cap rather than idle timeout (the
+        15 s ServerAlive keepalive defeats idle drops).  Diagnose via
+        `C-c j L`; if it correlates with the W13 ControlMaster, test with
+        `emacs-jupyter-notebook-ssh-control-master' nil.  Not yet fixed.
+
+---
+
 ## W13 — Async-ordering races + macOS/Docker dogfooding fixes
 
 - [x] sha=PENDING W13 async-ordering hardening.  MOTIVATION: the deferred
