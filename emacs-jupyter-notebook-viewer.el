@@ -69,12 +69,27 @@ creates a real unix-socket server and a placeholder process.")
 ;;; Script + Python resolution
 
 (defun emacs-jupyter-notebook-viewer--script-path ()
-  "Return the absolute path to the bundled `viewer/ejn_viewer.py', or nil."
+  "Return the absolute path to the bundled `viewer/ejn_viewer.py', or nil.
+Looks for `viewer/ejn_viewer.py' beside this file AND beside the symlink
+target of its `.el' source.  Package managers such as straight.el load a
+byte-compiled `.elc' from a build directory into which only the `.el' files
+are symlinked — the `viewer/' Python tree exists only in the source repo.
+Following the `.el' symlink via `file-truename' reaches that repo, so the
+viewer is found whether the package is a plain local checkout or a
+straight/elpa build."
   (let* ((base (or emacs-jupyter-notebook-viewer--load-file
                    (locate-library "emacs-jupyter-notebook-viewer")))
-         (dir (and base (file-name-directory base)))
-         (path (and dir (expand-file-name "viewer/ejn_viewer.py" dir))))
-    (and path (file-exists-p path) path)))
+         (dirs
+          (when base
+            (let ((el (concat (file-name-sans-extension base) ".el")))
+              (delq nil
+                    (list (file-name-directory base)
+                          (file-name-directory (file-truename base))
+                          (and (file-exists-p el)
+                               (file-name-directory (file-truename el)))))))))
+    (cl-loop for dir in (delete-dups dirs)
+             for path = (expand-file-name "viewer/ejn_viewer.py" dir)
+             when (file-exists-p path) return path)))
 
 (defun emacs-jupyter-notebook-viewer--python-path (command)
   "Resolve COMMAND to an executable path, or nil when not found."

@@ -420,7 +420,18 @@ def run(socket_path, backend_pref, idle_timeout):
         pass
 
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(socket_path)
+    # Create the socket owner-only regardless of the ambient umask: this
+    # endpoint hands figure paths straight to pickle.load, so no other local
+    # user should be able to connect and drive it (A7 hardening).
+    old_umask = os.umask(0o077)
+    try:
+        server.bind(socket_path)
+    finally:
+        os.umask(old_umask)
+    try:
+        os.chmod(socket_path, 0o600)
+    except OSError:
+        pass
     server.listen(8)
     server.setblocking(False)
 
