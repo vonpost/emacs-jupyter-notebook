@@ -48,6 +48,56 @@ Each element is (NAME . PLIST).  Supported PLIST keys include
   :type '(repeat string)
   :group 'emacs-jupyter-notebook)
 
+(defcustom emacs-jupyter-notebook-ssh-connect-timeout 10
+  "Bounded SSH `ConnectTimeout' (seconds) applied to every ssh/scp command.
+Caps how long an unreachable or black-holed remote can stall a launch,
+retrieve, tunnel, or management command during connection setup.  Set to
+nil or a non-positive value to omit the option entirely.  This is separate
+from `emacs-jupyter-notebook-prune-ssh-timeout', which bounds only the W11
+liveness probe."
+  :type '(choice (const :tag "No connect timeout" nil) integer)
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-ssh-batch-mode nil
+  "When non-nil, pass `-o BatchMode=yes' on every ssh/scp command.
+BatchMode disables all interactive prompts (password/passphrase and the
+host-key confirmation), so an ssh that would otherwise block forever on a
+prompt fails fast instead.  Left nil by default because it also blocks
+first-time host-key acceptance for a newly added remote; enable it once
+your hosts are in `known_hosts' and you use key/agent auth."
+  :type 'boolean
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-ssh-control-master t
+  "When non-nil, multiplex ssh/scp over a shared master connection.
+A kernel start otherwise pays a full TCP+SSH+auth handshake on EACH of its
+many short commands (launch, up to N connection-file polls, PID probe,
+cleanup).  With multiplexing the first command opens a master that the rest
+ride, collapsing those handshakes to roughly one — a large win on
+high-latency links and through a ProxyJump.  The persistent tunnel always
+opts OUT (it must own its own connection so its liveness can be detected).
+Requires OpenSSH 6.7+ (for the `%C'/`%i' ControlPath tokens)."
+  :type 'boolean
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-ssh-control-persist "60"
+  "Value for SSH `ControlPersist' when multiplexing is enabled.
+Seconds (as a string) to keep the background master alive after the last
+client exits, or \"yes\"/\"no\".  A short window (e.g. \"60\") is enough to
+cover a full start's burst of commands without leaving idle masters around."
+  :type 'string
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-ssh-control-path
+  (expand-file-name "ejn-ssh-%i-%C" temporary-file-directory)
+  "SSH `ControlPath' template for multiplexed connections.
+`%i' (local uid) keeps the socket private per local user and `%C' hashes
+the connection tuple, so the resulting path is short (well under the ~104
+byte unix-socket limit) and collision-free.  The containing directory must
+already exist; the default `temporary-file-directory' always does."
+  :type 'string
+  :group 'emacs-jupyter-notebook)
+
 (defcustom emacs-jupyter-notebook-remote-working-directory "~"
   "Default remote working directory for launched kernels."
   :type 'string
@@ -69,12 +119,6 @@ Can be overridden per-profile with :jupyter-command in the profile plist."
   :type 'string
   :group 'emacs-jupyter-notebook)
 
-(defcustom emacs-jupyter-notebook-use-detached nil
-  "Whether future process launch adapters may use detached.el when available.
-The durable reconnect source remains the registry regardless of this value."
-  :type 'boolean
-  :group 'emacs-jupyter-notebook)
-
 (defcustom emacs-jupyter-notebook-registry-file
   (locate-user-emacs-file "emacs-jupyter-notebook/registry.el")
   "File containing the durable local remote-kernel registry."
@@ -93,6 +137,18 @@ The durable reconnect source remains the registry regardless of this value."
 
 (defcustom emacs-jupyter-notebook-image-max-height 600
   "Maximum image height for inline image results, in pixels."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-panel-max-pickles 20
+  "Maximum number of panel entries that retain their matplotlib pickle payload.
+Each interactive-figure pickle stashed on a panel entry is a multi-MB
+base64 string.  The panel keeps full history, so an image-heavy session
+(re-running an `imshow' cell many times) would otherwise retain every
+pickle and grow Emacs's heap without bound.  Only the newest this-many
+entries keep the heavy payload used by the interactive viewer; older
+entries keep their PNG thumbnail and text but drop the pickle.  A
+non-positive value disables pruning (unbounded retention)."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
