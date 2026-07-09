@@ -1,3 +1,4 @@
 /.agent-shell/
 /.opencode/
 *.elc
+__pycache__/

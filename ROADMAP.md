@@ -970,6 +970,45 @@ subplot crops all siblings, killing Emacs reaps the viewer.
 
 ---
 
+## W12 — Single connection per buffer (interruptible attempts, no parallel/orphan)
+
+- [ ] sha=PENDING W12 single connection per buffer.  MOTIVATION: a
+      connection attempt could not be interrupted cleanly, and invoking
+      start/reconnect while one was in flight only hard-errored the user with
+      "use M-x cancel-operation" — a two-step dance that felt like the old
+      attempt just kept running behind the new one.  A buffer must own exactly
+      ONE connection.  TWO user-approved changes.
+      (A) PROMPT-TO-CANCEL ON NEW-WHILE-BUSY — `--ensure-no-async-operation'
+      (the guard at the top of `start-remote-kernel' /
+      `reconnect-remote-kernel') no longer hard-errors.  When an attempt is in
+      flight it asks `y-or-n-p' "cancel it and start a new one?".  On `y' it
+      aborts the in-flight attempt via the new shared helper
+      `--cancel-async-operation' and returns so the caller proceeds; on `n' it
+      signals `user-error' and leaves the running attempt untouched.  Two never
+      run in parallel (the buffer-local `--async-context' already enforced a
+      single context; this makes superseding it a one-step, user-consented act).
+      (B) KILL THE ATTEMPT'S ORPHAN KERNEL, SPARE A CONNECTED ONE — a start
+      attempt (`:owns-kernel') has usually already launched a remote kernel that
+      never finished connecting and holds NO registry entry.  Cancelling it (via
+      `--cancel-async-operation') and abandoning the buffer (kill-buffer /
+      mode-disable, via `--release-local-resources') now kill THAT kernel
+      through `--async-kill-remote-kernel' so it is not orphaned.  The guard is
+      strictly IN-PROGRESS-only + `:owns-kernel'-gated: a CONNECTED kernel
+      (async phase `done', a live client) and its registry entry remain the
+      durable reconnect surface and are always spared on buffer kill / mode
+      disable; a reconnect attempt (`:owns-kernel' nil) targets a pre-existing
+      kernel and never triggers a kill.  `--async-fail' itself is unchanged — it
+      still never kills the remote kernel; the kill is an explicit,
+      cancel/kill-buffer-only act layered above it.
+      TESTS: prompt yes-cancels / no-errors / noop-when-idle; start & reconnect
+      decline-refuses + start accept-supersedes; kill-buffer-during-attempt
+      kills the launched kernel while kill-buffer-with-connected-kernel spares
+      it; updated the W7.3 fresh-start cancel test to expect the launched kernel
+      IS killed (while shutdown / registry-remove / cleanup-remote-entry stay
+      uncalled).
+
+---
+
 ## W11 — Kernel lifecycle / GC (self-reaping idle kernels + prune dead entries)
 
 - [x] sha=44d1a7d W11 kernel lifecycle / GC.  MOTIVATION: remote kernels are

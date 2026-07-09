@@ -50,7 +50,27 @@ If no kernel is connected, the first send announces which profile it will use ("
          :kernelspec "python3")))
 ```
 
-If `jupyter` is not directly on the remote `PATH`, set `:jupyter-command` in the profile.
+If `jupyter` is not directly on the remote `PATH`, set `:jupyter-command` in the profile. This is the most common first-run failure: `ssh host 'cmd'` runs a **non-login, non-interactive** shell, so it does not source `~/.bashrc`/`~/.bash_profile` — a conda/venv/module `jupyter` will not be found. Set `:jupyter-command` to the absolute path (from `which jupyter` in an interactive login), or to `"bash -lc 'conda activate <env> && jupyter'"` for full env activation. When a start fails, the error surfaced in Emacs now includes the tail of the remote launch log so you can see the real cause without SSHing in.
+
+### ProxyJump / ssh config
+
+`ssh` and `scp` read your `~/.ssh/config`, and this package never bypasses it (no `-F none`, no `ProxyCommand` override). ProxyJump therefore works transparently: set the profile `:host` to the **`Host` alias** from your ssh config (not a raw IP) so its `ProxyJump`/`HostName`/`User`/`IdentityFile`/`Port` all apply, and leave `:port`/`:user`/`:identity-file` **unset** in the profile (those emit `-p`/`user@`/`-i`, which override the config). Connection multiplexing (on by default, `emacs-jupyter-notebook-ssh-control-master`) reuses one connection across the whole jump chain, so a ProxyJump setup is where it pays off most.
+
+### Running the kernel in Docker
+
+To launch the kernel via `docker run`, three flags are mandatory:
+
+```elisp
+:jupyter-command
+"docker run --rm --network host --gpus all -v /abs/cache:/abs/cache image_name jupyter"
+```
+
+- **No `-i`/`-t`.** The launch runs with stdin from `/dev/null`; `-t` fails with "the input device is not a tty".
+- **`-v <cache-dir>:<cache-dir>` (same path both sides).** Jupyter writes the connection file *inside* the container at `--KernelManager.connection_file=<cache-dir>/…`; without a bind-mount to the identical host path the file never appears where `scp` looks, and the retrieve times out.
+- **`--network host`.** The kernel binds dynamic ZMQ ports on the container loopback; the SSH tunnel forwards to `host:127.0.0.1:<port>`. Without host networking those ports are unreachable.
+- **Never `-d`.** The tool backgrounds the process itself and reads `$!` for liveness; a detached `docker run` returns immediately and breaks reconnect.
+
+If the container runs as root, add `--user "$(id -u):$(id -g)"` so the connection file is readable by your ssh user. For the interactive figure viewer, pin your local matplotlib to the image's matplotlib version.
 
 ## Keymap
 
@@ -83,6 +103,8 @@ All commands live under a single prefix, `emacs-jupyter-notebook-prefix-key` (de
 | `C-c j v` | `fetch-remote-log` |
 | `C-c j q` | `list-remote-processes` |
 | `C-c j w` | `clean-orphaned-kernels` (confirms; `C-u` skips) |
+| `C-c j P` | `prune-dead-kernels` (drops registry entries for confirmed-dead kernels) |
+| `C-c j l` | `clear-results` |
 | `C-c j n` | `forward-cell` |
 | `C-c j p` | `backward-cell` |
 
@@ -148,7 +170,7 @@ The local viewer is **Emacs-owned**: it is spawned lazily on first use, reused a
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `emacs-jupyter-notebook-local-python-command` | `"python3"` | Local Python that runs the viewer (absolute path or a command on `exec-path`). Must have matplotlib + a GUI backend, version-matched to the remote. |
-| `emacs-jupyter-notebook-viewer-backend` | `qt` | Preferred GUI backend, `qt` (QtAgg) or `tk` (TkAgg); falls back to the other automatically. |
+| `emacs-jupyter-notebook-viewer-backend` | `tk` | Preferred GUI backend, `tk` (TkAgg) or `qt` (QtAgg); falls back to the other automatically. |
 | `emacs-jupyter-notebook-viewer-idle-timeout` | `900` | Seconds the viewer stays alive with no open figures before self-exiting (0 disables). |
 | `emacs-jupyter-notebook-viewer-auto-open` | `nil` | When non-nil, pop the interactive window automatically for every inline figure instead of on demand. |
 
