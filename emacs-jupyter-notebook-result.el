@@ -600,17 +600,37 @@ If WAIT is non-nil, defer the clear until the next text arrives
          (setq entry (plist-put entry :pending-clear nil))
          entry)))))
 
+(defun emacs-jupyter-notebook-panel--prune-pickles (panel)
+  "Drop the matplotlib pickle from all but the newest N entries in PANEL.
+A5: `panel--entries' is append-only history and each `:mpl-pickle' is a
+multi-MB base64 string, so without bounding, an image-heavy session (re-run
+an `imshow' cell many times) retains every pickle and grows Emacs's heap
+without limit.  Only the interactive payload is dropped from older entries;
+their PNG thumbnail and text are untouched.  A non-positive
+`emacs-jupyter-notebook-panel-max-pickles' disables pruning."
+  (let ((max emacs-jupyter-notebook-panel-max-pickles))
+    (when (and (buffer-live-p panel) (integerp max) (> max 0))
+      (with-current-buffer panel
+        (let ((kept 0))
+          ;; Newest entries are appended to the end; walk newest-first.
+          (dolist (cell (reverse emacs-jupyter-notebook-panel--entries))
+            (when (plist-get (cdr cell) :mpl-pickle)
+              (if (< kept max)
+                  (setq kept (1+ kept))
+                (setcdr cell (plist-put (cdr cell) :mpl-pickle nil))))))))))
+
 (defun ejn-panel-set-pickle (handle base64)
   "Stash BASE64 matplotlib-pickle payload on HANDLE's entry.
 W8.2: stored under `:mpl-pickle' independently of the rendered content or
 image, so the PNG thumbnail path is untouched.  The interactive viewer
 (W8.5) reads this field to reopen the figure locally.  A nil BASE64 is a
-no-op."
+no-op.  A5: after stashing, prune pickles beyond the newest N entries."
   (when (and handle base64)
     (emacs-jupyter-notebook-panel--update-entry
      handle
      (lambda (entry)
-       (plist-put entry :mpl-pickle base64)))))
+       (plist-put entry :mpl-pickle base64)))
+    (emacs-jupyter-notebook-panel--prune-pickles (plist-get handle :panel))))
 
 (defun ejn-panel-clear-pickle (handle)
   "Drop any stashed matplotlib pickle on HANDLE's entry (W8.7(d))."
