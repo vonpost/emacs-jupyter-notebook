@@ -88,13 +88,17 @@ cover a full start's burst of commands without leaving idle masters around."
   :type 'string
   :group 'emacs-jupyter-notebook)
 
-(defcustom emacs-jupyter-notebook-ssh-control-path
-  (expand-file-name "ejn-ssh-%i-%C" temporary-file-directory)
+(defcustom emacs-jupyter-notebook-ssh-control-path "/tmp/ejn-%i-%C"
   "SSH `ControlPath' template for multiplexed connections.
 `%i' (local uid) keeps the socket private per local user and `%C' hashes
-the connection tuple, so the resulting path is short (well under the ~104
-byte unix-socket limit) and collision-free.  The containing directory must
-already exist; the default `temporary-file-directory' always does."
+the connection tuple, so the socket is collision-free.  The default is
+anchored at `/tmp' (not `temporary-file-directory') because `%C' expands to
+a 40-character SHA1 and macOS's per-user `$TMPDIR' under `/var/folders/…'
+would push the full path past the ~104-byte unix-domain-socket limit,
+failing every ssh with \"path too long for unix domain socket\".  The
+containing directory must already exist; `/tmp' always does.  Set this to
+nil-length or disable `emacs-jupyter-notebook-ssh-control-master' to turn
+multiplexing off."
   :type 'string
   :group 'emacs-jupyter-notebook)
 

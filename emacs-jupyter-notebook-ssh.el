@@ -231,13 +231,19 @@ The return value is a plist containing :argv, :remote-command,
    (format "kill %s" (shell-quote-argument (format "%s" pid)))))
 
 (defun emacs-jupyter-notebook-ssh-build-pid-alive (profile pid)
-  "Return an SSH argv list that exits 0 iff PID is alive on PROFILE's host.
-Uses `kill -0 <pid>' which sends no signal but reports whether the process
-exists and is owned by the SSH user.  Intended for the W4.4 reconnect-time
-liveness probe."
+  "Return an SSH argv list probing whether PID is alive on PROFILE's host.
+Uses `kill -0 <pid>' (sends no signal) but does NOT rely on the ssh exit
+status to convey the answer — that conflates \"PID is gone\" with \"ssh
+itself failed\" (auth, timeout, an over-long ControlPath), which would let
+an infra hiccup masquerade as a dead kernel.  Instead the remote shell
+always exits 0 and prints `__EJN_ALIVE__' only when the PID exists,
+followed by `__EJN_DONE__'.  The caller reads stdout: `__EJN_ALIVE__' →
+alive; `__EJN_DONE__' without it → confirmed dead; NEITHER → the host never
+answered, i.e. an ssh/infra failure, not a dead kernel (W13)."
   (emacs-jupyter-notebook-ssh-command
    profile
-   (format "kill -0 %s" (shell-quote-argument (format "%s" pid)))))
+   (format "if kill -0 %s 2>/dev/null; then echo __EJN_ALIVE__; fi; echo __EJN_DONE__"
+           (shell-quote-argument (format "%s" pid)))))
 
 (defun emacs-jupyter-notebook-ssh-build-batch-pid-alive (profile pids &optional connect-timeout)
   "Return an SSH argv reporting which of PIDS are alive on PROFILE's host.

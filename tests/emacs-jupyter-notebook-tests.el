@@ -1045,10 +1045,14 @@ missing) is visible without SSHing in to read the log by hand."
     (should (string-match-p "jupyter: command not found" captured))))
 
 (ert-deftest ejn-w4.4-build-pid-alive-uses-kill-zero ()
-  "W4.4: the PID-alive probe argv ends with `kill -0 <pid>'."
-  (let ((argv (emacs-jupyter-notebook-ssh-build-pid-alive
-               '(:profile "p" :host "mother") 12345)))
-    (should (member "kill -0 12345" argv))))
+  "W4.4/W13: the PID-alive probe uses `kill -0 <pid>' but reports the answer
+via stdout tokens (always exiting 0) so ssh failure is not read as death."
+  (let* ((argv (emacs-jupyter-notebook-ssh-build-pid-alive
+                '(:profile "p" :host "mother") 12345))
+         (remote (car (last argv))))
+    (should (string-match-p "kill -0 12345" remote))
+    (should (string-match-p "__EJN_ALIVE__" remote))
+    (should (string-match-p "__EJN_DONE__" remote))))
 
 (ert-deftest ejn-w4.8-async-probe-fails-when-no-pid ()
   "W4.8: when the registry entry has no `:remote-pid' (pre-W4.2 session)
@@ -1092,23 +1096,36 @@ to `--async-retrieve' (that would be a backwards-compat shim)."
     (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-retrieve)
                (lambda (_ctx) (setq retrieve-called t)))
               ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
-               (lambda (_name _argv sentinel)
-                 ;; Synthesize a process whose sentinel reports exit 0.
-                 (let ((proc (start-process "ejn-test-probe-ok" nil "true")))
-                   (set-process-sentinel proc sentinel)
-                   proc))))
+               (ejn-test--probe-process-fn
+                "echo __EJN_ALIVE__; echo __EJN_DONE__")))
       (emacs-jupyter-notebook--async-probe-pid-alive context)
       ;; Drive the sentinel by waiting for the process to exit.
       (let ((deadline (+ (float-time) 5)))
         (while (and (not retrieve-called) (< (float-time) deadline))
-          (sleep-for 0.01))))
+          (accept-process-output nil 0.01))))
     (setq emacs-jupyter-notebook--async-context nil)
     (should retrieve-called)))
 
+(defun ejn-test--probe-process-fn (script)
+  "Return an `ssh-start-process' stub running SCRIPT with captured output.
+The probe sentinel reads stdout (not the exit status), so the synthesized
+process must carry a real buffer + stderr like the production launcher."
+  (lambda (name _argv sentinel)
+    (let* ((stderr (generate-new-buffer (format " *%s stderr*" name)))
+           (proc (make-process
+                  :name name
+                  :buffer (generate-new-buffer (format " *%s*" name))
+                  :command (list "sh" "-c" script)
+                  :connection-type 'pipe :noquery t
+                  :sentinel sentinel :stderr stderr)))
+      (process-put proc 'emacs-jupyter-notebook-stderr-buffer stderr)
+      proc)))
+
 (ert-deftest ejn-w4.4-async-probe-dead-pid-fails-context ()
-  "W4.4: a nonzero PID-alive probe fails the context with a `kernel-dead'
-explanation, leaving the registry entry intact."
-  (let* (fail-called fail-reason
+  "W4.4/W13: a probe whose host ANSWERS `__EJN_DONE__' without
+`__EJN_ALIVE__' is a confirmed-dead kernel; fail with `kernel-dead',
+leaving the registry entry intact."
+  (let* (fail-called fail-reason fail-ctx
          (entry '(:profile "p" :session-id "s1" :remote-host "h"
                   :remote-pid 99999
                   :remote-connection-file "/r/k.json"))
@@ -1120,21 +1137,53 @@ explanation, leaving the registry entry intact."
                    :origin-buffer (current-buffer))))
     (setq emacs-jupyter-notebook--async-context context)
     (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-fail)
-               (lambda (_ctx err)
-                 (setq fail-called t fail-reason err)))
+               (lambda (ctx err)
+                 (setq fail-called t fail-reason err fail-ctx ctx)))
               ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
-               (lambda (_name _argv sentinel)
-                 (let ((proc (start-process "ejn-test-probe-fail" nil "false")))
-                   (set-process-sentinel proc sentinel)
-                   proc))))
+               (ejn-test--probe-process-fn "echo __EJN_DONE__")))
       (emacs-jupyter-notebook--async-probe-pid-alive context)
       (let ((deadline (+ (float-time) 5)))
         (while (and (not fail-called) (< (float-time) deadline))
-          (sleep-for 0.01))))
+          (accept-process-output nil 0.01))))
     (setq emacs-jupyter-notebook--async-context nil)
     (should fail-called)
+    (should (eq (plist-get fail-ctx :error-kind) 'kernel-dead))
     (should (string-match-p "no longer alive" fail-reason))
     (should (string-match-p "start-remote-kernel" fail-reason))))
+
+(ert-deftest ejn-w13-async-probe-unreachable-is-not-kernel-dead ()
+  "W13: a probe where the host never answers (no `__EJN_DONE__' — an
+ssh/infra failure such as an over-long ControlPath or a network blip) must
+NOT be reported as a dead kernel; it fails with `probe-unreachable' and
+advises retrying reconnect, never a fresh start."
+  (let* (fail-called fail-reason fail-ctx
+         (entry '(:profile "p" :session-id "s1" :remote-host "h"
+                  :remote-pid 12345
+                  :remote-connection-file "/r/k.json"))
+         (context (emacs-jupyter-notebook--async-new-context
+                   :phase 'retrieve
+                   :profile '(:profile "p" :host "h")
+                   :entry entry
+                   :session-id "s1"
+                   :origin-buffer (current-buffer))))
+    (setq emacs-jupyter-notebook--async-context context)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-fail)
+               (lambda (ctx err)
+                 (setq fail-called t fail-reason err fail-ctx ctx)))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
+               ;; ssh-style failure: no tokens on stdout, error on stderr.
+               (ejn-test--probe-process-fn
+                "echo 'ssh: connect failed' 1>&2; exit 255")))
+      (emacs-jupyter-notebook--async-probe-pid-alive context)
+      (let ((deadline (+ (float-time) 5)))
+        (while (and (not fail-called) (< (float-time) deadline))
+          (accept-process-output nil 0.01))))
+    (setq emacs-jupyter-notebook--async-context nil)
+    (should fail-called)
+    (should (eq (plist-get fail-ctx :error-kind) 'probe-unreachable))
+    (should (string-match-p "Could not reach" fail-reason))
+    (should (string-match-p "reconnect-remote-kernel" fail-reason))
+    (should-not (string-match-p "no longer alive" fail-reason))))
 
 (ert-deftest ejn-w4.8-ensure-client-async-does-not-auto-restart-on-dead-reconnect ()
   "W4.8: when reconnect-to-entry fails (e.g. W4.4 dead-PID), the
@@ -3216,6 +3265,58 @@ quoted case."
         (setq emacs-jupyter-notebook--session-entry nil)
         (emacs-jupyter-notebook--tunnel-reconnect (current-buffer))
         (should-not called)))))
+
+(ert-deftest ejn-w13-h2-inflight-attempt-not-superseded-by-parallel-send ()
+  "W13-H2: a send while a reconnect is in flight (which leaves --tunnel-dead t
+until finalize) attaches its callback to the running attempt instead of
+spawning a duplicate via --tunnel-reconnect."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client nil)
+          (emacs-jupyter-notebook--tunnel-dead t)
+          (emacs-jupyter-notebook--session-entry '(:profile "p" :session-id "s"))
+          (emacs-jupyter-notebook--async-context
+           (emacs-jupyter-notebook--async-new-context
+            :phase 'tunnel :origin-buffer (current-buffer)))
+          reconnect-called added)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--tunnel-reconnect)
+                 (lambda (&rest _) (setq reconnect-called t)))
+                ((symbol-function 'emacs-jupyter-notebook--async-add-callback)
+                 (lambda (&rest _) (setq added t))))
+        (emacs-jupyter-notebook--ensure-client-async (lambda (_) nil) nil))
+      (should added)
+      (should-not reconnect-called))))
+
+(ert-deftest ejn-w13-m1-stale-tunnel-dead-without-entry-does-not-wedge ()
+  "W13-M1: a stale --tunnel-dead flag with no session entry must not wedge
+send into a silent no-op; --ensure-client-async clears it and proceeds to a
+normal start/reconnect."
+  (with-temp-buffer
+    (setq buffer-file-name "/tmp/ejn-m1.py")
+    (let ((emacs-jupyter-notebook--client nil)
+          (emacs-jupyter-notebook--tunnel-dead t)
+          (emacs-jupyter-notebook--session-entry nil)
+          (emacs-jupyter-notebook--async-context nil)
+          started)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
+                 (lambda (&rest _) (setq started t))))
+        (emacs-jupyter-notebook--ensure-client-async (lambda (_) nil) nil))
+      (should started)
+      (should-not emacs-jupyter-notebook--tunnel-dead))))
+
+(ert-deftest ejn-w13-m1-deliberate-tunnel-delete-does-not-flag-dead ()
+  "W13-M1 root fix: --async-delete-process clears the sentinel first, so
+tearing down a tunnel whose death-sentinel is armed never spuriously sets
+--tunnel-dead (which would wedge later sends)."
+  (with-temp-buffer
+    (let ((buf (current-buffer))
+          (emacs-jupyter-notebook--tunnel-dead nil))
+      (let ((proc (start-process "ejn-w13-tunnel" nil "sleep" "60")))
+        (emacs-jupyter-notebook--install-tunnel-sentinel proc buf)
+        (emacs-jupyter-notebook--async-delete-process proc)
+        (accept-process-output nil 0.05)
+        (should-not emacs-jupyter-notebook--tunnel-dead)))))
 
 (ert-deftest ejn-tunnel-dead-branch-wires-callback-and-error-callback ()
   (ejn-test-with-temp-buffer "# %%\na = 1\n"

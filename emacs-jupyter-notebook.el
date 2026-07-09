@@ -1619,9 +1619,18 @@ Kills the process if it is still live, then disposes of both its stdout
 `process-buffer' and the stderr buffer stashed under the
 `emacs-jupyter-notebook-stderr-buffer' process property.  Without the second
 disposer, every SSH launch/scp/tunnel process leaked a hidden \" *NAME stderr*\"
-buffer per session (see ssh.el)."
+buffer per session (see ssh.el).
+
+W13-M1: clear the sentinel BEFORE deleting so a deliberate teardown never
+fires the process's death handler.  Otherwise deleting a tunnel whose
+`--install-tunnel-sentinel' watcher is armed queues that sentinel, which
+runs AFTER cleanup already reset state and re-sets `--tunnel-dead' t on a
+buffer that has no session — wedging every later `send-cell' into a silent
+no-op.  It also belt-and-suspenders the W12/A2 scp/launch resurrection: a
+deleted attempt's sentinel simply never runs."
   (when (processp process)
     (when (process-live-p process)
+      (set-process-sentinel process #'ignore)
       (delete-process process))
     (let ((stdout (process-buffer process))
           (stderr (process-get process 'emacs-jupyter-notebook-stderr-buffer)))
@@ -2119,16 +2128,21 @@ stored in the context and disposed in the sentinel via
              (sentinel
               (lambda (process _event)
                 (when (memq (process-status process) '(exit signal))
-                  (let ((ok (and (eq (process-status process) 'exit)
-                                 (zerop (process-exit-status process)))))
+                  ;; W13: read the probe's stdout, NOT its exit status, so an
+                  ;; ssh/infra failure is never mistaken for a dead kernel.
+                  (let* ((output (emacs-jupyter-notebook--process-output process))
+                         (answered (string-match-p "__EJN_DONE__" output))
+                         (alive (string-match-p "__EJN_ALIVE__" output)))
                     (when (buffer-live-p buffer)
                       (with-current-buffer buffer
                         (when (eq emacs-jupyter-notebook--async-context context)
                           (emacs-jupyter-notebook--async-put
                            context :probe-process nil)
                           (emacs-jupyter-notebook--async-delete-process process)
-                          (if ok
-                              (emacs-jupyter-notebook--async-retrieve context)
+                          (cond
+                           (alive
+                            (emacs-jupyter-notebook--async-retrieve context))
+                           (answered
                             (emacs-jupyter-notebook--async-fail
                              (emacs-jupyter-notebook--async-put
                               context :error-kind 'kernel-dead)
@@ -2139,7 +2153,25 @@ stored in the context and disposed in the sentinel via
                                "`M-x emacs-jupyter-notebook-start-remote-kernel'.")
                               pid
                               (or (plist-get entry :remote-host)
-                                  "the remote host")))))))))))
+                                  "the remote host"))))
+                           (t
+                            ;; The host never answered — ssh/infra failure, NOT
+                            ;; a dead kernel.  Do not deregister or advise a
+                            ;; fresh start; surface the reachability problem.
+                            (emacs-jupyter-notebook--async-fail
+                             (emacs-jupyter-notebook--async-put
+                              context :error-kind 'probe-unreachable)
+                             (format
+                              (concat
+                               "Could not reach %s to check kernel %s: %s "
+                               "The kernel may still be alive; retry "
+                               "`M-x emacs-jupyter-notebook-reconnect-remote-kernel'.")
+                              (or (plist-get entry :remote-host) "the remote host")
+                              pid
+                              (let ((trimmed (string-trim output)))
+                                (if (string-empty-p trimmed)
+                                    "SSH connection failed"
+                                  trimmed)))))))))))))
              (process (emacs-jupyter-notebook-ssh-start-process
                        probe-name argv sentinel)))
         (emacs-jupyter-notebook--async-put context :probe-process process))))))
@@ -2155,18 +2187,31 @@ stored in the context and disposed in the sentinel via
   "Ensure a kernel client is connected, then call CALLBACK.
 On failure, call ERROR-CALLBACK with (context error-data)."
   (cond
-   (emacs-jupyter-notebook--tunnel-dead
+   ;; W13-H2: an attempt is already in flight — ATTACH to it and never
+   ;; launch a parallel one.  This must precede the `--tunnel-dead' branch:
+   ;; a reconnect leaves `--tunnel-dead' t until `--async-connect-finalize',
+   ;; so without this a second send mid-reconnect would re-enter
+   ;; `--tunnel-reconnect' and clobber the in-flight context with a duplicate
+   ;; probe/tunnel.
+   ((emacs-jupyter-notebook--async-in-progress-p)
+    (emacs-jupyter-notebook--async-add-callback
+     emacs-jupyter-notebook--async-context callback)
+    (when error-callback
+      (emacs-jupyter-notebook--async-add-error-callback
+       emacs-jupyter-notebook--async-context error-callback)))
+   ;; A dead tunnel with a durable session entry reconnects it.
+   ((and emacs-jupyter-notebook--tunnel-dead
+         emacs-jupyter-notebook--session-entry)
     (emacs-jupyter-notebook--tunnel-reconnect
      (current-buffer) callback error-callback))
    (emacs-jupyter-notebook--client
     (funcall callback nil))
-   ((emacs-jupyter-notebook--async-in-progress-p)
-     (emacs-jupyter-notebook--async-add-callback
-      emacs-jupyter-notebook--async-context callback)
-     (when error-callback
-       (emacs-jupyter-notebook--async-add-error-callback
-        emacs-jupyter-notebook--async-context error-callback)))
    (t
+    ;; W13-M1: a `--tunnel-dead' flag with no session entry is stale debris
+    ;; (e.g. a deliberately torn-down start attempt); clear it so it cannot
+    ;; wedge a later send, then start/reconnect normally rather than
+    ;; silently no-op in `--tunnel-reconnect'.
+    (setq emacs-jupyter-notebook--tunnel-dead nil)
     ;; W4.8: when reconnect to a known registry entry fails (including the
     ;; W4.4 dead-PID case) we MUST NOT auto-remove the entry or auto-start
     ;; a fresh kernel — only the explicit user commands `shutdown-kernel'
