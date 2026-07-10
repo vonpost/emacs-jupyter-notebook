@@ -545,9 +545,23 @@ The probe sends a `kernel_info_request' via the configured adapter and
 arms a one-shot timeout matching `emacs-jupyter-notebook-heartbeat-timeout'.
 The reply (or timeout) routes through `--heartbeat-on-reply' or
 `--heartbeat-on-miss', which run in the originating buffer only and only
-when the inflight token still matches (so late replies are ignored)."
-  (when (and emacs-jupyter-notebook--client
-             (not emacs-jupyter-notebook--tunnel-dead))
+when the inflight token still matches (so late replies are ignored).
+
+W15-A: while the kernel is BUSY the probe is suspended entirely and the
+miss counter reset.  The probe is a shell-channel `kernel_info_request',
+and a busy kernel queues shell messages behind the running cell — silence
+is the EXPECTED state, not evidence of death.  Counting misses while busy
+flagged the tunnel dead ~45 s into any long-running cell (interval 20 s ×
+timeout 3 s × 2 misses), producing a false drop/reconnect cycle on every
+substantial ML training cell.  Transport death while busy is still caught
+by the tunnel process sentinel and the SSH ServerAlive keepalives; probing
+resumes on the first tick after the kernel reports non-busy."
+  (cond
+   ((eq emacs-jupyter-notebook--kernel-status 'busy)
+    ;; Busy: expected shell silence — no probe, no misses (W15-A).
+    (setq emacs-jupyter-notebook--heartbeat-misses 0))
+   ((and emacs-jupyter-notebook--client
+         (not emacs-jupyter-notebook--tunnel-dead))
     (let* ((buffer (current-buffer))
            (token (gensym "ejn-heartbeat-")))
       (setq emacs-jupyter-notebook--heartbeat-inflight token)
@@ -583,7 +597,7 @@ when the inflight token still matches (so late replies are ignored)."
                (when (timerp emacs-jupyter-notebook--heartbeat-timeout-timer)
                  (cancel-timer emacs-jupyter-notebook--heartbeat-timeout-timer))
                (setq emacs-jupyter-notebook--heartbeat-timeout-timer nil)
-               (emacs-jupyter-notebook--heartbeat-on-miss)))))))))
+               (emacs-jupyter-notebook--heartbeat-on-miss))))))))))
 
 (defun emacs-jupyter-notebook--heartbeat-on-reply ()
   "Handle a successful heartbeat reply: clear inflight and reset misses."
@@ -1969,15 +1983,25 @@ clobbering any newer attempt while re-issuing SCP against a killed kernel."
                       #'emacs-jupyter-notebook--async-wait-tunnel-tick context)))
           (emacs-jupyter-notebook--async-put context :timer timer)))))))
 
-(defun emacs-jupyter-notebook--async-connect-finalize (context buffer entry local-ports local-file client)
+(defun emacs-jupyter-notebook--async-connect-finalize (context buffer entry local-ports local-file client &optional busy)
   "Finalize the async connect for CONTEXT in BUFFER with CLIENT.
+Returns non-nil when it acted (guards passed), nil when it declined.
+
 W13-H3: guard on CONTEXT IDENTITY, not merely the buffer's current phase.
-`jupyter-connect-async' schedules this via a `run-at-time 0' closure that
-cannot be cancelled, so a superseded attempt's finalize can still fire.
-Without the identity check it would act on whatever context now occupies
-the buffer — installing a stale client on, or `--async-fail'-ing, a HEALTHY
-newer attempt that happens to also be at phase `connect'.  The check makes a
-stale finalize a no-op."
+The verify callback can fire arbitrarily late (a busy kernel queues the
+kernel-info probe behind the running cell), so a superseded attempt's
+finalize can still arrive.  Without the identity check it would act on
+whatever context now occupies the buffer — installing a stale client on,
+or `--async-fail'-ing, a HEALTHY newer attempt that happens to also be at
+phase `connect'.  The check makes a stale finalize a no-op.
+
+W15-B: when BUSY is non-nil the kernel's process was PID-probe-confirmed
+alive but its shell channel is silent (a long-running cell — think an
+overnight training loop).  Connect anyway: install the client, mark
+`--kernel-status' busy (which suspends the W4.5 heartbeat per W15-A), and
+tell the user.  Sends queue on the shell channel and run when the cell
+finishes; the still-queued verification kernel-info doubles as the
+became-responsive notifier via `--connect-verified-late'."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when (and (eq emacs-jupyter-notebook--async-context context)
@@ -1985,19 +2009,25 @@ stale finalize a no-op."
         (emacs-jupyter-notebook--async-cancel-timer
          emacs-jupyter-notebook--async-context)
         (if (not client)
-            (emacs-jupyter-notebook--async-fail
-             emacs-jupyter-notebook--async-context
-             "Kernel did not respond to kernel_info_request")
+            (progn
+              (emacs-jupyter-notebook--async-fail
+               emacs-jupyter-notebook--async-context
+               "Kernel did not respond to kernel_info_request")
+              t)
           (setq emacs-jupyter-notebook--client client)
           (setq emacs-jupyter-notebook--tunnel-dead nil)
+          (setq emacs-jupyter-notebook--kernel-status (if busy 'busy nil))
           (setq entry (plist-put entry :tunnel-ports local-ports))
           (setq entry (plist-put entry :local-connection-file local-file))
           (setq emacs-jupyter-notebook--session-entry entry)
           ;; W4.5: arm the kernel-info heartbeat now that the client is live.
+          ;; (W15-A: it self-suspends while the kernel is busy.)
           (emacs-jupyter-notebook--heartbeat-start)
           ;; W8.1: inject the in-memory matplotlib pickle formatter so inline
           ;; figures carry the interactive-viewer payload.  No-op / graceful
           ;; on kernels without matplotlib; never touches the remote FS.
+          ;; On a busy kernel these silent requests simply queue and run
+          ;; when the current cell finishes.
           (emacs-jupyter-notebook--inject-viewer-formatter client)
           ;; W11: inject the self-reaping idle watchdog so an abandoned or
           ;; crashed-out session's kernel eventually reaps itself.  No-op
@@ -2008,24 +2038,108 @@ stale finalize a no-op."
             (setq ctx (emacs-jupyter-notebook--async-put ctx :entry entry))
             (setq ctx (emacs-jupyter-notebook--async-put ctx :phase 'done))
             (emacs-jupyter-notebook-registry-save-entry entry)
-            (emacs-jupyter-notebook--async-message
-             ctx "connected to remote Jupyter kernel %s"
-             (plist-get ctx :session-id))
+            (if busy
+                (emacs-jupyter-notebook--async-message
+                 ctx (concat "connected to BUSY remote kernel %s — a cell is "
+                             "still executing; sends will queue and run when "
+                             "it finishes (interrupt with "
+                             "M-x emacs-jupyter-notebook-interrupt-kernel)")
+                 (plist-get ctx :session-id))
+              (emacs-jupyter-notebook--async-message
+               ctx "connected to remote Jupyter kernel %s"
+               (plist-get ctx :session-id)))
             (let ((cb (plist-get ctx :callback)))
               (when cb
-                (funcall cb ctx)))))))))
+                (funcall cb ctx)))
+            t))))))
+
+(defun emacs-jupyter-notebook--connect-verified-late (buffer client)
+  "Record that CLIENT answered kernel-info after a busy finalize in BUFFER.
+W15-B: when a reconnect finalized as connected-BUSY, the verification
+kernel-info stayed queued on the kernel's shell channel.  Its reply
+arriving — possibly hours later, when the training cell finishes — proves
+the kernel is responsive again: flip `--kernel-status' to idle so the
+W4.5 heartbeat resumes probing.  No-op unless CLIENT is still the
+buffer's current client and the status is still `busy' (a newer iopub
+status update owns the state otherwise)."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (and (eq emacs-jupyter-notebook--client client)
+                 (eq emacs-jupyter-notebook--kernel-status 'busy))
+        (setq emacs-jupyter-notebook--kernel-status 'idle)
+        (force-mode-line-update t)
+        (emacs-jupyter-notebook--log-append
+         'connect "kernel became responsive (queued kernel-info answered)")))))
 
 (defun emacs-jupyter-notebook--async-connect-timeout (context buffer)
-  "Fail CONTEXT in BUFFER when its connect has timed out.
+  "Arbitrate CONTEXT in BUFFER after its connect verification timed out.
 W13-H3: identity-guarded so a superseded attempt's timeout timer cannot
-fail a healthy newer attempt sitting at phase `connect'."
+fail a healthy newer attempt sitting at phase `connect'.
+
+W15-B: no `kernel_info_reply' within the window no longer means dead — a
+BUSY kernel (an overnight training cell) queues shell messages and cannot
+answer until the cell finishes, yet is exactly the kernel the user wants
+to reconnect to.  Arbitrate with a remote PID probe:
+- Fresh start (`:owns-kernel'): a just-launched kernel is never
+  legitimately busy — hard-fail as before.
+- Reconnect with a recorded PID: probe it.  Alive → finalize as
+  connected-BUSY.  Answered-dead → fail with the kernel-dead message.
+  Host unreachable → fail with a reachability message that never advises
+  a fresh start.
+- Reconnect without a PID (should not happen post-W4.2) → hard-fail."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when (and (eq emacs-jupyter-notebook--async-context context)
                  (eq (plist-get context :phase) 'connect))
-        (emacs-jupyter-notebook--async-fail
-         emacs-jupyter-notebook--async-context
-         "Timed out waiting for kernel_info_reply")))))
+        (let* ((entry (plist-get context :entry))
+               (pid (and entry (plist-get entry :remote-pid)))
+               (client (plist-get context :client-unverified)))
+          (if (or (plist-get context :owns-kernel)
+                  (not pid)
+                  (not client))
+              (emacs-jupyter-notebook--async-fail
+               emacs-jupyter-notebook--async-context
+               "Timed out waiting for kernel_info_reply")
+            (emacs-jupyter-notebook--async-message
+             context "kernel-info silent; probing whether kernel %s is busy or dead" pid)
+            (ignore-errors
+              (emacs-jupyter-notebook-ssh-start-process
+               (format "emacs-jupyter-notebook-busy-probe-%s"
+                       (or (plist-get context :session-id) pid))
+               (emacs-jupyter-notebook-ssh-build-pid-alive
+                (plist-get context :profile) pid)
+               (lambda (process _event)
+                 (when (memq (process-status process) '(exit signal))
+                   (let* ((output (emacs-jupyter-notebook--process-output process))
+                          (answered (string-match-p "__EJN_DONE__" output))
+                          (alive (string-match-p "__EJN_ALIVE__" output)))
+                     (emacs-jupyter-notebook--async-delete-process process)
+                     (when (emacs-jupyter-notebook--async-context-live-p context)
+                       (with-current-buffer buffer
+                         (cond
+                          (alive
+                           ;; Alive but shell-silent: connected-busy (W15-B).
+                           (emacs-jupyter-notebook--async-connect-finalize
+                            context buffer
+                            (copy-sequence (plist-get context :entry))
+                            (plist-get context :local-ports)
+                            (plist-get context :local-file)
+                            client 'busy))
+                          (answered
+                           (emacs-jupyter-notebook--async-fail
+                            context
+                            (format
+                             (concat "Remote kernel %s is no longer alive. "
+                                     "Start a new one with "
+                                     "`M-x emacs-jupyter-notebook-start-remote-kernel'.")
+                             pid)))
+                          (t
+                           (emacs-jupyter-notebook--async-fail
+                            context
+                            (concat "Kernel did not answer and its host could "
+                                    "not be reached to check on it; the kernel "
+                                    "may still be alive — retry "
+                                    "`M-x emacs-jupyter-notebook-reconnect-remote-kernel'.")))))))))))))))))
 
 (defun emacs-jupyter-notebook--async-connect (context)
   "Connect emacs-jupyter to the ready tunnel described by CONTEXT."
@@ -2045,19 +2159,38 @@ fail a healthy newer attempt sitting at phase `connect'."
                   (plist-get context :tunnel-process))
             (emacs-jupyter-notebook--install-tunnel-sentinel
               emacs-jupyter-notebook--tunnel-process buffer)
-            ;; W13-H3: capture the stable context object so the (uncancellable)
-            ;; connect closure and the timeout timer act only on THIS attempt.
+            ;; W13-H3: capture the stable context object so the verify
+            ;; callback (which can fire hours late off a busy kernel's shell
+            ;; queue) and the timeout timer act only on THIS attempt.
             (let ((ctx context))
               (let ((timer (run-at-time
                             emacs-jupyter-notebook-jupyter-connect-timeout nil
                             #'emacs-jupyter-notebook--async-connect-timeout
                             ctx buffer)))
                 (setq context (emacs-jupyter-notebook--async-put context :timer timer)))
-              (emacs-jupyter-notebook-jupyter-connect-async
-               local-file
-               (lambda (client)
-                 (emacs-jupyter-notebook--async-connect-finalize
-                  ctx buffer entry local-ports local-file client))))
+              ;; W15-B: the adapter attaches WITHOUT blocking and returns the
+              ;; unverified client; the callback fires only when the kernel
+              ;; actually answers kernel-info.  Stash the unverified client so
+              ;; `--async-connect-timeout' can busy-finalize with it.
+              (let ((client (emacs-jupyter-notebook-jupyter-connect-async
+                             local-file
+                             (lambda (client)
+                               ;; Verified: finalize as idle.  If finalize
+                               ;; declines (already busy-finalized or
+                               ;; superseded), a late answer from the
+                               ;; still-installed client means it just
+                               ;; became responsive (W15-B).
+                               (unless (emacs-jupyter-notebook--async-connect-finalize
+                                        ctx buffer entry local-ports local-file client)
+                                 (emacs-jupyter-notebook--connect-verified-late
+                                  buffer client))))))
+                (setq context (emacs-jupyter-notebook--async-put
+                               context :client-unverified client))
+                ;; Construction failed outright: no client to verify or
+                ;; busy-finalize — fail now rather than wait out the timer.
+                (unless client
+                  (emacs-jupyter-notebook--async-fail
+                   context "Could not attach to the kernel connection file"))))
             context)
         (error
          (emacs-jupyter-notebook--async-fail

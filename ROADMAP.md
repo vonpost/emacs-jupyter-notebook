@@ -970,6 +970,45 @@ subplot crops all siblings, killing Emacs reaps the viewer.
 
 ---
 
+## W15 — Busy kernels are alive: heartbeat + reconnect (dogfooding)
+
+- [x] sha=PENDING W15 busy-kernel correctness.  MOTIVATION: two dogfooding
+      failures shared one root cause — SHELL-CHANNEL SILENCE WAS TREATED AS
+      DEATH, but a busy kernel is SUPPOSED to be silent on shell (messages
+      queue behind the running cell).  For ML training workloads (cells that
+      run minutes to hours) this broke the package's core promise.
+      (1) "Kernel drops + reconnects every ~5 min": the W4.5 heartbeat
+      (kernel_info on shell, 20 s interval, 3 s timeout, 2 misses) flagged the
+      tunnel dead ~45 s into ANY long cell — one false drop per substantial
+      cell.  (2) "Cannot reconnect next morning": upstream emacs-jupyter's
+      `jupyter-client' constructor hard-blocks on a shell kernel_info_reply,
+      so reconnecting to a kernel mid-training-run could never succeed
+      ("Timed out waiting for kernel_info_reply" after 45 s of UI freeze).
+      - W15-A HEARTBEAT BUSY-SUSPEND: `--heartbeat-tick' sends no probe and
+        resets the miss counter while `--kernel-status' is busy.  Transport
+        death while busy is still caught by the tunnel sentinel + SSH
+        ServerAlive; probing resumes on the first non-busy tick.
+      - W15-B BUSY-TOLERANT NON-BLOCKING CONNECT: the connect adapter now
+        attaches WITHOUT upstream's blocking gate (replicates client
+        construction minus the kernel-info wait — also killing the 45 s UI
+        freeze, the old review H4), returns the unverified client
+        immediately, and fires an async kernel_info as the verify probe.
+        Reply → finalize idle (kernel-info slot populated so upstream's
+        blocking call stays a cache hit).  `--async-connect-timeout' now
+        ARBITRATES instead of failing: fresh starts still hard-fail (a
+        just-launched kernel is never busy); reconnects run a remote PID
+        probe — alive → finalize as connected-BUSY (client installed, status
+        busy, heartbeat suspended, sends queue behind the running cell),
+        answered-dead → kernel-dead error, unreachable → reachability error
+        that never advises a fresh start.  The queued verify kernel_info
+        doubles as the became-responsive notifier: its late reply flips
+        status busy → idle (`--connect-verified-late').
+      LIMITATION (documented): output of the cell that was already running
+      belongs to the OLD session's parent requests and cannot be rendered by
+      the reconnected client; the panel picks up from the next send.
+
+---
+
 ## W14 — Panel/completion/viewer dogfooding fixes
 
 - [x] sha=PENDING W14 dogfooding fixes (live UX bugs found while using the

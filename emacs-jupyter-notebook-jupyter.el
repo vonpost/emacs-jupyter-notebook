@@ -19,6 +19,7 @@
 
 (require 'cl-lib)
 (require 'ansi-color)
+(require 'eieio)                        ; oset/make-instance (W15-B)
 (require 'subr-x)
 (require 'emacs-jupyter-notebook-vars)
 (require 'emacs-jupyter-notebook-result)
@@ -413,41 +414,65 @@ without requiring a real Jupyter kernel in tests.")
         (jupyter-long-timeout (/ emacs-jupyter-notebook-jupyter-connect-timeout 3.0)))
     (jupyter-client (jupyter-kernel :conn-info connection-file :connect-p t))))
 
+(defun emacs-jupyter-notebook-jupyter--connect-unverified (connection-file)
+  "Attach a client to the kernel at CONNECTION-FILE without any blocking gate.
+Replicates upstream `jupyter-client' on a `jupyter-kernel' MINUS its
+constructor's synchronous `jupyter-kernel-info' wait: that gate requires a
+shell-channel `kernel_info_reply', which a BUSY kernel queues behind the
+currently-running cell — so reconnecting to a kernel mid-training could
+never succeed (and blocked the UI for the whole timeout, the old H4 seam).
+Construction here is non-blocking: it builds the ZMQ I/O for the session
+and returns immediately.  Liveness verification is the caller's job
+(W15-B: async kernel-info + PID-probe fallback in the core)."
+  (emacs-jupyter-notebook-jupyter--ensure)
+  (require 'jupyter-kernel)
+  (require 'jupyter-client)
+  (let ((kernel (jupyter-kernel :conn-info connection-file :connect-p t))
+        (client (make-instance 'jupyter-kernel-client)))
+    (oset client io (jupyter-io kernel))
+    client))
+
+(defun emacs-jupyter-notebook-jupyter--store-kernel-info (client content)
+  "Store kernel-info CONTENT on CLIENT the way upstream `jupyter-kernel-info' does.
+Populating the slot keeps any later upstream `jupyter-kernel-info' call a
+cache hit instead of a blocking shell round trip.  Mirrors the upstream
+slot bookkeeping including interning the language name for method
+dispatch.  Best-effort: errors are swallowed."
+  (ignore-errors
+    (oset client kernel-info content)
+    (let* ((info (plist-get content :language_info))
+           (lang (plist-get info :name)))
+      (when (and info (stringp lang))
+        (plist-put info :name
+                   (intern (jupyter-canonicalize-language-string lang)))))))
+
 (defun emacs-jupyter-notebook-jupyter--connect-async (connection-file callback)
-  "Connect to CONNECTION-FILE and call CALLBACK with the client.
-The actual connect is deferred to the next command loop iteration
-via `run-at-time' so the current keystroke/command finishes before
-the synchronous emacs-jupyter connect blocks the event loop."
-  (message "Connecting to Jupyter kernel (this may take a moment)...")
-  (run-at-time
-   0 nil
-   (lambda ()
-     ;; W10: obtain the client under `condition-case', but invoke CALLBACK
-     ;; strictly OUTSIDE it and exactly ONCE.  CALLBACK runs the connect
-     ;; finalize, which stores the client, arms the heartbeat, injects the
-     ;; viewer formatter, and drains any queued evaluation callbacks.  When
-     ;; the callback was wrapped by the `condition-case' (the old shape), a
-     ;; raise from ANY of that downstream work was misread as a connect
-     ;; failure and re-entered CALLBACK a second time with a nil client —
-     ;; silently corrupting the async phase and swallowing the real error
-     ;; even though a live client had already been obtained.  That is the
-     ;; silent half-connect seam behind the client-less-debris wedge (W10):
-     ;; queued evals that never completed while no error surfaced.
-     (let ((client
-            (condition-case err
-                (let ((c (catch 'timeout
-                           (emacs-jupyter-notebook-jupyter--connect connection-file))))
-                  (if (eq c 'timeout)
-                      (progn
-                        (message "Timed out connecting to Jupyter kernel")
-                        nil)
-                    (message "Connected to Jupyter kernel")
-                    c))
-              (error
-               (message "Failed to connect to Jupyter kernel: %s"
-                        (error-message-string err))
-               nil))))
-       (funcall callback client)))))
+  "Attach to CONNECTION-FILE now; call CALLBACK with the client once verified.
+W15-B: returns the UNVERIFIED client immediately (or nil when construction
+fails) without blocking the UI.  An async `kernel_info_request' is fired as
+the verification probe; when its reply arrives CALLBACK is invoked exactly
+once with the client — possibly MUCH later for a busy kernel, whose shell
+channel queues the request behind the running cell.  CALLBACK is never
+invoked with nil and never invoked on failure: timeout policy belongs to
+the caller (`--async-connect-timeout' arbitrates alive-but-busy vs dead via
+a remote PID probe)."
+  (message "Connecting to Jupyter kernel...")
+  (condition-case err
+      (let ((client (emacs-jupyter-notebook-jupyter--connect-unverified
+                     connection-file))
+            (called nil))
+        (emacs-jupyter-notebook-jupyter-kernel-info
+         client
+         (lambda (reply _error)
+           (when (and reply (not called))
+             (setq called t)
+             (emacs-jupyter-notebook-jupyter--store-kernel-info client reply)
+             (funcall callback client))))
+        client)
+    (error
+     (message "Failed to connect to Jupyter kernel: %s"
+              (error-message-string err))
+     nil)))
 
 (defun emacs-jupyter-notebook-jupyter--evaluate (client code entry-handle)
   "Evaluate CODE through CLIENT, sending callbacks driving ENTRY-HANDLE.

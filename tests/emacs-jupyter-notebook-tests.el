@@ -4371,6 +4371,129 @@ Mock interrupt to a no-op; the interactive cancel path must not block."
       (emacs-jupyter-notebook--async-connect-timeout context buffer)
       (should (eq (plist-get emacs-jupyter-notebook--async-context :phase) 'done)))))
 
+(ert-deftest ejn-w15-heartbeat-suspended-while-kernel-busy ()
+  "W15-A: while the kernel is busy the heartbeat sends NO probe and resets
+the miss counter — shell silence is the expected state of a busy kernel,
+not evidence of death.  This kills the false tunnel-death that fired ~45 s
+into every long-running (training) cell."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook--tunnel-dead nil)
+          (emacs-jupyter-notebook--kernel-status 'busy)
+          (emacs-jupyter-notebook--heartbeat-misses 2)
+          probed)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-kernel-info)
+                 (lambda (&rest _) (setq probed t))))
+        (emacs-jupyter-notebook--heartbeat-tick))
+      (should-not probed)
+      (should (= emacs-jupyter-notebook--heartbeat-misses 0))
+      (should-not emacs-jupyter-notebook--tunnel-dead))))
+
+(ert-deftest ejn-w15-connect-timeout-busy-kernel-finalizes-busy ()
+  "W15-B: kernel-info timeout on a RECONNECT + PID probe says alive →
+finalize as connected-BUSY: client installed, status busy, phase done,
+registry saved — no failure."
+  (with-temp-buffer
+    (let* ((buffer (current-buffer))
+           (entry '(:profile "p" :session-id "s15" :remote-host "h"
+                    :remote-pid 4242
+                    :remote-connection-file "/r/k.json"))
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'connect
+                     :profile '(:profile "p" :host "h")
+                     :entry entry
+                     :session-id "s15"
+                     :local-ports '(:shell_port 1001)
+                     :local-file "/tmp/k15.json"
+                     :client-unverified 'mock-client
+                     :origin-buffer buffer))
+           failed)
+      (setq emacs-jupyter-notebook--async-context context)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-fail)
+                 (lambda (&rest _) (setq failed t)))
+                ((symbol-function 'emacs-jupyter-notebook--heartbeat-start) #'ignore)
+                ((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent) #'ignore)
+                ((symbol-function 'emacs-jupyter-notebook-registry-save-entry) #'ignore)
+                ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
+                 (ejn-test--probe-process-fn
+                  "echo __EJN_ALIVE__; echo __EJN_DONE__")))
+        (emacs-jupyter-notebook--async-connect-timeout context buffer)
+        (let ((deadline (+ (float-time) 5)))
+          (while (and (not (eq emacs-jupyter-notebook--client 'mock-client))
+                      (not failed)
+                      (< (float-time) deadline))
+            (accept-process-output nil 0.02))))
+      (should-not failed)
+      (should (eq emacs-jupyter-notebook--client 'mock-client))
+      (should (eq emacs-jupyter-notebook--kernel-status 'busy))
+      (should (eq (plist-get emacs-jupyter-notebook--async-context :phase) 'done)))))
+
+(ert-deftest ejn-w15-connect-timeout-dead-kernel-fails ()
+  "W15-B: kernel-info timeout + PID probe answers dead → fail with the
+kernel-dead message; no client installed."
+  (with-temp-buffer
+    (let* ((buffer (current-buffer))
+           (entry '(:profile "p" :session-id "s15d" :remote-host "h"
+                    :remote-pid 4243
+                    :remote-connection-file "/r/k.json"))
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'connect
+                     :profile '(:profile "p" :host "h")
+                     :entry entry
+                     :session-id "s15d"
+                     :client-unverified 'mock-client
+                     :origin-buffer buffer))
+           fail-reason)
+      (setq emacs-jupyter-notebook--async-context context)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-fail)
+                 (lambda (_ctx err) (setq fail-reason err)))
+                ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
+                 (ejn-test--probe-process-fn "echo __EJN_DONE__")))
+        (emacs-jupyter-notebook--async-connect-timeout context buffer)
+        (let ((deadline (+ (float-time) 5)))
+          (while (and (not fail-reason) (< (float-time) deadline))
+            (accept-process-output nil 0.02))))
+      (should fail-reason)
+      (should (string-match-p "no longer alive" fail-reason))
+      (should-not emacs-jupyter-notebook--client))))
+
+(ert-deftest ejn-w15-connect-timeout-fresh-start-fails-hard ()
+  "W15-B: a FRESH START's kernel is never legitimately busy — kernel-info
+timeout hard-fails without any PID probe."
+  (with-temp-buffer
+    (let* ((buffer (current-buffer))
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'connect
+                     :owns-kernel t
+                     :entry '(:profile "p" :session-id "sf" :remote-pid 99)
+                     :client-unverified 'mock-client
+                     :origin-buffer buffer))
+           fail-reason probed)
+      (setq emacs-jupyter-notebook--async-context context)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-fail)
+                 (lambda (_ctx err) (setq fail-reason err)))
+                ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
+                 (lambda (&rest _) (setq probed t) nil)))
+        (emacs-jupyter-notebook--async-connect-timeout context buffer))
+      (should fail-reason)
+      (should (string-match-p "kernel_info_reply" fail-reason))
+      (should-not probed))))
+
+(ert-deftest ejn-w15-late-verify-flips-busy-to-idle ()
+  "W15-B: the queued verification kernel-info answering hours later flips a
+busy-finalized buffer to idle; a stale client or non-busy status is a no-op."
+  (with-temp-buffer
+    (let ((buffer (current-buffer)))
+      (setq emacs-jupyter-notebook--client 'mock-client
+            emacs-jupyter-notebook--kernel-status 'busy)
+      (emacs-jupyter-notebook--connect-verified-late buffer 'other-client)
+      (should (eq emacs-jupyter-notebook--kernel-status 'busy))
+      (emacs-jupyter-notebook--connect-verified-late buffer 'mock-client)
+      (should (eq emacs-jupyter-notebook--kernel-status 'idle))
+      ;; Already idle: no flip back / no error.
+      (emacs-jupyter-notebook--connect-verified-late buffer 'mock-client)
+      (should (eq emacs-jupyter-notebook--kernel-status 'idle)))))
+
 (ert-deftest ejn-w13-h3-stale-connect-finalize-spares-newer-attempt ()
   "W13-H3: a superseded attempt's connect callback must not touch the newer
 attempt that now occupies the buffer.  Finalizing with the OLD context while
@@ -6033,26 +6156,36 @@ start — the guard's original leak-prevention is preserved.  A present
     (should emacs-jupyter-notebook--session-entry)))
 
 (ert-deftest ejn-w10-connect-async-invokes-callback-once-despite-finalize-error ()
-  "W10 silent half-connect: `--connect-async' must invoke CALLBACK exactly
-ONCE, with CALLBACK strictly outside the connect `condition-case'.  A raise
-from the downstream finalize/eval work must propagate — it must NOT be
-misread as a connect failure and re-enter CALLBACK with a nil client (the
-swallow-and-misreport seam that hid errors while a live client existed)."
+  "W10 lesson re-pinned on the W15 adapter shape: the verify callback fires
+exactly ONCE, always with a non-nil client, and a raise from the downstream
+finalize work must NOT be misread as a connect failure nor re-enter the
+callback with nil.  In the W15 shape the reply arrives through the
+adapter's `--safe-callback' layer, which contains the raise (surfacing it
+as a message) — the `called' latch guarantees single invocation.  The
+adapter returns the unverified client synchronously."
   (let ((calls 0)
         captured)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--connect)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--connect-unverified)
                (lambda (_file) 'mock-client))
-              ((symbol-function 'run-at-time)
-               (lambda (_secs _rep fn &rest args) (apply fn args) nil))
+              ((symbol-function 'emacs-jupyter-notebook-jupyter--store-kernel-info)
+               #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook-jupyter-kernel-info)
+               (lambda (_client cb)
+                 ;; Deliver the reply through the same safe-callback layer
+                 ;; production uses, twice — the latch must dedupe.
+                 (emacs-jupyter-notebook-jupyter--safe-callback
+                  cb '(:status "ok") nil)
+                 (emacs-jupyter-notebook-jupyter--safe-callback
+                  cb '(:status "ok") nil)))
               ((symbol-function 'message) (lambda (&rest _) nil)))
-      ;; The finalize raise propagates out (proof the callback is NOT wrapped).
-      (should-error
-       (emacs-jupyter-notebook-jupyter--connect-async
-        "/tmp/kernel.json"
-        (lambda (client)
-          (cl-incf calls)
-          (setq captured client)
-          (error "finalize boom"))))
+      (let ((client (emacs-jupyter-notebook-jupyter--connect-async
+                     "/tmp/kernel.json"
+                     (lambda (client)
+                       (cl-incf calls)
+                       (setq captured client)
+                       (error "finalize boom")))))
+        ;; Unverified client returned synchronously.
+        (should (eq client 'mock-client)))
       (should (= calls 1))
       (should (eq captured 'mock-client)))))
 
