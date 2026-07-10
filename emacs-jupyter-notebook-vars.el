@@ -361,15 +361,23 @@ the remote kernels.  Set to an absolute path or a command found on
 
 (defcustom emacs-jupyter-notebook-viewer-backend 'tk
   "Preferred GUI backend for the local matplotlib viewer.
-The viewer selects `TkAgg' for `tk' and `QtAgg' for `qt', falling back to
-the other automatically when the preferred one is unavailable.
+The viewer selects `TkAgg' for `tk', `QtAgg' for `qt', and the native
+Cocoa backend for `macosx', falling back through the other candidates
+automatically when the preferred one is unavailable.
 
-Default is `tk': under a bare nix `python3.withPackages' env, PyQt5 cannot
-locate its Qt platform plugin (xcb) and aborts before matplotlib's
-fallback can run, whereas TkAgg inherits Emacs's DISPLAY and just works.
-Choose `qt' only if your local Python has a properly-wrapped PyQt5."
+On macOS the viewer ALWAYS tries the native `MacOSX' backend first
+regardless of this setting (W16): system Tk there commonly renders blank
+canvases or fails to run its event loop, Qt needs a separately-installed
+binding, and the Cocoa backend ships with every matplotlib.
+
+Default is `tk' (for Linux): under a bare nix `python3.withPackages' env,
+PyQt5 cannot locate its Qt platform plugin (xcb) and aborts before
+matplotlib's fallback can run, whereas TkAgg inherits Emacs's DISPLAY and
+just works.  Choose `qt' only if your local Python has a properly-wrapped
+PyQt5."
   :type '(choice (const :tag "Tk (TkAgg)" tk)
-                 (const :tag "Qt (QtAgg)" qt))
+                 (const :tag "Qt (QtAgg)" qt)
+                 (const :tag "macOS native (Cocoa)" macosx))
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-viewer-idle-timeout 900

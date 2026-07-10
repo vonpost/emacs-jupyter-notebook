@@ -214,6 +214,15 @@ connect (viewer socket not yet bound) reschedules on a timer up to
   (emacs-jupyter-notebook-viewer-ensure)
   (emacs-jupyter-notebook-viewer--send-path-attempt path 1))
 
+(defun emacs-jupyter-notebook-viewer--stderr-tail (&optional n)
+  "Return the last N (default 5) non-empty viewer stderr lines, or nil."
+  (let ((stderr (get-buffer " *emacs-jupyter-notebook-viewer-stderr*")))
+    (when (buffer-live-p stderr)
+      (with-current-buffer stderr
+        (let ((lines (split-string (string-trim (buffer-string)) "\n" t)))
+          (when lines
+            (string-join (last lines (or n 5)) "\n    ")))))))
+
 (defun emacs-jupyter-notebook-viewer--send-path-attempt (path attempt)
   "Attempt number ATTEMPT to connect and send PATH to the viewer socket.
 W8.7(c): if the viewer is not live, respawn it (which allocates a fresh
@@ -221,8 +230,28 @@ socket path) before connecting; catch any `error' — not just
 `file-error' — so a viewer death after connect (`process-send-string' /
 `process-send-eof' signalling) also triggers a retry rather than
 propagating.  W8.7(e): the one-shot connection process is disposed via a
-sentinel once it closes."
+sentinel once it closes.
+
+W16: a viewer that is ALIVE but whose socket never appears is wedged (a
+GUI backend that hangs instead of exiting — seen with macOS Tk).  The old
+loop retried the same never-appearing socket to exhaustion and buried the
+reason in the log.  Now: halfway through the attempt budget a live viewer
+with no bound socket is killed and respawned fresh, and exhaustion raises
+a user-visible `message' carrying the viewer's stderr tail so the cause is
+readable without hunting for the log buffer."
   (unless (emacs-jupyter-notebook-viewer-live-p)
+    (ignore-errors (emacs-jupyter-notebook-viewer-ensure)))
+  ;; W16: wedged-viewer restart — alive, but never bound its socket.
+  (when (and (= attempt (max 2 (/ emacs-jupyter-notebook-viewer-send-max-attempts 2)))
+             (emacs-jupyter-notebook-viewer-live-p)
+             emacs-jupyter-notebook-viewer--socket-path
+             (not (file-exists-p emacs-jupyter-notebook-viewer--socket-path)))
+    (emacs-jupyter-notebook-viewer--log
+     "viewer alive but socket never bound after %d attempts; restarting it"
+     attempt)
+    (ignore-errors (delete-process emacs-jupyter-notebook-viewer--process))
+    (setq emacs-jupyter-notebook-viewer--process nil
+          emacs-jupyter-notebook-viewer--socket-path nil)
     (ignore-errors (emacs-jupyter-notebook-viewer-ensure)))
   (let ((socket-path emacs-jupyter-notebook-viewer--socket-path))
     (if (null socket-path)
@@ -247,9 +276,18 @@ sentinel once it closes."
             conn)
         (error
          (if (>= attempt emacs-jupyter-notebook-viewer-send-max-attempts)
-             (emacs-jupyter-notebook-viewer--log
-              "failed to reach viewer after %d attempts: %s"
-              attempt (error-message-string err))
+             (let ((tail (emacs-jupyter-notebook-viewer--stderr-tail)))
+               (emacs-jupyter-notebook-viewer--log
+                "failed to reach viewer after %d attempts: %s%s"
+                attempt (error-message-string err)
+                (if tail (format "\n    viewer stderr: %s" tail) ""))
+               ;; W16: surface the failure — and WHY — to the user directly;
+               ;; the panel PNG is unaffected, only the interactive open failed.
+               (message
+                (concat "emacs-jupyter-notebook: could not reach the figure "
+                        "viewer (%s)%s")
+                (error-message-string err)
+                (if tail (format "; viewer said: %s" tail) "")))
            ;; Invalidate a dead viewer so the next attempt respawns it.
            (unless (emacs-jupyter-notebook-viewer-live-p)
              (setq emacs-jupyter-notebook-viewer--process nil

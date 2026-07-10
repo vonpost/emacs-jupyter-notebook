@@ -1377,7 +1377,7 @@ leaves source-buffer text untouched."
           (should (cl-find-if
                    (lambda (cell)
                      (let* ((e (cdr cell))
-                            (c (or (plist-get e :content) "")))
+                            (c (ejn-panel-entry-text e)))
                        (string-match-p "Evaluation failed: connect failed" c)))
                    emacs-jupyter-notebook-panel--entries)))))))
 
@@ -1406,7 +1406,7 @@ text-properties rather than leaving them as literal bytes."
         (funcall err-fn 'mock-msg))
       (let* ((entry (emacs-jupyter-notebook-panel--entry
                      panel (plist-get handle :id)))
-             (content (plist-get entry :content)))
+             (content (ejn-panel-entry-text entry)))
         (should content)
         (should-not (string-match-p "\e\\[[0-9;]*m" content))
         (should (string-match-p "ZeroDivisionError" content))
@@ -1427,7 +1427,7 @@ the uncoloured spans."
        'emacs-jupyter-notebook-result-error-face)
       (let* ((entry (emacs-jupyter-notebook-panel--entry
                      panel (plist-get handle :id)))
-             (content (plist-get entry :content))
+             (content (ejn-panel-entry-text entry))
              (red-face (get-text-property 0 'face content))
              (plain-face (get-text-property (length "red-part") 'face content)))
         ;; Preserved ANSI-style face on the colored span.
@@ -2914,20 +2914,20 @@ quoted case."
       (ejn-panel-append-text handle "hello\n")
       (ejn-panel-append-text handle "world")
       (let ((e (ejn-panel-entry-snapshot handle)))
-        (should (equal (plist-get e :content) "hello\nworld")))
+        (should (equal (ejn-panel-entry-text e) "hello\nworld")))
       (ejn-panel-clear-entry handle)
-      (should (equal (plist-get (ejn-panel-entry-snapshot handle) :content) ""))
+      (should (equal (ejn-panel-entry-text handle) ""))
       (ejn-panel-append-text handle "existing")
       (ejn-panel-clear-entry handle t)
       (let ((e (ejn-panel-entry-snapshot handle)))
-        (should (equal (plist-get e :content) "existing"))
+        (should (equal (ejn-panel-entry-text e) "existing"))
         (should (plist-get e :pending-clear)))
       (ejn-panel-append-text handle "fresh")
       (let ((e (ejn-panel-entry-snapshot handle)))
-        (should (equal (plist-get e :content) "fresh"))
+        (should (equal (ejn-panel-entry-text e) "fresh"))
         (should-not (plist-get e :pending-clear)))
       (ejn-panel-replace-text handle "swapped")
-      (should (equal (plist-get (ejn-panel-entry-snapshot handle) :content)
+      (should (equal (ejn-panel-entry-text handle)
                      "swapped")))))
 
 (ert-deftest ejn-callback-clear-output-immediate ()
@@ -2943,7 +2943,7 @@ quoted case."
                  (lambda (_msg) '(:wait nil))))
         (funcall clear-fn 'mock-msg))
       (let ((e (ejn-panel-entry-snapshot handle)))
-        (should (equal (plist-get e :content) ""))
+        (should (equal (ejn-panel-entry-text e) ""))
         (should-not (plist-get e :pending-clear))))))
 
 (ert-deftest ejn-callback-clear-output-wait-defers-clear ()
@@ -2959,7 +2959,7 @@ quoted case."
                  (lambda (_msg) '(:wait t))))
         (funcall clear-fn 'mock-msg))
       (let ((e (ejn-panel-entry-snapshot handle)))
-        (should (equal (plist-get e :content) "some output"))
+        (should (equal (ejn-panel-entry-text e) "some output"))
         (should (plist-get e :pending-clear))))))
 
 (ert-deftest ejn-callback-update-display-data-replaces-content ()
@@ -2978,7 +2978,7 @@ quoted case."
                  (lambda (_msg mimetype)
                    (when (eq mimetype :text/plain) "updated output"))))
         (funcall update-fn 'mock-update-msg))
-      (should (equal (plist-get (ejn-panel-entry-snapshot handle) :content)
+      (should (equal (ejn-panel-entry-text handle)
                      "updated output")))))
 
 (ert-deftest ejn-evaluate-cell-completeness-check-allows-complete-code-async ()
@@ -3119,33 +3119,35 @@ quoted case."
       (let ((result (emacs-jupyter-notebook--render-mime-result data)))
         (should (equal result "fallback"))))))
 
-(ert-deftest ejn-panel-set-image-clears-text-content ()
-  "W2.5: setting an image clears the panel entry's text content."
+(ert-deftest ejn-panel-image-and-text-coexist-in-order ()
+  "W16: text and images COEXIST as ordered segments — a cell that prints
+and plots shows both, in arrival order, like a notebook.  (Replaces the
+pre-W16 exclusive-output tests.)"
   (with-temp-buffer
     (let* ((source (current-buffer))
            (panel (ejn-panel-ensure source))
            (handle (ejn-panel-start-entry panel '("x.py" . 1) "")))
-      (ejn-panel-append-text handle "some text")
-      (should (equal (plist-get (ejn-panel-entry-snapshot handle) :content)
-                     "some text"))
+      (ejn-panel-append-text handle "before ")
       (ejn-panel-set-image handle '(image :type png :data "fake"))
-      (let ((e (ejn-panel-entry-snapshot handle)))
-        (should (equal (plist-get e :content) ""))
-        (should (equal (plist-get e :image)
+      (ejn-panel-append-text handle "after")
+      (let* ((e (ejn-panel-entry-snapshot handle))
+             (outputs (plist-get e :outputs)))
+        ;; Everything retained, in order: text, image, text.
+        (should (equal (mapcar #'car outputs) '(text image text)))
+        (should (equal (ejn-panel-entry-text e) "before after"))
+        (should (equal (car (ejn-panel-entry-images e))
                        '(image :type png :data "fake")))))))
 
-(ert-deftest ejn-panel-append-clears-image ()
-  "W2.5: text appended after an image clears the image."
+(ert-deftest ejn-panel-multiple-images-each-get-a-segment ()
+  "W16: two figures displayed in one execution both render (own segments)."
   (with-temp-buffer
-    (let* ((source (current-buffer))
-           (panel (ejn-panel-ensure source))
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
            (handle (ejn-panel-start-entry panel '("x.py" . 1) "")))
-      (ejn-panel-set-image handle '(image :type png :data "fake"))
-      (should (plist-get (ejn-panel-entry-snapshot handle) :image))
-      (ejn-panel-append-text handle "text after image")
-      (let ((e (ejn-panel-entry-snapshot handle)))
-        (should-not (plist-get e :image))
-        (should (equal (plist-get e :content) "text after image"))))))
+      (ejn-panel-set-image handle '(image :type png :data "one"))
+      (ejn-panel-set-image handle '(image :type png :data "two"))
+      (should (equal (ejn-panel-entry-images handle)
+                     '((image :type png :data "one")
+                       (image :type png :data "two")))))))
 
 (ert-deftest ejn-panel-clear-removes-image ()
   "W2.5: clearing an entry also removes its image."
@@ -3154,11 +3156,11 @@ quoted case."
            (panel (ejn-panel-ensure source))
            (handle (ejn-panel-start-entry panel '("x.py" . 1) "")))
       (ejn-panel-set-image handle '(image :type png :data "fake"))
-      (should (plist-get (ejn-panel-entry-snapshot handle) :image))
+      (should (car (ejn-panel-entry-images handle)))
       (ejn-panel-clear-entry handle)
       (let ((e (ejn-panel-entry-snapshot handle)))
-        (should-not (plist-get e :image))
-        (should (equal (plist-get e :content) ""))))))
+        (should-not (car (ejn-panel-entry-images e)))
+        (should (equal (ejn-panel-entry-text e) ""))))))
 
 (ert-deftest ejn-callback-execute-result-renders-text-via-mime ()
   "W2.7: execute_result with text MIME goes through replace-text."
@@ -3172,8 +3174,8 @@ quoted case."
                  (lambda (_msg) '(:data (:text/plain "42")))))
         (funcall exec-fn 'mock-msg))
       (let ((e (ejn-panel-entry-snapshot handle)))
-        (should (equal (plist-get e :content) "42"))
-        (should-not (plist-get e :image))))))
+        (should (equal (ejn-panel-entry-text e) "42"))
+        (should-not (car (ejn-panel-entry-images e)))))))
 
 (ert-deftest ejn-callback-execute-result-renders-image-via-mime ()
   "W2.7: display_data with PNG MIME goes through set-image."
@@ -3190,11 +3192,13 @@ quoted case."
                  (lambda (data &optional _type _data-p &rest _props)
                    (list 'image :type 'png :data data))))
         (funcall display-fn 'mock-msg))
-      (should (equal (plist-get (ejn-panel-entry-snapshot handle) :image)
+      (should (equal (car (ejn-panel-entry-images handle))
                      '(image :type png :data "imgdata"))))))
 
 (ert-deftest ejn-callback-update-display-data-replaces-image ()
-  "W2.7: update_display_data with image MIME swaps the entry's image."
+  "W2.7/W16: update_display_data with image MIME updates the entry's LAST
+image segment IN PLACE — the kernel is refreshing an existing display —
+while surrounding text segments are left untouched."
   (with-temp-buffer
     (let* ((buffer (current-buffer))
            (panel (ejn-panel-ensure buffer))
@@ -3203,6 +3207,7 @@ quoted case."
            (update-fn (cadr (assoc "update_display_data" callbacks)))
            (encoded (base64-encode-string "newimg" t)))
       (ejn-panel-append-text handle "old text")
+      (ejn-panel-set-image handle '(image :type png :data "oldimg"))
       (cl-letf (((symbol-function 'jupyter-message-content)
                  (lambda (_msg) `(:data (:image/jpeg ,encoded))))
                 ((symbol-function 'create-image)
@@ -3210,9 +3215,11 @@ quoted case."
                    (list 'image :type 'jpeg :data data))))
         (funcall update-fn 'mock-msg))
       (let ((e (ejn-panel-entry-snapshot handle)))
-        (should (equal (plist-get e :image)
-                       '(image :type jpeg :data "newimg")))
-        (should (equal (plist-get e :content) ""))))))
+        ;; Still exactly one image; its spec was swapped in place.
+        (should (equal (ejn-panel-entry-images e)
+                       '((image :type jpeg :data "newimg"))))
+        ;; The text segment survives the display update.
+        (should (equal (ejn-panel-entry-text e) "old text"))))))
 
 (ert-deftest ejn-mime-render-image-jpeg-decodes-base64 ()
   (let* ((raw "jpeg-data")
@@ -3453,7 +3460,7 @@ the evaluate flow."
                  (lambda (_client _value) nil)))
         (funcall input-fn 'mock-input-msg))
       (should (string-match-p "Enter value: "
-                              (plist-get (ejn-panel-entry-snapshot handle) :content))))))
+                              (ejn-panel-entry-text handle))))))
 
 (ert-deftest ejn-callback-input-request-sends-reply-with-user-input ()
   "W2.7: input_request relays the user's response back to the kernel."
@@ -3519,7 +3526,7 @@ the evaluate flow."
         (funcall input-fn 'mock-input-msg))
       (should-not reply-called)
       (should (string-match-p "Input: "
-                              (plist-get (ejn-panel-entry-snapshot handle) :content))))))
+                              (ejn-panel-entry-text handle))))))
 
 (ert-deftest ejn-callback-input-request-extracts-prompt-and-password-fields ()
   "W2.7: input_request reads :prompt and :password fields correctly."
@@ -3613,7 +3620,7 @@ the evaluate flow."
                      (:x (:status "ok" :data (:text/plain "10"))
                       :bad (:status "error" :ename "NameError" :evalue "name 'bad' is not defined"))))))
         (funcall reply-fn 'mock-reply-msg))
-      (let ((content (plist-get (ejn-panel-entry-snapshot handle) :content)))
+      (let ((content (ejn-panel-entry-text handle)))
         (should (string-match-p "\\[watch\\]" content))
         (should (string-match-p "x: 10" content))
         (should (string-match-p "bad: NameError: name 'bad' is not defined" content))))))
@@ -3860,7 +3867,7 @@ the evaluate flow."
       (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-interrupt) #'ignore))
         (emacs-jupyter-notebook--evaluation-on-timeout 1))
       (let* ((snap (ejn-panel-entry-snapshot handle))
-             (content (plist-get snap :content)))
+             (content (ejn-panel-entry-text snap)))
         (should (stringp content))
         (should (string-match-p "timed out after 5s" content))
         (should (eq (plist-get snap :status) 'error))
@@ -3928,7 +3935,7 @@ the evaluate flow."
         (emacs-jupyter-notebook--evaluation-on-timeout 1))
       (should-not interrupt-called)
       (should-not emacs-jupyter-notebook--evaluation-request)
-      (let ((content (plist-get (ejn-panel-entry-snapshot handle) :content)))
+      (let ((content (ejn-panel-entry-text handle)))
         (should (string-match-p "timed out after 5s" content))))))
 
 (ert-deftest ejn-w5.4-interrupt-kernel-dispatches-through-adapter-var ()
@@ -4217,7 +4224,7 @@ hypothetically did work — the adapter is fire-and-forget."
       (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-interrupt) #'ignore))
         (emacs-jupyter-notebook-cancel-operation))
       (let* ((snap (ejn-panel-entry-snapshot handle))
-             (content (plist-get snap :content)))
+             (content (ejn-panel-entry-text snap)))
         (should (string-match-p "cancelled" content))
         (should (eq (plist-get snap :status) 'error))))))
 
@@ -5169,21 +5176,22 @@ durable reconnect surface and must survive buffer kill."
           (ejn-panel-append-text handle "hello ")
           (ejn-panel-append-text handle "world")
           (let ((e (ejn-panel-entry-snapshot handle)))
-            (should (equal (plist-get e :content) "hello world"))
+            (should (equal (ejn-panel-entry-text e) "hello world"))
             (should (eq (plist-get e :status) 'running))
             (should (equal (plist-get e :exec-count) "*")))
           (ejn-panel-replace-text handle "swapped")
-          (should (equal (plist-get (ejn-panel-entry-snapshot handle) :content)
+          (should (equal (ejn-panel-entry-text handle)
                          "swapped"))
           (ejn-panel-set-image handle '(image :type png :data "fake"))
           (let ((e (ejn-panel-entry-snapshot handle)))
-            (should (equal (plist-get e :image)
+            (should (equal (car (ejn-panel-entry-images e))
                            '(image :type png :data "fake")))
-            (should (equal (plist-get e :content) "")))
+            ;; W16: the image is a new segment; the text coexists below it.
+            (should (equal (ejn-panel-entry-text e) "swapped")))
           (ejn-panel-clear-entry handle)
           (let ((e (ejn-panel-entry-snapshot handle)))
-            (should (equal (plist-get e :content) ""))
-            (should-not (plist-get e :image)))
+            (should (equal (ejn-panel-entry-text e) ""))
+            (should-not (car (ejn-panel-entry-images e))))
           (ejn-panel-finish-entry handle 'ok 7)
           (let ((e (ejn-panel-entry-snapshot handle)))
             (should (eq (plist-get e :status) 'ok))
@@ -5360,7 +5368,7 @@ batch timing, but it must be a tiny fraction of the event count."
           (with-current-buffer panel
             (emacs-jupyter-notebook-panel-toggle-view)
             (emacs-jupyter-notebook-panel-toggle-view))
-          (should (equal (plist-get (ejn-panel-entry-snapshot handle) :image)
+          (should (equal (car (ejn-panel-entry-images handle))
                          '(image :type png :data "data"))))
       (ejn-test--kill-source-buffer buf))))
 
@@ -5466,7 +5474,7 @@ batch timing, but it must be a tiny fraction of the event count."
           (cl-letf (((symbol-function 'jupyter-message-content)
                      (lambda (_msg) '(:text "hello\n" :name "stdout"))))
             (funcall stream 'mock))
-          (should (equal (plist-get (ejn-panel-entry-snapshot handle) :content)
+          (should (equal (ejn-panel-entry-text handle)
                          "hello\n"))
           (with-current-buffer buf
             (should (equal (buffer-string) before))))
@@ -5485,7 +5493,7 @@ batch timing, but it must be a tiny fraction of the event count."
                      (lambda (_msg)
                        '(:traceback ("a" "b") :ename "Boom" :evalue "x"))))
             (funcall err-fn 'mock))
-          (let ((content (plist-get (ejn-panel-entry-snapshot handle) :content)))
+          (let ((content (ejn-panel-entry-text handle)))
             (should (string-match-p "a\nb" content))))
       (ejn-test--kill-source-buffer buf))))
 
@@ -7047,7 +7055,7 @@ key never disturbs the existing PNG path."
                  (lambda (data &optional _type _data-p &rest _props)
                    (list 'image :type 'png :data data))))
         (funcall display-fn 'mock-msg))
-      (should (equal (plist-get (ejn-panel-entry-snapshot handle) :image)
+      (should (equal (car (ejn-panel-entry-images handle))
                      '(image :type png :data "imgdata"))))))
 
 ;;; W8.2 — MIME recognition + pickle stash
@@ -7119,18 +7127,28 @@ latest frame in the stored entry content (no dumped intermediate frames)."
       (ejn-panel-append-text h "\r 10%")
       (ejn-panel-append-text h "\r 55%")
       (ejn-panel-append-text h "\r100%")
-      (should (equal (plist-get (ejn-panel-entry-snapshot h) :content) "100%")))))
+      (should (equal (ejn-panel-entry-text h) "100%")))))
 
-(ert-deftest ejn-w14-image-zoom-tolerates-default-scale ()
-  "W14: the panel zoom keys must not signal (wrong-type-argument
-number-or-marker-p default) when `:scale' is the symbol `default' (Emacs
-29+), and must leave a numeric scale behind."
+(ert-deftest ejn-w14-image-zoom-rebuilds-spec-numeric-unclamped ()
+  "W14/W16: zooming rebuilds the entry's image spec — a non-numeric
+`:scale' (Emacs 29+ reports the symbol `default') is coerced before
+multiplying, the clamping `:max-width'/`:max-height' keys are dropped (they
+made zoom-in a visual no-op), and the new spec persists on the entry so it
+survives re-renders."
   (with-temp-buffer
-    (insert (propertize " " 'display (list 'image :type 'png :scale 'default)))
-    (goto-char (point-min))
-    (emacs-jupyter-notebook-panel--scale-image-at-point 1.2)
-    (let ((img (get-text-property (point-min) 'display)))
-      (should (numberp (image-property img :scale))))))
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (h (ejn-panel-start-entry panel '("x.py" . 1) "plot()")))
+      (ejn-panel-set-image h (list 'image :type 'png :scale 'default
+                                   :max-width 800 :max-height 600))
+      (with-current-buffer panel
+        (emacs-jupyter-notebook-panel--render panel)
+        (goto-char (next-single-property-change (point-min) 'display))
+        (emacs-jupyter-notebook-panel--scale-image-at-point 1.2))
+      (let ((img (car (ejn-panel-entry-images h))))
+        (should (numberp (plist-get (cdr img) :scale)))
+        (should (< (abs (- (plist-get (cdr img) :scale) 1.2)) 1e-6))
+        (should-not (plist-member (cdr img) :max-width))
+        (should-not (plist-member (cdr img) :max-height))))))
 
 (ert-deftest ejn-w14-panel-open-figure-finds-pickle-off-header ()
   "W14: `v' / open-figure finds the entry's pickle when point is on the
@@ -7172,7 +7190,7 @@ pickle on the entry."
                    (list 'image :type 'png :data data))))
         (funcall display-fn 'mock-msg))
       (let ((e (ejn-panel-entry-snapshot handle)))
-        (should (equal (plist-get e :image) '(image :type png :data "imgdata")))
+        (should (equal (car (ejn-panel-entry-images e)) '(image :type png :data "imgdata")))
         (should (equal (plist-get e :mpl-pickle) pickle))))))
 
 (ert-deftest ejn-w8.2-display-data-png-only-stores-no-pickle ()
@@ -7191,7 +7209,7 @@ pickle on the entry."
                    (list 'image :type 'png :data data))))
         (funcall display-fn 'mock-msg))
       (let ((e (ejn-panel-entry-snapshot handle)))
-        (should (equal (plist-get e :image) '(image :type png :data "imgdata")))
+        (should (equal (car (ejn-panel-entry-images e)) '(image :type png :data "imgdata")))
         (should (null (plist-get e :mpl-pickle)))))))
 
 (ert-deftest ejn-w8.7-display-without-pickle-clears-stale-pickle ()

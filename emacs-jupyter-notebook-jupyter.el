@@ -220,7 +220,9 @@ panel/fringe state set by the timeout or `cancel-operation' paths."
                       (ejn-panel-replace-text
                        entry-handle "[unsupported output format]"))
                      ((get-text-property 0 'display rendered)
-                      (ejn-panel-set-image
+                      ;; W16: update-in-place — the kernel is refreshing an
+                      ;; existing display, not adding a new output segment.
+                      (ejn-panel-update-image
                        entry-handle (get-text-property 0 'display rendered)))
                      (t
                       (ejn-panel-replace-text

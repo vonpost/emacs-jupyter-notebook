@@ -970,6 +970,50 @@ subplot crops all siblings, killing Emacs reaps the viewer.
 
 ---
 
+## W16 — Panel correctness under evil + interleaved outputs + macOS viewer
+
+- [x] sha=PENDING W16 panel/viewer dogfooding batch (macOS + Doom host).
+      - EVIL SHADOWED EVERY PANEL KEY: under evil (Doom) special-mode
+        buffers land in motion/normal state whose maps shadow the panel's
+        single-key commands — `H' was move-to-window-top, `v' opened visual
+        state, `+'/`-' were line motions.  "History toggle doesn't work at
+        all" and much of "the pane seems very buggy" was evil eating the
+        keys before the panel ever saw them.  The panel mode now registers
+        emacs initial state via `evil-set-initial-state' (guarded
+        `with-eval-after-load').
+      - ZOOM ACTUALLY RESCALES: entry images carry `:max-width'/`:max-height',
+        which CLAMP the rendered size — a growing `:scale' changed nothing.
+        The zoom keys now REBUILD the spec (fresh object; in-place mutation
+        is not reliably re-rendered) without the clamp keys, persist it on
+        the entry (survives re-renders), and re-render restoring point.
+      - INTERLEAVED OUTPUTS: entries held EITHER `:image' OR `:content' —
+        `set-image' erased text, `append-text' erased the figure, so a cell
+        that prints AND plots (the normal ML case) lost one of them.
+        Entries now hold ordered `:outputs' segments (`(text . STR)' /
+        `(image . SPEC)') rendered interleaved like a notebook cell;
+        consecutive text appends merge (tqdm `\r' collapse still applies
+        within the trailing segment); multiple figures each get their own
+        segment; `update_display_data' updates the LAST image segment in
+        place via the new `ejn-panel-update-image' (protocol semantics:
+        refresh an existing display, not a new output); the byte cap trims
+        oldest text first and never drops images.  New accessors
+        `ejn-panel-entry-text' / `ejn-panel-entry-images'.
+      - macOS VIEWER: prefer the native `MacOSX' (Cocoa) backend on darwin
+        regardless of preference — system Tk renders blank canvases or
+        wedges its event loop (both observed) and Qt needs a separate
+        binding; Cocoa ships with every matplotlib.  `macosx' added to the
+        backend defcustom + viewer argparse.  A synchronous `canvas.draw()'
+        after `manager.show()' guarantees the first frame on backends where
+        `draw_idle' alone leaves the canvas blank.
+      - VIEWER WEDGE RECOVERY + DIAGNOSTICS: a viewer process that is alive
+        but never binds its socket (hung GUI backend) was retried to
+        exhaustion against a socket that would never appear, with the cause
+        buried in the log.  Halfway through the attempt budget such a
+        viewer is killed and respawned fresh; exhaustion now raises a
+        user-visible message carrying the viewer's stderr tail.
+
+---
+
 ## W15 — Busy kernels are alive: heartbeat + reconnect (dogfooding)
 
 - [x] sha=PENDING W15 busy-kernel correctness.  MOTIVATION: two dogfooding

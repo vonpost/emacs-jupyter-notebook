@@ -186,7 +186,19 @@ def _select_backend(preferred):
     """
     import matplotlib
 
-    order = ["QtAgg", "TkAgg"] if preferred == "qt" else ["TkAgg", "QtAgg"]
+    order = {
+        "qt": ["QtAgg", "TkAgg"],
+        "tk": ["TkAgg", "QtAgg"],
+        "macosx": ["MacOSX", "QtAgg", "TkAgg"],
+    }.get(preferred, ["TkAgg", "QtAgg"])
+    # W16: on macOS the native Cocoa backend is by far the most reliable
+    # (system Tk commonly renders blank canvases or fails to run its event
+    # loop at all, and Qt needs a properly-installed binding), and it ships
+    # with every matplotlib.  Try it first regardless of preference; the
+    # preferred backend remains the next candidate.  On other platforms
+    # matplotlib.use("MacOSX") raises immediately, so this is darwin-only.
+    if sys.platform == "darwin" and "MacOSX" not in order:
+        order = ["MacOSX"] + order
     last_exc = None
     for backend in order:
         try:
@@ -445,6 +457,13 @@ def open_figure(path):
         fig.canvas.draw_idle()
         try:
             manager.show()
+        except Exception:
+            pass
+        # W16: on some backends (macOS Tk in particular) `draw_idle' alone
+        # can leave the freshly-shown canvas blank until an event forces a
+        # paint.  A synchronous draw after show guarantees the first frame.
+        try:
+            fig.canvas.draw()
         except Exception:
             pass
     except Exception as exc:
@@ -836,7 +855,8 @@ def _parse_args(argv):
     parser = argparse.ArgumentParser(description="emacs-jupyter-notebook local "
                                                  "interactive matplotlib viewer")
     parser.add_argument("--socket", help="unix-domain socket path to listen on")
-    parser.add_argument("--backend", default="qt", choices=["qt", "tk"],
+    parser.add_argument("--backend", default="qt",
+                        choices=["qt", "tk", "macosx"],
                         help="preferred GUI backend")
     parser.add_argument("--idle-timeout", type=int, default=900,
                         help="seconds of idleness before self-exit (0 disables)")

@@ -245,6 +245,15 @@ history-log view appends every evaluation in time order."
   (add-hook 'kill-buffer-hook
             #'emacs-jupyter-notebook-panel--on-kill nil t))
 
+;; W16: under evil (Doom, Spacemacs, ...) special-mode buffers land in
+;; motion/normal state, whose maps SHADOW the panel's single-key commands —
+;; `H' becomes move-to-window-top, `v' starts visual selection, `+'/`-' are
+;; line motions — so toggle/zoom/open-figure silently never ran.  Put the
+;; panel in emacs state so its keymap works exactly as designed.
+(declare-function evil-set-initial-state "evil-core" (mode state))
+(with-eval-after-load 'evil
+  (evil-set-initial-state 'emacs-jupyter-notebook-panel-mode 'emacs))
+
 (defun emacs-jupyter-notebook-panel--on-kill ()
   "Cancel any pending flush timer when the panel buffer is killed."
   (when (timerp emacs-jupyter-notebook-panel--flush-timer)
@@ -472,20 +481,26 @@ entry is visible; latest-per-cell view goes to the top."
                'face 'emacs-jupyter-notebook-result-header-face))
       (dolist (e entries)
         (insert (emacs-jupyter-notebook-panel--format-header e))
-        (let ((image (plist-get e :image))
-              (content (or (plist-get e :content) "")))
-          (cond
-           (image
-            (insert (propertize " " 'display image))
-            (insert "\n"))
-           ((not (string-empty-p content))
-            (let ((c (copy-sequence content)))
-              (add-face-text-property
-               0 (length c) 'emacs-jupyter-notebook-result-face 'append c)
-              (insert c)
-              (unless (string-suffix-p "\n" c)
-                (insert "\n"))))
-           (t nil)))
+        ;; W16: render the ordered output segments interleaved, like a
+        ;; notebook cell.  Each image carries its segment index so the zoom
+        ;; keys can rebuild exactly the spec under point.
+        (let ((index -1))
+          (dolist (seg (plist-get e :outputs))
+            (cl-incf index)
+            (pcase (car seg)
+              ('image
+               (insert (propertize
+                        " " 'display (cdr seg)
+                        'emacs-jupyter-notebook-segment-index index))
+               (insert "\n"))
+              ('text
+               (let ((c (copy-sequence (cdr seg))))
+                 (unless (string-empty-p c)
+                   (add-face-text-property
+                    0 (length c) 'emacs-jupyter-notebook-result-face 'append c)
+                   (insert c)
+                   (unless (string-suffix-p "\n" c)
+                     (insert "\n"))))))))
         (insert "\n"))
       (if (eq emacs-jupyter-notebook-panel--view 'history)
           (goto-char (point-max))
@@ -513,8 +528,10 @@ state appears in place."
                         :status 'running
                         :exec-count "*"
                         :timestamp (format-time-string "%Y-%m-%dT%H:%M:%S")
-                        :content ""
-                        :image nil
+                        ;; W16: ordered output segments — `(text . STRING)'
+                        ;; and `(image . SPEC)' conses, rendered interleaved
+                        ;; in arrival order like a real notebook cell.
+                        :outputs nil
                         :pending-clear nil)))
       (setq emacs-jupyter-notebook-panel--entries
             (append emacs-jupyter-notebook-panel--entries
@@ -540,8 +557,63 @@ Text properties (ANSI-coloured spans) are preserved."
        (split-string text "\n")
        "\n"))))
 
+(defun ejn-panel-entry-text (handle-or-entry)
+  "Return the concatenated text of all text segments, or \"\" when none.
+HANDLE-OR-ENTRY is an entry handle plist (with a `:panel' key) or a raw
+entry plist."
+  (let ((entry (if (plist-get handle-or-entry :panel)
+                   (ejn-panel-entry-snapshot handle-or-entry)
+                 handle-or-entry)))
+    (mapconcat #'cdr
+               (cl-remove-if-not (lambda (seg) (eq (car seg) 'text))
+                                 (plist-get entry :outputs))
+               "")))
+
+(defun ejn-panel-entry-images (handle-or-entry)
+  "Return the list of image specs on the entry, in display order."
+  (let ((entry (if (plist-get handle-or-entry :panel)
+                   (ejn-panel-entry-snapshot handle-or-entry)
+                 handle-or-entry)))
+    (mapcar #'cdr
+            (cl-remove-if-not (lambda (seg) (eq (car seg) 'image))
+                              (plist-get entry :outputs)))))
+
+(defun emacs-jupyter-notebook-panel--trim-outputs (outputs)
+  "Return OUTPUTS with total text bounded by `...-result-max-bytes'.
+Trims the OLDEST text first (drops leading segments, then truncates the
+front of the first survivor) so the newest output is always retained.
+Image segments are never dropped by the byte cap."
+  (let ((max-bytes emacs-jupyter-notebook-result-max-bytes))
+    (let ((total (cl-loop for seg in outputs
+                          when (eq (car seg) 'text)
+                          sum (string-bytes (cdr seg)))))
+      (if (<= total max-bytes)
+          outputs
+        (let ((excess (- total max-bytes))
+              keep)
+          (dolist (seg outputs)
+            (if (or (not (eq (car seg) 'text)) (<= excess 0))
+                (push seg keep)
+              (let ((bytes (string-bytes (cdr seg))))
+                (cond
+                 ((>= excess bytes) (cl-decf excess bytes)) ; drop whole segment
+                 (t (push (cons 'text (emacs-jupyter-notebook--last-bytes
+                                       (cdr seg) (- bytes excess)))
+                          keep)
+                    (setq excess 0))))))
+          (nreverse keep))))))
+
+(defun emacs-jupyter-notebook-panel--outputs-after-pending (entry)
+  "Return ENTRY's outputs honoring a pending clear_output(wait=True)."
+  (if (plist-get entry :pending-clear) nil (plist-get entry :outputs)))
+
 (defun ejn-panel-append-text (handle text &optional face)
   "Append TEXT (optionally propertized with FACE) to HANDLE's entry.
+W16: text and images now coexist as ordered segments — appending text
+after a figure no longer erases the figure; it starts a new text segment
+below it.  Consecutive text appends merge into the trailing text segment
+so streaming output stays one block (and `\\r' progress repaints keep
+collapsing within it).
 When TEXT already carries `face' text-properties (e.g. from
 `ansi-color-apply' on a Python traceback), FACE is composed via
 `add-face-text-property' with append priority so per-character ANSI
@@ -553,46 +625,77 @@ colours are preserved and uncoloured spans still get the fallback FACE."
       (emacs-jupyter-notebook-panel--update-entry
        handle
        (lambda (entry)
-         (let* ((pending (plist-get entry :pending-clear))
-                (current (or (plist-get entry :content) ""))
-                (new (if pending display-text (concat current display-text)))
-                (max-bytes emacs-jupyter-notebook-result-max-bytes))
-           ;; Collapse carriage-return progress repaints (tqdm) so the panel
-           ;; shows the latest frame, not every intermediate one.  Only when
-           ;; the incoming chunk carries a `\r' — plain output skips the work.
-           (when (string-search "\r" display-text)
-             (setq new (emacs-jupyter-notebook--apply-carriage-returns new)))
-           (when (> (string-bytes new) max-bytes)
-             (setq new (emacs-jupyter-notebook--last-bytes new max-bytes)))
-           (setq entry (plist-put entry :content new))
-           (setq entry (plist-put entry :image nil))
+         (let* ((outputs (emacs-jupyter-notebook-panel--outputs-after-pending entry))
+                (last-seg (car (last outputs))))
+           (if (and last-seg (eq (car last-seg) 'text))
+               ;; Merge into the trailing text segment.
+               (let ((new (concat (cdr last-seg) display-text)))
+                 ;; Collapse carriage-return progress repaints (tqdm) so the
+                 ;; panel shows the latest frame, not every intermediate one.
+                 (when (string-search "\r" display-text)
+                   (setq new (emacs-jupyter-notebook--apply-carriage-returns new)))
+                 (setcdr last-seg new))
+             (setq outputs
+                   (append outputs
+                           (list (cons 'text
+                                       (if (string-search "\r" display-text)
+                                           (emacs-jupyter-notebook--apply-carriage-returns
+                                            display-text)
+                                         display-text))))))
+           (setq entry (plist-put entry :outputs
+                                  (emacs-jupyter-notebook-panel--trim-outputs
+                                   outputs)))
            (setq entry (plist-put entry :pending-clear nil))
            entry))))))
 
 (defun ejn-panel-replace-text (handle text)
-  "Replace HANDLE's entry content with TEXT.
+  "Replace ALL of HANDLE's entry output with TEXT.
 W8.7(d): also drops any stashed matplotlib pickle, since text has
 replaced whatever figure the entry previously showed."
   (when handle
     (emacs-jupyter-notebook-panel--update-entry
      handle
      (lambda (entry)
-       (setq entry (plist-put entry :content (or text "")))
-       (setq entry (plist-put entry :image nil))
+       (setq entry (plist-put entry :outputs
+                              (list (cons 'text (or text "")))))
        (setq entry (plist-put entry :mpl-pickle nil))
        (setq entry (plist-put entry :pending-clear nil))
        entry))))
 
 (defun ejn-panel-set-image (handle image-spec)
-  "Set HANDLE's entry to display IMAGE-SPEC and clear text content."
+  "Append IMAGE-SPEC as a new image segment on HANDLE's entry.
+W16: no longer erases prior text — a cell that prints AND plots shows
+both, in order, like a notebook.  Multiple figures in one execution each
+get their own segment."
   (when handle
     (emacs-jupyter-notebook-panel--update-entry
      handle
      (lambda (entry)
-       (setq entry (plist-put entry :image image-spec))
-       (setq entry (plist-put entry :content ""))
-       (setq entry (plist-put entry :pending-clear nil))
-       entry))))
+       (let ((outputs (emacs-jupyter-notebook-panel--outputs-after-pending entry)))
+         (setq entry (plist-put entry :outputs
+                                (append outputs
+                                        (list (cons 'image image-spec)))))
+         (setq entry (plist-put entry :pending-clear nil))
+         entry)))))
+
+(defun ejn-panel-update-image (handle image-spec)
+  "Replace the LAST image segment on HANDLE's entry with IMAGE-SPEC.
+Appends when the entry has no image yet.  W16: this is the
+`update_display_data' semantic — the kernel is updating an existing
+display in place (e.g. an animation frame), not adding a new output —
+so text segments are left untouched and no new segment is created."
+  (when handle
+    (emacs-jupyter-notebook-panel--update-entry
+     handle
+     (lambda (entry)
+       (let* ((outputs (emacs-jupyter-notebook-panel--outputs-after-pending entry))
+              (last-image (cl-find 'image (reverse outputs) :key #'car)))
+         (if last-image
+             (setcdr last-image image-spec)
+           (setq outputs (append outputs (list (cons 'image image-spec)))))
+         (setq entry (plist-put entry :outputs outputs))
+         (setq entry (plist-put entry :pending-clear nil))
+         entry)))))
 
 (defun ejn-panel-finish-entry (handle status execution-count)
   "Mark HANDLE's entry as completed with STATUS and EXECUTION-COUNT."
@@ -616,8 +719,7 @@ If WAIT is non-nil, defer the clear until the next text arrives
      (lambda (entry)
        (if wait
            (plist-put entry :pending-clear t)
-         (setq entry (plist-put entry :content ""))
-         (setq entry (plist-put entry :image nil))
+         (setq entry (plist-put entry :outputs nil))
          ;; W8.7(d): clearing the entry drops the figure too.
          (setq entry (plist-put entry :mpl-pickle nil))
          (setq entry (plist-put entry :pending-clear nil))
@@ -768,18 +870,45 @@ above it yields an `equal' key."
         (when next (get-text-property next 'display)))))
 
 (defun emacs-jupyter-notebook-panel--scale-image-at-point (factor)
-  "Scale the image at point in the panel by FACTOR (multiplicative)."
-  (let ((image (emacs-jupyter-notebook-panel--image-at-point)))
+  "Scale the image of the panel entry at point by FACTOR (multiplicative).
+
+W16: rebuilding the spec (rather than mutating the displayed one) is the
+only reliable way to rescale.  Two defects made the zoom keys look dead:
+- Entry images are created with `:max-width'/`:max-height', which CLAMP the
+  rendered size — a growing `:scale' on a clamped image changes nothing.
+  The rebuilt spec drops both keys: once the user zooms, their explicit
+  intent overrides the default bounding box.
+- Emacs caches rendered images per spec; in-place property mutation is not
+  reliably picked up.  The rebuilt spec (a fresh object, plus
+  `image-flush' on the old one) always re-renders.
+The new spec is stored back on the ENTRY so the zoom level survives
+subsequent panel re-renders, and point is restored after the re-render.
+Also coerces a non-numeric `:scale' (Emacs 29+ reports the symbol
+`default' for unset) to 1.0 before multiplying."
+  (let* ((id (emacs-jupyter-notebook-panel--entry-id-at-point))
+         (entry (and id (emacs-jupyter-notebook-panel--entry (current-buffer) id)))
+         (outputs (and entry (plist-get entry :outputs)))
+         ;; W16: pick the image segment under point (each rendered image
+         ;; carries its segment index); fall back to the entry's first image.
+         (seg-index (or (get-text-property (point) 'emacs-jupyter-notebook-segment-index)
+                        (cl-position 'image outputs :key #'car)))
+         (seg (and seg-index (nth seg-index outputs)))
+         (image (and seg (eq (car seg) 'image) (cdr seg))))
     (when (and image (consp image) (eq (car image) 'image))
-      ;; Emacs 29+ returns the symbol `default' (not nil) for an unset
-      ;; `:scale', so coerce any non-number to 1.0 before multiplying —
-      ;; otherwise the zoom keys signal (wrong-type-argument number-or-marker-p
-      ;; default).
-      (let* ((raw (image-property image :scale))
+      (let* ((raw (plist-get (cdr image) :scale))
              (scale (if (numberp raw) raw 1.0))
-             (new-scale (max 0.05 (* scale factor))))
-        (setf (image-property image :scale) new-scale)
-        (force-window-update (current-buffer))))))
+             (new-scale (max 0.05 (* scale factor)))
+             (props (cl-loop for (k v) on (cdr image) by #'cddr
+                             unless (memq k '(:scale :max-width :max-height))
+                             collect k and collect v))
+             (new-image (cons 'image (append props (list :scale new-scale)))))
+        (ignore-errors (image-flush image))
+        ;; Mutate the segment in place; the entry list structure is shared
+        ;; with the stored entry, so the new spec persists across renders.
+        (setcdr seg new-image)
+        (let ((pos (point)))
+          (emacs-jupyter-notebook-panel--render (current-buffer))
+          (goto-char (min pos (point-max))))))))
 
 (defun emacs-jupyter-notebook-panel-image-zoom-in ()
   "Zoom in the image at point in the panel."

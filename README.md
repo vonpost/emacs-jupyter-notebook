@@ -139,7 +139,7 @@ Evaluation output never appears in the source buffer. A dedicated side panel (`*
 - **Latest-per-cell** (default): one section per cell, indexed by cell marker. Re-running the same cell replaces its section in place.
 - **History log**: every evaluation, including region/paragraph/defun, appended in time order with timestamp, execution count, and status.
 
-Toggle the view inside the panel with `H`, or globally with `C-c j t`. `q` buries the panel. `RET` on an entry header jumps to its originating cell. `n` / `p` step between entries. Images render inline with native zoom keys (`+`, `-`, `=`). `v` on a plot entry opens that figure in the interactive local viewer (see below).
+Toggle the view inside the panel with `H`, or globally with `C-c j t`. `q` buries the panel. `RET` anywhere in an entry jumps to its originating cell. `n` / `p` step between entries. A cell's text and figures interleave in arrival order, like a notebook — printing and plotting in the same cell shows both. Images render inline with zoom keys (`+`, `-`, `=`), which work with point anywhere on the image. `v` anywhere in a plot entry opens that figure in the interactive local viewer (see below). Under evil (Doom/Spacemacs) the panel uses emacs state so all of these single-key commands work as listed.
 
 ## Interactive matplotlib viewer
 
@@ -170,7 +170,7 @@ The local viewer is **Emacs-owned**: it is spawned lazily on first use, reused a
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `emacs-jupyter-notebook-local-python-command` | `"python3"` | Local Python that runs the viewer (absolute path or a command on `exec-path`). Must have matplotlib + a GUI backend, version-matched to the remote. |
-| `emacs-jupyter-notebook-viewer-backend` | `tk` | Preferred GUI backend, `tk` (TkAgg) or `qt` (QtAgg); falls back to the other automatically. |
+| `emacs-jupyter-notebook-viewer-backend` | `tk` | Preferred GUI backend: `tk` (TkAgg), `qt` (QtAgg), or `macosx` (native Cocoa); falls back through the others automatically. On macOS the native Cocoa backend is always tried first regardless of this setting. |
 | `emacs-jupyter-notebook-viewer-idle-timeout` | `900` | Seconds the viewer stays alive with no open figures before self-exiting (0 disables). |
 | `emacs-jupyter-notebook-viewer-auto-open` | `nil` | When non-nil, pop the interactive window automatically for every inline figure instead of on demand. |
 
