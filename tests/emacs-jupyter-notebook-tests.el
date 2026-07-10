@@ -7150,6 +7150,21 @@ survives re-renders."
         (should-not (plist-member (cdr img) :max-width))
         (should-not (plist-member (cdr img) :max-height))))))
 
+(ert-deftest ejn-w17-image-insert-tags-segment-and-falls-back-headless ()
+  "W17: `--insert-image' tags the whole inserted region with the segment
+index (so zoom resolves the right output from any slice row), and on a
+non-graphic display falls back to a plain single display-property insert."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook-panel-slice-images t))
+      (emacs-jupyter-notebook-panel--insert-image
+       '(image :type png :data "fake") 3)
+      ;; Batch mode is non-graphic: single-property fallback.
+      (should (equal (get-text-property (point-min) 'display)
+                     '(image :type png :data "fake")))
+      (should (= (get-text-property (point-min)
+                                    'emacs-jupyter-notebook-segment-index)
+                 3)))))
+
 (ert-deftest ejn-w14-panel-open-figure-finds-pickle-off-header ()
   "W14: `v' / open-figure finds the entry's pickle when point is on the
 image line, not just the header — the entry-id lives on the header, so the

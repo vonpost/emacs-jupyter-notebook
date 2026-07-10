@@ -444,6 +444,31 @@ no source-buffer marker is registered, e.g. in tests)."
                    ((numberp pa) t)
                    (t nil))))))))))
 
+(defun emacs-jupyter-notebook-panel--insert-image (image index)
+  "Insert IMAGE tagged with segment INDEX, sliced for smooth scrolling.
+W17: a tall image inserted as ONE display property is a single screen
+line — window-start can only land on line boundaries, so any scroll
+crossing the figure jumps its whole height at once, even under
+pixel-precise scroll modes (emacs-mac included).  Slicing the image into
+line-height rows via `insert-sliced-image' (the doc-view/EWW technique)
+gives every row its own screen line, so scrolling walks smoothly across
+the figure.  All slice rows carry the segment-index text property, so the
+zoom keys resolve the right output segment with point anywhere on the
+figure.  Falls back to a plain single-property insert when slicing is
+disabled, on non-graphic displays (batch/tty — the pixel size is unknown
+there), or if the slice insert fails."
+  (let ((start (point)))
+    (if (and emacs-jupyter-notebook-panel-slice-images
+             (display-graphic-p))
+        (condition-case nil
+            (let* ((height (cdr (image-size image t)))
+                   (rows (max 1 (ceiling height (frame-char-height)))))
+              (insert-sliced-image image " " nil rows 1))
+          (error (insert (propertize " " 'display image))))
+      (insert (propertize " " 'display image)))
+    (add-text-properties
+     start (point) (list 'emacs-jupyter-notebook-segment-index index))))
+
 (defun emacs-jupyter-notebook-panel--format-header (entry)
   "Return the propertized header string for ENTRY."
   (let* ((count (or (plist-get entry :exec-count) "*"))
@@ -489,10 +514,8 @@ entry is visible; latest-per-cell view goes to the top."
             (cl-incf index)
             (pcase (car seg)
               ('image
-               (insert (propertize
-                        " " 'display (cdr seg)
-                        'emacs-jupyter-notebook-segment-index index))
-               (insert "\n"))
+               (emacs-jupyter-notebook-panel--insert-image (cdr seg) index)
+               (unless (bolp) (insert "\n")))
               ('text
                (let ((c (copy-sequence (cdr seg))))
                  (unless (string-empty-p c)
@@ -862,12 +885,6 @@ above it yields an `equal' key."
          (before (cl-find-if (lambda (p) (< p (point))) (reverse positions))))
     (when before
       (goto-char before))))
-
-(defun emacs-jupyter-notebook-panel--image-at-point ()
-  "Return the image spec on display at point, or nil."
-  (or (get-text-property (point) 'display)
-      (let ((next (next-single-property-change (point) 'display)))
-        (when next (get-text-property next 'display)))))
 
 (defun emacs-jupyter-notebook-panel--scale-image-at-point (factor)
   "Scale the image of the panel entry at point by FACTOR (multiplicative).

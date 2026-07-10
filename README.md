@@ -139,6 +139,8 @@ Evaluation output never appears in the source buffer. A dedicated side panel (`*
 - **Latest-per-cell** (default): one section per cell, indexed by cell marker. Re-running the same cell replaces its section in place.
 - **History log**: every evaluation, including region/paragraph/defun, appended in time order with timestamp, execution count, and status.
 
+Images are inserted **sliced** into line-height rows (the doc-view/EWW technique), so scrolling — including emacs-mac / `pixel-scroll-precision-mode` smooth scrolling — moves fluidly across figures instead of jumping their full height (an unsliced tall image is a single screen line, and Emacs can only anchor scrolling on line boundaries). Disable with `emacs-jupyter-notebook-panel-slice-images` if you prefer whole-image lines.
+
 Toggle the view inside the panel with `H`, or globally with `C-c j t`. `q` buries the panel. `RET` anywhere in an entry jumps to its originating cell. `n` / `p` step between entries. A cell's text and figures interleave in arrival order, like a notebook — printing and plotting in the same cell shows both. Images render inline with zoom keys (`+`, `-`, `=`), which work with point anywhere on the image. `v` anywhere in a plot entry opens that figure in the interactive local viewer (see below). Under evil (Doom/Spacemacs) the panel uses emacs state so all of these single-key commands work as listed.
 
 ## Interactive matplotlib viewer

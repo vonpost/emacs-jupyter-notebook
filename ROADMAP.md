@@ -970,6 +970,23 @@ subplot crops all siblings, killing Emacs reaps the viewer.
 
 ---
 
+## W17 — Sliced panel images (smooth scrolling over figures)
+
+- [x] sha=PENDING W17 sliced image rendering.  MOTIVATION: a tall figure
+      inserted as ONE display property is a single screen line; Emacs can
+      only anchor window-start on line boundaries, so any scroll crossing
+      the figure jumps its whole height at once — even under emacs-mac /
+      `pixel-scroll-precision-mode' smooth scrolling.  The panel now inserts
+      images sliced into line-height rows via `insert-sliced-image' (the
+      doc-view/EWW technique) through the new `--insert-image', so scrolling
+      walks fluidly across figures.  All slice rows carry the segment-index
+      property (zoom works from any row); non-graphic displays and failures
+      fall back to the single-property insert; disable via
+      `emacs-jupyter-notebook-panel-slice-images'.  Removed the now-dead
+      `--image-at-point' helper.
+
+---
+
 ## W16 — Panel correctness under evil + interleaved outputs + macOS viewer
 
 - [x] sha=PENDING W16 panel/viewer dogfooding batch (macOS + Doom host).

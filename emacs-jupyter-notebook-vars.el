@@ -144,6 +144,18 @@ Can be overridden per-profile with :jupyter-command in the profile plist."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
+(defcustom emacs-jupyter-notebook-panel-slice-images t
+  "When non-nil, insert panel images sliced into line-height rows.
+A tall image inserted as one display property is a single screen line, so
+scrolling must jump its whole height at once (window-start can only land
+on line boundaries — even pixel-precise scroll modes anchor there).
+Slicing (the `doc-view'/EWW technique) makes each row its own screen
+line, so the scroll walks smoothly across figures.  Costs nothing
+functionally: zoom, `v', and RET still treat the figure as one output.
+Only effective on graphical displays."
+  :type 'boolean
+  :group 'emacs-jupyter-notebook)
+
 (defcustom emacs-jupyter-notebook-panel-max-pickles 20
   "Maximum number of panel entries that retain their matplotlib pickle payload.
 Each interactive-figure pickle stashed on a panel entry is a multi-MB
