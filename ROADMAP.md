@@ -123,7 +123,7 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
-- [ ] CC1 `--async-retrieve-attempt' leaks the prior SCP process's stdout/stderr
+- [~] owner=codex-root claimed=2026-08-28 CC1 `--async-retrieve-attempt' leaks the prior SCP process's stdout/stderr
       buffers on every retry — it overwrites `:scp-process' without disposing
       the old process first, so a failed retrieve with N attempts leaks 2·(N-1)
       hidden ` *emacs-jupyter-notebook-scp-*' buffers.  Fix: call
@@ -970,6 +970,29 @@ subplot crops all siblings, killing Emacs reaps the viewer.
 
 ---
 
+## W19 — Reconnect robustness after long outages
+
+- [~] owner=codex-root claimed=2026-08-28 W19 reconnect robustness.  Preserve
+      profile-specific SSH transport settings across durable reconnects; make
+      explicit reconnect an authoritative local reset that never kills the
+      remote kernel; bound every one-shot connection process and the overall
+      attempt; distinguish alive/dead/unreachable kernel identity; add
+      non-blocking backoff recovery after tunnel death; and correct status/log
+      guidance for reconnect, cancellation, and the idle watchdog.
+
+---
+
+## W18 — Bounded, non-blocking panel images
+
+- [~] owner=codex-root claimed=2026-08-28 W18 panel image resource model.
+      Remove eager full-history image decoding and O(history) streaming
+      rerenders; retain image payloads outside the Lisp heap in disposable
+      local files; bound inline preview/cache residency; flush retired image
+      specs; and add a generic asynchronous external-image command while
+      preserving the matplotlib viewer path.
+
+---
+
 ## W17 — Sliced panel images (smooth scrolling over figures)
 
 - [x] sha=PENDING W17 sliced image rendering.  MOTIVATION: a tall figure
@@ -1153,7 +1176,7 @@ subplot crops all siblings, killing Emacs reaps the viewer.
 
 ## W12 — Single connection per buffer (interruptible attempts, no parallel/orphan)
 
-- [ ] sha=PENDING W12 single connection per buffer.  MOTIVATION: a
+- [x] sha=55fd7af W12 single connection per buffer.  MOTIVATION: a
       connection attempt could not be interrupted cleanly, and invoking
       start/reconnect while one was in flight only hard-errored the user with
       "use M-x cancel-operation" — a two-step dance that felt like the old
