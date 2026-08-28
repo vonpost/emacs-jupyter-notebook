@@ -1009,6 +1009,24 @@ subplot crops all siblings, killing Emacs reaps the viewer.
       silent supersede, fresh-start offer + Lisp-caller gate, disconnect-not-
       shutdown).  467/467 green; byte-compile clean (only the two known evil
       free-var warnings).
+      POST-REVIEW HARDENING (external review, confirmed against the emacs-jupyter
+      source): two local-resource leaks in the reconnect path.
+      (a) `jupyter-disconnect' is a NO-OP for this client path — its kernel-action
+      handler is inverted (`disconnect' runs the ioloop START, a silent no-op while
+      the ioloop is alive).  The `jupyter-disconnect' adapter therefore releases the
+      client by unbinding its `io' slot instead, making the ZMQ ioloop subprocess
+      unreachable so emacs-jupyter's GC finalizer reclaims it.  Never touches the
+      remote kernel (conn-info clients have no Emacs-launched process).
+      (b) Failed/superseded connects retained `:client-unverified', holding its ZMQ
+      ioloop subprocess until the context happened to be released and GC'd — repeated
+      failed recoveries accumulated ioloops.  `--async-fail' and
+      `--cancel-async-context-locally' now dispose it via `--dispose-unverified-client'
+      (disconnect + clear the slot in place, without writing the context back to the
+      buffer, so a superseded context cannot be resurrected).
+      TESTS: +3 ERT (fail/cancel-locally dispose the unverified client; no-op without
+      one).  The new fail-path test stubs `display-warning'/`force-mode-line-update' —
+      calling the real `--async-fail' side effects made later timing-sensitive tests
+      (W3.4/W7.1) flaky under load.  471/471 green over 12 consecutive runs.
 
 ---
 

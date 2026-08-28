@@ -875,7 +875,11 @@ disposer does not prevent the remaining disposers from running."
        (plist-get context :tunnel-process)))
     (ignore-errors
       (emacs-jupyter-notebook--async-delete-file
-       (plist-get context :remote-copy)))))
+       (plist-get context :remote-copy)))
+    ;; Review fix: an in-flight connect that is abandoned by buffer kill /
+    ;; mode disable must not retain its `:client-unverified' ioloop either.
+    (ignore-errors
+      (emacs-jupyter-notebook--dispose-unverified-client context))))
 
 (defun emacs-jupyter-notebook--clear-buffer-timers ()
   "Cancel the buffer-local evaluation and completion-idle timers."
@@ -1908,19 +1912,37 @@ Non-string or unrecognized errors are returned verbatim."
                   hint)))
     error-data))
 
+(defun emacs-jupyter-notebook--dispose-unverified-client (context)
+  "Release the local Jupyter I/O of CONTEXT's abandoned `:client-unverified'.
+A connect that fails, times out, or is superseded leaves its unverified
+client — and the ZMQ ioloop subprocess behind it — referenced by the context.
+emacs-jupyter reclaims that subprocess only through a GC finalizer, so the
+reference must be dropped promptly instead of being retained for the whole
+lifetime of the context (repeated failed recoveries would otherwise
+accumulate ioloop subprocesses between garbage collections).  The client's
+local I/O is released via `jupyter-disconnect' and the slot cleared; the
+remote kernel is never touched — an unverified client is a conn-info
+attachment that was never installed as the buffer's live client.  Mutates
+CONTEXT in place and deliberately does NOT write it back to the buffer, so a
+superseded context cannot be resurrected into the buffer's async slot."
+  (when context
+    (when-let* ((client (plist-get context :client-unverified)))
+      (ignore-errors (emacs-jupyter-notebook-jupyter-disconnect client)))
+    (ignore-errors (plist-put context :client-unverified nil))))
+
 (defun emacs-jupyter-notebook--async-fail (context error-data)
   "Move CONTEXT to error state with ERROR-DATA and clean up.
 
 Releases only LOCAL resources: cancels the deadline timer, disposes the
-launch/scp/tunnel processes (and their stderr buffers), and removes the
-fetched :remote-copy.  Does NOT terminate the remote kernel, even when
-`:owns-kernel' is set: the binding rule forbids automatic remote-kernel
-cleanup from async failure paths.  Does NOT delete `:local-file' either —
-once `--async-connect-finalize' runs that same path becomes the registry
-entry's `:local-connection-file' (the offline reconnect key), and this
-function is also called from failure paths that may race with that
-promotion.  A small temp-file leak is acceptable; loss of the reconnect
-key is not.
+launch/scp/tunnel processes (and their stderr buffers), disposes any
+abandoned `:client-unverified', and removes the fetched :remote-copy.  Does
+NOT terminate the remote kernel, even when `:owns-kernel' is set: the
+binding rule forbids automatic remote-kernel cleanup from async failure
+paths.  Does NOT delete `:local-file' either — once
+`--async-connect-finalize' runs that same path becomes the registry entry's
+`:local-connection-file' (the offline reconnect key), and this function is
+also called from failure paths that may race with that promotion.  A small
+temp-file leak is acceptable; loss of the reconnect key is not.
 
 ERROR-DATA is passed through `--enrich-ssh-error' (W4.3) so the
 user-visible message carries a kind label and an actionable hint when the
@@ -1941,6 +1963,10 @@ underlying stderr matches a known SSH failure pattern."
      (plist-get context :busy-probe-process))
     (emacs-jupyter-notebook--async-delete-process (plist-get context :log-process))
     (emacs-jupyter-notebook--async-delete-file (plist-get context :remote-copy))
+    ;; Review fix: a failed connect must not retain its `:client-unverified'
+    ;; (its ZMQ ioloop subprocess is otherwise held until the context is
+    ;; released and GC'd).
+    (emacs-jupyter-notebook--dispose-unverified-client context)
     ;; W6.2: record the error for the mode-line lighter.
     (when-let* ((buffer (plist-get context :origin-buffer)))
       (when (buffer-live-p buffer)

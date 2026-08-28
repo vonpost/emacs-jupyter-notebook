@@ -378,6 +378,39 @@ Two conventions worth preserving:
   though they were subscribed on that buffer — the buffer may have
   been killed between subscribe and dispatch.
 
+### 25b. emacs-jupyter client teardown is a minefield (W19 post-review)
+
+Two confirmed facts about the emacs-jupyter client I/O lifecycle that any
+reconnect / local-cleanup code must respect:
+
+- **`jupyter-disconnect` is a silent no-op here.** Its kernel-action handler
+  in `jupyter-kernel-process.el` is inverted — the `disconnect` action runs the
+  ioloop `START` (and `connect` runs `STOP`). For a client whose ioloop is
+  already alive, `disconnect` does nothing. To actually release a client's I/O,
+  unbind its `io` slot (`slot-makeunbound client 'io`); that makes the ZMQ
+  ioloop subprocess unreachable so emacs-jupyter's GC finalizer deletes it.
+- **The ioloop is a subprocess reclaimed only by a GC finalizer.** Each client
+  attachment starts a `zmq-start-process` ioloop. Nothing tears it down
+  deterministically; the finalizer on the ioloop object `delete-process`es it
+  once the object is collected. So any abandoned client keeps a live subprocess
+  until GC gets around to it.
+
+Consequences for this package:
+
+- A connect that fails / times out / is superseded leaves its
+  `:client-unverified` on the async context. `--async-fail` and
+  `--cancel-async-context-locally` MUST dispose it (`--dispose-unverified-client`),
+  or repeated failed recoveries accumulate ioloop subprocesses between GCs.
+- Disposing means: disconnect (release I/O) + clear the slot **in place with
+  `plist-put`, WITHOUT `--async-put`** — writing the context back to the buffer
+  would resurrect a superseded context into the buffer's async slot (the A2 bug).
+- Releasing a client's local I/O is SAFE and is NOT a kernel termination: our
+  clients are conn-info attachments (the kernel is launched out-of-band over
+  SSH), so there is no Emacs-launched process for `jupyter-shutdown` to kill.
+  This is why `jupyter-disconnect` (local I/O) is allowed on buffer-kill /
+  failure paths while `jupyter-shutdown` (a kernel terminator) is not — the W1.7
+  test pins that distinction.
+
 ---
 
 ## Test discipline

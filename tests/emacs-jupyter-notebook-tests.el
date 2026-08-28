@@ -8359,6 +8359,56 @@ is durable and outlives the local client."
         (should-not shutdown)
         (should-not emacs-jupyter-notebook--client)))))
 
+(ert-deftest ejn-w19-async-fail-disposes-unverified-client ()
+  "Review fix: a FAILED connect must not retain its `:client-unverified'.
+The abandoned client holds a ZMQ ioloop subprocess that emacs-jupyter only
+reclaims through a GC finalizer, so `--async-fail' releases the client's
+local I/O and clears the reference — repeated failed recoveries must not
+accumulate ioloop subprocesses."
+  (with-temp-buffer
+    (let* ((disconnected-client nil)
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'connect
+                     :origin-buffer (current-buffer)
+                     :session-id "s"
+                     :client-unverified 'stale-io-client)))
+      (setq emacs-jupyter-notebook--async-context context)
+      ;; Keep the test hermetic: `--async-fail' would otherwise emit a real
+      ;; warning and force a mode-line redisplay.
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-disconnect)
+                 (lambda (client) (setq disconnected-client client)))
+                ((symbol-function 'display-warning) #'ignore)
+                ((symbol-function 'force-mode-line-update) #'ignore))
+        (emacs-jupyter-notebook--async-fail context "boom"))
+      (should (eq disconnected-client 'stale-io-client))
+      (should-not (plist-get context :client-unverified)))))
+
+(ert-deftest ejn-w19-cancel-context-locally-disposes-unverified-client ()
+  "Review fix: an in-flight connect abandoned by buffer kill / mode disable
+\(`--cancel-async-context-locally') also releases its `:client-unverified'
+ioloop, and does so without resurrecting the context into the buffer slot."
+  (let ((disconnected-client nil)
+        (context (emacs-jupyter-notebook--async-new-context
+                  :phase 'connect
+                  :client-unverified 'stale-io)))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-disconnect)
+               (lambda (client) (setq disconnected-client client))))
+      (emacs-jupyter-notebook--cancel-async-context-locally context))
+    (should (eq disconnected-client 'stale-io))
+    (should-not (plist-get context :client-unverified))))
+
+(ert-deftest ejn-w19-dispose-unverified-client-noop-without-client ()
+  "Review fix: disposing a context that never reached connect (no
+`:client-unverified') is a harmless no-op — no disconnect, no error."
+  (let ((disconnected nil)
+        (context (emacs-jupyter-notebook--async-new-context
+                  :phase 'retrieve)))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-disconnect)
+               (lambda (_client) (setq disconnected t))))
+      (emacs-jupyter-notebook--dispose-unverified-client context)
+      (should-not disconnected)
+      (should-not (plist-get context :client-unverified)))))
+
 ;;; W18 — bounded, non-blocking panel images
 
 (ert-deftest ejn-w18-panel-materialize-image-to-file ()

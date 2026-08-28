@@ -573,15 +573,25 @@ the remote filesystem."
   (jupyter-shutdown-kernel client))
 
 (defun emacs-jupyter-notebook-jupyter--disconnect (client)
-  "Disconnect CLIENT's local I/O from its kernel WITHOUT terminating it.
-The remote kernel is durable and outlives the local client; this only tears
-down the local channel handles so a stale client can be dropped cleanly
-before a reconnect installs a fresh one.  Best-effort: errors are swallowed
+  "Release CLIENT's local I/O WITHOUT terminating the remote kernel.
+The remote kernel is durable and outlives the local client; this only drops
+the local channel handles so a stale or abandoned client can be reclaimed.
+
+emacs-jupyter's own `jupyter-disconnect' is NOT used: for this client path
+its kernel-action handler is inverted — the `disconnect' action runs the
+ioloop START, which is a silent no-op while the ioloop is alive — so it
+releases nothing.  Instead we unbind the client's `io' slot, which makes the
+whole I/O graph (the ZMQ channels and the ioloop subprocess behind them)
+unreachable; emacs-jupyter's GC finalizer then deletes the subprocess.  This
+is purely local: it sends no message to the kernel, and our clients are
+conn-info attachments (the kernel is launched out-of-band over SSH), so
+nothing remote is started or stopped.  Best-effort: errors are swallowed
 because a half-dead client is exactly the case this is called for."
   (when (emacs-jupyter-notebook-jupyter-available-p)
     (ignore-errors
       (require 'jupyter-client)
-      (jupyter-disconnect client))))
+      (when (and (eieio-object-p client) (slot-boundp client 'io))
+        (slot-makeunbound client 'io)))))
 
 (defun emacs-jupyter-notebook-jupyter--safe-callback (callback reply error-data)
   "Call CALLBACK with REPLY and ERROR-DATA without leaking callback errors."
