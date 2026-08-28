@@ -123,7 +123,7 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
-- [x] sha=PENDING CC1 `--async-retrieve-attempt' leaked the prior SCP process's stdout/stderr
+- [x] sha=b60239f CC1 `--async-retrieve-attempt' leaked the prior SCP process's stdout/stderr
       buffers on every retry — it overwrote `:scp-process' without disposing
       the old process first, so a failed retrieve with N attempts leaked 2·(N-1)
       hidden ` *emacs-jupyter-notebook-scp-*' buffers.  FIXED: the attempt now
@@ -973,7 +973,7 @@ subplot crops all siblings, killing Emacs reaps the viewer.
 
 ## W19 — Reconnect robustness after long outages
 
-- [x] sha=PENDING W19 reconnect robustness.  MOTIVATION: reconnect worked only
+- [x] sha=b60239f W19 reconnect robustness.  MOTIVATION: reconnect worked only
       when a drop was healed immediately; after a multi-hour outage it never
       recovered and every retry reported "a connection attempt is already in
       progress", leaving shutdown+fresh-start as the only escape.  Root causes
@@ -1014,7 +1014,7 @@ subplot crops all siblings, killing Emacs reaps the viewer.
 
 ## W18 — Bounded, non-blocking panel images
 
-- [x] sha=PENDING W18 panel image resource model.  MOTIVATION: with many
+- [x] sha=b60239f W18 panel image resource model.  MOTIVATION: with many
       figures the panel crawled and Emacs's memory climbed without bound —
       every image's decoded bytes lived forever in the append-only entry
       history on the Lisp heap, every stream flush re-rendered the WHOLE
