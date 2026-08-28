@@ -42,6 +42,7 @@
 (declare-function jupyter-interrupt-kernel "jupyter-client" (client))
 (declare-function jupyter-restart-kernel "jupyter-client" (client))
 (declare-function jupyter-shutdown-kernel "jupyter-client" (client))
+(declare-function jupyter-disconnect "jupyter-client" (client))
 (declare-function jupyter-insert "jupyter-mime" (mime-or-plist &optional metadata))
 (declare-function jupyter-eval-ov--fold-string "jupyter-client" (text))
 (defvar jupyter-current-client)
@@ -372,6 +373,13 @@ produces no output and no panel entry.  Stubbed in W8.1 tests.")
   #'emacs-jupyter-notebook-jupyter--shutdown
   "Function used by `emacs-jupyter-notebook-jupyter-shutdown'.")
 
+(defvar emacs-jupyter-notebook-jupyter-disconnect-function
+  #'emacs-jupyter-notebook-jupyter--disconnect
+  "Function used by `emacs-jupyter-notebook-jupyter-disconnect'.
+Called with CLIENT; disconnects the local client I/O WITHOUT terminating
+the remote kernel.  Stubbed in tests so local teardown can be verified
+without a real Jupyter kernel.")
+
 (defvar emacs-jupyter-notebook-jupyter-complete-function
   #'emacs-jupyter-notebook-jupyter--complete
   "Function used by `emacs-jupyter-notebook-jupyter-complete'.
@@ -564,6 +572,17 @@ the remote filesystem."
   (emacs-jupyter-notebook-jupyter--ensure)
   (jupyter-shutdown-kernel client))
 
+(defun emacs-jupyter-notebook-jupyter--disconnect (client)
+  "Disconnect CLIENT's local I/O from its kernel WITHOUT terminating it.
+The remote kernel is durable and outlives the local client; this only tears
+down the local channel handles so a stale client can be dropped cleanly
+before a reconnect installs a fresh one.  Best-effort: errors are swallowed
+because a half-dead client is exactly the case this is called for."
+  (when (emacs-jupyter-notebook-jupyter-available-p)
+    (ignore-errors
+      (require 'jupyter-client)
+      (jupyter-disconnect client))))
+
 (defun emacs-jupyter-notebook-jupyter--safe-callback (callback reply error-data)
   "Call CALLBACK with REPLY and ERROR-DATA without leaking callback errors."
   (condition-case err
@@ -659,6 +678,11 @@ Call CALLBACK with the client on success, or nil on failure."
 (defun emacs-jupyter-notebook-jupyter-shutdown (client)
   "Shut down CLIENT through the configured adapter."
   (funcall emacs-jupyter-notebook-jupyter-shutdown-function client))
+
+(defun emacs-jupyter-notebook-jupyter-disconnect (client)
+  "Disconnect CLIENT's local I/O through the configured adapter.
+Never terminates the remote kernel."
+  (funcall emacs-jupyter-notebook-jupyter-disconnect-function client))
 
 (defun emacs-jupyter-notebook-jupyter-complete (client code cursor-pos callback)
   "Complete CODE at CURSOR-POS through the configured adapter."

@@ -58,13 +58,15 @@ liveness probe."
   :type '(choice (const :tag "No connect timeout" nil) integer)
   :group 'emacs-jupyter-notebook)
 
-(defcustom emacs-jupyter-notebook-ssh-batch-mode nil
+(defcustom emacs-jupyter-notebook-ssh-batch-mode t
   "When non-nil, pass `-o BatchMode=yes' on every ssh/scp command.
 BatchMode disables all interactive prompts (password/passphrase and the
 host-key confirmation), so an ssh that would otherwise block forever on a
-prompt fails fast instead.  Left nil by default because it also blocks
-first-time host-key acceptance for a newly added remote; enable it once
-your hosts are in `known_hosts' and you use key/agent auth."
+prompt fails fast instead.  Enabled by default because a silently blocking
+prompt is exactly the kind of wedge that strands reconnect attempts; the
+cost is that first-time host-key acceptance for a brand-new remote must be
+done once by hand (run `ssh HOST' in a terminal).  Set nil only if you add
+new remotes from Emacs and rely on the interactive host-key prompt."
   :type 'boolean
   :group 'emacs-jupyter-notebook)
 
@@ -144,16 +146,37 @@ Can be overridden per-profile with :jupyter-command in the profile plist."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
-(defcustom emacs-jupyter-notebook-panel-slice-images t
+(defcustom emacs-jupyter-notebook-panel-slice-images nil
   "When non-nil, insert panel images sliced into line-height rows.
 A tall image inserted as one display property is a single screen line, so
 scrolling must jump its whole height at once (window-start can only land
 on line boundaries — even pixel-precise scroll modes anchor there).
 Slicing (the `doc-view'/EWW technique) makes each row its own screen
-line, so the scroll walks smoothly across figures.  Costs nothing
-functionally: zoom, `v', and RET still treat the figure as one output.
-Only effective on graphical displays."
+line, so the scroll walks smoothly across figures.  Slicing asks Emacs for
+the rendered image size and can be expensive, so it is opt-in.  The panel's
+inline preview budget still bounds how many images can be sized this way.
+Zoom, `o', `v', and RET continue to treat the figure as one output.  Only
+effective on graphical displays."
   :type 'boolean
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-panel-max-inline-images 8
+  "Maximum number of image previews materialized inline in a panel view.
+The newest this-many visible images are rendered; older images remain as
+lightweight placeholders and can still be opened externally with `o'.
+Keeping this value small bounds Emacs's native image-cache memory.  A
+non-positive value disables inline previews while preserving originals."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-external-image-viewer-command nil
+  "Command argv used to open a panel image in an external application.
+The image file name is appended as the final argument and the command is
+started asynchronously without a shell.  Nil selects the platform opener:
+`open' on macOS, `xdg-open' on GNU/Linux and BSD, and the Windows shell on
+Windows."
+  :type '(choice (const :tag "Platform default" nil)
+                 (repeat :tag "Command and arguments" string))
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-panel-max-pickles 20
@@ -199,6 +222,37 @@ swallowed by a stateful NAT.  Set to 0 to disable keepalives."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
+(defcustom emacs-jupyter-notebook-auto-reconnect t
+  "When non-nil, automatically try to restore a dropped tunnel.
+When the transport dies (SSH tunnel exit or heartbeat misses) the buffer
+schedules a background reconnect and retries with exponential backoff
+capped at `emacs-jupyter-notebook-reconnect-max-delay'.  Recovery is
+TRANSPORT-ONLY: it rebuilds the tunnel and client against the durable
+registry entry.  It never starts a remote kernel and never terminates one —
+a probe that confirms the registered kernel is gone (or is a different
+process) stops the loop and leaves the entry for an explicit command.
+Retries stop on a successful connect, on that confirmed-terminal probe, or
+when the minor mode is disabled / the buffer killed.  Set nil to only ever
+reconnect through an explicit command."
+  :type 'boolean
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-reconnect-initial-delay 2
+  "Seconds before the first automatic reconnect attempt after a drop.
+Each subsequent failed attempt doubles the delay (exponential backoff)
+until it reaches `emacs-jupyter-notebook-reconnect-max-delay'."
+  :type 'number
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-reconnect-max-delay 300
+  "Maximum seconds between automatic reconnect attempts.
+The exponential backoff that starts at
+`emacs-jupyter-notebook-reconnect-initial-delay' never grows past this
+value, so a long outage settles into one attempt every this-many seconds
+instead of giving up."
+  :type 'number
+  :group 'emacs-jupyter-notebook)
+
 (defcustom emacs-jupyter-notebook-heartbeat-interval 20
   "Seconds between per-buffer kernel-info heartbeat probes.
 The heartbeat fires a `kernel_info_request' and treats no reply
@@ -228,6 +282,28 @@ that the remote kernel outlives Emacs."
 This needs to be generous for high-latency remote kernels, especially
 when the remote side uses Nix or other environment initialization."
   :type 'number
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-connection-attempt-timeout 180
+  "Hard wall-clock deadline for a single start or reconnect attempt.
+An attempt that is still in flight (any phase: launch, probe, retrieve,
+tunnel, connect) after this many seconds is failed with a timeout error.
+This is the backstop that guarantees no connection attempt can wedge a
+buffer forever even if an individual phase's own bounding fails.  Set to
+nil or a non-positive value to disable the deadline."
+  :type '(choice (const :tag "No overall deadline" nil) number)
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-ssh-process-timeout 60
+  "Hard wall-clock deadline for a single one-shot remote process.
+Each launch, PID probe, connection-file retrieval (scp), and log fetch
+process that is still running after this many seconds is killed and its
+attempt failed with a timeout error.  This bounds the processes that ride
+a ControlMaster or otherwise outlive their `ConnectTimeout'.  The tunnel
+is NOT bounded here (it is meant to live indefinitely); it is bounded by
+the keepalives and the overall attempt deadline instead.  Set to nil or a
+non-positive value to disable the per-process watchdog."
+  :type '(choice (const :tag "No per-process deadline" nil) number)
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-jupyter-request-timeout 2

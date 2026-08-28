@@ -139,9 +139,11 @@ Evaluation output never appears in the source buffer. A dedicated side panel (`*
 - **Latest-per-cell** (default): one section per cell, indexed by cell marker. Re-running the same cell replaces its section in place.
 - **History log**: every evaluation, including region/paragraph/defun, appended in time order with timestamp, execution count, and status.
 
-Images are inserted **sliced** into line-height rows (the doc-view/EWW technique), so scrolling — including emacs-mac / `pixel-scroll-precision-mode` smooth scrolling — moves fluidly across figures instead of jumping their full height (an unsliced tall image is a single screen line, and Emacs can only anchor scrolling on line boundaries). Disable with `emacs-jupyter-notebook-panel-slice-images` if you prefer whole-image lines.
+Image originals are kept in private disposable local files instead of the Emacs Lisp heap. The newest `emacs-jupyter-notebook-panel-max-inline-images` images in the current view render as bounded previews; older figures remain lightweight placeholders, which keeps Emacs's native image cache from growing with the full history. Press `o` anywhere on an image entry to open the original with the platform viewer. The files and cached image specs are released when the panel is killed.
 
-Toggle the view inside the panel with `H`, or globally with `C-c j t`. `q` buries the panel. `RET` anywhere in an entry jumps to its originating cell. `n` / `p` step between entries. A cell's text and figures interleave in arrival order, like a notebook — printing and plotting in the same cell shows both. Images render inline with zoom keys (`+`, `-`, `=`), which work with point anywhere on the image. `v` anywhere in a plot entry opens that figure in the interactive local viewer (see below). Under evil (Doom/Spacemacs) the panel uses emacs state so all of these single-key commands work as listed.
+Sliced line-height rendering remains available through `emacs-jupyter-notebook-panel-slice-images`, but is disabled by default because determining every rendered image height can make a large history expensive. When enabled, slicing applies only to the bounded inline-preview set.
+
+Toggle the view inside the panel with `H`, or globally with `C-c j t`. `q` buries the panel. `RET` anywhere in an entry jumps to its originating cell. `n` / `p` step between entries. A cell's text and figures interleave in arrival order, like a notebook — printing and plotting in the same cell shows both. Inline previews use zoom keys (`+`, `-`, `=`). `o` opens any stored PNG/JPEG image externally; `v` remains the matplotlib-pickle interactive viewer command (see below). Under evil (Doom/Spacemacs) the panel uses emacs state so all of these single-key commands work as listed.
 
 ## Interactive matplotlib viewer
 
@@ -230,4 +232,24 @@ Tuning:
 
 Sessions are recorded in a local registry under `user-emacs-directory`. Reopening Emacs and visiting a previously-used file lets you reconnect to the still-running remote kernel via `C-c j R`. The chooser always appears, with the entry for the current file pre-selected as the default — press RET to accept it or pick another.
 
-The remote kernel outlives Emacs. Only the explicit commands `shutdown-kernel` and `clean-orphaned-kernels` terminate it; closing the buffer, disabling the mode, and Emacs exit all leave the remote kernel running so a future session can reconnect.
+The remote kernel outlives Emacs. Only the explicit commands `shutdown-kernel`, `clean-orphaned-kernels`, and `retry-fresh-kernel` terminate it; closing the buffer, disabling the mode, and Emacs exit all leave the remote kernel running so a future session can reconnect.
+
+### Automatic recovery after a drop
+
+When the transport dies — the SSH tunnel exits, or the heartbeat misses its kernel-info replies — the buffer schedules an **automatic reconnect** and retries in the background with exponential backoff (starting at `emacs-jupyter-notebook-reconnect-initial-delay`, doubling, capped at `emacs-jupyter-notebook-reconnect-max-delay`). This is transport-only recovery: it rebuilds the tunnel and the client against the durable registry entry. It never starts a remote kernel and never terminates one. So when your laptop loses Wi-Fi for a while and regains it, the tunnel typically re-forms by itself; the mode line shows ` EJN!` while dead and the attempt/next-retry countdown is visible in `C-c j ?`.
+
+The loop stops on its own in three cases:
+
+- **Success** — the transport is restored and the kernel answers (or is confirmed busy executing a long cell; the client attaches and sends queue behind the running cell).
+- **Confirmed-dead kernel** — a probe reaches the host and finds the registered PID is gone (for example, the idle watchdog reaped it after `emacs-jupyter-notebook-kernel-idle-timeout`). The registry entry is kept; start a fresh kernel explicitly.
+- **Confirmed-mismatch kernel** — the PID is alive but belongs to a *different* process (PID reuse after a long outage). This is reported distinctly from "dead" and also stops the loop.
+
+If the host simply cannot be reached, that is treated as *transient*: the loop keeps retrying with backoff rather than declaring the kernel dead. Set `emacs-jupyter-notebook-auto-reconnect` to nil to disable background recovery entirely and only ever reconnect through an explicit command.
+
+### Explicit reconnect is the escape hatch
+
+`C-c j R` (or `reconnect-remote-kernel`) is an authoritative local reset: it tears down the stale local client and tunnel and rebuilds them against the chosen registry entry, without touching the remote kernel. If a previous connection attempt is wedged in the background, an explicit reconnect supersedes it silently (no second prompt) — you never need to cancel-by-hand first. A wedged *start* attempt still asks before being superseded, because cancelling it may terminate the kernel it launched.
+
+Before reconnecting, Emacs probes the remote PID **with identity**: it confirms the live process is really this session's kernel (its command line carries the session's connection file), not a reused PID. Every reconnect phase is bounded — each one-shot SSH/SCP process by `emacs-jupyter-notebook-ssh-process-timeout` and the whole attempt by `emacs-jupyter-notebook-connection-attempt-timeout` — so a reconnect can stall neither on a dead ControlMaster nor on an interactive SSH prompt (`BatchMode=yes` is on by default for this reason).
+
+If an interactive reconnect confirms the registered kernel is gone, Emacs offers to start a fresh kernel on the same profile right there (one `y-or-n-p`), instead of leaving you to run shutdown + start by hand.

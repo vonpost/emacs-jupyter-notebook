@@ -216,6 +216,18 @@ Each entry plist supports:
 (defvar-local emacs-jupyter-notebook-panel--render-count 0
   "Counter incremented every time the panel re-renders.  Test instrument.")
 
+(defvar-local emacs-jupyter-notebook-panel--image-directory nil
+  "Private temporary directory holding this panel's original images.")
+
+(defvar-local emacs-jupyter-notebook-panel--inline-image-specs nil
+  "Image specs materialized by the most recent panel render.")
+
+(defvar-local emacs-jupyter-notebook-panel--dirty-entry-ids nil
+  "Entry ids eligible for an incremental render on the next flush.")
+
+(defvar-local emacs-jupyter-notebook-panel--force-full-render nil
+  "Non-nil when the next flush must rebuild the complete panel view.")
+
 ;;; Panel mode
 
 (defvar emacs-jupyter-notebook-panel-mode-map
@@ -229,6 +241,8 @@ Each entry plist supports:
     (define-key map (kbd "+") #'emacs-jupyter-notebook-panel-image-zoom-in)
     (define-key map (kbd "=") #'emacs-jupyter-notebook-panel-image-zoom-in)
     (define-key map (kbd "-") #'emacs-jupyter-notebook-panel-image-zoom-out)
+    ;; W18: open the original static image through a local external viewer.
+    (define-key map (kbd "o") #'emacs-jupyter-notebook-panel-open-image-externally)
     ;; W8.5: open the figure at point interactively in the local viewer.
     (define-key map (kbd "v") #'emacs-jupyter-notebook-panel-open-figure)
     map)
@@ -255,10 +269,18 @@ history-log view appends every evaluation in time order."
   (evil-set-initial-state 'emacs-jupyter-notebook-panel-mode 'emacs))
 
 (defun emacs-jupyter-notebook-panel--on-kill ()
-  "Cancel any pending flush timer when the panel buffer is killed."
+  "Release timers, cached images, and private files owned by this panel."
   (when (timerp emacs-jupyter-notebook-panel--flush-timer)
     (cancel-timer emacs-jupyter-notebook-panel--flush-timer))
-  (setq emacs-jupyter-notebook-panel--flush-timer nil))
+  (setq emacs-jupyter-notebook-panel--flush-timer nil)
+  (dolist (spec emacs-jupyter-notebook-panel--inline-image-specs)
+    (ignore-errors (image-flush spec t)))
+  (setq emacs-jupyter-notebook-panel--inline-image-specs nil)
+  (when (and (stringp emacs-jupyter-notebook-panel--image-directory)
+             (file-directory-p emacs-jupyter-notebook-panel--image-directory))
+    (ignore-errors
+      (delete-directory emacs-jupyter-notebook-panel--image-directory t)))
+  (setq emacs-jupyter-notebook-panel--image-directory nil))
 
 ;;; Buffer naming & lookup
 
@@ -286,6 +308,10 @@ with the same basename) so distinct sources always map to distinct panels."
             (setq emacs-jupyter-notebook-panel--view
                   emacs-jupyter-notebook-panel-default-view))
           (setq emacs-jupyter-notebook--panel-buffer panel)
+          ;; The panel owns disposable temp images even when tests or callers
+          ;; use the panel API without enabling the source minor mode.
+          (add-hook 'kill-buffer-hook
+                    #'emacs-jupyter-notebook--kill-panel nil t)
           panel))))
 
 (defun emacs-jupyter-notebook-panel-buffer (source-buffer)
@@ -332,9 +358,11 @@ with the same basename) so distinct sources always map to distinct panels."
   "Return a public entry handle for ID in PANEL with cell KEY."
   (list :panel panel :id id :cell-key key))
 
-(defun emacs-jupyter-notebook-panel--update-entry (handle updater)
+(defun emacs-jupyter-notebook-panel--update-entry (handle updater &optional force-full)
   "Apply UPDATER to the entry referenced by HANDLE and schedule a render.
-UPDATER is called with the current entry plist and must return a new plist."
+UPDATER is called with the current entry plist and must return a new plist.
+When FORCE-FULL is non-nil, rebuild the whole view because image-preview
+membership or entry ordering may have changed."
   (when handle
     (let ((panel (plist-get handle :panel))
           (id (plist-get handle :id)))
@@ -343,11 +371,12 @@ UPDATER is called with the current entry plist and must return a new plist."
           (when entry
             (let ((new (funcall updater entry)))
               (emacs-jupyter-notebook-panel--set-entry panel id new)
-              (emacs-jupyter-notebook-panel--schedule-render panel))))))))
+              (emacs-jupyter-notebook-panel--schedule-render
+               panel id force-full))))))))
 
 ;;; Render scheduling (W2.4 throttle)
 
-(defun emacs-jupyter-notebook-panel--schedule-render (panel)
+(defun emacs-jupyter-notebook-panel--schedule-render (panel &optional entry-id force-full)
   "Mark PANEL dirty and schedule a flush within the throttle window.
 
 W2.4: every API call that changes an entry routes through this scheduler.
@@ -359,6 +388,10 @@ state the entries are in at flush time."
   (when (buffer-live-p panel)
     (with-current-buffer panel
       (setq emacs-jupyter-notebook-panel--dirty t)
+      (when entry-id
+        (cl-pushnew entry-id emacs-jupyter-notebook-panel--dirty-entry-ids))
+      (when force-full
+        (setq emacs-jupyter-notebook-panel--force-full-render t))
       (unless (timerp emacs-jupyter-notebook-panel--flush-timer)
         (let ((delay (/ (max 0 emacs-jupyter-notebook-panel-stream-throttle-ms)
                         1000.0)))
@@ -374,7 +407,10 @@ state the entries are in at flush time."
       (setq emacs-jupyter-notebook-panel--flush-timer nil)
       (when emacs-jupyter-notebook-panel--dirty
         (setq emacs-jupyter-notebook-panel--dirty nil)
-        (emacs-jupyter-notebook-panel--render panel)))))
+        (if (or emacs-jupyter-notebook-panel--force-full-render
+                (null emacs-jupyter-notebook-panel--dirty-entry-ids))
+            (emacs-jupyter-notebook-panel--render panel)
+          (emacs-jupyter-notebook-panel--render-dirty-entries panel))))))
 
 (defun emacs-jupyter-notebook-panel-flush-now (panel)
   "Force PANEL to render immediately, cancelling any pending throttle timer."
@@ -384,9 +420,17 @@ state the entries are in at flush time."
         (cancel-timer emacs-jupyter-notebook-panel--flush-timer))
       (setq emacs-jupyter-notebook-panel--flush-timer nil)
       (setq emacs-jupyter-notebook-panel--dirty nil)
-      (emacs-jupyter-notebook-panel--render panel))))
+      (if (or emacs-jupyter-notebook-panel--force-full-render
+              (null emacs-jupyter-notebook-panel--dirty-entry-ids))
+          (emacs-jupyter-notebook-panel--render panel)
+        (emacs-jupyter-notebook-panel--render-dirty-entries panel)))))
 
 ;;; Rendering
+
+;; Forward declaration: the buffer-local definition lives further down (see
+;; `defvar-local' near the cell-key marker registry); referenced here on the
+;; SOURCE buffer via `with-current-buffer'.
+(defvar emacs-jupyter-notebook--cell-key-markers)
 
 (defun emacs-jupyter-notebook-panel--key-position (key source-buffer)
   "Return the current buffer position for cell KEY in SOURCE-BUFFER.
@@ -444,8 +488,49 @@ no source-buffer marker is registered, e.g. in tests)."
                    ((numberp pa) t)
                    (t nil))))))))))
 
-(defun emacs-jupyter-notebook-panel--insert-image (image index)
-  "Insert IMAGE tagged with segment INDEX, sliced for smooth scrolling.
+(defun emacs-jupyter-notebook-panel--image-specs (entries)
+  "Return image specs in ENTRIES in their display order."
+  (cl-loop for entry in entries
+           append (cl-loop for seg in (plist-get entry :outputs)
+                           when (eq (car seg) 'image)
+                           collect (cdr seg))))
+
+(defun emacs-jupyter-notebook-panel--bounded-inline-specs (entries)
+  "Return the newest bounded subset of image specs visible in ENTRIES."
+  (let* ((specs (emacs-jupyter-notebook-panel--image-specs entries))
+         (max emacs-jupyter-notebook-panel-max-inline-images))
+    (if (and (integerp max) (> max 0))
+        (last specs (min max (length specs)))
+      nil)))
+
+(defun emacs-jupyter-notebook-panel--set-inline-specs (specs)
+  "Install SPECS as the inline set, flushing previews that were demoted."
+  (dolist (old emacs-jupyter-notebook-panel--inline-image-specs)
+    (unless (member old specs)
+      (ignore-errors (image-flush old t))))
+  (setq emacs-jupyter-notebook-panel--inline-image-specs specs))
+
+(defun emacs-jupyter-notebook-panel--insert-image-placeholder (image index)
+  "Insert a lightweight placeholder for IMAGE tagged with segment INDEX."
+  (let* ((type (or (plist-get (cdr image) :type) 'image))
+         (file (plist-get (cdr image) :file))
+         (bytes (and (stringp file)
+                     (file-exists-p file)
+                     (file-attribute-size (file-attributes file))))
+         (label (if bytes
+                    (format "[%s image, %s]" type
+                            (file-size-human-readable bytes))
+                  (format "[%s image]" type))))
+    (insert (propertize label
+                        'face 'shadow
+                        'help-echo file
+                        'emacs-jupyter-notebook-segment-index index))))
+
+(defun emacs-jupyter-notebook-panel--insert-image (image index &optional inline-p)
+  "Insert IMAGE tagged with segment INDEX when INLINE-P is non-nil.
+When INLINE-P is nil, insert a lightweight placeholder that retains the
+segment identity needed by `o', `v', zoom, and source navigation.
+
 W17: a tall image inserted as ONE display property is a single screen
 line — window-start can only land on line boundaries, so any scroll
 crossing the figure jumps its whole height at once, even under
@@ -456,16 +541,19 @@ the figure.  All slice rows carry the segment-index text property, so the
 zoom keys resolve the right output segment with point anywhere on the
 figure.  Falls back to a plain single-property insert when slicing is
 disabled, on non-graphic displays (batch/tty — the pixel size is unknown
-there), or if the slice insert fails."
+there), or if the slice insert fails.  W18 bounds this work to the newest
+configured inline previews; placeholder images never call `image-size'."
   (let ((start (point)))
-    (if (and emacs-jupyter-notebook-panel-slice-images
-             (display-graphic-p))
-        (condition-case nil
-            (let* ((height (cdr (image-size image t)))
-                   (rows (max 1 (ceiling height (frame-char-height)))))
-              (insert-sliced-image image " " nil rows 1))
-          (error (insert (propertize " " 'display image))))
-      (insert (propertize " " 'display image)))
+    (if (not inline-p)
+        (emacs-jupyter-notebook-panel--insert-image-placeholder image index)
+      (if (and emacs-jupyter-notebook-panel-slice-images
+               (display-graphic-p))
+          (condition-case nil
+              (let* ((height (cdr (image-size image t)))
+                     (rows (max 1 (ceiling height (frame-char-height)))))
+                (insert-sliced-image image " " nil rows 1))
+            (error (insert (propertize " " 'display image))))
+        (insert (propertize " " 'display image))))
     (add-text-properties
      start (point) (list 'emacs-jupyter-notebook-segment-index index))))
 
@@ -491,6 +579,71 @@ there), or if the slice insert fails."
      'emacs-jupyter-notebook-entry-id (plist-get entry :id)
      'emacs-jupyter-notebook-cell-key (plist-get entry :cell-key))))
 
+(defun emacs-jupyter-notebook-panel--insert-entry (entry inline-specs)
+  "Insert ENTRY, materializing only images present in INLINE-SPECS."
+  (insert (emacs-jupyter-notebook-panel--format-header entry))
+  (let ((index -1))
+    (dolist (seg (plist-get entry :outputs))
+      (cl-incf index)
+      (pcase (car seg)
+        ('image
+         (emacs-jupyter-notebook-panel--insert-image
+          (cdr seg) index (member (cdr seg) inline-specs))
+         (unless (bolp) (insert "\n")))
+        ('text
+         (let ((content (copy-sequence (cdr seg))))
+           (unless (string-empty-p content)
+             (add-face-text-property
+              0 (length content) 'emacs-jupyter-notebook-result-face
+              'append content)
+             (insert content)
+             (unless (string-suffix-p "\n" content)
+               (insert "\n"))))))))
+  (insert "\n"))
+
+(defun emacs-jupyter-notebook-panel--entry-bounds (id)
+  "Return the rendered buffer bounds for entry ID, or nil."
+  (let* ((property 'emacs-jupyter-notebook-entry-id)
+         (start (text-property-any (point-min) (point-max) property id)))
+    (when start
+      (let ((pos (next-single-property-change start property nil (point-max))))
+        (while (and (< pos (point-max))
+                    (null (get-text-property pos property)))
+          (setq pos (next-single-property-change pos property nil (point-max))))
+        (cons start pos)))))
+
+(defun emacs-jupyter-notebook-panel--render-dirty-entries (panel)
+  "Incrementally re-render dirty entries in PANEL.
+Falls back to a full render if an affected visible entry has no existing
+section, which means ordering or view membership changed unexpectedly."
+  (with-current-buffer panel
+    (let* ((ids (prog1 emacs-jupyter-notebook-panel--dirty-entry-ids
+                  (setq emacs-jupyter-notebook-panel--dirty-entry-ids nil)))
+           (visible (emacs-jupyter-notebook-panel--visible-entries))
+           (inline emacs-jupyter-notebook-panel--inline-image-specs)
+           (was-at-end (= (point) (point-max)))
+           (fallback nil)
+           (inhibit-read-only t))
+      (setq emacs-jupyter-notebook-panel--force-full-render nil)
+      (dolist (id ids)
+        (let ((entry (cl-find id visible :key (lambda (e) (plist-get e :id))))
+              (bounds (emacs-jupyter-notebook-panel--entry-bounds id)))
+          (cond
+           ((and entry bounds)
+            (save-excursion
+              (goto-char (car bounds))
+              (delete-region (car bounds) (cdr bounds))
+              (emacs-jupyter-notebook-panel--insert-entry entry inline)))
+           ((and (null entry) bounds)
+            (delete-region (car bounds) (cdr bounds)))
+           (entry
+            (setq fallback t)))))
+      (if fallback
+          (emacs-jupyter-notebook-panel--render panel)
+        (cl-incf emacs-jupyter-notebook-panel--render-count)
+        (when was-at-end
+          (goto-char (point-max)))))))
+
 (defun emacs-jupyter-notebook-panel--render (panel)
   "Render PANEL contents according to current view.
 History view auto-scrolls to the bottom of the buffer so the newest
@@ -498,38 +651,98 @@ entry is visible; latest-per-cell view goes to the top."
   (with-current-buffer panel
     (let ((inhibit-read-only t)
           (entries (emacs-jupyter-notebook-panel--visible-entries)))
+      (setq emacs-jupyter-notebook-panel--dirty-entry-ids nil)
+      (setq emacs-jupyter-notebook-panel--force-full-render nil)
+      (emacs-jupyter-notebook-panel--set-inline-specs
+       (emacs-jupyter-notebook-panel--bounded-inline-specs entries))
       (erase-buffer)
       (cl-incf emacs-jupyter-notebook-panel--render-count)
       (insert (propertize
                (format "Output panel — view: %s   (H toggle, RET visit, q bury)\n\n"
                        emacs-jupyter-notebook-panel--view)
                'face 'emacs-jupyter-notebook-result-header-face))
-      (dolist (e entries)
-        (insert (emacs-jupyter-notebook-panel--format-header e))
-        ;; W16: render the ordered output segments interleaved, like a
-        ;; notebook cell.  Each image carries its segment index so the zoom
-        ;; keys can rebuild exactly the spec under point.
-        (let ((index -1))
-          (dolist (seg (plist-get e :outputs))
-            (cl-incf index)
-            (pcase (car seg)
-              ('image
-               (emacs-jupyter-notebook-panel--insert-image (cdr seg) index)
-               (unless (bolp) (insert "\n")))
-              ('text
-               (let ((c (copy-sequence (cdr seg))))
-                 (unless (string-empty-p c)
-                   (add-face-text-property
-                    0 (length c) 'emacs-jupyter-notebook-result-face 'append c)
-                   (insert c)
-                   (unless (string-suffix-p "\n" c)
-                     (insert "\n"))))))))
-        (insert "\n"))
+      (dolist (entry entries)
+        (emacs-jupyter-notebook-panel--insert-entry
+         entry emacs-jupyter-notebook-panel--inline-image-specs))
       (if (eq emacs-jupyter-notebook-panel--view 'history)
           (goto-char (point-max))
         (goto-char (point-min))))))
 
 ;;; Public API
+
+(defun emacs-jupyter-notebook-panel--ensure-image-directory (panel)
+  "Return PANEL's private image directory, creating it with mode 0700."
+  (with-current-buffer panel
+    (unless (and (stringp emacs-jupyter-notebook-panel--image-directory)
+                 (file-directory-p emacs-jupyter-notebook-panel--image-directory))
+      (setq emacs-jupyter-notebook-panel--image-directory
+            (make-temp-file "ejn-panel-images-" t))
+      (set-file-modes emacs-jupyter-notebook-panel--image-directory #o700))
+    emacs-jupyter-notebook-panel--image-directory))
+
+(defun emacs-jupyter-notebook-panel--image-suffix (image)
+  "Return a file suffix appropriate for IMAGE's declared type."
+  (pcase (plist-get (cdr image) :type)
+    ((or 'jpeg 'jpg) ".jpg")
+    ('png ".png")
+    ('gif ".gif")
+    ('webp ".webp")
+    (_ ".img")))
+
+(defun emacs-jupyter-notebook-panel--replace-image-data-with-file (image file)
+  "Return a fresh IMAGE spec referring to FILE instead of inline data."
+  (let ((props (cl-loop for (key value) on (cdr image) by #'cddr
+                        unless (memq key '(:data :file))
+                        collect key and collect value)))
+    (cons 'image (append props (list :file file)))))
+
+(defun emacs-jupyter-notebook-panel--materialize-image (panel image)
+  "Move IMAGE's inline data to a private file owned by PANEL.
+Specs that already refer to a file, or do not contain string data, are
+returned unchanged.  The file is mode 0600 and written without coding."
+  (let ((data (and (consp image) (plist-get (cdr image) :data))))
+    (if (not (stringp data))
+        image
+      (let* ((directory
+              (emacs-jupyter-notebook-panel--ensure-image-directory panel))
+             (file (make-temp-file
+                    (expand-file-name "image-" directory) nil
+                    (emacs-jupyter-notebook-panel--image-suffix image)))
+             (coding-system-for-write 'no-conversion))
+        (condition-case err
+            (progn
+              (write-region data nil file nil 'silent)
+              (set-file-modes file #o600)
+              (emacs-jupyter-notebook-panel--replace-image-data-with-file
+               image file))
+          (error
+           (ignore-errors (delete-file file))
+           (signal (car err) (cdr err))))))))
+
+(defun emacs-jupyter-notebook-panel--owned-image-file-p (panel file)
+  "Return non-nil when FILE belongs to PANEL's private image directory."
+  (and (stringp file)
+       (buffer-live-p panel)
+       (with-current-buffer panel
+         (and (stringp emacs-jupyter-notebook-panel--image-directory)
+              (file-directory-p emacs-jupyter-notebook-panel--image-directory)
+              (file-exists-p file)
+              (file-in-directory-p
+               file emacs-jupyter-notebook-panel--image-directory)))))
+
+(defun emacs-jupyter-notebook-panel--retire-image (panel image)
+  "Flush IMAGE and delete its private PANEL-owned backing file."
+  (when (and (consp image) (eq (car image) 'image))
+    (ignore-errors (image-flush image t))
+    (let ((file (plist-get (cdr image) :file)))
+      (when (emacs-jupyter-notebook-panel--owned-image-file-p panel file)
+        (ignore-errors (delete-file file))))))
+
+(defun emacs-jupyter-notebook-panel--retire-outputs (panel outputs)
+  "Retire every image spec in OUTPUTS owned by PANEL."
+  (dolist (seg outputs)
+    (when (eq (car seg) 'image)
+      (emacs-jupyter-notebook-panel--retire-image panel (cdr seg)))))
 
 (defun ejn-panel-start-entry (panel cell-key code)
   "Begin a new output entry in PANEL associated with CELL-KEY for CODE.
@@ -559,7 +772,7 @@ state appears in place."
       (setq emacs-jupyter-notebook-panel--entries
             (append emacs-jupyter-notebook-panel--entries
                     (list (cons id entry))))
-      (emacs-jupyter-notebook-panel--schedule-render panel)
+      (emacs-jupyter-notebook-panel--schedule-render panel nil t)
       (emacs-jupyter-notebook-panel--handle panel id cell-key))))
 
 (defun emacs-jupyter-notebook--apply-carriage-returns (text)
@@ -626,9 +839,15 @@ Image segments are never dropped by the byte cap."
                     (setq excess 0))))))
           (nreverse keep))))))
 
-(defun emacs-jupyter-notebook-panel--outputs-after-pending (entry)
-  "Return ENTRY's outputs honoring a pending clear_output(wait=True)."
-  (if (plist-get entry :pending-clear) nil (plist-get entry :outputs)))
+(defun emacs-jupyter-notebook-panel--outputs-after-pending (panel entry)
+  "Return ENTRY's outputs honoring a pending clear_output(wait=True).
+When the pending clear takes effect, retire its old private image files."
+  (if (plist-get entry :pending-clear)
+      (progn
+        (emacs-jupyter-notebook-panel--retire-outputs
+         panel (plist-get entry :outputs))
+        nil)
+    (plist-get entry :outputs)))
 
 (defun ejn-panel-append-text (handle text &optional face)
   "Append TEXT (optionally propertized with FACE) to HANDLE's entry.
@@ -642,13 +861,19 @@ When TEXT already carries `face' text-properties (e.g. from
 `add-face-text-property' with append priority so per-character ANSI
 colours are preserved and uncoloured spans still get the fallback FACE."
   (when (and handle text)
-    (let ((display-text (copy-sequence text)))
+    (let* ((panel (plist-get handle :panel))
+           (old-entry (ejn-panel-entry-snapshot handle))
+           (force-full (and (plist-get old-entry :pending-clear)
+                            (cl-find 'image (plist-get old-entry :outputs)
+                                     :key #'car)))
+           (display-text (copy-sequence text)))
       (when face
         (add-face-text-property 0 (length display-text) face t display-text))
       (emacs-jupyter-notebook-panel--update-entry
        handle
        (lambda (entry)
-         (let* ((outputs (emacs-jupyter-notebook-panel--outputs-after-pending entry))
+         (let* ((outputs (emacs-jupyter-notebook-panel--outputs-after-pending
+                          panel entry))
                 (last-seg (car (last outputs))))
            (if (and last-seg (eq (car last-seg) 'text))
                ;; Merge into the trailing text segment.
@@ -669,21 +894,26 @@ colours are preserved and uncoloured spans still get the fallback FACE."
                                   (emacs-jupyter-notebook-panel--trim-outputs
                                    outputs)))
            (setq entry (plist-put entry :pending-clear nil))
-           entry))))))
+           entry))
+       force-full))))
 
 (defun ejn-panel-replace-text (handle text)
   "Replace ALL of HANDLE's entry output with TEXT.
 W8.7(d): also drops any stashed matplotlib pickle, since text has
 replaced whatever figure the entry previously showed."
   (when handle
-    (emacs-jupyter-notebook-panel--update-entry
-     handle
-     (lambda (entry)
-       (setq entry (plist-put entry :outputs
-                              (list (cons 'text (or text "")))))
-       (setq entry (plist-put entry :mpl-pickle nil))
-       (setq entry (plist-put entry :pending-clear nil))
-       entry))))
+    (let ((panel (plist-get handle :panel)))
+      (emacs-jupyter-notebook-panel--update-entry
+       handle
+       (lambda (entry)
+         (emacs-jupyter-notebook-panel--retire-outputs
+          panel (plist-get entry :outputs))
+         (setq entry (plist-put entry :outputs
+                                (list (cons 'text (or text "")))))
+         (setq entry (plist-put entry :mpl-pickle nil))
+         (setq entry (plist-put entry :pending-clear nil))
+         entry)
+       t))))
 
 (defun ejn-panel-set-image (handle image-spec)
   "Append IMAGE-SPEC as a new image segment on HANDLE's entry.
@@ -691,15 +921,21 @@ W16: no longer erases prior text — a cell that prints AND plots shows
 both, in order, like a notebook.  Multiple figures in one execution each
 get their own segment."
   (when handle
-    (emacs-jupyter-notebook-panel--update-entry
-     handle
-     (lambda (entry)
-       (let ((outputs (emacs-jupyter-notebook-panel--outputs-after-pending entry)))
-         (setq entry (plist-put entry :outputs
-                                (append outputs
-                                        (list (cons 'image image-spec)))))
-         (setq entry (plist-put entry :pending-clear nil))
-         entry)))))
+    (let* ((panel (plist-get handle :panel)))
+      (when (buffer-live-p panel)
+        (let ((stored (emacs-jupyter-notebook-panel--materialize-image
+                       panel image-spec)))
+          (emacs-jupyter-notebook-panel--update-entry
+           handle
+           (lambda (entry)
+             (let ((outputs (emacs-jupyter-notebook-panel--outputs-after-pending
+                             panel entry)))
+               (setq entry (plist-put entry :outputs
+                                      (append outputs
+                                              (list (cons 'image stored)))))
+               (setq entry (plist-put entry :pending-clear nil))
+               entry))
+           t))))))
 
 (defun ejn-panel-update-image (handle image-spec)
   "Replace the LAST image segment on HANDLE's entry with IMAGE-SPEC.
@@ -708,17 +944,26 @@ Appends when the entry has no image yet.  W16: this is the
 display in place (e.g. an animation frame), not adding a new output —
 so text segments are left untouched and no new segment is created."
   (when handle
-    (emacs-jupyter-notebook-panel--update-entry
-     handle
-     (lambda (entry)
-       (let* ((outputs (emacs-jupyter-notebook-panel--outputs-after-pending entry))
-              (last-image (cl-find 'image (reverse outputs) :key #'car)))
-         (if last-image
-             (setcdr last-image image-spec)
-           (setq outputs (append outputs (list (cons 'image image-spec)))))
-         (setq entry (plist-put entry :outputs outputs))
-         (setq entry (plist-put entry :pending-clear nil))
-         entry)))))
+    (let ((panel (plist-get handle :panel)))
+      (when (buffer-live-p panel)
+        (let ((stored (emacs-jupyter-notebook-panel--materialize-image
+                       panel image-spec)))
+          (emacs-jupyter-notebook-panel--update-entry
+           handle
+           (lambda (entry)
+             (let* ((outputs (emacs-jupyter-notebook-panel--outputs-after-pending
+                              panel entry))
+                    (last-image (cl-find 'image (reverse outputs) :key #'car)))
+               (if last-image
+                   (progn
+                     (emacs-jupyter-notebook-panel--retire-image
+                      panel (cdr last-image))
+                     (setcdr last-image stored))
+                 (setq outputs (append outputs (list (cons 'image stored)))))
+               (setq entry (plist-put entry :outputs outputs))
+               (setq entry (plist-put entry :pending-clear nil))
+               entry))
+           t))))))
 
 (defun ejn-panel-finish-entry (handle status execution-count)
   "Mark HANDLE's entry as completed with STATUS and EXECUTION-COUNT."
@@ -737,16 +982,20 @@ so text segments are left untouched and no new segment is created."
 If WAIT is non-nil, defer the clear until the next text arrives
 (matches Jupyter's clear_output :wait semantics)."
   (when handle
-    (emacs-jupyter-notebook-panel--update-entry
-     handle
-     (lambda (entry)
-       (if wait
-           (plist-put entry :pending-clear t)
-         (setq entry (plist-put entry :outputs nil))
-         ;; W8.7(d): clearing the entry drops the figure too.
-         (setq entry (plist-put entry :mpl-pickle nil))
-         (setq entry (plist-put entry :pending-clear nil))
-         entry)))))
+    (let ((panel (plist-get handle :panel)))
+      (emacs-jupyter-notebook-panel--update-entry
+       handle
+       (lambda (entry)
+         (if wait
+             (plist-put entry :pending-clear t)
+           (emacs-jupyter-notebook-panel--retire-outputs
+            panel (plist-get entry :outputs))
+           (setq entry (plist-put entry :outputs nil))
+           ;; W8.7(d): clearing the entry drops the figure too.
+           (setq entry (plist-put entry :mpl-pickle nil))
+           (setq entry (plist-put entry :pending-clear nil))
+           entry))
+       (not wait)))))
 
 (defun emacs-jupyter-notebook-panel--prune-pickles (panel)
   "Drop the matplotlib pickle from all but the newest N entries in PANEL.
@@ -1087,7 +1336,7 @@ The fringe values silently fall back to `left-margin'."
   "Return the fringe overlay for CELL-KEY, or nil."
   (cdr (assoc cell-key emacs-jupyter-notebook--fringe-overlays)))
 
-;;; Interactive figure open (W8.5)
+;;; External/static and interactive figure open (W18/W8.5)
 
 (declare-function emacs-jupyter-notebook-open-figure-with-pickle
                   "emacs-jupyter-notebook" (base64))
@@ -1104,6 +1353,79 @@ inside an entry's section — not only when point sits on the header line."
                                  (reverse positions))))
         (and header
              (get-text-property header 'emacs-jupyter-notebook-entry-id)))))
+
+(defun emacs-jupyter-notebook-panel--image-at-point ()
+  "Return the stored image spec for the panel image at point, or nil.
+The segment-index property identifies both inline previews and lightweight
+placeholders.  On an entry header, fall back to its first image segment."
+  (let* ((id (emacs-jupyter-notebook-panel--entry-id-at-point))
+         (entry (and id
+                     (emacs-jupyter-notebook-panel--entry
+                      (current-buffer) id)))
+         (outputs (and entry (plist-get entry :outputs)))
+         (index (get-text-property
+                 (point) 'emacs-jupyter-notebook-segment-index))
+         (segment (and (integerp index) (nth index outputs))))
+    (cond
+     ((and segment (eq (car segment) 'image)) (cdr segment))
+     (t (cdr (cl-find 'image outputs :key #'car))))))
+
+(declare-function w32-shell-execute "w32fns.c"
+                  (operation document &optional parameters show-flag))
+
+(defun emacs-jupyter-notebook-panel--spawn-external-opener (command file)
+  "Start COMMAND asynchronously with FILE appended to its argv."
+  (let ((program (car command)))
+    (unless (and program
+                 (or (and (file-name-absolute-p program)
+                          (file-executable-p program))
+                     (executable-find program)))
+      (user-error
+       "No external image opener found; customize `%s'"
+       'emacs-jupyter-notebook-external-image-viewer-command))
+    (make-process
+     :name (generate-new-buffer-name "ejn-image-viewer")
+     :buffer nil
+     :command (append command (list file))
+     :connection-type 'pipe
+     :noquery t
+     :sentinel (lambda (process _event)
+                 (unless (process-live-p process)
+                   (delete-process process))))))
+
+(defun emacs-jupyter-notebook-panel--external-open-default (file)
+  "Open FILE asynchronously using the configured or platform image opener."
+  (cond
+   (emacs-jupyter-notebook-external-image-viewer-command
+    (emacs-jupyter-notebook-panel--spawn-external-opener
+     emacs-jupyter-notebook-external-image-viewer-command file))
+   ((eq system-type 'windows-nt)
+    (w32-shell-execute "open" file))
+   (t
+    (let ((command (cond
+                    ((eq system-type 'darwin) '("open"))
+                    ((memq system-type '(gnu gnu/linux gnu/kfreebsd
+                                             berkeley-unix))
+                     '("xdg-open"))
+                    (t nil))))
+      (emacs-jupyter-notebook-panel--spawn-external-opener command file)))))
+
+(defvar emacs-jupyter-notebook-panel-external-open-function
+  #'emacs-jupyter-notebook-panel--external-open-default
+  "Function called with an image file path to open it externally.")
+
+(defun emacs-jupyter-notebook-panel-open-image-externally ()
+  "Open the original static image at point in an external application."
+  (interactive)
+  (unless (derived-mode-p 'emacs-jupyter-notebook-panel-mode)
+    (user-error "Not in an EJN output panel"))
+  (let* ((image (emacs-jupyter-notebook-panel--image-at-point))
+         (file (and image (plist-get (cdr image) :file))))
+    (unless image
+      (user-error "No image on this entry"))
+    (unless (and (stringp file) (file-readable-p file))
+      (user-error "Image original is unavailable"))
+    (funcall emacs-jupyter-notebook-panel-external-open-function file)))
 
 (defun emacs-jupyter-notebook-panel--entry-pickle-at-point ()
   "Return the matplotlib pickle stashed on the panel entry at point, or nil."

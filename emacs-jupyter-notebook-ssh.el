@@ -112,11 +112,12 @@ When REMOTE-COMMAND is non-nil, append it as the remote shell command."
   (append (list emacs-jupyter-notebook-ssh-command)
           (emacs-jupyter-notebook-ssh--option-args profile)
           (emacs-jupyter-notebook-ssh--control-args)
+          (emacs-jupyter-notebook-ssh--keepalive-args)
           (list (emacs-jupyter-notebook-ssh-destination profile))
           (when remote-command (list remote-command))))
 
 (defun emacs-jupyter-notebook-ssh--keepalive-args ()
-  "Return SSH keepalive option args based on the keepalive customization.
+  "Return ServerAlive option args based on the keepalive customization.
 When `emacs-jupyter-notebook-tunnel-keepalive-interval' is a
 positive integer, return `(\"-o\" \"ServerAliveInterval=N\" \"-o\"
 \"ServerAliveCountMax=3\")'.  Otherwise return nil."
@@ -164,6 +165,7 @@ without a `~' anchor) are returned unchanged."
   (append (list emacs-jupyter-notebook-scp-command)
           (emacs-jupyter-notebook-ssh--option-args profile t)
           (emacs-jupyter-notebook-ssh--control-args)
+          (emacs-jupyter-notebook-ssh--keepalive-args)
           (list (format "%s:%s"
                         (emacs-jupyter-notebook-ssh-destination profile)
                         (emacs-jupyter-notebook-ssh--scp-remote-path remote-file))
@@ -230,7 +232,7 @@ The return value is a plist containing :argv, :remote-command,
    profile
    (format "kill %s" (shell-quote-argument (format "%s" pid)))))
 
-(defun emacs-jupyter-notebook-ssh-build-pid-alive (profile pid)
+(defun emacs-jupyter-notebook-ssh-build-pid-alive (profile pid &optional connection-file)
   "Return an SSH argv list probing whether PID is alive on PROFILE's host.
 Uses `kill -0 <pid>' (sends no signal) but does NOT rely on the ssh exit
 status to convey the answer — that conflates \"PID is gone\" with \"ssh
@@ -239,11 +241,43 @@ an infra hiccup masquerade as a dead kernel.  Instead the remote shell
 always exits 0 and prints `__EJN_ALIVE__' only when the PID exists,
 followed by `__EJN_DONE__'.  The caller reads stdout: `__EJN_ALIVE__' →
 alive; `__EJN_DONE__' without it → confirmed dead; NEITHER → the host never
-answered, i.e. an ssh/infra failure, not a dead kernel (W13)."
-  (emacs-jupyter-notebook-ssh-command
-   profile
-   (format "if kill -0 %s 2>/dev/null; then echo __EJN_ALIVE__; fi; echo __EJN_DONE__"
-           (shell-quote-argument (format "%s" pid)))))
+answered, i.e. an ssh/infra failure, not a dead kernel (W13).
+
+When CONNECTION-FILE is non-nil, also verify that PID's command line has
+the exact `--KernelManager.connection_file=CONNECTION-FILE' argument.  The
+remote command emits one of `__EJN_ALIVE_MATCH__', `__EJN_DEAD__',
+`__EJN_ALIVE_MISMATCH__', or `__EJN_INSPECT_UNAVAILABLE__', then the same
+`__EJN_DONE__' terminator.  It prefers the NUL-delimited argv exposed by
+Linux /proc and falls back to `ps' only when the expected token contains no
+whitespace, since `ps' cannot otherwise preserve argument boundaries."
+  (let ((pid (shell-quote-argument (format "%s" pid))))
+    (emacs-jupyter-notebook-ssh-command
+     profile
+     (if (not connection-file)
+         (format
+          "if kill -0 %s 2>/dev/null; then echo __EJN_ALIVE__; fi; echo __EJN_DONE__"
+          pid)
+       (let ((remote-file
+              (emacs-jupyter-notebook-ssh--quote-remote-path connection-file)))
+         (format
+          (concat
+           "pid=%s; connection_file=%s; "
+           "expected=\"--KernelManager.connection_file=$connection_file\"; "
+           "if ! kill -0 \"$pid\" 2>/dev/null; then echo __EJN_DEAD__; "
+           "elif [ -r \"/proc/$pid/cmdline\" ] && "
+           "command -v tr >/dev/null 2>&1 && command -v grep >/dev/null 2>&1; then "
+           "if tr '\\000' '\\n' < \"/proc/$pid/cmdline\" | "
+           "grep -F -x -- \"$expected\" >/dev/null 2>&1; "
+           "then echo __EJN_ALIVE_MATCH__; else echo __EJN_ALIVE_MISMATCH__; fi; "
+           "elif command -v ps >/dev/null 2>&1; then "
+           "args=$(ps -p \"$pid\" -o args= 2>/dev/null) || args=; "
+           "if [ -z \"$args\" ]; then echo __EJN_INSPECT_UNAVAILABLE__; "
+           "else case \"$expected\" in *[[:space:]]*) "
+           "echo __EJN_INSPECT_UNAVAILABLE__;; "
+           "*) case \" $args \" in *\" $expected \"*) "
+           "echo __EJN_ALIVE_MATCH__;; *) echo __EJN_ALIVE_MISMATCH__;; esac;; esac; fi; "
+           "else echo __EJN_INSPECT_UNAVAILABLE__; fi; echo __EJN_DONE__")
+          pid remote-file))))))
 
 (defun emacs-jupyter-notebook-ssh-build-batch-pid-alive (profile pids &optional connect-timeout)
   "Return an SSH argv reporting which of PIDS are alive on PROFILE's host.

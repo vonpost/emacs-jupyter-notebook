@@ -123,14 +123,15 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
-- [~] owner=codex-root claimed=2026-08-28 CC1 `--async-retrieve-attempt' leaks the prior SCP process's stdout/stderr
-      buffers on every retry — it overwrites `:scp-process' without disposing
-      the old process first, so a failed retrieve with N attempts leaks 2·(N-1)
-      hidden ` *emacs-jupyter-notebook-scp-*' buffers.  Fix: call
-      `--async-delete-process' on the previous `:scp-process' at the top of
-      `--async-retrieve-attempt' before allocating the new one.  Discovered by
-      the W7.2 ERT (leak assertion against `ejn-test--ejn-process-buffers').
-      — touches: `emacs-jupyter-notebook.el` — for: W7.2
+- [x] sha=PENDING CC1 `--async-retrieve-attempt' leaked the prior SCP process's stdout/stderr
+      buffers on every retry — it overwrote `:scp-process' without disposing
+      the old process first, so a failed retrieve with N attempts leaked 2·(N-1)
+      hidden ` *emacs-jupyter-notebook-scp-*' buffers.  FIXED: the attempt now
+      disposes the previous `:scp-process' via `--async-delete-process' before
+      allocating the new one.  The W7.2 leak ERT (assertion against
+      `ejn-test--ejn-process-buffers') was flipped from `:expected-result
+      :failed' to passing.  — touches: `emacs-jupyter-notebook.el`,
+      `tests/emacs-jupyter-notebook-tests.el` — for: W7.2
 
 ---
 
@@ -972,24 +973,79 @@ subplot crops all siblings, killing Emacs reaps the viewer.
 
 ## W19 — Reconnect robustness after long outages
 
-- [~] owner=codex-root claimed=2026-08-28 W19 reconnect robustness.  Preserve
-      profile-specific SSH transport settings across durable reconnects; make
-      explicit reconnect an authoritative local reset that never kills the
-      remote kernel; bound every one-shot connection process and the overall
-      attempt; distinguish alive/dead/unreachable kernel identity; add
-      non-blocking backoff recovery after tunnel death; and correct status/log
-      guidance for reconnect, cancellation, and the idle watchdog.
+- [x] sha=PENDING W19 reconnect robustness.  MOTIVATION: reconnect worked only
+      when a drop was healed immediately; after a multi-hour outage it never
+      recovered and every retry reported "a connection attempt is already in
+      progress", leaving shutdown+fresh-start as the only escape.  Root causes
+      fixed:
+      (1) PROFILE LOSS — reconnect rebuilt a bare plist from the registry entry,
+      dropping the named profile's port/identity-file/jump-host once the live
+      ControlMaster that masked the omission expired.  `--entry-profile' now
+      resolves the named profile first and overlays only the durable session
+      fields.
+      (2) WEDGED ATTEMPTS — an interactive SSH prompt (BatchMode was off) or a
+      ride on a silently-dead ControlMaster could hang a probe/scp forever,
+      stranding the attempt "in progress".  `emacs-jupyter-notebook-ssh-batch-mode'
+      now defaults to t; one-shot ssh/scp carry ServerAlive keepalives; every
+      one-shot process is bounded by `emacs-jupyter-notebook-ssh-process-timeout'
+      and the whole attempt by `emacs-jupyter-notebook-connection-attempt-timeout'.
+      (3) NO SELF-HEALING — tunnel death (sentinel or heartbeat) now schedules a
+      TRANSPORT-ONLY automatic reconnect with exponential backoff
+      (`reconnect-initial-delay'→`reconnect-max-delay'); it rebuilds tunnel+client
+      against the durable entry and never starts or terminates a kernel.  A
+      confirmed-dead or confirmed-MISMATCHED kernel (identity-aware PID probe)
+      stops the loop; an unreachable host is transient and retries.
+      ALSO: explicit reconnect is an authoritative local reset that supersedes a
+      stale reconnect attempt without a second prompt and releases the stale
+      client via the new `jupyter-disconnect' adapter (local I/O only, never the
+      kernel); an interactive reconnect that finds the kernel gone offers a
+      one-step fresh start on the same profile; the status buffer surfaces the
+      in-flight attempt age and the auto-reconnect countdown.  Binding rules held:
+      no background path starts or terminates a kernel; the registry entry and
+      remote connection file are never touched on transport failure.
+      TESTS: +16 deterministic ERT (probe classifier, identity argv, match/
+      mismatch/unverified sentinels, entry-profile preservation, overall +
+      per-process timeouts, backoff, auto-reconnect schedule/terminal/transient,
+      silent supersede, fresh-start offer + Lisp-caller gate, disconnect-not-
+      shutdown).  467/467 green; byte-compile clean (only the two known evil
+      free-var warnings).
 
 ---
 
 ## W18 — Bounded, non-blocking panel images
 
-- [~] owner=codex-root claimed=2026-08-28 W18 panel image resource model.
-      Remove eager full-history image decoding and O(history) streaming
-      rerenders; retain image payloads outside the Lisp heap in disposable
-      local files; bound inline preview/cache residency; flush retired image
-      specs; and add a generic asynchronous external-image command while
-      preserving the matplotlib viewer path.
+- [x] sha=PENDING W18 panel image resource model.  MOTIVATION: with many
+      figures the panel crawled and Emacs's memory climbed without bound —
+      every image's decoded bytes lived forever in the append-only entry
+      history on the Lisp heap, every stream flush re-rendered the WHOLE
+      history (an O(images) erase+reinsert, each sliced insert forcing a
+      decode), and scrolling rendered every figure into the native image
+      cache.  Delivered:
+      (1) OFF-HEAP ORIGINALS — image payloads are moved out of the Lisp heap
+      into private 0600 disposable files owned by the panel (a per-panel temp
+      directory); stored specs reference the file and drop `:data'.  The
+      directory and cached specs are released when the panel is killed.
+      (2) BOUNDED PREVIEWS — only the newest
+      `emacs-jupyter-notebook-panel-max-inline-images' images in a view are
+      materialized inline; older figures render as one-line placeholders (no
+      display property, so no image-cache footprint) that still open
+      externally.  Demoted previews are `image-flush'ed.
+      (3) INCREMENTAL RENDERS — a stream flush that only appends text to an
+      existing entry re-renders just that entry instead of erasing and
+      reinserting the whole history.
+      (4) EXTERNAL OPENER — `o' on any image entry opens the stored original
+      through a platform/configurable asynchronous viewer
+      (`emacs-jupyter-notebook-external-image-viewer-command'), complementing
+      the matplotlib-pickle viewer `v'.
+      ALSO: `panel-slice-images' defaults to nil (slicing asks Emacs for every
+      rendered image height, expensive on a large history); when enabled it
+      applies only to the bounded inline set.  The matplotlib viewer path is
+      unchanged.
+      TESTS: +8 deterministic ERT (materialize-to-file 0600, panel-kill
+      cleanup, inline-preview cap + placeholders, external opener + no-image
+      error, incremental-render-avoids-full-rerender) and updated the
+      image-bearing W16/W2.5/W8 assertions to the file-backed spec.  467/467
+      green; byte-compile clean.
 
 ---
 

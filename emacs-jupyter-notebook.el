@@ -441,6 +441,15 @@ figure or the local viewer is unavailable."
 (defvar-local emacs-jupyter-notebook--tunnel-dead nil
   "Non-nil when the current buffer's SSH tunnel has disconnected.")
 
+(defvar-local emacs-jupyter-notebook--reconnect-timer nil
+  "Pending timer for automatic reconnect after transport failure.")
+
+(defvar-local emacs-jupyter-notebook--reconnect-attempt 0
+  "Number of consecutive automatic reconnect attempts for this buffer.")
+
+(defvar-local emacs-jupyter-notebook--reconnect-next-at nil
+  "Absolute time when the next automatic reconnect attempt will run.")
+
 (defvar-local emacs-jupyter-notebook--kernel-status nil
   "Current kernel status: `busy', `idle', or nil.")
 
@@ -634,7 +643,8 @@ crossing the misses-allowed threshold writes a `heartbeat-dead' line."
      (format
       "Heartbeat: %d consecutive kernel-info misses in `%s'; tunnel flagged dead."
       emacs-jupyter-notebook--heartbeat-misses (buffer-name)))
-    (emacs-jupyter-notebook--heartbeat-cancel)))
+    (emacs-jupyter-notebook--heartbeat-cancel)
+    (emacs-jupyter-notebook--schedule-auto-reconnect)))
 
 (defvar-local emacs-jupyter-notebook--async-last-error nil
   "Buffer-local flag: set when the last async operation finished with `error'.
@@ -647,7 +657,7 @@ Returns nil when no context exists or the context is at terminal phase
 \\='done or \\='error."
   (let* ((ctx emacs-jupyter-notebook--async-context)
          (phase (and ctx (plist-get ctx :phase))))
-    (and (memq phase '(launch retrieve tunnel connect)) phase)))
+    (and (memq phase '(launch probe retrieve tunnel connect)) phase)))
 
 (defun emacs-jupyter-notebook--mode-line-string ()
   "Return the mode-line lighter string for the W6.2 state machine.
@@ -664,6 +674,7 @@ Precedence (highest first):
      (emacs-jupyter-notebook--tunnel-dead " EJN!")
      (emacs-jupyter-notebook--async-last-error " EJN✗")
      ((eq phase 'launch)    " EJN…launch")
+     ((eq phase 'probe)     " EJN…probe")
      ((eq phase 'retrieve)  " EJN…retrieve")
      ((eq phase 'tunnel)    " EJN…tunnel")
      ((eq phase 'connect)   " EJN…connect")
@@ -694,6 +705,13 @@ Precedence (highest first):
           :tunnel-state (emacs-jupyter-notebook--tunnel-state)
           :async-phase (plist-get context :phase)
           :async-error (plist-get context :error)
+          :async-age (when-let* ((started (plist-get context :started-at)))
+                       (max 0 (- (float-time) started)))
+          :reconnect-attempt emacs-jupyter-notebook--reconnect-attempt
+          :reconnect-next-in
+          (when emacs-jupyter-notebook--reconnect-next-at
+            (max 0 (- emacs-jupyter-notebook--reconnect-next-at
+                      (float-time))))
           :profile (or (plist-get entry :profile)
                        (plist-get (plist-get context :entry) :profile))
           :session-id (or (plist-get entry :session-id)
@@ -716,6 +734,16 @@ Precedence (highest first):
     (format "Kernel status: %s" (or (plist-get snapshot :kernel-status) "unknown"))
     (format "Tunnel: %s" (plist-get snapshot :tunnel-state))
     (format "Async phase: %s" (or (plist-get snapshot :async-phase) "none"))
+    (format "Async age: %s"
+            (if-let* ((age (plist-get snapshot :async-age)))
+                (format "%.1fs" age)
+              "none"))
+    (format "Reconnect attempt: %s"
+            (or (plist-get snapshot :reconnect-attempt) 0))
+    (format "Next reconnect: %s"
+            (if-let* ((delay (plist-get snapshot :reconnect-next-in)))
+                (format "%.1fs" delay)
+              "none"))
     (format "Async error: %s" (or (plist-get snapshot :async-error) "none"))
     (format "Remote host: %s" (or (plist-get snapshot :remote-host) "unknown"))
     (format "Remote PID: %s" (or (plist-get snapshot :remote-pid) "unknown"))
@@ -735,7 +763,7 @@ Precedence (highest first):
                     "or reconnect with `M-x emacs-jupyter-notebook-reconnect-remote-kernel'.")
             suggestions))
     (when (memq (plist-get snapshot :tunnel-state) '(dead exited))
-      (push "Tunnel is not alive: retry with `M-x emacs-jupyter-notebook-retry-fresh-kernel'."
+      (push "Tunnel is not alive: reconnect with `M-x emacs-jupyter-notebook-reconnect-remote-kernel'."
             suggestions))
     (when-let* ((error (plist-get snapshot :async-error)))
       (push (format "Last async failure: %s" error) suggestions))
@@ -826,11 +854,22 @@ disposer does not prevent the remaining disposers from running."
   (when context
     (ignore-errors (emacs-jupyter-notebook--async-cancel-timer context))
     (ignore-errors
+      (emacs-jupyter-notebook--async-cancel-overall-timer context))
+    (ignore-errors
       (emacs-jupyter-notebook--async-delete-process
        (plist-get context :launch-process)))
     (ignore-errors
       (emacs-jupyter-notebook--async-delete-process
        (plist-get context :scp-process)))
+    (ignore-errors
+      (emacs-jupyter-notebook--async-delete-process
+       (plist-get context :probe-process)))
+    (ignore-errors
+      (emacs-jupyter-notebook--async-delete-process
+       (plist-get context :busy-probe-process)))
+    (ignore-errors
+      (emacs-jupyter-notebook--async-delete-process
+       (plist-get context :log-process)))
     (ignore-errors
       (emacs-jupyter-notebook--async-delete-process
        (plist-get context :tunnel-process)))
@@ -933,6 +972,11 @@ executes."
      emacs-jupyter-notebook--async-context))
   (ignore-errors (emacs-jupyter-notebook--clear-buffer-timers))
   (ignore-errors (emacs-jupyter-notebook--heartbeat-cancel))
+  (ignore-errors (emacs-jupyter-notebook--cancel-auto-reconnect))
+  (ignore-errors
+    (when emacs-jupyter-notebook--client
+      (emacs-jupyter-notebook-jupyter-disconnect
+       emacs-jupyter-notebook--client)))
   (ignore-errors
     (when (processp emacs-jupyter-notebook--tunnel-process)
       (emacs-jupyter-notebook--async-delete-process
@@ -940,6 +984,8 @@ executes."
   (setq emacs-jupyter-notebook--client nil
         emacs-jupyter-notebook--async-context nil
         emacs-jupyter-notebook--async-last-error nil
+        emacs-jupyter-notebook--reconnect-attempt 0
+        emacs-jupyter-notebook--reconnect-next-at nil
         emacs-jupyter-notebook--tunnel-process nil
         emacs-jupyter-notebook--tunnel-dead nil
         emacs-jupyter-notebook--kernel-status nil
@@ -1165,15 +1211,26 @@ spurious numbers in an SSH banner or MOTD cannot poison the parse."
     (string-to-number (match-string 1 output))))
 
 (defun emacs-jupyter-notebook--entry-profile (entry)
-  "Return a profile plist reconstructed from registry ENTRY."
-  (emacs-jupyter-notebook-ssh-profile
-   (list :profile (plist-get entry :profile)
-         :host (plist-get entry :remote-host)
-         :remote-cwd (plist-get entry :remote-cwd)
-          :remote-cache-dir (file-name-directory
-                             (plist-get entry :remote-connection-file))
-          :kernelspec (plist-get entry :kernelspec)
-          :jupyter-command (plist-get entry :jupyter-command))))
+  "Return the configured profile overlaid with durable fields from ENTRY.
+Reconnect used to construct a bare plist from ENTRY, which bypassed the
+named profile lookup in `emacs-jupyter-notebook-ssh-profile'.  Immediate
+reconnects could appear to work through a still-live ControlMaster, while a
+later reconnect silently lost the profile's port, identity file, ProxyJump,
+and other SSH options.  Resolve the current named profile first, then pin the
+session-specific host, paths, kernelspec, and Jupyter command recorded in the
+registry."
+  (let ((profile (emacs-jupyter-notebook-ssh-profile
+                  (plist-get entry :profile))))
+    (dolist (pair `((:host . ,(plist-get entry :remote-host))
+                    (:remote-cwd . ,(plist-get entry :remote-cwd))
+                    (:remote-cache-dir
+                     . ,(file-name-directory
+                         (plist-get entry :remote-connection-file)))
+                    (:kernelspec . ,(plist-get entry :kernelspec))
+                    (:jupyter-command . ,(plist-get entry :jupyter-command))))
+      (when (cdr pair)
+        (setq profile (plist-put profile (car pair) (cdr pair)))))
+    profile))
 
 (defun emacs-jupyter-notebook--current-file-registry-entry ()
   "Return the latest registry entry for the current buffer's file, or nil."
@@ -1433,7 +1490,8 @@ unchanged, so a flaky probe can never block reconnect."
         (with-current-buffer buffer
           (setq emacs-jupyter-notebook--tunnel-dead t)
           (setq emacs-jupyter-notebook--kernel-status nil)
-          (force-mode-line-update t)))
+          (force-mode-line-update t)
+          (emacs-jupyter-notebook--schedule-auto-reconnect)))
     (set-process-sentinel
      process
      (lambda (proc _event)
@@ -1442,13 +1500,96 @@ unchanged, so a flaky probe can never block reconnect."
            (with-current-buffer buffer
              (setq emacs-jupyter-notebook--tunnel-dead t)
              (setq emacs-jupyter-notebook--kernel-status nil)
-             (force-mode-line-update t))))))))
+             (force-mode-line-update t)
+             (emacs-jupyter-notebook--schedule-auto-reconnect))))))))
+
+(defun emacs-jupyter-notebook--cancel-auto-reconnect ()
+  "Cancel this buffer's pending automatic reconnect timer."
+  (when (timerp emacs-jupyter-notebook--reconnect-timer)
+    (cancel-timer emacs-jupyter-notebook--reconnect-timer))
+  (setq emacs-jupyter-notebook--reconnect-timer nil
+        emacs-jupyter-notebook--reconnect-next-at nil))
+
+(defun emacs-jupyter-notebook--auto-reconnect-delay ()
+  "Return the delay before this buffer's next automatic reconnect."
+  (let ((initial (max 0.1 emacs-jupyter-notebook-reconnect-initial-delay))
+        (maximum (max 0.1 emacs-jupyter-notebook-reconnect-max-delay)))
+    (min maximum
+         (* initial (expt 2 (min emacs-jupyter-notebook--reconnect-attempt
+                                 20))))))
+
+(defun emacs-jupyter-notebook--schedule-auto-reconnect (&optional immediate)
+  "Schedule bounded transport recovery for this buffer.
+When IMMEDIATE is non-nil, run as soon as Emacs can dispatch the timer.
+Retries continue with capped exponential backoff until the transport comes
+back or a probe confirms that the registered kernel is no longer the same
+live process.  This function never starts or terminates a remote kernel."
+  (when (and emacs-jupyter-notebook-auto-reconnect
+             emacs-jupyter-notebook-mode
+             emacs-jupyter-notebook--tunnel-dead
+             emacs-jupyter-notebook--session-entry
+             (not (timerp emacs-jupyter-notebook--reconnect-timer))
+             (not (emacs-jupyter-notebook--async-in-progress-p)))
+    (let* ((buffer (current-buffer))
+           (delay (if immediate 0 (emacs-jupyter-notebook--auto-reconnect-delay))))
+      (setq emacs-jupyter-notebook--reconnect-next-at (+ (float-time) delay)
+            emacs-jupyter-notebook--reconnect-timer
+            (run-at-time delay nil
+                         #'emacs-jupyter-notebook--auto-reconnect-fire
+                         buffer))
+      (emacs-jupyter-notebook--log-append
+       'auto-reconnect "attempt %d scheduled in %.1fs for `%s'"
+       (1+ emacs-jupyter-notebook--reconnect-attempt) delay (buffer-name))
+      (force-mode-line-update t))))
+
+(defun emacs-jupyter-notebook--auto-reconnect-fire (buffer)
+  "Run one automatic reconnect attempt for BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq emacs-jupyter-notebook--reconnect-timer nil
+            emacs-jupyter-notebook--reconnect-next-at nil)
+      (when (and emacs-jupyter-notebook-auto-reconnect
+                 emacs-jupyter-notebook-mode
+                 emacs-jupyter-notebook--tunnel-dead
+                 emacs-jupyter-notebook--session-entry
+                 (not (emacs-jupyter-notebook--async-in-progress-p)))
+        (cl-incf emacs-jupyter-notebook--reconnect-attempt)
+        (let ((entry emacs-jupyter-notebook--session-entry))
+          (condition-case err
+              (emacs-jupyter-notebook--begin-reconnect
+               entry
+               (lambda (_context)
+                 (when (buffer-live-p buffer)
+                   (with-current-buffer buffer
+                     (emacs-jupyter-notebook--log-append
+                      'auto-reconnect "transport restored for `%s'"
+                      (buffer-name)))))
+               (lambda (context error-data)
+                 (when (buffer-live-p buffer)
+                   (with-current-buffer buffer
+                     (let ((kind (plist-get context :error-kind)))
+                       (if (memq kind '(kernel-dead kernel-mismatch no-pid))
+                           (progn
+                             (emacs-jupyter-notebook--cancel-auto-reconnect)
+                             (emacs-jupyter-notebook--log-append
+                              'auto-reconnect
+                              "stopped after confirmed terminal probe: %s"
+                              error-data))
+                         (setq emacs-jupyter-notebook--tunnel-dead t)
+                         (emacs-jupyter-notebook--schedule-auto-reconnect)))))))
+            (error
+             (setq emacs-jupyter-notebook--tunnel-dead t)
+             (emacs-jupyter-notebook--log-append
+              'auto-reconnect "could not start attempt: %s"
+              (error-message-string err))
+             (emacs-jupyter-notebook--schedule-auto-reconnect))))))))
 
 ;;; Async machinery
 
 (defun emacs-jupyter-notebook--async-new-context (&rest properties)
   "Return a new async operation context initialized with PROPERTIES."
   (let ((context (list :phase nil
+                       :started-at (float-time)
                        :profile nil
                        :entry nil
                        :session-id nil
@@ -1456,6 +1597,9 @@ unchanged, so a flaky probe can never block reconnect."
                        :launch-process nil
                        :scp-process nil
                        :scp-attempt 0
+                       :probe-process nil
+                       :busy-probe-process nil
+                       :log-process nil
                        :tunnel-process nil
                        :local-ports nil
                        :remote-ports nil
@@ -1463,6 +1607,7 @@ unchanged, so a flaky probe can never block reconnect."
                        :remote-copy nil
                        :local-file nil
                        :timer nil
+                       :overall-timer nil
                        :deadline nil
                        :callback nil
                        :error-callback nil
@@ -1512,16 +1657,19 @@ W4.4 PID-probe sentinel already performs."
            (and (eq emacs-jupyter-notebook--async-context context)
                 (emacs-jupyter-notebook--async-in-progress-p))))))
 
-(defun emacs-jupyter-notebook--ensure-no-async-operation ()
+(defun emacs-jupyter-notebook--ensure-no-async-operation (&optional supersede-reconnect)
   "Ensure the current buffer holds no in-flight connection attempt.
 A single buffer owns a single connection — two attempts must never run
-in parallel.  When an attempt is already in progress, prompt to cancel
-it: on `y' abort it via `--cancel-async-operation' (which also kills any
-kernel a start attempt launched, so nothing is left running behind the
-new one) and return so the caller may proceed; on `n' signal a
-`user-error' and leave the running attempt untouched."
+in parallel.  When SUPERSEDE-RECONNECT is non-nil, an existing reconnect
+attempt is cancelled locally without prompting; this makes an explicit
+reconnect command the reliable escape hatch from a wedged background
+attempt.  A start attempt still requires confirmation because cancelling
+it may terminate the kernel that attempt launched."
   (when (emacs-jupyter-notebook--async-in-progress-p)
-    (if (y-or-n-p "A Jupyter connection attempt is already in progress; cancel it and start a new one? ")
+    (if (or (and supersede-reconnect
+                 (not (plist-get emacs-jupyter-notebook--async-context
+                                 :owns-kernel)))
+            (y-or-n-p "A Jupyter connection attempt is already in progress; cancel it and start a new one? "))
         (emacs-jupyter-notebook--cancel-async-operation
          emacs-jupyter-notebook--async-context
          "Superseded by a new connection attempt")
@@ -1627,6 +1775,68 @@ async-context phase (or `none' when the context is nil)."
       (cancel-timer timer)))
   (emacs-jupyter-notebook--async-put context :timer nil))
 
+(defun emacs-jupyter-notebook--async-cancel-overall-timer (context)
+  "Cancel CONTEXT's whole-attempt deadline timer, if present."
+  (when-let* ((timer (plist-get context :overall-timer)))
+    (when (timerp timer)
+      (cancel-timer timer)))
+  (emacs-jupyter-notebook--async-put context :overall-timer nil))
+
+(defun emacs-jupyter-notebook--async-arm-overall-timeout (context)
+  "Arm the whole-attempt deadline for CONTEXT and return CONTEXT."
+  (let ((timeout emacs-jupyter-notebook-connection-attempt-timeout))
+    (if (not (and (numberp timeout) (> timeout 0)))
+        context
+      (let ((timer
+             (run-at-time
+              timeout nil
+              (lambda ()
+                (when (emacs-jupyter-notebook--async-context-live-p context)
+                  (emacs-jupyter-notebook--async-fail
+                   (emacs-jupyter-notebook--async-put
+                    context :error-kind 'attempt-timeout)
+                   (format "Connection attempt timed out after %ss" timeout)))))))
+        (emacs-jupyter-notebook--async-put context :overall-timer timer)))))
+
+(defun emacs-jupyter-notebook--async-cancel-process-timeout (process)
+  "Cancel PROCESS's EJN watchdog timer, if present."
+  (when (processp process)
+    (when-let* ((timer (process-get process 'emacs-jupyter-notebook-timeout-timer)))
+      (when (timerp timer)
+        (cancel-timer timer)))
+    (process-put process 'emacs-jupyter-notebook-timeout-timer nil)))
+
+(defun emacs-jupyter-notebook--async-arm-process-timeout (context process role &optional timeout)
+  "Arm a bounded watchdog for PROCESS belonging to CONTEXT as ROLE.
+TIMEOUT, when a positive number, overrides the default
+`emacs-jupyter-notebook-ssh-process-timeout' — used for the launch process,
+whose remote side may legitimately spend a long time in environment
+initialization (Nix etc.) and is instead bounded by the overall attempt
+deadline."
+  (let ((timeout (or timeout emacs-jupyter-notebook-ssh-process-timeout)))
+    (when (and (processp process)
+               (process-live-p process)
+               (numberp timeout)
+               (> timeout 0))
+      (process-put
+       process 'emacs-jupyter-notebook-timeout-timer
+       (run-at-time
+        timeout nil
+        (lambda ()
+          (when (and (process-live-p process)
+                     (emacs-jupyter-notebook--async-context-live-p context))
+            (let ((detail (emacs-jupyter-notebook--process-output process)))
+              (emacs-jupyter-notebook--async-delete-process process)
+              (emacs-jupyter-notebook--async-fail
+               (emacs-jupyter-notebook--async-put
+                context :error-kind 'process-timeout)
+               (format "%s timed out after %ss%s"
+                       role timeout
+                       (if (string-empty-p detail)
+                           ""
+                         (format ": %s" detail)))))))))))
+  process)
+
 (defun emacs-jupyter-notebook--async-delete-process (process)
   "Delete PROCESS and the buffers it carries.
 Kills the process if it is still live, then disposes of both its stdout
@@ -1643,6 +1853,7 @@ buffer that has no session — wedging every later `send-cell' into a silent
 no-op.  It also belt-and-suspenders the W12/A2 scp/launch resurrection: a
 deleted attempt's sentinel simply never runs."
   (when (processp process)
+    (emacs-jupyter-notebook--async-cancel-process-timeout process)
     (when (process-live-p process)
       (set-process-sentinel process #'ignore)
       (delete-process process))
@@ -1718,12 +1929,17 @@ underlying stderr matches a known SSH failure pattern."
     (setq context (emacs-jupyter-notebook--async-put context :phase 'error))
     (setq context (emacs-jupyter-notebook--async-put context :error error-data))
     (setq context (emacs-jupyter-notebook--async-cancel-timer context))
+    (setq context
+          (emacs-jupyter-notebook--async-cancel-overall-timer context))
     (emacs-jupyter-notebook--async-delete-process (plist-get context :launch-process))
     (emacs-jupyter-notebook--async-delete-process (plist-get context :scp-process))
     (emacs-jupyter-notebook--async-delete-process (plist-get context :tunnel-process))
     ;; W4.8: dispose the W4.4 PID-probe process too so its stdout/stderr
     ;; buffers do not leak when the probe itself fails the context.
     (emacs-jupyter-notebook--async-delete-process (plist-get context :probe-process))
+    (emacs-jupyter-notebook--async-delete-process
+     (plist-get context :busy-probe-process))
+    (emacs-jupyter-notebook--async-delete-process (plist-get context :log-process))
     (emacs-jupyter-notebook--async-delete-file (plist-get context :remote-copy))
     ;; W6.2: record the error for the mode-line lighter.
     (when-let* ((buffer (plist-get context :origin-buffer)))
@@ -1767,16 +1983,34 @@ session, which cancel is not."
   "Asynchronously launch the remote kernel for CONTEXT."
   (let* ((launch (plist-get context :launch))
          (session-id (plist-get context :session-id))
-         (process
-          (emacs-jupyter-notebook-ssh-start-process
-           (format "emacs-jupyter-notebook-launch-%s" session-id)
-           (plist-get launch :argv)
-           (lambda (process _event)
-             (emacs-jupyter-notebook--async-launch-sentinel context process)))))
+         process)
     (setq context (emacs-jupyter-notebook--async-put context :phase 'launch))
-    (setq context (emacs-jupyter-notebook--async-put context :launch-process process))
-    (emacs-jupyter-notebook--async-message context "starting remote kernel %s" session-id)
-    context))
+    (condition-case err
+        (progn
+          (setq process
+                (emacs-jupyter-notebook-ssh-start-process
+                 (format "emacs-jupyter-notebook-launch-%s" session-id)
+                 (plist-get launch :argv)
+                 (lambda (process _event)
+                   (emacs-jupyter-notebook--async-launch-sentinel
+                    context process))))
+          (setq context
+                (emacs-jupyter-notebook--async-put
+                 context :launch-process process))
+          ;; The launch's remote side may legitimately spend a long time in
+          ;; environment initialization (Nix etc.), so bound it with the
+          ;; generous overall attempt deadline rather than the short
+          ;; per-process timeout used for one-shot probes/retrievals.
+          (emacs-jupyter-notebook--async-arm-process-timeout
+           context process "Remote kernel launch"
+           emacs-jupyter-notebook-connection-attempt-timeout)
+          (emacs-jupyter-notebook--async-message
+           context "starting remote kernel %s" session-id)
+          context)
+      (error
+       (emacs-jupyter-notebook--async-fail
+        context (format "Could not start remote kernel launch process: %s"
+                        (error-message-string err)))))))
 
 (defun emacs-jupyter-notebook--async-launch-sentinel (context process)
   "Advance CONTEXT after remote launch PROCESS exits.
@@ -1785,6 +2019,7 @@ failed, or superseded) so a stale launch process cannot re-enter the
 pipeline or double-invoke the error callback."
   (when (and (memq (process-status process) '(exit signal))
              (emacs-jupyter-notebook--async-context-live-p context))
+    (emacs-jupyter-notebook--async-cancel-process-timeout process)
     (if (emacs-jupyter-notebook--async-process-failed-p process)
         (emacs-jupyter-notebook--async-fail
          context (format "Remote kernel launch failed: %s"
@@ -1844,21 +2079,26 @@ no-op; if the log is unavailable the base timeout message is still raised."
                          " `:jupyter-command' / the remote PATH.)")))))))
     (if (not connection-file)
         (funcall finish nil)
-      (let ((process
-             (ignore-errors
-               (emacs-jupyter-notebook-ssh-start-process
-                (format "emacs-jupyter-notebook-launchlog-%s"
-                        (or (plist-get context :session-id) "kernel"))
-                (emacs-jupyter-notebook-ssh-build-remote-cat-log
-                 (plist-get context :profile) connection-file)
-                (lambda (proc _event)
-                  (when (memq (process-status proc) '(exit signal))
-                    (let ((out (emacs-jupyter-notebook--process-output proc)))
-                      (emacs-jupyter-notebook--async-delete-process proc)
-                      (funcall finish
-                               (emacs-jupyter-notebook--last-lines out 30)))))))))
-        (unless process
-          (funcall finish nil))))))
+      (condition-case nil
+          (let ((process
+                 (emacs-jupyter-notebook-ssh-start-process
+                  (format "emacs-jupyter-notebook-launchlog-%s"
+                          (or (plist-get context :session-id) "kernel"))
+                  (emacs-jupyter-notebook-ssh-build-remote-cat-log
+                   (plist-get context :profile) connection-file)
+                  (lambda (proc _event)
+                    (when (memq (process-status proc) '(exit signal))
+                      (emacs-jupyter-notebook--async-cancel-process-timeout proc)
+                      (let ((out (emacs-jupyter-notebook--process-output proc)))
+                        (emacs-jupyter-notebook--async-delete-process proc)
+                        (funcall finish
+                                 (emacs-jupyter-notebook--last-lines out 30))))))))
+            (setq context
+                  (emacs-jupyter-notebook--async-put
+                   context :log-process process))
+            (emacs-jupyter-notebook--async-arm-process-timeout
+             context process "Remote launch-log retrieval"))
+        (error (funcall finish nil))))))
 
 (defun emacs-jupyter-notebook--async-retrieve-attempt (context)
   "Start one asynchronous SCP attempt for CONTEXT."
@@ -1871,19 +2111,37 @@ no-op; if the log is unavailable the base timeout message is still raised."
                     (plist-get entry :remote-connection-file)
                     (plist-get context :remote-copy)))
              process)
+        ;; Dispose the completed prior attempt before replacing the context
+        ;; slot.  Otherwise every retry retains its stdout/stderr buffers.
+        (emacs-jupyter-notebook--async-delete-process
+         (plist-get context :scp-process))
+        (setq context
+              (emacs-jupyter-notebook--async-put context :scp-process nil))
         (emacs-jupyter-notebook--async-delete-file (plist-get context :remote-copy))
         (setq context (emacs-jupyter-notebook--async-put context :scp-attempt attempt))
-        (setq process
-              (emacs-jupyter-notebook-ssh-start-process
-               (format "emacs-jupyter-notebook-scp-%s"
-                       (plist-get context :session-id))
-               argv
-               (lambda (process _event)
-                 (emacs-jupyter-notebook--async-scp-sentinel context process))))
-        (setq context (emacs-jupyter-notebook--async-put context :scp-process process))
-        (emacs-jupyter-notebook--async-message
-         context "retrieving connection file, attempt %d" attempt)
-        context))))
+        (condition-case err
+            (progn
+              (setq process
+                    (emacs-jupyter-notebook-ssh-start-process
+                     (format "emacs-jupyter-notebook-scp-%s"
+                             (plist-get context :session-id))
+                     argv
+                     (lambda (process _event)
+                       (emacs-jupyter-notebook--async-scp-sentinel
+                        context process))))
+              (setq context
+                    (emacs-jupyter-notebook--async-put
+                     context :scp-process process))
+              (emacs-jupyter-notebook--async-arm-process-timeout
+               context process "Connection-file retrieval")
+              (emacs-jupyter-notebook--async-message
+               context "retrieving connection file, attempt %d" attempt)
+              context)
+          (error
+           (emacs-jupyter-notebook--async-fail
+            context
+            (format "Could not start connection-file retrieval: %s"
+                    (error-message-string err)))))))))
 
 (defun emacs-jupyter-notebook--async-retrieve-retry (context reason)
   "Schedule another connection-file retrieval for CONTEXT because of REASON.
@@ -1908,6 +2166,7 @@ and `--async-put' the dead context back into the buffer, resurrecting it and
 clobbering any newer attempt while re-issuing SCP against a killed kernel."
   (when (and (memq (process-status process) '(exit signal))
              (emacs-jupyter-notebook--async-context-live-p context))
+    (emacs-jupyter-notebook--async-cancel-process-timeout process)
     (cond
      ((emacs-jupyter-notebook--async-process-failed-p process)
       (emacs-jupyter-notebook--async-retrieve-retry
@@ -2008,6 +2267,8 @@ became-responsive notifier via `--connect-verified-late'."
                  (eq (plist-get context :phase) 'connect))
         (emacs-jupyter-notebook--async-cancel-timer
          emacs-jupyter-notebook--async-context)
+        (emacs-jupyter-notebook--async-cancel-overall-timer
+         emacs-jupyter-notebook--async-context)
         (if (not client)
             (progn
               (emacs-jupyter-notebook--async-fail
@@ -2016,6 +2277,11 @@ became-responsive notifier via `--connect-verified-late'."
               t)
           (setq emacs-jupyter-notebook--client client)
           (setq emacs-jupyter-notebook--tunnel-dead nil)
+          ;; W19: the transport is restored — reset the auto-reconnect backoff
+          ;; so the NEXT drop starts from the initial delay instead of
+          ;; inheriting this recovery's accumulated attempt count.
+          (setq emacs-jupyter-notebook--reconnect-attempt 0)
+          (setq emacs-jupyter-notebook--reconnect-next-at nil)
           (setq emacs-jupyter-notebook--kernel-status (if busy 'busy nil))
           (setq entry (plist-put entry :tunnel-ports local-ports))
           (setq entry (plist-put entry :local-connection-file local-file))
@@ -2102,44 +2368,69 @@ to reconnect to.  Arbitrate with a remote PID probe:
                "Timed out waiting for kernel_info_reply")
             (emacs-jupyter-notebook--async-message
              context "kernel-info silent; probing whether kernel %s is busy or dead" pid)
-            (ignore-errors
-              (emacs-jupyter-notebook-ssh-start-process
-               (format "emacs-jupyter-notebook-busy-probe-%s"
-                       (or (plist-get context :session-id) pid))
-               (emacs-jupyter-notebook-ssh-build-pid-alive
-                (plist-get context :profile) pid)
-               (lambda (process _event)
-                 (when (memq (process-status process) '(exit signal))
-                   (let* ((output (emacs-jupyter-notebook--process-output process))
-                          (answered (string-match-p "__EJN_DONE__" output))
-                          (alive (string-match-p "__EJN_ALIVE__" output)))
-                     (emacs-jupyter-notebook--async-delete-process process)
-                     (when (emacs-jupyter-notebook--async-context-live-p context)
-                       (with-current-buffer buffer
-                         (cond
-                          (alive
-                           ;; Alive but shell-silent: connected-busy (W15-B).
-                           (emacs-jupyter-notebook--async-connect-finalize
-                            context buffer
-                            (copy-sequence (plist-get context :entry))
-                            (plist-get context :local-ports)
-                            (plist-get context :local-file)
-                            client 'busy))
-                          (answered
-                           (emacs-jupyter-notebook--async-fail
-                            context
-                            (format
-                             (concat "Remote kernel %s is no longer alive. "
-                                     "Start a new one with "
-                                     "`M-x emacs-jupyter-notebook-start-remote-kernel'.")
-                             pid)))
-                          (t
-                           (emacs-jupyter-notebook--async-fail
-                            context
-                            (concat "Kernel did not answer and its host could "
-                                    "not be reached to check on it; the kernel "
-                                    "may still be alive — retry "
-                                    "`M-x emacs-jupyter-notebook-reconnect-remote-kernel'.")))))))))))))))))
+            (condition-case nil
+                (let ((process
+                       (emacs-jupyter-notebook-ssh-start-process
+                        (format "emacs-jupyter-notebook-busy-probe-%s"
+                                (or (plist-get context :session-id) pid))
+                        (emacs-jupyter-notebook-ssh-build-pid-alive
+                         (plist-get context :profile) pid
+                         (plist-get entry :remote-connection-file))
+                        (lambda (process _event)
+                          (when (memq (process-status process) '(exit signal))
+                            (let* ((output (emacs-jupyter-notebook--process-output process))
+                                   (kind (emacs-jupyter-notebook--classify-pid-probe output)))
+                              (emacs-jupyter-notebook--async-cancel-process-timeout process)
+                              (emacs-jupyter-notebook--async-delete-process process)
+                              (when (emacs-jupyter-notebook--async-context-live-p context)
+                                (with-current-buffer buffer
+                                  (emacs-jupyter-notebook--async-put
+                                   context :busy-probe-process nil)
+                                  (pcase kind
+                                    ((or 'alive 'unverified)
+                                     ;; Alive but shell-silent: connected-busy (W15-B).
+                                     (emacs-jupyter-notebook--async-connect-finalize
+                                      context buffer
+                                      (copy-sequence (plist-get context :entry))
+                                      (plist-get context :local-ports)
+                                      (plist-get context :local-file)
+                                      client 'busy))
+                                    ('mismatch
+                                     (emacs-jupyter-notebook--async-fail
+                                      (emacs-jupyter-notebook--async-put
+                                       context :error-kind 'kernel-mismatch)
+                                      (format
+                                       (concat "Remote PID %s is alive but belongs "
+                                               "to a different process (the registered "
+                                               "kernel is gone).  Start a new one with "
+                                               "`M-x emacs-jupyter-notebook-start-remote-kernel'.")
+                                       pid)))
+                                    ('dead
+                                     (emacs-jupyter-notebook--async-fail
+                                      (emacs-jupyter-notebook--async-put
+                                       context :error-kind 'kernel-dead)
+                                      (format
+                                       (concat "Remote kernel %s is no longer alive. "
+                                               "Start a new one with "
+                                               "`M-x emacs-jupyter-notebook-start-remote-kernel'.")
+                                       pid)))
+                                    (_
+                                     (emacs-jupyter-notebook--async-fail
+                                      context
+                                      (concat "Kernel did not answer and its host could "
+                                              "not be reached to check on it; the kernel "
+                                              "may still be alive — retry "
+                                              "`M-x emacs-jupyter-notebook-reconnect-remote-kernel'."))))))))))))
+                  (emacs-jupyter-notebook--async-put context :busy-probe-process process)
+                  (emacs-jupyter-notebook--async-arm-process-timeout
+                   context process "Busy-kernel probe"))
+              (error
+               (emacs-jupyter-notebook--async-fail
+                context
+                (concat "Kernel did not answer and its host could "
+                        "not be reached to check on it; the kernel "
+                        "may still be alive — retry "
+                        "`M-x emacs-jupyter-notebook-reconnect-remote-kernel'."))))))))))
 
 (defun emacs-jupyter-notebook--async-connect (context)
   "Connect emacs-jupyter to the ready tunnel described by CONTEXT."
@@ -2212,6 +2503,8 @@ CALLBACK and ERROR-CALLBACK are optional completion hooks."
                   :callback callback
                   :error-callback error-callback)))
     (setq emacs-jupyter-notebook--async-context context)
+    (setq context
+          (emacs-jupyter-notebook--async-arm-overall-timeout context))
     context))
 
 (defun emacs-jupyter-notebook--async-reconnect-context (profile entry
@@ -2228,34 +2521,85 @@ CALLBACK and ERROR-CALLBACK are optional completion hooks."
                   :callback callback
                   :error-callback error-callback)))
     (setq emacs-jupyter-notebook--async-context context)
+    (setq context
+          (emacs-jupyter-notebook--async-arm-overall-timeout context))
     context))
 
 (defun emacs-jupyter-notebook--tunnel-reconnect (buffer &optional callback error-callback)
   "Reconnect the tunnel for BUFFER asynchronously.
 CALLBACK is called on success, ERROR-CALLBACK on failure."
-  (when-let* ((entry emacs-jupyter-notebook--session-entry))
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when-let* ((entry emacs-jupyter-notebook--session-entry))
+        (emacs-jupyter-notebook--begin-reconnect
+         entry callback error-callback)))))
+
+(defun emacs-jupyter-notebook--begin-reconnect (entry callback error-callback)
+  "Replace local transport state and reconnect asynchronously to ENTRY.
+CALLBACK and ERROR-CALLBACK receive the async context.  Durable registry
+state and the remote kernel are left untouched."
+  (let ((attempt emacs-jupyter-notebook--reconnect-attempt))
+    ;; A stale emacs-jupyter client is only a local handle.  Keeping it is
+    ;; what made explicit reconnect reject the exact broken state it is
+    ;; intended to repair.
+    (emacs-jupyter-notebook--release-local-resources)
+    (setq emacs-jupyter-notebook--session-entry entry
+          emacs-jupyter-notebook--tunnel-dead t
+          emacs-jupyter-notebook--reconnect-attempt attempt)
+    (emacs-jupyter-notebook-jupyter--ensure)
     (let* ((profile (emacs-jupyter-notebook--entry-profile entry))
            (context (emacs-jupyter-notebook--async-reconnect-context
                      profile entry callback error-callback)))
-      (with-current-buffer buffer
-        (setq emacs-jupyter-notebook--async-context context))
       (emacs-jupyter-notebook--async-probe-pid-alive context))))
 
+(defun emacs-jupyter-notebook--classify-pid-probe (output)
+  "Classify a PID-probe stdout string OUTPUT into a liveness kind.
+Returns one of:
+- `alive'        — the PID is alive AND (when identity was checked) its
+                   command line carries this session's connection file.
+- `unverified'   — the PID is alive but its identity could not be confirmed
+                   (no readable /proc cmdline and no `ps').  Treated as alive
+                   for the reconnect decision; the kernel_info verification
+                   on connect is the real arbiter.
+- `mismatch'     — the PID is alive but belongs to a DIFFERENT process (PID
+                   reuse after a long outage).  The registered kernel is gone.
+- `dead'         — the host answered and the PID is not alive.
+- `unreachable'  — the host never produced the `__EJN_DONE__' sentinel, i.e.
+                   ssh/infra failed.  NOT a dead kernel.
+
+Pure function; the legacy two-token probe (`__EJN_ALIVE__'/`__EJN_DONE__')
+is still understood so an in-flight old-format answer classifies correctly."
+  (let ((answered (string-match-p "__EJN_DONE__" output)))
+    (cond
+     ((string-match-p "__EJN_ALIVE_MATCH__" output) 'alive)
+     ((string-match-p "__EJN_ALIVE_MISMATCH__" output) 'mismatch)
+     ((string-match-p "__EJN_INSPECT_UNAVAILABLE__" output) 'unverified)
+     ((string-match-p "__EJN_DEAD__" output) 'dead)
+     ;; Legacy / plain probes: an explicit alive token wins.
+     ((string-match-p "__EJN_ALIVE__" output) 'alive)
+     (answered 'dead)
+     (t 'unreachable))))
+
 (defun emacs-jupyter-notebook--async-probe-pid-alive (context)
-  "W4.4: probe the remote kernel PID for CONTEXT before reconnect.
-The registry entry MUST carry a `:remote-pid' (W4.2 sentinel).  When the
-PID is alive (`kill -0 <pid>' exits 0) the context advances to
-`--async-retrieve'; otherwise the context fails with a `kernel-dead'
-explanation pointing the user at `start-remote-kernel'.  The registry
-entry is NOT removed — the user may inspect it or clean it explicitly
-via `clean-orphaned-kernels' (per the binding rule that only the
+  "W4.4/W19: probe the remote kernel PID for CONTEXT before reconnect.
+The registry entry MUST carry a `:remote-pid' (W4.2 sentinel).  The probe
+is IDENTITY-AWARE: it passes the entry's `:remote-connection-file' so the
+remote side confirms the live PID is really THIS session's kernel (its
+command line carries the connection file), not a reused PID.  The context
+advances to `--async-retrieve' on a live match (or an unverified-but-alive
+PID); it fails with `kernel-dead' when the host answers and the PID is
+gone, with `kernel-mismatch' when the PID belongs to another process, and
+with `probe-unreachable' when the host cannot be reached at all.  The
+registry entry is NOT removed — the user may inspect it or clean it
+explicitly via `clean-orphaned-kernels' (per the binding rule that only the
 explicit user commands may remove durable state).
 
 W4.8: an entry without `:remote-pid' is a session from before W4.2
 landed; per the no-backwards-compat rule we surface a clear failure
 rather than silently bypass the probe.  The probe process itself is
 stored in the context and disposed in the sentinel via
-`--async-delete-process' so its stdout/stderr buffers do not leak."
+`--async-delete-process' so its stdout/stderr buffers do not leak, and is
+bounded by the per-process watchdog so it cannot hang the attempt."
   (let* ((entry (plist-get context :entry))
          (pid (and entry (plist-get entry :remote-pid)))
          (profile (plist-get context :profile))
@@ -2269,7 +2613,8 @@ stored in the context and disposed in the sentinel via
                "`M-x emacs-jupyter-notebook-start-remote-kernel'.")))
      (t
       (setq context (emacs-jupyter-notebook--async-put context :phase 'probe))
-      (let* ((argv (emacs-jupyter-notebook-ssh-build-pid-alive profile pid))
+      (let* ((argv (emacs-jupyter-notebook-ssh-build-pid-alive
+                    profile pid (plist-get entry :remote-connection-file)))
              (probe-name (format "emacs-jupyter-notebook-pid-probe-%s"
                                  (or (plist-get context :session-id) pid)))
              (sentinel
@@ -2278,50 +2623,69 @@ stored in the context and disposed in the sentinel via
                   ;; W13: read the probe's stdout, NOT its exit status, so an
                   ;; ssh/infra failure is never mistaken for a dead kernel.
                   (let* ((output (emacs-jupyter-notebook--process-output process))
-                         (answered (string-match-p "__EJN_DONE__" output))
-                         (alive (string-match-p "__EJN_ALIVE__" output)))
+                         (kind (emacs-jupyter-notebook--classify-pid-probe output)))
                     (when (buffer-live-p buffer)
                       (with-current-buffer buffer
                         (when (eq emacs-jupyter-notebook--async-context context)
                           (emacs-jupyter-notebook--async-put
                            context :probe-process nil)
                           (emacs-jupyter-notebook--async-delete-process process)
-                          (cond
-                           (alive
-                            (emacs-jupyter-notebook--async-retrieve context))
-                           (answered
-                            (emacs-jupyter-notebook--async-fail
-                             (emacs-jupyter-notebook--async-put
-                              context :error-kind 'kernel-dead)
-                             (format
-                              (concat
-                               "Remote kernel %s is no longer alive on %s. "
-                               "Start a new one with "
-                               "`M-x emacs-jupyter-notebook-start-remote-kernel'.")
-                              pid
-                              (or (plist-get entry :remote-host)
-                                  "the remote host"))))
-                           (t
-                            ;; The host never answered — ssh/infra failure, NOT
-                            ;; a dead kernel.  Do not deregister or advise a
-                            ;; fresh start; surface the reachability problem.
-                            (emacs-jupyter-notebook--async-fail
-                             (emacs-jupyter-notebook--async-put
-                              context :error-kind 'probe-unreachable)
-                             (format
-                              (concat
-                               "Could not reach %s to check kernel %s: %s "
-                               "The kernel may still be alive; retry "
-                               "`M-x emacs-jupyter-notebook-reconnect-remote-kernel'.")
-                              (or (plist-get entry :remote-host) "the remote host")
-                              pid
-                              (let ((trimmed (string-trim output)))
-                                (if (string-empty-p trimmed)
-                                    "SSH connection failed"
-                                  trimmed)))))))))))))
+                          (pcase kind
+                            ((or 'alive 'unverified)
+                             (when (eq kind 'unverified)
+                               (emacs-jupyter-notebook--async-message
+                                context
+                                (concat "kernel %s alive but identity could not "
+                                        "be confirmed; verifying on connect") pid))
+                             (emacs-jupyter-notebook--async-retrieve context))
+                            ('mismatch
+                             (emacs-jupyter-notebook--async-fail
+                              (emacs-jupyter-notebook--async-put
+                               context :error-kind 'kernel-mismatch)
+                              (format
+                               (concat
+                                "Remote PID %s on %s is alive but belongs to a "
+                                "different process (the registered kernel is "
+                                "gone).  Start a new one with "
+                                "`M-x emacs-jupyter-notebook-start-remote-kernel'.")
+                               pid
+                               (or (plist-get entry :remote-host)
+                                   "the remote host"))))
+                            ('dead
+                             (emacs-jupyter-notebook--async-fail
+                              (emacs-jupyter-notebook--async-put
+                               context :error-kind 'kernel-dead)
+                              (format
+                               (concat
+                                "Remote kernel %s is no longer alive on %s. "
+                                "Start a new one with "
+                                "`M-x emacs-jupyter-notebook-start-remote-kernel'.")
+                               pid
+                               (or (plist-get entry :remote-host)
+                                   "the remote host"))))
+                            (_
+                             ;; The host never answered — ssh/infra failure, NOT
+                             ;; a dead kernel.  Do not deregister or advise a
+                             ;; fresh start; surface the reachability problem.
+                             (emacs-jupyter-notebook--async-fail
+                              (emacs-jupyter-notebook--async-put
+                               context :error-kind 'probe-unreachable)
+                              (format
+                               (concat
+                                "Could not reach %s to check kernel %s: %s "
+                                "The kernel may still be alive; retry "
+                                "`M-x emacs-jupyter-notebook-reconnect-remote-kernel'.")
+                               (or (plist-get entry :remote-host) "the remote host")
+                               pid
+                               (let ((trimmed (string-trim output)))
+                                 (if (string-empty-p trimmed)
+                                     "SSH connection failed"
+                                   trimmed)))))))))))))
              (process (emacs-jupyter-notebook-ssh-start-process
                        probe-name argv sentinel)))
-        (emacs-jupyter-notebook--async-put context :probe-process process))))))
+        (emacs-jupyter-notebook--async-put context :probe-process process)
+        (emacs-jupyter-notebook--async-arm-process-timeout
+         context process "Kernel liveness probe"))))))
 
 ;; W4.7: the synchronous `--connect-entry' that drove the now-removed
 ;; `--retrieve-connection-file' and `--wait-for-tunnel' has been removed.
@@ -2897,12 +3261,24 @@ non-nil, do not send a Jupyter shutdown request to the current client."
   "Reconnect current buffer to an existing remote kernel ENTRY asynchronously.
   CALLBACK and ERROR-CALLBACK are optional completion hooks."
   (interactive (list (emacs-jupyter-notebook--read-registry-entry)))
-  (emacs-jupyter-notebook--ensure-no-async-operation)
-  (emacs-jupyter-notebook--ensure-clean-before-start)
-  (emacs-jupyter-notebook-jupyter--ensure)
-  (let ((profile (emacs-jupyter-notebook--entry-profile entry)))
-    (emacs-jupyter-notebook--async-probe-pid-alive
-     (emacs-jupyter-notebook--async-reconnect-context profile entry callback error-callback))))
+  (let ((interactivep (called-interactively-p 'interactive))
+        (profile-name (plist-get entry :profile)))
+    ;; Explicit reconnect supersedes a stale reconnect attempt without a
+    ;; second prompt.  It never supersedes a start attempt silently.
+    (emacs-jupyter-notebook--ensure-no-async-operation t)
+    (emacs-jupyter-notebook--begin-reconnect
+     entry callback
+     (lambda (context error-data)
+       (when error-callback
+         (funcall error-callback context error-data))
+       (when (and interactivep
+                  (memq (plist-get context :error-kind)
+                        '(kernel-dead kernel-mismatch))
+                  (y-or-n-p
+                   (concat
+                    "The registered kernel is gone (possibly after its idle "
+                    "timeout); start a fresh kernel on the same profile? ")))
+         (emacs-jupyter-notebook-retry-fresh-kernel profile-name))))))
 
 (defun emacs-jupyter-notebook--cold-start-p ()
   "Return non-nil when sending would trigger a cold remote-kernel start.

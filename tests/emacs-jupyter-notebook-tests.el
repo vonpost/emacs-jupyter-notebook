@@ -35,6 +35,23 @@
   (or (overlay-get ov 'after-string)
       (overlay-get ov 'before-string)))
 
+(defun ejn-test-image-spec-data (spec)
+  "Return the bytes represented by image SPEC from `:data' or `:file'."
+  (or (plist-get (cdr spec) :data)
+      (let ((file (plist-get (cdr spec) :file)))
+        (when (and file (file-readable-p file))
+          (with-temp-buffer
+            (set-buffer-multibyte nil)
+            (insert-file-contents-literally file)
+            (buffer-string))))))
+
+(defun ejn-test-image-file-backed-p (spec)
+  "Return non-nil when SPEC is backed by a readable private file."
+  (let ((file (plist-get (cdr spec) :file)))
+    (and (not (plist-member (cdr spec) :data))
+         (stringp file)
+         (file-readable-p file))))
+
 (ert-deftest ejn-cell-no-marker-is-whole-buffer ()
   (ejn-test-with-temp-buffer "x = 1\ny = 2\n"
     (should (equal (emacs-jupyter-notebook-cell-bounds)
@@ -456,9 +473,12 @@ via `--cancel-async-operation' and proceeds with the new start."
           (should-not (plist-get context :owns-kernel)))))))
 
 (ert-deftest ejn-reconnect-remote-kernel-declining-cancel-refuses-duplicate-operation ()
-  "W12: reconnecting while an attempt is in flight prompts to cancel it;
-declining (`n') refuses the reconnect with a `user-error' and never begins
-retrieval, so the buffer keeps its single in-progress attempt."
+  "W12/W19: reconnecting while a START attempt is in flight prompts to
+cancel it (a start attempt owns a launched kernel, so superseding it is not
+silent); declining (`n') refuses the reconnect with a `user-error' and never
+begins retrieval, so the buffer keeps its single in-progress attempt.  A
+stale RECONNECT attempt, by contrast, is superseded silently — see
+`ejn-w19-reconnect-supersedes-stale-reconnect-without-prompt'."
   (let ((entry '(:profile "p"
                  :remote-host "example.com"
                  :remote-cwd "~"
@@ -476,6 +496,7 @@ retrieval, so the buffer keeps its single in-progress attempt."
         (setq emacs-jupyter-notebook--async-context
               (emacs-jupyter-notebook--async-new-context
                :phase 'connect
+               :owns-kernel t
                :origin-buffer (current-buffer)))
         (should-error (emacs-jupyter-notebook-reconnect-remote-kernel entry)
                       :type 'user-error)
@@ -544,10 +565,12 @@ Pressing RET on the chooser with no edit returns the current-file entry."
   (let ((emacs-jupyter-notebook-ssh-command "ssh")
         (emacs-jupyter-notebook-ssh-options '("-o" "BatchMode=yes"))
         ;; Isolate the core argv shape from the A3/A4 global options, which
-        ;; have their own dedicated tests below.
+        ;; have their own dedicated tests below, and from the W19 keepalive
+        ;; args (tested separately).
         (emacs-jupyter-notebook-ssh-connect-timeout nil)
         (emacs-jupyter-notebook-ssh-batch-mode nil)
-        (emacs-jupyter-notebook-ssh-control-master nil))
+        (emacs-jupyter-notebook-ssh-control-master nil)
+        (emacs-jupyter-notebook-tunnel-keepalive-interval 0))
     (should (equal (emacs-jupyter-notebook-ssh-command
                     '(:profile "p" :host "example.com" :user "alice" :port 2222))
                    '("ssh" "-o" "BatchMode=yes" "-p" "2222" "alice@example.com")))))
@@ -617,10 +640,12 @@ protocol) treats a leading `~' as a literal directory name — so
 `host:~/.cache/...' fails even though the launch created the dir.  The
 home-relative form resolves against the login home on both the SFTP and
 legacy SCP protocols."
-  ;; Isolate the path-rewrite behavior from the A3/A4 global options.
+  ;; Isolate the path-rewrite behavior from the A3/A4 global options and the
+  ;; W19 keepalive args.
   (let ((emacs-jupyter-notebook-ssh-connect-timeout nil)
         (emacs-jupyter-notebook-ssh-batch-mode nil)
-        (emacs-jupyter-notebook-ssh-control-master nil))
+        (emacs-jupyter-notebook-ssh-control-master nil)
+        (emacs-jupyter-notebook-tunnel-keepalive-interval 0))
     (should (equal (emacs-jupyter-notebook-ssh-scp-from-command
                     '(:profile "p" :host "example.com")
                     "~/.cache/ejn/kernel.json" "/tmp/kernel.json")
@@ -632,13 +657,41 @@ legacy SCP protocols."
   "An absolute remote path is forwarded to scp verbatim — no rewriting."
   (let ((emacs-jupyter-notebook-ssh-connect-timeout nil)
         (emacs-jupyter-notebook-ssh-batch-mode nil)
-        (emacs-jupyter-notebook-ssh-control-master nil))
+        (emacs-jupyter-notebook-ssh-control-master nil)
+        (emacs-jupyter-notebook-tunnel-keepalive-interval 0))
     (should (equal (emacs-jupyter-notebook-ssh-scp-from-command
                     '(:profile "p" :host "example.com")
                     "/home/alice/.cache/ejn/kernel.json" "/tmp/kernel.json")
                    (list emacs-jupyter-notebook-scp-command
                          "example.com:/home/alice/.cache/ejn/kernel.json"
                          "/tmp/kernel.json")))))
+
+(ert-deftest ejn-w19-one-shot-commands-carry-keepalive ()
+  "W19: one-shot ssh/scp commands carry ServerAlive keepalives so a ride on
+a silently-dead ControlMaster (or a black-holed path) is bounded instead of
+hanging the attempt forever.  The keepalive interval customization controls
+them; 0 disables them."
+  (let ((emacs-jupyter-notebook-ssh-connect-timeout nil)
+        (emacs-jupyter-notebook-ssh-batch-mode nil)
+        (emacs-jupyter-notebook-ssh-control-master nil)
+        (emacs-jupyter-notebook-tunnel-keepalive-interval 15))
+    (let ((ssh-cmd (emacs-jupyter-notebook-ssh-command
+                    '(:profile "p" :host "example.com") "true"))
+          (scp-cmd (emacs-jupyter-notebook-ssh-scp-from-command
+                    '(:profile "p" :host "example.com")
+                    "~/.cache/ejn/kernel.json" "/tmp/kernel.json")))
+      (should (member "ServerAliveInterval=15" ssh-cmd))
+      (should (member "ServerAliveCountMax=3" ssh-cmd))
+      (should (member "ServerAliveInterval=15" scp-cmd))
+      (should (member "ServerAliveCountMax=3" scp-cmd))))
+  ;; Disabled: no keepalive args.
+  (let ((emacs-jupyter-notebook-ssh-connect-timeout nil)
+        (emacs-jupyter-notebook-ssh-batch-mode nil)
+        (emacs-jupyter-notebook-ssh-control-master nil)
+        (emacs-jupyter-notebook-tunnel-keepalive-interval 0))
+    (should-not (member "ServerAliveInterval=15"
+                        (emacs-jupyter-notebook-ssh-command
+                         '(:profile "p" :host "example.com") "true")))))
 
 (ert-deftest ejn-a3-scp-carries-multiplexing-when-enabled ()
   "A3: scp rides the shared master too (its many connection-file polls are
@@ -990,11 +1043,10 @@ CC1 and must always pass."
 (ert-deftest ejn-w7.2-async-retrieve-does-not-leak-scp-buffers ()
   "W7.2 (leak assertion, split from the retry-exhaustion test per W7.6):
 after retrieve exhausts its retries, no scp stdout/stderr buffers survive
-above the baseline.  Currently `:expected-result :failed' — CC1:
-`--async-retrieve-attempt' overwrites `:scp-process' on every retry
-without disposing the previous process, so (attempts-1)*2 hidden scp
-buffers leak.  Flip to `:passed' once CC1 lands."
-  :expected-result :failed
+above the baseline.  CC1 fixed this: `--async-retrieve-attempt' now
+disposes the previous attempt's scp process before overwriting the
+`:scp-process' slot, so retries no longer leak 2·(attempts-1) hidden scp
+buffers."
   (let ((run (ejn-w7.2--run-retrieve-exhaustion)))
     (let ((leaked (cl-set-difference (ejn-test--ejn-process-buffers)
                                      (plist-get run :baseline))))
@@ -1623,11 +1675,26 @@ deactivated the standard region before the interactive form runs."
     (should (string-match-p "reconnect-remote-kernel" text))))
 
 (ert-deftest ejn-status-suggestions-report-dead-tunnel-and-async-error ()
+  "W19: a dead tunnel suggests RECONNECT (the non-destructive recovery), not
+the destructive retry-fresh-kernel."
   (let ((text (emacs-jupyter-notebook--status-suggestions
                '(:client t :tunnel-state dead :async-error "boom"))))
     (should (string-match-p "Tunnel is not alive" text))
-    (should (string-match-p "retry-fresh-kernel" text))
+    (should (string-match-p "reconnect-remote-kernel" text))
+    (should-not (string-match-p "retry-fresh-kernel" text))
     (should (string-match-p "Last async failure: boom" text))))
+
+(ert-deftest ejn-w19-status-format-reports-reconnect-state ()
+  "W19: the status buffer surfaces the in-flight attempt's age and the
+auto-reconnect progress so a background recovery (or a wedged attempt) is
+visible and diagnosable."
+  (let ((text (emacs-jupyter-notebook--format-status
+               '(:buffer "b" :async-phase probe :async-age 12.5
+                 :reconnect-attempt 3 :reconnect-next-in 4.2))))
+    (should (string-match-p "Async phase: probe" text))
+    (should (string-match-p "Async age: 12.5s" text))
+    (should (string-match-p "Reconnect attempt: 3" text))
+    (should (string-match-p "Next reconnect: 4.2s" text))))
 
 (ert-deftest ejn-status-suggestions-report-healthy-state ()
   (let ((text (emacs-jupyter-notebook--status-suggestions
@@ -3135,8 +3202,9 @@ pre-W16 exclusive-output tests.)"
         ;; Everything retained, in order: text, image, text.
         (should (equal (mapcar #'car outputs) '(text image text)))
         (should (equal (ejn-panel-entry-text e) "before after"))
-        (should (equal (car (ejn-panel-entry-images e))
-                       '(image :type png :data "fake")))))))
+        (let ((image (car (ejn-panel-entry-images e))))
+          (should (ejn-test-image-file-backed-p image))
+          (should (equal (ejn-test-image-spec-data image) "fake")))))))
 
 (ert-deftest ejn-panel-multiple-images-each-get-a-segment ()
   "W16: two figures displayed in one execution both render (own segments)."
@@ -3145,9 +3213,11 @@ pre-W16 exclusive-output tests.)"
            (handle (ejn-panel-start-entry panel '("x.py" . 1) "")))
       (ejn-panel-set-image handle '(image :type png :data "one"))
       (ejn-panel-set-image handle '(image :type png :data "two"))
-      (should (equal (ejn-panel-entry-images handle)
-                     '((image :type png :data "one")
-                       (image :type png :data "two")))))))
+      (let ((images (ejn-panel-entry-images handle)))
+        (should (= (length images) 2))
+        (should (cl-every #'ejn-test-image-file-backed-p images))
+        (should (equal (mapcar #'ejn-test-image-spec-data images)
+                       '("one" "two")))))))
 
 (ert-deftest ejn-panel-clear-removes-image ()
   "W2.5: clearing an entry also removes its image."
@@ -3192,8 +3262,9 @@ pre-W16 exclusive-output tests.)"
                  (lambda (data &optional _type _data-p &rest _props)
                    (list 'image :type 'png :data data))))
         (funcall display-fn 'mock-msg))
-      (should (equal (car (ejn-panel-entry-images handle))
-                     '(image :type png :data "imgdata"))))))
+      (let ((image (car (ejn-panel-entry-images handle))))
+        (should (ejn-test-image-file-backed-p image))
+        (should (equal (ejn-test-image-spec-data image) "imgdata"))))))
 
 (ert-deftest ejn-callback-update-display-data-replaces-image ()
   "W2.7/W16: update_display_data with image MIME updates the entry's LAST
@@ -3216,8 +3287,10 @@ while surrounding text segments are left untouched."
         (funcall update-fn 'mock-msg))
       (let ((e (ejn-panel-entry-snapshot handle)))
         ;; Still exactly one image; its spec was swapped in place.
-        (should (equal (ejn-panel-entry-images e)
-                       '((image :type jpeg :data "newimg"))))
+        (let ((images (ejn-panel-entry-images e)))
+          (should (= (length images) 1))
+          (should (ejn-test-image-file-backed-p (car images)))
+          (should (equal (ejn-test-image-spec-data (car images)) "newimg")))
         ;; The text segment survives the display update.
         (should (equal (ejn-panel-entry-text e) "old text"))))))
 
@@ -3247,7 +3320,9 @@ while surrounding text segments are left untouched."
                  :remote-connection-file "~/.cache/ejn/kernel.json"
                  :session-id "session"))
         (retrieve-called nil))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-probe-pid-alive)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+               #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook--async-probe-pid-alive)
                (lambda (context)
                  (emacs-jupyter-notebook--async-retrieve context)))
               ((symbol-function 'emacs-jupyter-notebook--async-retrieve)
@@ -5184,8 +5259,9 @@ durable reconnect surface and must survive buffer kill."
                          "swapped"))
           (ejn-panel-set-image handle '(image :type png :data "fake"))
           (let ((e (ejn-panel-entry-snapshot handle)))
-            (should (equal (car (ejn-panel-entry-images e))
-                           '(image :type png :data "fake")))
+            (let ((image (car (ejn-panel-entry-images e))))
+              (should (ejn-test-image-file-backed-p image))
+              (should (equal (ejn-test-image-spec-data image) "fake")))
             ;; W16: the image is a new segment; the text coexists below it.
             (should (equal (ejn-panel-entry-text e) "swapped")))
           (ejn-panel-clear-entry handle)
@@ -5368,8 +5444,9 @@ batch timing, but it must be a tiny fraction of the event count."
           (with-current-buffer panel
             (emacs-jupyter-notebook-panel-toggle-view)
             (emacs-jupyter-notebook-panel-toggle-view))
-          (should (equal (car (ejn-panel-entry-images handle))
-                         '(image :type png :data "data"))))
+          (let ((image (car (ejn-panel-entry-images handle))))
+            (should (ejn-test-image-file-backed-p image))
+            (should (equal (ejn-test-image-spec-data image) "data"))))
       (ejn-test--kill-source-buffer buf))))
 
 ;; W2.6: navigation
@@ -7055,8 +7132,9 @@ key never disturbs the existing PNG path."
                  (lambda (data &optional _type _data-p &rest _props)
                    (list 'image :type 'png :data data))))
         (funcall display-fn 'mock-msg))
-      (should (equal (car (ejn-panel-entry-images handle))
-                     '(image :type png :data "imgdata"))))))
+      (let ((image (car (ejn-panel-entry-images handle))))
+        (should (ejn-test-image-file-backed-p image))
+        (should (equal (ejn-test-image-spec-data image) "imgdata"))))))
 
 ;;; W8.2 — MIME recognition + pickle stash
 
@@ -7151,19 +7229,35 @@ survives re-renders."
         (should-not (plist-member (cdr img) :max-height))))))
 
 (ert-deftest ejn-w17-image-insert-tags-segment-and-falls-back-headless ()
-  "W17: `--insert-image' tags the whole inserted region with the segment
+  "W17/W18: `--insert-image' tags the whole inserted region with the segment
 index (so zoom resolves the right output from any slice row), and on a
-non-graphic display falls back to a plain single display-property insert."
+non-graphic display falls back to a plain single display-property insert.
+W18: the materialized preview requires INLINE-P; without it a lightweight
+placeholder (no `display' property) carrying the same segment index is
+inserted instead."
   (with-temp-buffer
     (let ((emacs-jupyter-notebook-panel-slice-images t))
+      ;; Inline preview: real image inserted.
       (emacs-jupyter-notebook-panel--insert-image
-       '(image :type png :data "fake") 3)
+       '(image :type png :data "fake") 3 t)
       ;; Batch mode is non-graphic: single-property fallback.
       (should (equal (get-text-property (point-min) 'display)
                      '(image :type png :data "fake")))
       (should (= (get-text-property (point-min)
                                     'emacs-jupyter-notebook-segment-index)
-                 3)))))
+                 3)))
+    (goto-char (point-max))
+    (let ((emacs-jupyter-notebook-panel-slice-images t)
+          (placeholder-start (point)))
+      ;; Placeholder: no display property, but keeps the segment index.
+      (emacs-jupyter-notebook-panel--insert-image
+       '(image :type png :file "/tmp/x.png") 4 nil)
+      (should-not (get-text-property placeholder-start 'display))
+      (should (= (get-text-property placeholder-start
+                                    'emacs-jupyter-notebook-segment-index)
+                 4))
+      (should (string-match-p "png image"
+                              (buffer-substring placeholder-start (point)))))))
 
 (ert-deftest ejn-w14-panel-open-figure-finds-pickle-off-header ()
   "W14: `v' / open-figure finds the entry's pickle when point is on the
@@ -7205,7 +7299,9 @@ pickle on the entry."
                    (list 'image :type 'png :data data))))
         (funcall display-fn 'mock-msg))
       (let ((e (ejn-panel-entry-snapshot handle)))
-        (should (equal (car (ejn-panel-entry-images e)) '(image :type png :data "imgdata")))
+        (let ((image (car (ejn-panel-entry-images e))))
+          (should (ejn-test-image-file-backed-p image))
+          (should (equal (ejn-test-image-spec-data image) "imgdata")))
         (should (equal (plist-get e :mpl-pickle) pickle))))))
 
 (ert-deftest ejn-w8.2-display-data-png-only-stores-no-pickle ()
@@ -7224,7 +7320,9 @@ pickle on the entry."
                    (list 'image :type 'png :data data))))
         (funcall display-fn 'mock-msg))
       (let ((e (ejn-panel-entry-snapshot handle)))
-        (should (equal (car (ejn-panel-entry-images e)) '(image :type png :data "imgdata")))
+        (let ((image (car (ejn-panel-entry-images e))))
+          (should (ejn-test-image-file-backed-p image))
+          (should (equal (ejn-test-image-spec-data image) "imgdata")))
         (should (null (plist-get e :mpl-pickle)))))))
 
 (ert-deftest ejn-w8.7-display-without-pickle-clears-stale-pickle ()
@@ -7879,6 +7977,508 @@ alive/unknown ones; the dead ghost is removed from the registry too."
           ;; The dead ghost was pruned from the durable registry.
           (should (member live saved))
           (should-not (member dead saved)))))))
+
+;;; W19 — reconnect robustness
+
+(ert-deftest ejn-w19-classify-pid-probe ()
+  "W19: the pure probe-output classifier distinguishes a live match, a
+reused PID (mismatch), an unverifiable-but-alive PID, a confirmed death, and
+an unreachable host — and still understands the legacy two-token probe."
+  (should (eq (emacs-jupyter-notebook--classify-pid-probe
+               "__EJN_ALIVE_MATCH__\n__EJN_DONE__") 'alive))
+  (should (eq (emacs-jupyter-notebook--classify-pid-probe
+               "__EJN_ALIVE__\n__EJN_DONE__") 'alive))
+  (should (eq (emacs-jupyter-notebook--classify-pid-probe
+               "__EJN_ALIVE_MISMATCH__\n__EJN_DONE__") 'mismatch))
+  (should (eq (emacs-jupyter-notebook--classify-pid-probe
+               "__EJN_INSPECT_UNAVAILABLE__\n__EJN_DONE__") 'unverified))
+  (should (eq (emacs-jupyter-notebook--classify-pid-probe
+               "__EJN_DEAD__\n__EJN_DONE__") 'dead))
+  (should (eq (emacs-jupyter-notebook--classify-pid-probe "__EJN_DONE__") 'dead))
+  (should (eq (emacs-jupyter-notebook--classify-pid-probe
+               "ssh: connect failed") 'unreachable)))
+
+(ert-deftest ejn-w19-build-pid-alive-with-connection-file-checks-identity ()
+  "W19: with a connection file the probe verifies the live PID's command
+line carries this session's `--KernelManager.connection_file=' argument,
+emitting the identity tokens."
+  (let* ((argv (emacs-jupyter-notebook-ssh-build-pid-alive
+                '(:profile "p" :host "mother") 12345
+                "/home/u/.cache/ejn/kernel.json"))
+         (remote (car (last argv))))
+    (should (string-match-p "kill -0" remote))
+    (should (string-match-p "KernelManager.connection_file" remote))
+    (should (string-match-p "__EJN_ALIVE_MATCH__" remote))
+    (should (string-match-p "__EJN_ALIVE_MISMATCH__" remote))
+    (should (string-match-p "__EJN_DEAD__" remote))
+    (should (string-match-p "__EJN_DONE__" remote))))
+
+(ert-deftest ejn-w19-async-probe-match-proceeds-to-retrieve ()
+  "W19: an identity-confirmed live kernel proceeds to retrieval."
+  (let* ((retrieve-called nil)
+         (entry '(:profile "p" :session-id "s1" :remote-host "h"
+                  :remote-pid 12345 :remote-connection-file "/r/k.json"))
+         (context (emacs-jupyter-notebook--async-new-context
+                   :phase 'retrieve :profile '(:profile "p" :host "h")
+                   :entry entry :session-id "s1"
+                   :origin-buffer (current-buffer))))
+    (setq emacs-jupyter-notebook--async-context context)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-retrieve)
+               (lambda (_ctx) (setq retrieve-called t)))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
+               (ejn-test--probe-process-fn
+                "echo __EJN_ALIVE_MATCH__; echo __EJN_DONE__")))
+      (emacs-jupyter-notebook--async-probe-pid-alive context)
+      (let ((deadline (+ (float-time) 5)))
+        (while (and (not retrieve-called) (< (float-time) deadline))
+          (accept-process-output nil 0.01))))
+    (setq emacs-jupyter-notebook--async-context nil)
+    (should retrieve-called)))
+
+(ert-deftest ejn-w19-async-probe-mismatch-fails-kernel-mismatch ()
+  "W19: a live PID that belongs to a DIFFERENT process (PID reuse after a
+long outage) fails with `kernel-mismatch' — the registered kernel is gone,
+but we never claim it is merely dead-and-reachable."
+  (let* (fail-called fail-reason fail-ctx
+         (entry '(:profile "p" :session-id "s1" :remote-host "h"
+                  :remote-pid 12345 :remote-connection-file "/r/k.json"))
+         (context (emacs-jupyter-notebook--async-new-context
+                   :phase 'retrieve :profile '(:profile "p" :host "h")
+                   :entry entry :session-id "s1"
+                   :origin-buffer (current-buffer))))
+    (setq emacs-jupyter-notebook--async-context context)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-fail)
+               (lambda (ctx err)
+                 (setq fail-called t fail-reason err fail-ctx ctx)))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
+               (ejn-test--probe-process-fn
+                "echo __EJN_ALIVE_MISMATCH__; echo __EJN_DONE__")))
+      (emacs-jupyter-notebook--async-probe-pid-alive context)
+      (let ((deadline (+ (float-time) 5)))
+        (while (and (not fail-called) (< (float-time) deadline))
+          (accept-process-output nil 0.01))))
+    (setq emacs-jupyter-notebook--async-context nil)
+    (should fail-called)
+    (should (eq (plist-get fail-ctx :error-kind) 'kernel-mismatch))
+    (should (string-match-p "different process" fail-reason))))
+
+(ert-deftest ejn-w19-async-probe-unverified-still-proceeds ()
+  "W19: when the host confirms the PID is alive but identity cannot be
+checked (no readable /proc cmdline, no ps), we proceed to retrieve — the
+kernel_info verification on connect is the real arbiter.  We must NOT treat
+an unverified-alive PID as dead."
+  (let* ((retrieve-called nil)
+         (entry '(:profile "p" :session-id "s1" :remote-host "h"
+                  :remote-pid 12345 :remote-connection-file "/r/k.json"))
+         (context (emacs-jupyter-notebook--async-new-context
+                   :phase 'retrieve :profile '(:profile "p" :host "h")
+                   :entry entry :session-id "s1"
+                   :origin-buffer (current-buffer))))
+    (setq emacs-jupyter-notebook--async-context context)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-retrieve)
+               (lambda (_ctx) (setq retrieve-called t)))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
+               (ejn-test--probe-process-fn
+                "echo __EJN_INSPECT_UNAVAILABLE__; echo __EJN_DONE__")))
+      (emacs-jupyter-notebook--async-probe-pid-alive context)
+      (let ((deadline (+ (float-time) 5)))
+        (while (and (not retrieve-called) (< (float-time) deadline))
+          (accept-process-output nil 0.01))))
+    (setq emacs-jupyter-notebook--async-context nil)
+    (should retrieve-called)))
+
+(ert-deftest ejn-w19-entry-profile-preserves-named-profile-options ()
+  "W19 (root cause of the hours-later reconnect failure): reconnect must
+reconstruct the FULL named profile, not a bare plist from the registry entry
+— otherwise the profile's port, identity file, and jump host are silently
+lost once the ControlMaster that masked the omission expires.  The resolved
+profile carries the named profile's `:port' and `:identity-file' into argv."
+  (let ((emacs-jupyter-notebook-remote-profiles
+         '(("prod" :host "mother.lan" :user "alice" :port 2222
+            :identity-file "~/.ssh/prod_id")))
+        (entry '(:profile "prod" :remote-host "mother.lan" :remote-cwd "~"
+                 :remote-connection-file "~/.cache/ejn/kernel.json"
+                 :kernelspec "python3" :jupyter-command "jupyter")))
+    (let* ((profile (emacs-jupyter-notebook--entry-profile entry))
+           (argv (emacs-jupyter-notebook-ssh-build-pid-alive
+                  profile 123 (plist-get entry :remote-connection-file))))
+      (should (member "-p" argv))
+      (should (member "2222" argv))
+      (should (member "-i" argv))
+      (should (cl-some (lambda (a) (string-match-p "prod_id" a)) argv))
+      ;; The durable registry fields still overlay the profile.
+      (should (equal (plist-get profile :kernelspec) "python3")))))
+
+(ert-deftest ejn-w19-overall-attempt-timeout-fails-context ()
+  "W19: the whole-attempt deadline fails an in-flight attempt that overruns
+it, with the `attempt-timeout' kind — the backstop that guarantees no
+connection attempt can wedge a buffer forever."
+  (with-temp-buffer
+    (let* ((emacs-jupyter-notebook-connection-attempt-timeout 0.05)
+           fail-called fail-kind
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'retrieve :origin-buffer (current-buffer))))
+      (setq emacs-jupyter-notebook--async-context context)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-fail)
+                 (lambda (ctx _err)
+                   (setq fail-called t
+                         fail-kind (plist-get ctx :error-kind)))))
+        (emacs-jupyter-notebook--async-arm-overall-timeout context)
+        (let ((deadline (+ (float-time) 2)))
+          (while (and (not fail-called) (< (float-time) deadline))
+            (accept-process-output nil 0.01))))
+      (setq emacs-jupyter-notebook--async-context nil)
+      (should fail-called)
+      (should (eq fail-kind 'attempt-timeout)))))
+
+(ert-deftest ejn-w19-process-watchdog-kills-hung-process ()
+  "W19: a one-shot remote process that outlives the per-process deadline is
+killed and its attempt failed with `process-timeout' — bounding a probe or
+retrieval that rides a dead ControlMaster or otherwise ignores ConnectTimeout."
+  (with-temp-buffer
+    (let* ((emacs-jupyter-notebook-ssh-process-timeout 0.05)
+           fail-called fail-kind
+           (proc (emacs-jupyter-notebook-ssh-start-process
+                  "ejn-test-watchdog" '("sleep" "60")))
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'retrieve :origin-buffer (current-buffer))))
+      (setq emacs-jupyter-notebook--async-context context)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-fail)
+                 (lambda (ctx _err)
+                   (setq fail-called t
+                         fail-kind (plist-get ctx :error-kind)))))
+        (emacs-jupyter-notebook--async-arm-process-timeout
+         context proc "Test op")
+        (let ((deadline (+ (float-time) 2)))
+          (while (and (not fail-called) (< (float-time) deadline))
+            (accept-process-output nil 0.01))))
+      (setq emacs-jupyter-notebook--async-context nil)
+      (should fail-called)
+      (should (eq fail-kind 'process-timeout))
+      (should-not (process-live-p proc)))))
+
+(ert-deftest ejn-w19-auto-reconnect-delay-backoff ()
+  "W19: the automatic reconnect delay doubles per attempt (exponential
+backoff) and is capped at the configured maximum."
+  (let ((emacs-jupyter-notebook-reconnect-initial-delay 2)
+        (emacs-jupyter-notebook-reconnect-max-delay 300))
+    (with-temp-buffer
+      (setq emacs-jupyter-notebook--reconnect-attempt 0)
+      (should (= (emacs-jupyter-notebook--auto-reconnect-delay) 2))
+      (setq emacs-jupyter-notebook--reconnect-attempt 1)
+      (should (= (emacs-jupyter-notebook--auto-reconnect-delay) 4))
+      (setq emacs-jupyter-notebook--reconnect-attempt 3)
+      (should (= (emacs-jupyter-notebook--auto-reconnect-delay) 16))
+      (setq emacs-jupyter-notebook--reconnect-attempt 25)
+      (should (= (emacs-jupyter-notebook--auto-reconnect-delay) 300)))))
+
+(ert-deftest ejn-w19-auto-reconnect-schedules-on-tunnel-death ()
+  "W19: with a durable session entry and a dead tunnel, auto-reconnect
+schedules a background attempt; disabling the option or lacking a session
+entry schedules nothing."
+  (let ((entry '(:profile "p" :session-id "s" :remote-host "h"
+                 :remote-pid 1 :remote-connection-file "/r/k.json")))
+    (with-temp-buffer
+      (setq emacs-jupyter-notebook-mode t)
+      (setq emacs-jupyter-notebook--tunnel-dead t)
+      (setq emacs-jupyter-notebook--session-entry entry)
+      (emacs-jupyter-notebook--schedule-auto-reconnect)
+      (should (timerp emacs-jupyter-notebook--reconnect-timer))
+      (should emacs-jupyter-notebook--reconnect-next-at)
+      (emacs-jupyter-notebook--cancel-auto-reconnect)
+      (should-not emacs-jupyter-notebook--reconnect-timer)
+      ;; Disabled by customization: nothing scheduled.
+      (let ((emacs-jupyter-notebook-auto-reconnect nil))
+        (emacs-jupyter-notebook--schedule-auto-reconnect)
+        (should-not emacs-jupyter-notebook--reconnect-timer))
+      ;; No session entry: nothing scheduled.
+      (setq emacs-jupyter-notebook--session-entry nil)
+      (emacs-jupyter-notebook--schedule-auto-reconnect)
+      (should-not emacs-jupyter-notebook--reconnect-timer))))
+
+(ert-deftest ejn-w19-auto-reconnect-terminal-probe-stops-loop ()
+  "W19: a confirmed-terminal probe outcome (kernel-dead / kernel-mismatch /
+no-pid) STOPS the automatic loop — the background path never starts or
+terminates a kernel, it just leaves the durable entry for an explicit
+command."
+  (let ((entry '(:profile "p" :session-id "s" :remote-host "h"
+                 :remote-pid 1 :remote-connection-file "/r/k.json")))
+    (dolist (kind '(kernel-dead kernel-mismatch no-pid))
+      (with-temp-buffer
+        (setq emacs-jupyter-notebook-mode t)
+        (setq emacs-jupyter-notebook--tunnel-dead t)
+        (setq emacs-jupyter-notebook--session-entry entry)
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook--begin-reconnect)
+                   (lambda (_entry _cb error-cb)
+                     (funcall error-cb (list :error-kind kind) "terminal"))))
+          (emacs-jupyter-notebook--auto-reconnect-fire (current-buffer)))
+        (should-not (timerp emacs-jupyter-notebook--reconnect-timer))))))
+
+(ert-deftest ejn-w19-auto-reconnect-transient-failure-reschedules ()
+  "W19: a transient failure (host unreachable) reschedules another attempt
+with backoff instead of giving up; a success schedules nothing further."
+  (let ((entry '(:profile "p" :session-id "s" :remote-host "h"
+                 :remote-pid 1 :remote-connection-file "/r/k.json")))
+    (with-temp-buffer
+      (setq emacs-jupyter-notebook-mode t)
+      (setq emacs-jupyter-notebook--tunnel-dead t)
+      (setq emacs-jupyter-notebook--session-entry entry)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--begin-reconnect)
+                 (lambda (_entry _cb error-cb)
+                   (funcall error-cb '(:error-kind probe-unreachable) "blip"))))
+        (emacs-jupyter-notebook--auto-reconnect-fire (current-buffer)))
+      (should (timerp emacs-jupyter-notebook--reconnect-timer))
+      (should (= emacs-jupyter-notebook--reconnect-attempt 1))
+      (emacs-jupyter-notebook--cancel-auto-reconnect)
+      ;; Success path: no further attempt is scheduled.
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--begin-reconnect)
+                 (lambda (_entry cb _error-cb)
+                   (funcall cb '(:phase done)))))
+        (emacs-jupyter-notebook--auto-reconnect-fire (current-buffer)))
+      (should-not (timerp emacs-jupyter-notebook--reconnect-timer)))))
+
+(ert-deftest ejn-w19-reconnect-supersedes-stale-reconnect-without-prompt ()
+  "W19: an explicit reconnect is the reliable escape hatch from a wedged
+background attempt — it supersedes a stale RECONNECT attempt silently (no
+second prompt), because cancelling a reconnect never touches a kernel."
+  (let ((entry '(:profile "p" :remote-host "h" :remote-cwd "~"
+                 :kernelspec "python3" :remote-pid 1
+                 :remote-connection-file "/r/k.json" :session-id "s"))
+        prompted retrieved)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+               #'ignore)
+              ((symbol-function 'y-or-n-p)
+               (lambda (&rest _) (setq prompted t) nil))
+              ((symbol-function 'emacs-jupyter-notebook--async-probe-pid-alive)
+               (lambda (context)
+                 (emacs-jupyter-notebook--async-retrieve context)))
+              ((symbol-function 'emacs-jupyter-notebook--async-retrieve)
+               (lambda (context) (setq retrieved t) context)))
+      (with-temp-buffer
+        (setq emacs-jupyter-notebook--async-context
+              (emacs-jupyter-notebook--async-new-context
+               :phase 'connect :owns-kernel nil
+               :origin-buffer (current-buffer)))
+        (emacs-jupyter-notebook-reconnect-remote-kernel entry)
+        (should-not prompted)
+        (should retrieved)))))
+
+(ert-deftest ejn-w19-reconnect-kernel-dead-offers-fresh-start ()
+  "W19: when an interactive reconnect confirms the registered kernel is gone
+(kernel-dead / kernel-mismatch, e.g. after the idle watchdog reaped it), the
+user is offered a one-step fresh kernel on the same profile instead of being
+left to run shutdown + start by hand."
+  (let ((entry '(:profile "prod" :remote-host "h" :remote-cwd "~"
+                 :kernelspec "python3" :remote-pid 1
+                 :remote-connection-file "/r/k.json" :session-id "s"))
+        fresh-profile)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+               #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook--read-registry-entry)
+               (lambda () entry))
+              ((symbol-function 'emacs-jupyter-notebook--begin-reconnect)
+               (lambda (_entry _cb error-cb)
+                 (funcall error-cb '(:error-kind kernel-dead) "dead")))
+              ;; `called-interactively-p' with kind `interactive' is nil in
+              ;; batch by design; stub it to model a real user invocation.
+              ((symbol-function 'called-interactively-p) (lambda (&rest _) t))
+              ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+              ((symbol-function 'emacs-jupyter-notebook-retry-fresh-kernel)
+               (lambda (profile) (setq fresh-profile profile))))
+      (with-temp-buffer
+        (call-interactively #'emacs-jupyter-notebook-reconnect-remote-kernel)
+        (should (equal fresh-profile "prod"))))))
+
+(ert-deftest ejn-w19-reconnect-kernel-dead-no-prompt-for-lisp-callers ()
+  "W19: the fresh-start offer is gated on a genuine interactive invocation —
+a Lisp caller (e.g. the `--ensure-client-async' fallback) that reconnects and
+hits kernel-dead must NOT be answered with an interactive prompt; it just
+surfaces the error."
+  (let ((entry '(:profile "prod" :remote-host "h" :remote-cwd "~"
+                 :kernelspec "python3" :remote-pid 1
+                 :remote-connection-file "/r/k.json" :session-id "s"))
+        fresh-called err-seen)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+               #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook--begin-reconnect)
+               (lambda (_entry _cb error-cb)
+                 (funcall error-cb '(:error-kind kernel-dead) "dead")))
+              ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+              ((symbol-function 'emacs-jupyter-notebook-retry-fresh-kernel)
+               (lambda (_profile) (setq fresh-called t))))
+      (with-temp-buffer
+        ;; Non-interactive (Lisp) call: no prompt, error surfaced to the
+        ;; caller's error-callback.
+        (emacs-jupyter-notebook-reconnect-remote-kernel
+         entry nil (lambda (_ctx _err) (setq err-seen t)))
+        (should err-seen)
+        (should-not fresh-called)))))
+
+(ert-deftest ejn-w19-finalize-resets-reconnect-backoff ()
+  "W19: a successful connect resets the auto-reconnect backoff counter and
+clears the pending-reconnect timestamp, so the NEXT drop starts from the
+initial delay instead of inheriting this recovery's accumulated attempts."
+  (with-temp-buffer
+    (let* ((entry '(:profile "p" :session-id "s" :remote-host "h"))
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'connect :entry entry :session-id "s"
+                     :origin-buffer (current-buffer))))
+      (setq emacs-jupyter-notebook--async-context context)
+      (setq emacs-jupyter-notebook--reconnect-attempt 5)
+      (setq emacs-jupyter-notebook--reconnect-next-at 12345.0)
+      (setq emacs-jupyter-notebook--tunnel-dead t)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--heartbeat-start)
+                 #'ignore)
+                ((symbol-function 'emacs-jupyter-notebook--inject-viewer-formatter)
+                 #'ignore)
+                ((symbol-function 'emacs-jupyter-notebook--inject-idle-watchdog)
+                 #'ignore)
+                ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
+                 #'ignore))
+        (emacs-jupyter-notebook--async-connect-finalize
+         context (current-buffer) entry '(:shell_port 1)
+         "/tmp/local.json" 'mock-client))
+      (should (= emacs-jupyter-notebook--reconnect-attempt 0))
+      (should-not emacs-jupyter-notebook--reconnect-next-at)
+      (should-not emacs-jupyter-notebook--tunnel-dead)
+      (should (eq emacs-jupyter-notebook--client 'mock-client)))))
+
+(ert-deftest ejn-w19-release-local-resources-disconnects-client-not-kernel ()
+  "W19: tearing down local transport disconnects the stale emacs-jupyter
+client (a local handle) but NEVER shuts the remote kernel down — the kernel
+is durable and outlives the local client."
+  (with-temp-buffer
+    (let (disconnected shutdown)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-disconnect)
+                 (lambda (_client) (setq disconnected t)))
+                ((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
+                 (lambda (_client) (setq shutdown t))))
+        (setq emacs-jupyter-notebook--client 'stale-client)
+        (emacs-jupyter-notebook--release-local-resources)
+        (should disconnected)
+        (should-not shutdown)
+        (should-not emacs-jupyter-notebook--client)))))
+
+;;; W18 — bounded, non-blocking panel images
+
+(ert-deftest ejn-w18-panel-materialize-image-to-file ()
+  "W18: image payloads are moved out of the Lisp heap into a private 0600
+file owned by the panel; the stored spec references the file and drops the
+inline `:data'."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (h (ejn-panel-start-entry panel '("x.py" . 1) "plot")))
+      (ejn-panel-set-image h '(image :type png :data "imgdata"))
+      (let* ((image (car (ejn-panel-entry-images (ejn-panel-entry-snapshot h))))
+             (file (plist-get (cdr image) :file)))
+        (should-not (plist-member (cdr image) :data))
+        (should (stringp file))
+        (should (file-exists-p file))
+        (should (= (logand (file-modes file) #o777) #o600))
+        (should (equal (ejn-test-image-spec-data image) "imgdata"))))))
+
+(ert-deftest ejn-w18-panel-kill-cleans-image-directory ()
+  "W18: killing the panel releases its private image directory (disposable
+local files), so an image-heavy session leaves no debris behind."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (h (ejn-panel-start-entry panel '("x.py" . 1) "plot"))
+           dir)
+      (ejn-panel-set-image h '(image :type png :data "imgdata"))
+      (setq dir (with-current-buffer panel
+                  emacs-jupyter-notebook-panel--image-directory))
+      (should (file-directory-p dir))
+      (kill-buffer panel)
+      (should-not (file-directory-p dir)))))
+
+(ert-deftest ejn-w18-panel-inline-preview-cap-placeholder ()
+  "W18: only the newest `panel-max-inline-images' images are materialized as
+inline previews; older images render as lightweight placeholders (no display
+property) that still open externally.  This bounds the native image-cache
+memory regardless of history length."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (emacs-jupyter-notebook-panel-max-inline-images 2))
+      (dotimes (i 4)
+        (let ((h (ejn-panel-start-entry panel `("x.py" . ,i) "plot")))
+          (ejn-panel-set-image h `(image :type png :data ,(format "img%d" i)))
+          (ejn-panel-finish-entry h 'ok (1+ i))))
+      (with-current-buffer panel
+        (emacs-jupyter-notebook-panel-flush-now panel)
+        (should (= (length emacs-jupyter-notebook-panel--inline-image-specs) 2))
+        (let ((text (buffer-substring-no-properties (point-min) (point-max)))
+              (placeholders 0) (start 0))
+          (while (string-match "png image" text start)
+            (cl-incf placeholders)
+            (setq start (match-end 0)))
+          ;; The two OLDER images are placeholders.
+          (should (= placeholders 2)))))))
+
+(ert-deftest ejn-w18-panel-open-image-externally ()
+  "W18: `o' opens the stored original image through the configured external
+opener function with the backing file path."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (h (ejn-panel-start-entry panel '("x.py" . 1) "plot"))
+           opened-file)
+      (ejn-panel-set-image h '(image :type png :data "imgdata"))
+      (ejn-panel-finish-entry h 'ok 1)
+      (with-current-buffer panel
+        (emacs-jupyter-notebook-panel-flush-now panel)
+        (let ((img-pos (next-single-property-change (point-min) 'display)))
+          (should img-pos)
+          (goto-char img-pos)
+          (let ((emacs-jupyter-notebook-panel-external-open-function
+                 (lambda (file) (setq opened-file file))))
+            (emacs-jupyter-notebook-panel-open-image-externally))))
+      (should (stringp opened-file))
+      (should (file-exists-p opened-file))
+      (should (equal (with-temp-buffer
+                       (set-buffer-multibyte nil)
+                       (insert-file-contents-literally opened-file)
+                       (buffer-string))
+                     "imgdata")))))
+
+(ert-deftest ejn-w18-panel-open-image-externally-no-image-errors ()
+  "W18: `o' on an entry without an image signals a friendly user-error."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (h (ejn-panel-start-entry panel '("x.py" . 1) "print")))
+      (ejn-panel-append-text h "just text")
+      (ejn-panel-finish-entry h 'ok 1)
+      (with-current-buffer panel
+        (emacs-jupyter-notebook-panel-flush-now panel)
+        (goto-char (point-min))
+        (should-error (emacs-jupyter-notebook-panel-open-image-externally)
+                      :type 'user-error)))))
+
+(ert-deftest ejn-w18-incremental-render-avoids-full-rerender ()
+  "W18: appending streaming text to an existing entry re-renders only that
+entry (incremental path), NOT the whole history — so a long image-heavy
+session does not pay an O(history) erase+reinsert on every stream flush."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (h1 (ejn-panel-start-entry panel '("x.py" . 1) "cell1"))
+           (h2 (ejn-panel-start-entry panel '("x.py" . 2) "cell2"))
+           (full-render-calls 0))
+      (ejn-panel-append-text h1 "first")
+      (ejn-panel-append-text h2 "second")
+      (with-current-buffer panel
+        (emacs-jupyter-notebook-panel-flush-now panel))
+      (cl-letf* ((orig-render
+                  (symbol-function 'emacs-jupyter-notebook-panel--render))
+                 ((symbol-function 'emacs-jupyter-notebook-panel--render)
+                  (lambda (p) (cl-incf full-render-calls)
+                          (funcall orig-render p))))
+        (ejn-panel-append-text h2 " more")
+        (with-current-buffer panel
+          (emacs-jupyter-notebook-panel-flush-now panel)))
+      ;; The streaming append used the incremental path, not a full render.
+      (should (= full-render-calls 0))
+      (with-current-buffer panel
+        (should (string-match-p
+                 "second more"
+                 (buffer-substring-no-properties (point-min) (point-max))))))))
 
 (provide 'emacs-jupyter-notebook-tests)
 
