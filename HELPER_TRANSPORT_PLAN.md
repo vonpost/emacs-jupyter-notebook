@@ -503,7 +503,7 @@ modules.
   - Narrow run: ERT selector `^ejn-ir3s-` plus streaming/panel tests.
   - Non-goal: no helper protocol work.
 
-- [~] owner=terra-ir4 claimed=2026-08-30 **IR4 Remove synchronous management SSH from ordinary UI paths.**
+- [x] owner=terra-ir4 claimed=2026-08-30 landed=7c049d3 **IR4 Remove synchronous management SSH from ordinary UI paths.**
   - Depends: IR3S.
   - Files: `emacs-jupyter-notebook-ssh.el`, `emacs-jupyter-notebook.el`,
     `emacs-jupyter-notebook-vars.el`, `tests/emacs-jupyter-notebook-tests.el`.
@@ -519,7 +519,7 @@ modules.
   - Narrow run: ERT selector `^ejn-ir4-` plus W4, W11, and W19 selectors.
   - Non-goal: remote smoke tests are not required.
 
-- [ ] **IR5 Make automatic reconnect retry ownership and status truthful.**
+- [~] owner=terra-ir5 claimed=2026-08-31 **IR5 Make automatic reconnect retry ownership and status truthful.**
   - Depends: IR4.
   - Files: `emacs-jupyter-notebook.el`,
     `tests/emacs-jupyter-notebook-tests.el`.
@@ -641,7 +641,7 @@ modules.
   - Narrow run: `PYTHONPATH=helper python3 -m unittest discover -s helper/tests -p 'test_dispatcher.py'`.
   - Non-goal: no `jupyter_client` import in the fake test path.
 
-- [~] owner=terra-ht7 claimed=2026-08-31 **HT7 Attach `AsyncKernelClient` without owning kernel lifecycle.**
+- [x] owner=terra-ht7 claimed=2026-08-31 landed=e6bcbb1 **HT7 Attach `AsyncKernelClient` without owning kernel lifecycle.**
   - Depends: HT6, TH2.
   - Files: `helper/ejn_helper/jupyter_backend.py`,
     `helper/integration_tests/test_connect.py`.
@@ -656,7 +656,7 @@ modules.
     helper close to prove kernel survival.
   - Narrow run: local integration selector `test_connect.py` under 45 seconds.
 
-- [ ] **HT8 Correlate all Jupyter channels and execution terminal ordering.**
+- [~] owner=terra-ht8 claimed=2026-08-31 **HT8 Correlate all Jupyter channels and execution terminal ordering.**
   - Depends: HT7.
   - Files: `helper/ejn_helper/jupyter_backend.py`,
     `helper/ejn_helper/requests.py`,
@@ -771,7 +771,7 @@ modules.
     UTF-8/JSON; source objects are not mutated.
   - Narrow run: ERT selector `^ejn-et1-`.
 
-- [ ] **ET2 Supervise helper process and handshake without blocking Emacs.**
+- [~] owner=terra-et2 claimed=2026-08-31 **ET2 Supervise helper process and handshake without blocking Emacs.**
   - Depends: ET1, TH1.
   - Files: `emacs-jupyter-notebook-helper.el`,
     `emacs-jupyter-notebook-vars.el`,
