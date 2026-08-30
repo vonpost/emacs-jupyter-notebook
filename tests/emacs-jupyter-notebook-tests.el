@@ -1251,7 +1251,7 @@ error-callback so the user can decide."
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
                  (lambda () entry))
                 ((symbol-function 'emacs-jupyter-notebook-reconnect-remote-kernel)
-                 (lambda (_entry _cb error-cb)
+                 (lambda (_entry _cb error-cb &optional _owner)
                    (setq reconnect-error-cb error-cb)))
                 ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
                  (lambda (&rest _) (setq start-called t)))
@@ -1661,7 +1661,10 @@ deactivated the standard region before the interactive form runs."
         (should (plist-get snapshot :client))
         (should (eq (plist-get snapshot :kernel-status) 'idle))
         (should (eq (plist-get snapshot :tunnel-state) 'dead))
-        (should (eq (plist-get snapshot :async-phase) 'error))
+        ;; Terminal contexts retain their error for diagnosis but are not
+        ;; presented as a live phase or cancellable operation.
+        (should-not (plist-get snapshot :async-live))
+        (should-not (plist-get snapshot :async-phase))
         (should (equal (plist-get snapshot :async-error) "boom"))
         (should (equal (plist-get snapshot :profile) "p"))
         (should (equal (plist-get snapshot :session-id) "session"))
@@ -1669,39 +1672,41 @@ deactivated the standard region before the interactive form runs."
                                 (emacs-jupyter-notebook-status)))))))
 
 (ert-deftest ejn-status-suggestions-report-no-client ()
-  (let ((text (emacs-jupyter-notebook--status-suggestions
-               '(:client nil :tunnel-state none))))
-    (should (string-match-p "No client connected" text))
-    (should (string-match-p "start-remote-kernel" text))
-    (should (string-match-p "reconnect-remote-kernel" text))))
+  (let ((actions (emacs-jupyter-notebook--status-suggestions-for
+                  '(:client nil :tunnel-state none))))
+    (should (eq (cdr (assoc "Start a remote kernel" actions))
+                'emacs-jupyter-notebook-start-remote-kernel))
+    (should (eq (cdr (assoc "Reconnect to an existing remote kernel" actions))
+                'emacs-jupyter-notebook-reconnect-remote-kernel))))
 
 (ert-deftest ejn-status-suggestions-report-dead-tunnel-and-async-error ()
   "W19: a dead tunnel suggests RECONNECT (the non-destructive recovery), not
 the destructive retry-fresh-kernel."
-  (let ((text (emacs-jupyter-notebook--status-suggestions
-               '(:client t :tunnel-state dead :async-error "boom"))))
-    (should (string-match-p "Tunnel is not alive" text))
-    (should (string-match-p "reconnect-remote-kernel" text))
-    (should-not (string-match-p "retry-fresh-kernel" text))
-    (should (string-match-p "Last async failure: boom" text))))
+  (let ((actions (emacs-jupyter-notebook--status-suggestions-for
+                  '(:client t :tunnel-state dead :async-error "boom"))))
+    (should (eq (cdr (assoc "Reconnect to the remote kernel" actions))
+                'emacs-jupyter-notebook-reconnect-remote-kernel))
+    (should-not (rassq 'emacs-jupyter-notebook-retry-fresh-kernel actions))
+    (should-not (rassq 'emacs-jupyter-notebook-cancel-operation actions))))
 
 (ert-deftest ejn-w19-status-format-reports-reconnect-state ()
   "W19: the status buffer surfaces the in-flight attempt's age and the
 auto-reconnect progress so a background recovery (or a wedged attempt) is
 visible and diagnosable."
-  (let ((text (emacs-jupyter-notebook--format-status
+  (let ((text (emacs-jupyter-notebook--status-snapshot-text
                '(:buffer "b" :async-phase probe :async-age 12.5
-                 :reconnect-attempt 3 :reconnect-next-in 4.2))))
-    (should (string-match-p "Async phase: probe" text))
-    (should (string-match-p "Async age: 12.5s" text))
-    (should (string-match-p "Reconnect attempt: 3" text))
-    (should (string-match-p "Next reconnect: 4.2s" text))))
+                 :retry-count 3 :reconnect-next-in 4.2))))
+    (should (string-match-p "Live phase: probe" text))
+    (should (string-match-p "Attempt age: 12.5s" text))
+    (should (string-match-p "Retry count: 3" text))
+    (should (string-match-p "Next retry: 4.2s" text))))
 
 (ert-deftest ejn-status-suggestions-report-healthy-state ()
-  (let ((text (emacs-jupyter-notebook--status-suggestions
-               '(:client t :tunnel-state alive))))
-    (should (string-match-p "Engine looks healthy" text))
-    (should (string-match-p "C-c j c" text))))
+  (let ((actions (emacs-jupyter-notebook--status-suggestions-for
+                  '(:client t :tunnel-state alive))))
+    (should (equal actions
+                   '(("Send the current cell"
+                      . emacs-jupyter-notebook-send-cell))))))
 
 (ert-deftest ejn-cleanup-current-state-resets-buffer-state ()
   (let* ((dir (make-temp-file "ejn-cleanup-" t))
@@ -2062,6 +2067,7 @@ client) never kills the remote kernel — it is the durable reconnect surface."
            (emacs-jupyter-notebook--async-context nil)
            (entry '(:profile "p" :session-id "s" :local-file "/tmp/x.py"))
            (reconnect-captured nil)
+           (reconnect-owner nil)
            (eval-called nil)
            (emacs-jupyter-notebook-jupyter-evaluate-function
             (lambda (_client _code _entry-handle)
@@ -2069,13 +2075,16 @@ client) never kills the remote kernel — it is the durable reconnect surface."
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
                  (lambda () entry))
                  ((symbol-function 'emacs-jupyter-notebook-reconnect-remote-kernel)
-                  (lambda (captured-entry callback &optional _error-callback)
+                  (lambda (captured-entry callback
+                           &optional _error-callback owner)
                     (setq reconnect-captured (cons captured-entry callback))
+                    (setq reconnect-owner owner)
                     (setq emacs-jupyter-notebook--client 'mock-client)
                     (funcall callback nil))))
         (emacs-jupyter-notebook-send-cell)
         (should (equal (car reconnect-captured) entry))
         (should (functionp (cdr reconnect-captured)))
+        (should (eq reconnect-owner 'evaluation))
         (should eval-called)))))
 
 (ert-deftest ejn-evaluate-cell-no-client-no-entry-calls-start-default ()
@@ -3334,9 +3343,10 @@ while surrounding text segments are left untouched."
                  (setq retrieve-called t)
                  context))
               ((symbol-function 'emacs-jupyter-notebook--async-reconnect-context)
-               (lambda (profile entry &optional callback error-callback)
+               (lambda (profile entry &optional callback error-callback owner)
                  (should callback)
                  (should error-callback)
+                 (should (eq owner 'evaluation))
                  (list :profile profile :entry entry
                        :callback callback :error-callback error-callback))))
       (with-temp-buffer
@@ -8217,10 +8227,14 @@ command."
         (setq emacs-jupyter-notebook-mode t)
         (setq emacs-jupyter-notebook--tunnel-dead t)
         (setq emacs-jupyter-notebook--session-entry entry)
+        (setq emacs-jupyter-notebook--reconnect-schedule-token
+              (gensym "w19-terminal-"))
         (cl-letf (((symbol-function 'emacs-jupyter-notebook--begin-reconnect)
-                   (lambda (_entry _cb error-cb)
+                   (lambda (_entry _cb error-cb &optional _owner)
                      (funcall error-cb (list :error-kind kind) "terminal"))))
-          (emacs-jupyter-notebook--auto-reconnect-fire (current-buffer)))
+          (emacs-jupyter-notebook--auto-reconnect-fire
+           (current-buffer)
+           emacs-jupyter-notebook--reconnect-schedule-token))
         (should-not (timerp emacs-jupyter-notebook--reconnect-timer))))))
 
 (ert-deftest ejn-w19-auto-reconnect-transient-failure-reschedules ()
@@ -8232,18 +8246,32 @@ with backoff instead of giving up; a success schedules nothing further."
       (setq emacs-jupyter-notebook-mode t)
       (setq emacs-jupyter-notebook--tunnel-dead t)
       (setq emacs-jupyter-notebook--session-entry entry)
+      (setq emacs-jupyter-notebook--reconnect-schedule-token
+            (gensym "w19-transient-"))
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--begin-reconnect)
-                 (lambda (_entry _cb error-cb)
-                   (funcall error-cb '(:error-kind probe-unreachable) "blip"))))
-        (emacs-jupyter-notebook--auto-reconnect-fire (current-buffer)))
+                 (lambda (_entry _cb error-cb &optional _owner)
+                   (let ((context
+                          (emacs-jupyter-notebook--async-new-context
+                           :phase 'error :error-kind 'probe-unreachable
+                           :origin-buffer (current-buffer))))
+                     (setq emacs-jupyter-notebook--async-context context)
+                     (emacs-jupyter-notebook--handle-reconnect-failure
+                      context "blip" error-cb)))))
+        (emacs-jupyter-notebook--auto-reconnect-fire
+         (current-buffer)
+         emacs-jupyter-notebook--reconnect-schedule-token))
       (should (timerp emacs-jupyter-notebook--reconnect-timer))
       (should (= emacs-jupyter-notebook--reconnect-attempt 1))
       (emacs-jupyter-notebook--cancel-auto-reconnect)
       ;; Success path: no further attempt is scheduled.
+      (setq emacs-jupyter-notebook--reconnect-schedule-token
+            (gensym "w19-success-"))
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--begin-reconnect)
-                 (lambda (_entry cb _error-cb)
+                 (lambda (_entry cb _error-cb &optional _owner)
                    (funcall cb '(:phase done)))))
-        (emacs-jupyter-notebook--auto-reconnect-fire (current-buffer)))
+        (emacs-jupyter-notebook--auto-reconnect-fire
+         (current-buffer)
+         emacs-jupyter-notebook--reconnect-schedule-token))
       (should-not (timerp emacs-jupyter-notebook--reconnect-timer)))))
 
 (ert-deftest ejn-w19-reconnect-supersedes-stale-reconnect-without-prompt ()
@@ -8286,7 +8314,7 @@ left to run shutdown + start by hand."
               ((symbol-function 'emacs-jupyter-notebook--read-registry-entry-async)
                (lambda (callback) (funcall callback entry)))
               ((symbol-function 'emacs-jupyter-notebook--begin-reconnect)
-               (lambda (_entry _cb error-cb)
+               (lambda (_entry _cb error-cb &optional _owner)
                  (funcall error-cb '(:error-kind kernel-dead) "dead")))
               ;; `called-interactively-p' with kind `interactive' is nil in
               ;; batch by design; stub it to model a real user invocation.
@@ -8310,7 +8338,7 @@ surfaces the error."
     (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
                #'ignore)
               ((symbol-function 'emacs-jupyter-notebook--begin-reconnect)
-               (lambda (_entry _cb error-cb)
+               (lambda (_entry _cb error-cb &optional _owner)
                  (funcall error-cb '(:error-kind kernel-dead) "dead")))
               ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
               ((symbol-function 'emacs-jupyter-notebook-retry-fresh-kernel)
@@ -9689,6 +9717,307 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
     (should (memq 'emacs-jupyter-notebook-ssh-start-management-operation seen))
     (should (memq 'emacs-jupyter-notebook-ssh-start-process seen))
     (should-not (memq 'emacs-jupyter-notebook--read-registry-entry seen))))
+
+;;; IR5 — truthful reconnect ownership and retry status
+
+(defun ejn-ir5--begin-without-io (entry owner &optional error-callback)
+  "Begin reconnect to ENTRY as OWNER without Jupyter, SSH, or timers."
+  (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+             #'ignore)
+            ((symbol-function
+              'emacs-jupyter-notebook--async-arm-overall-timeout)
+             #'identity)
+            ((symbol-function 'emacs-jupyter-notebook--async-probe-pid-alive)
+             #'identity))
+    (emacs-jupyter-notebook--begin-reconnect
+     entry nil error-callback owner)))
+
+(ert-deftest ejn-ir5-transient-transition-table-rearms-exactly-once ()
+  "Scheduled-explicit and evaluation reconnect failures each own one retry."
+  (let ((entry '(:profile "p" :session-id "s" :remote-host "h"
+                 :remote-pid 17 :remote-connection-file "/r/kernel.json"))
+        (emacs-jupyter-notebook-reconnect-initial-delay 600))
+    (dolist (case '((scheduled-explicit explicit t)
+                    (evaluation evaluation nil)))
+      (with-temp-buffer
+        (let ((expected-owner (nth 1 case))
+              (start-scheduled (nth 2 case))
+              old-token context retry-timer (error-count 0))
+          (unwind-protect
+              (progn
+                (setq emacs-jupyter-notebook-mode t
+                      emacs-jupyter-notebook--tunnel-dead t
+                      emacs-jupyter-notebook--session-entry entry)
+                (when start-scheduled
+                  (emacs-jupyter-notebook--schedule-auto-reconnect)
+                  (setq old-token
+                        emacs-jupyter-notebook--reconnect-schedule-token))
+                (setq context
+                      (if start-scheduled
+                          (ejn-ir5--begin-without-io
+                           entry 'explicit
+                           (lambda (_context _error)
+                             (cl-incf error-count)))
+                        (cl-letf
+                            (((symbol-function
+                               'emacs-jupyter-notebook-jupyter--ensure)
+                              #'ignore)
+                             ((symbol-function
+                               'emacs-jupyter-notebook--async-arm-overall-timeout)
+                              #'identity)
+                             ((symbol-function
+                               'emacs-jupyter-notebook--async-probe-pid-alive)
+                              #'identity))
+                          (emacs-jupyter-notebook--tunnel-reconnect
+                           (current-buffer) nil
+                           (lambda (_context _error)
+                             (cl-incf error-count))))))
+                (should (eq (plist-get context :reconnect-owner)
+                            expected-owner))
+                (when old-token
+                  (should-not
+                   (eq old-token
+                       emacs-jupyter-notebook--reconnect-schedule-token)))
+                (plist-put context :error-kind 'probe-unreachable)
+                (emacs-jupyter-notebook--async-fail context "offline")
+                (setq retry-timer
+                      emacs-jupyter-notebook--reconnect-timer)
+                (should (timerp retry-timer))
+                (should emacs-jupyter-notebook--reconnect-schedule-token)
+                (should (= error-count 1))
+                ;; Duplicate completion/error delivery cannot create a second
+                ;; timer or notify the caller twice.
+                (funcall (plist-get context :error-callback)
+                         context "duplicate")
+                (should (eq retry-timer
+                            emacs-jupyter-notebook--reconnect-timer))
+                (should (= error-count 1)))
+            (emacs-jupyter-notebook--cancel-auto-reconnect)))))))
+
+(ert-deftest ejn-ir5-failure-classification-transition-table ()
+  "Confirmed-dead outcomes stop; unreachable and timeout outcomes retry."
+  (let ((entry '(:profile "p" :session-id "s" :remote-host "h"
+                 :remote-pid 17 :remote-connection-file "/r/kernel.json"))
+        (emacs-jupyter-notebook-reconnect-initial-delay 600))
+    (dolist (case '((kernel-dead nil)
+                    (kernel-mismatch nil)
+                    (no-pid nil)
+                    (probe-unreachable t)
+                    (attempt-timeout t)
+                    (process-timeout t)))
+      (with-temp-buffer
+        (unwind-protect
+            (let* ((kind (car case))
+                   (retry-p (cadr case))
+                   (context
+                    (emacs-jupyter-notebook--async-new-context
+                     :phase 'error :error-kind kind
+                     :origin-buffer (current-buffer)
+                     :reconnect-owner 'explicit)))
+              (setq emacs-jupyter-notebook-mode t
+                    emacs-jupyter-notebook--tunnel-dead t
+                    emacs-jupyter-notebook--session-entry entry
+                    emacs-jupyter-notebook--async-context context)
+              (emacs-jupyter-notebook--handle-reconnect-failure
+               context "failed" nil)
+              (should (eq (and (timerp
+                                emacs-jupyter-notebook--reconnect-timer)
+                               t)
+                          retry-p))
+              (when retry-p
+                (let ((timer emacs-jupyter-notebook--reconnect-timer))
+                  (emacs-jupyter-notebook--handle-reconnect-failure
+                   context "duplicate" nil)
+                  (should (eq timer
+                              emacs-jupyter-notebook--reconnect-timer)))))
+          (emacs-jupyter-notebook--cancel-auto-reconnect))))))
+
+(ert-deftest ejn-ir5-synchronous-probe-start-failure-enters-retry-policy ()
+  "A synchronous process-construction error is a bounded transient failure."
+  (let ((entry '(:profile "p" :session-id "s" :remote-host "h"
+                 :remote-pid 17 :remote-connection-file "/r/kernel.json"))
+        (emacs-jupyter-notebook-reconnect-initial-delay 600)
+        (error-count 0))
+    (with-temp-buffer
+      (unwind-protect
+          (progn
+            (setq emacs-jupyter-notebook-mode t
+                  emacs-jupyter-notebook--tunnel-dead t
+                  emacs-jupyter-notebook--session-entry entry)
+            (cl-letf (((symbol-function
+                        'emacs-jupyter-notebook-jupyter--ensure)
+                       #'ignore)
+                      ((symbol-function
+                        'emacs-jupyter-notebook--async-arm-overall-timeout)
+                       #'identity)
+                      ((symbol-function
+                        'emacs-jupyter-notebook--async-probe-pid-alive)
+                       (lambda (_context) (error "make-process failed"))))
+              (emacs-jupyter-notebook--begin-reconnect
+               entry nil
+               (lambda (_context _error) (cl-incf error-count))
+               'evaluation))
+            (should (= error-count 1))
+            (should (eq (plist-get emacs-jupyter-notebook--async-context
+                                   :error-kind)
+                        'probe-start-failed))
+            (should (eq (plist-get emacs-jupyter-notebook--async-context
+                                   :phase)
+                        'error))
+            (should (timerp emacs-jupyter-notebook--reconnect-timer)))
+        (emacs-jupyter-notebook--cancel-auto-reconnect)))))
+
+(ert-deftest ejn-ir5-cancel-live-reconnect-is-terminal-and-local ()
+  "Cancel marks the live reconnect terminal without touching its kernel."
+  (let ((entry '(:profile "p" :session-id "s" :remote-host "h"
+                 :remote-pid 17 :remote-connection-file "/r/kernel.json")))
+    (with-temp-buffer
+      (setq emacs-jupyter-notebook-mode t
+            emacs-jupyter-notebook--tunnel-dead t
+            emacs-jupyter-notebook--session-entry entry)
+      (let ((context (ejn-ir5--begin-without-io entry 'explicit)))
+        (cl-letf (((symbol-function
+                    'emacs-jupyter-notebook-ssh-start-process)
+                   (lambda (&rest _)
+                     (ert-fail "reconnect cancel must not run remote cleanup"))))
+          (emacs-jupyter-notebook-cancel-operation))
+        (should (plist-get context :cancelled))
+        (should-not emacs-jupyter-notebook--async-context)
+        (should-not emacs-jupyter-notebook--reconnect-timer)
+        (should (equal emacs-jupyter-notebook--session-entry entry))))))
+
+(ert-deftest ejn-ir5-stale-retry-timer-cannot-supersede-new-owner ()
+  "A cancelled timer generation cannot consume or replace a newer schedule."
+  (let ((entry '(:profile "p" :session-id "s" :remote-host "h"
+                 :remote-pid 17 :remote-connection-file "/r/kernel.json"))
+        (emacs-jupyter-notebook-reconnect-initial-delay 600))
+    (with-temp-buffer
+      (unwind-protect
+          (let (old-token new-token new-timer (started 0))
+            (setq emacs-jupyter-notebook-mode t
+                  emacs-jupyter-notebook--tunnel-dead t
+                  emacs-jupyter-notebook--session-entry entry)
+            (emacs-jupyter-notebook--schedule-auto-reconnect)
+            (setq old-token emacs-jupyter-notebook--reconnect-schedule-token)
+            (emacs-jupyter-notebook--cancel-auto-reconnect)
+            (emacs-jupyter-notebook--schedule-auto-reconnect)
+            (setq new-token emacs-jupyter-notebook--reconnect-schedule-token
+                  new-timer emacs-jupyter-notebook--reconnect-timer)
+            (should-not (eq old-token new-token))
+            (cl-letf (((symbol-function
+                        'emacs-jupyter-notebook--begin-reconnect)
+                       (lambda (&rest _) (cl-incf started))))
+              (emacs-jupyter-notebook--auto-reconnect-fire
+               (current-buffer) old-token))
+            (should (= started 0))
+            (should (eq new-token
+                        emacs-jupyter-notebook--reconnect-schedule-token))
+            (should (eq new-timer
+                        emacs-jupyter-notebook--reconnect-timer)))
+        (emacs-jupyter-notebook--cancel-auto-reconnect)))))
+
+(ert-deftest ejn-ir5-successful-reconnect-resets-all-retry-state ()
+  "Successful finalize clears retry count, deadline, timer, and token."
+  (with-temp-buffer
+    (let* ((entry '(:profile "p" :session-id "s" :remote-host "h"))
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'connect :entry entry :session-id "s"
+                     :origin-buffer (current-buffer)
+                     :reconnect-owner 'automatic))
+           (timer (run-at-time 600 nil #'ignore)))
+      (setq emacs-jupyter-notebook--async-context context
+            emacs-jupyter-notebook--reconnect-attempt 4
+            emacs-jupyter-notebook--reconnect-next-at (+ (float-time) 600)
+            emacs-jupyter-notebook--reconnect-schedule-token (gensym "retry-")
+            emacs-jupyter-notebook--reconnect-timer timer
+            emacs-jupyter-notebook--tunnel-dead t)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--heartbeat-start)
+                 #'ignore)
+                ((symbol-function
+                  'emacs-jupyter-notebook--inject-viewer-formatter)
+                 #'ignore)
+                ((symbol-function
+                  'emacs-jupyter-notebook--inject-idle-watchdog)
+                 #'ignore)
+                ((symbol-function
+                  'emacs-jupyter-notebook-registry-save-entry)
+                 #'ignore))
+        (emacs-jupyter-notebook--async-connect-finalize
+         context (current-buffer) entry '(:shell_port 1)
+         "/tmp/ejn-ir5-local.json" 'mock-client))
+      (should (= emacs-jupyter-notebook--reconnect-attempt 0))
+      (should-not emacs-jupyter-notebook--reconnect-next-at)
+      (should-not emacs-jupyter-notebook--reconnect-schedule-token)
+      (should-not emacs-jupyter-notebook--reconnect-timer)
+      (should-not (memq timer timer-list))
+      (should-not emacs-jupyter-notebook--tunnel-dead)
+      (should (eq (plist-get context :phase) 'done)))))
+
+(ert-deftest ejn-ir5-live-status-button-cancels-advertised-context ()
+  "The actual status buffer reports and cancels its source's live reconnect."
+  (let ((entry '(:profile "p" :session-id "s" :remote-host "h"
+                 :remote-pid 17 :remote-connection-file "/r/kernel.json")))
+    (with-temp-buffer
+      (let* ((source (current-buffer))
+             (context
+              (emacs-jupyter-notebook--async-new-context
+               :phase 'probe :started-at (- (float-time) 12)
+               :entry entry :origin-buffer source
+               :reconnect-owner 'evaluation
+               :error-callback
+               (lambda (failed error-data)
+                 (emacs-jupyter-notebook--handle-reconnect-failure
+                  failed error-data nil)))))
+        (setq emacs-jupyter-notebook-mode t
+              emacs-jupyter-notebook--tunnel-dead t
+              emacs-jupyter-notebook--session-entry entry
+              emacs-jupyter-notebook--reconnect-attempt 3
+              emacs-jupyter-notebook--async-context context)
+        (ejn-test-with-status-buffer status-buffer
+          (with-current-buffer status-buffer
+            (let ((text (buffer-string)))
+              (should (string-match-p "Live phase: probe" text))
+              (should (string-match-p "Attempt owner: evaluation" text))
+              (should (string-match-p "Attempt age: 1[12]\\.[0-9]s" text))
+              (should (string-match-p "Retry count: 3" text))
+              (should (string-match-p "Next retry: none" text)))
+            (goto-char (point-min))
+            (should (search-forward "Cancel reconnect" nil t))
+            (let ((button (button-at (match-beginning 0))))
+              (should button)
+              (button-activate button)))
+          (with-current-buffer source
+            (should (plist-get context :cancelled))
+            (should-not emacs-jupyter-notebook--async-context)
+            (should-not emacs-jupyter-notebook--reconnect-timer)
+            (should (equal emacs-jupyter-notebook--session-entry entry))))))))
+
+(ert-deftest ejn-ir5-scheduled-status-shows-deadline-and-cancels-timer ()
+  "The interactive status countdown advertises a working timer cancel action."
+  (let ((entry '(:profile "p" :session-id "s" :remote-host "h"
+                 :remote-pid 17 :remote-connection-file "/r/kernel.json"))
+        (emacs-jupyter-notebook-reconnect-initial-delay 600))
+    (with-temp-buffer
+      (setq emacs-jupyter-notebook-mode t
+            emacs-jupyter-notebook--tunnel-dead t
+            emacs-jupyter-notebook--session-entry entry
+            emacs-jupyter-notebook--reconnect-attempt 2)
+      (emacs-jupyter-notebook--schedule-auto-reconnect)
+      (unwind-protect
+          (ejn-test-with-status-buffer status-buffer
+            (with-current-buffer status-buffer
+              (should (string-match-p "Retry count: 2" (buffer-string)))
+              (should (string-match-p "Next retry: [0-9]+\\.[0-9]s"
+                                      (buffer-string)))
+              (goto-char (point-min))
+              (should (search-forward "Cancel scheduled reconnect" nil t))
+              (let ((button (button-at (match-beginning 0))))
+                (should button)
+                (button-activate button)))
+            (should-not emacs-jupyter-notebook--reconnect-timer)
+            (should-not emacs-jupyter-notebook--reconnect-schedule-token)
+            (should (equal emacs-jupyter-notebook--session-entry entry)))
+        (emacs-jupyter-notebook--cancel-auto-reconnect)))))
 
 (provide 'emacs-jupyter-notebook-tests)
 
