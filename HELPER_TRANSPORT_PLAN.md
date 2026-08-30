@@ -583,7 +583,7 @@ modules.
     and Nix build.
   - Non-goal: no protocol loop or kernel launch.
 
-- [~] owner=luna-ht3 claimed=2026-08-30 **HT3 Implement the pure Python frame codec.**
+- [x] sha=959b739 **HT3 Implement the pure Python frame codec.**
   - Depends: HT2.
   - Files: `helper/ejn_helper/framing.py`,
     `helper/tests/test_framing.py`.
@@ -804,7 +804,7 @@ modules.
 
 ### Phase TH - reusable local fault harnesses
 
-- [ ] **TH1 Build a deterministic fake helper executable for ERT.**
+- [~] owner=luna-th1 claimed=2026-08-30 **TH1 Build a deterministic fake helper executable for ERT.**
   - Depends: HT1.
   - Files: `tests/fixtures/ejn_fake_helper.py`,
     `tests/fixtures/README.md`.
