@@ -221,6 +221,7 @@ class ConnectTests(unittest.IsolatedAsyncioTestCase):
             def load_connection_info(self, _info): pass
             def start_channels(self): self.started += 1; started.set()
             def stop_channels(self): self.stopped += 1
+            async def wait_for_ready(self, timeout=None): await asyncio.sleep(60)
             def kernel_info(self): return "id"
             async def get_shell_msg(self, timeout): await asyncio.sleep(60)
         old = sys.modules.get("jupyter_client")
