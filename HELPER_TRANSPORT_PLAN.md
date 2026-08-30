@@ -830,7 +830,7 @@ modules.
     and proof no matching process/connection/temp files remain.
   - Narrow run: fixture integration test under 60 seconds.
 
-- [~] owner=terra-th3 claimed=2026-08-31 **TH3 Build five-channel stoppable TCP relay fault harness.**
+- [x] owner=terra-th3 claimed=2026-08-31 landed=4fbb460 **TH3 Build five-channel stoppable TCP relay fault harness.**
   - Depends: TH2.
   - Files: `helper/integration_tests/tcp_relays.py`,
     `helper/integration_tests/test_tcp_relays.py`.
