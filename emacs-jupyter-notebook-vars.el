@@ -120,6 +120,46 @@ Can be overridden per-profile with :jupyter-command in the profile plist."
   :type 'string
   :group 'emacs-jupyter-notebook)
 
+(defcustom emacs-jupyter-notebook-helper-command '("ejn-helper")
+  "Local helper command argv.
+The first element names the executable and remaining elements are passed
+unchanged.  A bare executable name is resolved through `exec-path' and then
+beside this package's source/build tree, so loading the package through a
+checkout or Nix result symlink does not make the command depend on the
+current default directory."
+  :type '(repeat string)
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-helper-hello-timeout 5
+  "Maximum seconds allowed for the helper's initial hello response.
+Invalid values fall back to a finite internal deadline."
+  :type 'number
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-helper-partial-frame-timeout 5
+  "Maximum seconds an incomplete helper frame may remain buffered.
+Invalid values fall back to a finite internal deadline."
+  :type 'number
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-helper-stderr-max-bytes 65536
+  "Maximum bytes retained from one local helper's stderr stream.
+The supervisor clamps this to a finite protocol-independent hard maximum."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-helper-max-to-emacs-frame 262144
+  "Complete helper-to-Emacs frame ceiling, including its four-byte prefix.
+This may lower but never raise the protocol v1 ceiling."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-helper-raw-accumulator-max-bytes 1048576
+  "Maximum undecoded helper stdout bytes retained by one session.
+This may lower but never raise the protocol v1 accumulator ceiling."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
 (defcustom emacs-jupyter-notebook-default-kernelspec "python3"
   "Default remote Jupyter kernelspec name."
   :type 'string
