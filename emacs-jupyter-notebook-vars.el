@@ -325,6 +325,22 @@ non-positive value to disable the per-process watchdog."
   :type '(choice (const :tag "No per-process deadline" nil) number)
   :group 'emacs-jupyter-notebook)
 
+(defcustom emacs-jupyter-notebook-management-process-timeout 60
+  "Hard deadline in seconds for one-shot interactive management commands.
+Unlike the general SSH process watchdog, this deadline cannot be disabled:
+fetch, list, liveness, prune, and explicit clean operations must never wedge
+Emacs.  A non-positive or non-numeric value falls back to 60 seconds."
+  :type 'number
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-management-output-max-bytes (* 1024 1024)
+  "Maximum bytes retained per stdout or stderr management buffer.
+The newest output is retained with an explicit truncation marker.  This bound
+cannot be disabled: invalid values use a 1 MiB hard fallback so a noisy remote
+command cannot grow Emacs memory without limit while its watchdog is pending."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
 (defcustom emacs-jupyter-notebook-jupyter-request-timeout 2
   "Seconds to wait for runtime completion, inspect, and completeness replies."
   :type 'number

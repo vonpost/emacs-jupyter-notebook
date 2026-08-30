@@ -726,11 +726,12 @@ leaves absolute paths untouched."
                             remote-command))))
 
 (ert-deftest ejn-ssh-remote-cat-log-targets-connection-log ()
-  (let* ((cmd (emacs-jupyter-notebook-ssh-build-remote-cat-log
+  (let* ((emacs-jupyter-notebook-management-output-max-bytes 12345)
+         (cmd (emacs-jupyter-notebook-ssh-build-remote-cat-log
                '(:profile "p" :host "example.com")
                "~/.cache/ejn/kernel-session.json"))
          (remote-command (car (last cmd))))
-    (should (string-match-p "cat \\$HOME/.cache/ejn/kernel-session.log"
+    (should (string-match-p "tail -c 12345 < \\$HOME/.cache/ejn/kernel-session.log"
                             remote-command))))
 
 (ert-deftest ejn-ssh-remote-ps-command-targets-cache-dir ()
@@ -1976,10 +1977,11 @@ client) never kills the remote kernel — it is the durable reconnect surface."
 
 (ert-deftest ejn-fetch-remote-log-displays-command-output ()
   (let (argv displayed)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-ssh-run-command)
-               (lambda (captured-argv)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--management-run)
+               (lambda (_label _name captured-argv success _failure
+                        &optional _timeout)
                  (setq argv captured-argv)
-                 "log text"))
+                 (funcall success "log text")))
               ((symbol-function 'emacs-jupyter-notebook--display-command-output)
                (lambda (buffer-name output)
                  (setq displayed (list buffer-name output)))))
@@ -1999,10 +2001,11 @@ client) never kills the remote kernel — it is the durable reconnect surface."
     (cl-letf (((symbol-function 'emacs-jupyter-notebook--read-host-profile)
                (lambda (_profile)
                  '(:profile "p" :host "example.com" :remote-cache-dir "/tmp/ejn")))
-              ((symbol-function 'emacs-jupyter-notebook-ssh-run-command)
-               (lambda (captured-argv)
+              ((symbol-function 'emacs-jupyter-notebook--management-run)
+               (lambda (_label _name captured-argv success _failure
+                        &optional _timeout)
                  (setq argv captured-argv)
-                 "ps output"))
+                 (funcall success "ps output")))
               ((symbol-function 'emacs-jupyter-notebook--display-command-output)
                (lambda (buffer-name output)
                  (setq displayed (list buffer-name output)))))
@@ -2015,10 +2018,11 @@ client) never kills the remote kernel — it is the durable reconnect surface."
     (cl-letf (((symbol-function 'emacs-jupyter-notebook--read-host-profile)
                (lambda (_profile)
                  '(:profile "p" :host "example.com" :remote-cache-dir "/tmp/ejn")))
-              ((symbol-function 'emacs-jupyter-notebook-ssh-run-command)
-               (lambda (captured-argv)
+              ((symbol-function 'emacs-jupyter-notebook--management-run)
+               (lambda (_label _name captured-argv success _failure
+                        &optional _timeout)
                  (setq argv captured-argv)
-                 ""))
+                 (funcall success "")))
               ((symbol-function 'message)
                (lambda (format-string &rest args)
                  (setq message-text (apply #'format format-string args)))))
@@ -6512,8 +6516,8 @@ callback(nil) -> `--async-connect-finalize' seam."
                  '(:profile "p" :host "host" :remote-cache-dir "/tmp/ejn")))
               ((symbol-function 'y-or-n-p)
                (lambda (_p) (setq asked t) nil))
-              ((symbol-function 'emacs-jupyter-notebook-ssh-run-command)
-               (lambda (_argv) (setq ran t) "")))
+              ((symbol-function 'emacs-jupyter-notebook--management-run)
+               (lambda (&rest _) (setq ran t))))
       (call-interactively #'emacs-jupyter-notebook-clean-orphaned-kernels)
       (should asked)
       (should-not ran))))
@@ -6528,8 +6532,10 @@ callback(nil) -> `--async-connect-finalize' seam."
                  '(:profile "p" :host "host" :remote-cache-dir "/tmp/ejn")))
               ((symbol-function 'y-or-n-p)
                (lambda (_p) (setq asked t) nil))
-              ((symbol-function 'emacs-jupyter-notebook-ssh-run-command)
-               (lambda (_argv) (setq ran t) "")))
+              ((symbol-function 'emacs-jupyter-notebook--management-run)
+               (lambda (_label _name _argv success _failure &optional _timeout)
+                 (setq ran t)
+                 (funcall success ""))))
       (let ((current-prefix-arg '(4)))
         (call-interactively #'emacs-jupyter-notebook-clean-orphaned-kernels))
       (should-not asked)
@@ -7918,18 +7924,19 @@ prune."
   (let* ((live (ejn-w11--entry "live" "100" "up.example"))
          (dead (ejn-w11--entry "dead" "200" "up.example"))
          (entries (list live dead))
-         (msg nil)
-         (probe (lambda (_profile pids)
-                  (list :answered t
-                        :alive (cl-remove-if-not
-                                (lambda (p) (equal (format "%s" p) "100")) pids)))))
-    (let ((emacs-jupyter-notebook--liveness-probe-function probe))
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
+         (msg nil))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
                  (lambda (&optional _file) entries))
                 ((symbol-function 'emacs-jupyter-notebook-registry-save)
                  (lambda (_kept &optional _file) nil))
+                ((symbol-function
+                  'emacs-jupyter-notebook--classify-registry-liveness-async)
+                 (lambda (_entries _token callback)
+                   (funcall callback
+                            (list (cons live 'alive) (cons dead 'dead)) nil)))
                 ((symbol-function 'message)
                  (lambda (fmt &rest args) (setq msg (apply #'format fmt args)))))
+      (with-temp-buffer
         (call-interactively #'emacs-jupyter-notebook-prune-dead-kernels)
         (should (string-match-p "pruned 1 dead" msg))
         (should (string-match-p "1 live remain" msg))))))
@@ -7952,31 +7959,33 @@ alive/unknown ones; the dead ghost is removed from the registry too."
          (entries (list live dead))
          (saved nil)
          (offered nil)
-         (probe (lambda (_profile pids)
-                  (list :answered t
-                        :alive (cl-remove-if-not
-                                (lambda (p) (equal (format "%s" p) "100")) pids))))
-         (emacs-jupyter-notebook--liveness-probe-function probe))
+         selected)
     (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
                (lambda (&optional _file) entries))
               ((symbol-function 'emacs-jupyter-notebook-registry-save)
                (lambda (kept &optional _file) (setq saved kept)))
               ((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
                (lambda () nil))
+              ((symbol-function
+                'emacs-jupyter-notebook--classify-registry-liveness-async)
+               (lambda (_entries _token callback)
+                 (funcall callback
+                          (list (cons live 'alive) (cons dead 'dead)) nil)))
               ((symbol-function 'completing-read)
                (lambda (_prompt collection &rest _)
                  (setq offered collection)
                  ;; Pick the first (only surviving) choice.
                  (caar collection))))
       (with-temp-buffer
-        (let ((selected (emacs-jupyter-notebook--read-registry-entry)))
+        (emacs-jupyter-notebook--read-registry-entry-async
+         (lambda (entry) (setq selected entry)))
           ;; Only the live entry survived and was selectable.
           (should (equal selected live))
           (should (= (length offered) 1))
           (should (string-match-p "live" (caar offered)))
           ;; The dead ghost was pruned from the durable registry.
           (should (member live saved))
-          (should-not (member dead saved)))))))
+          (should-not (member dead saved))))))
 
 ;;; W19 — reconnect robustness
 
@@ -8274,8 +8283,8 @@ left to run shutdown + start by hand."
         fresh-profile)
     (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
                #'ignore)
-              ((symbol-function 'emacs-jupyter-notebook--read-registry-entry)
-               (lambda () entry))
+              ((symbol-function 'emacs-jupyter-notebook--read-registry-entry-async)
+               (lambda (callback) (funcall callback entry)))
               ((symbol-function 'emacs-jupyter-notebook--begin-reconnect)
                (lambda (_entry _cb error-cb)
                  (funcall error-cb '(:error-kind kernel-dead) "dead")))
@@ -9295,6 +9304,391 @@ session does not pay an O(history) erase+reinsert on every stream flush."
       (ejn-panel-append-text handle "10%")
       (ejn-panel-append-text handle "\r100%")
       (should (equal (ejn-panel-entry-text handle) "100%")))))
+
+;;; IR4 — asynchronous management SSH
+
+(defun ejn-ir4--never-exiting-command ()
+  "Return a local command that remains alive until an IR4 test disposes it."
+  (list shell-file-name shell-command-switch "sleep 10"))
+
+(defun ejn-ir4--exercise-never-exiting-command (starter terminal)
+  "Run STARTER and assert its child remains non-blocking through TERMINAL.
+TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
+  (let* ((registry-file (make-temp-file "ejn-ir4-registry-"))
+         (initial-registry "durable-registry-sentinel\n")
+         (emacs-jupyter-notebook-registry-file registry-file)
+         (emacs-jupyter-notebook-ssh-process-timeout 0.05)
+         (emacs-jupyter-notebook-management-process-timeout 0.05)
+         (emacs-jupyter-notebook-prune-ssh-timeout 0.05)
+         (deadline (+ (float-time) 2.0))
+         tick tick-timer cancel-timer process stdout stderr session-before)
+    (unwind-protect
+        (progn
+          (with-temp-file registry-file (insert initial-registry))
+          (with-temp-buffer
+            (setq-local emacs-jupyter-notebook--session-entry
+                        '(:profile "p" :session-id "durable" :remote-pid 71
+                          :remote-host "host"
+                          :remote-connection-file "/remote/kernel.json"))
+            (setq session-before
+                  (copy-tree emacs-jupyter-notebook--session-entry))
+            (setq tick-timer
+                  (run-at-time 0.01 nil (lambda () (setq tick t))))
+            (funcall starter)
+            (setq process
+                  (plist-get emacs-jupyter-notebook--management-operation
+                             :process))
+            (should (processp process))
+            (setq stdout (process-buffer process)
+                  stderr (process-get
+                          process 'emacs-jupyter-notebook-stderr-buffer))
+            (when (eq terminal 'cancelled)
+              (let ((source (current-buffer)))
+                (setq cancel-timer
+                      (run-at-time
+                       0.02 nil
+                       (lambda ()
+                         (when (buffer-live-p source)
+                           (with-current-buffer source
+                             (emacs-jupyter-notebook-cancel-operation))))))))
+            (while (and (emacs-jupyter-notebook--management-active-p)
+                        (< (float-time) deadline))
+              (accept-process-output nil 0.01))
+            (should tick)
+            (should-not (emacs-jupyter-notebook--management-active-p))
+            (should (eq (process-get process 'ejn-management-outcome)
+                        terminal))
+            (should-not (process-live-p process))
+            (should-not (buffer-live-p stdout))
+            (should-not (buffer-live-p stderr))
+            (should-not (process-get process 'ejn-management-timeout))
+            (should-not (process-get process 'ejn-management-success))
+            (should-not (process-get process 'ejn-management-failure))
+            (should (equal emacs-jupyter-notebook--session-entry
+                           session-before)))
+          (with-temp-buffer
+            (insert-file-contents registry-file)
+            (should (equal (buffer-string) initial-registry)))
+          process)
+      (when (timerp tick-timer) (cancel-timer tick-timer))
+      (when (timerp cancel-timer) (cancel-timer cancel-timer))
+      (when (and (processp process) (process-live-p process))
+        (delete-process process))
+      (when (file-exists-p registry-file) (delete-file registry-file)))))
+
+(ert-deftest ejn-ir4-fetch-log-never-exiting-child-times-out ()
+  "Fetch-log returns immediately; its deadline and independent timer fire."
+  (with-temp-buffer
+    (setq-local emacs-jupyter-notebook--session-entry
+                '(:profile "p" :remote-host "host"
+                  :remote-connection-file "/remote/kernel-s.json"))
+    (cl-letf (((symbol-function
+                'emacs-jupyter-notebook-ssh-build-remote-cat-log)
+               (lambda (&rest _) (ejn-ir4--never-exiting-command))))
+      (ejn-ir4--exercise-never-exiting-command
+       #'emacs-jupyter-notebook-fetch-remote-log 'timeout))))
+
+(ert-deftest ejn-ir4-list-processes-never-exiting-child-cancels ()
+  "Remote process listing is cancellable while independent timers run."
+  (cl-letf (((symbol-function 'emacs-jupyter-notebook--read-host-profile)
+             (lambda (&rest _) '(:profile "p" :host "host")))
+            ((symbol-function
+              'emacs-jupyter-notebook-ssh-build-remote-ps-command)
+             (lambda (&rest _) (ejn-ir4--never-exiting-command))))
+    (ejn-ir4--exercise-never-exiting-command
+     (lambda () (emacs-jupyter-notebook-list-remote-processes "p"))
+     'cancelled)))
+
+(ert-deftest ejn-ir4-prune-never-exiting-child-times-out ()
+  "Prune maps a timed-out host to unknown and preserves durable state."
+  (let ((entry '(:profile "p" :remote-host "host" :remote-pid 71
+                 :remote-connection-file "/remote/kernel.json"
+                 :session-id "durable")))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
+               (lambda (&optional _) (list entry)))
+              ((symbol-function 'emacs-jupyter-notebook-registry-save)
+               (lambda (&rest _) (ert-fail "timeout must not rewrite registry")))
+              ((symbol-function
+                'emacs-jupyter-notebook-ssh-build-batch-pid-alive)
+               (lambda (&rest _) (ejn-ir4--never-exiting-command))))
+      (ejn-ir4--exercise-never-exiting-command
+       #'emacs-jupyter-notebook-prune-dead-kernels 'timeout))))
+
+(ert-deftest ejn-ir4-clean-orphans-never-exiting-child-cancels ()
+  "Explicit orphan cleanup is cancellable and never mutates local registry."
+  (cl-letf (((symbol-function 'emacs-jupyter-notebook--read-host-profile)
+             (lambda (&rest _)
+               '(:profile "p" :host "host" :remote-cache-dir "/cache")))
+            ((symbol-function
+              'emacs-jupyter-notebook-ssh-build-remote-cleanup-all)
+             (lambda (&rest _) (ejn-ir4--never-exiting-command))))
+    (ejn-ir4--exercise-never-exiting-command
+     (lambda () (emacs-jupyter-notebook-clean-orphaned-kernels "p"))
+     'cancelled)))
+
+(ert-deftest ejn-ir4-reconnect-picker-never-exiting-child-cancels ()
+  "Reconnect liveness is cancellable before the picker or reconnect starts."
+  (let ((entry '(:profile "p" :remote-host "host" :remote-pid 71
+                 :remote-connection-file "/remote/kernel.json"
+                 :session-id "durable")))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
+               (lambda (&optional _) (list entry)))
+              ((symbol-function 'emacs-jupyter-notebook-registry-save)
+               (lambda (&rest _) (ert-fail "cancel must not rewrite registry")))
+              ((symbol-function 'completing-read)
+               (lambda (&rest _) (ert-fail "cancel must not open picker")))
+              ((symbol-function 'emacs-jupyter-notebook--begin-reconnect)
+               (lambda (&rest _) (ert-fail "cancel must not reconnect")))
+              ((symbol-function
+                'emacs-jupyter-notebook-ssh-build-batch-pid-alive)
+               (lambda (&rest _) (ejn-ir4--never-exiting-command))))
+      (ejn-ir4--exercise-never-exiting-command
+       (lambda () (emacs-jupyter-notebook-reconnect-remote-kernel))
+       'cancelled))))
+
+(ert-deftest ejn-ir4-management-success-disposes-before-callback ()
+  "Successful management callbacks run once after all local resources are gone."
+  (let (process stdout stderr callback-state callback-count)
+    (setq process
+          (emacs-jupyter-notebook-ssh-start-management-operation
+           "ejn-ir4-success"
+           (list shell-file-name shell-command-switch
+                 "printf stdout; printf stderr >&2")
+           (lambda (output)
+             (setq callback-count (1+ (or callback-count 0))
+                   callback-state
+                   (list output
+                         (buffer-live-p stdout)
+                         (buffer-live-p stderr))))
+           (lambda (&rest _) (ert-fail "successful child must not fail"))
+           1.0))
+    (setq stdout (process-buffer process)
+          stderr (process-get process 'emacs-jupyter-notebook-stderr-buffer))
+    (let ((deadline (+ (float-time) 2.0)))
+      (while (and (not (process-get process 'ejn-management-finished))
+                  (< (float-time) deadline))
+        (accept-process-output process 0.01)))
+    (should (= callback-count 1))
+    (should (equal callback-state '("stdout" nil nil)))
+    (should-not (process-get process 'ejn-management-timeout))
+    (should-not (process-get process 'ejn-management-success))
+    (should-not (process-get process 'ejn-management-failure))))
+
+(ert-deftest ejn-ir4-management-stale-sentinel-is-exact-once ()
+  "A sentinel arriving after cancellation cannot invoke either callback again."
+  (let ((success-count 0) (failure-count 0) process stale-sentinel)
+    (setq process
+          (emacs-jupyter-notebook-ssh-start-management-operation
+           "ejn-ir4-stale" (ejn-ir4--never-exiting-command)
+           (lambda (&rest _) (cl-incf success-count))
+           (lambda (&rest _) (cl-incf failure-count))
+           1.0)
+          stale-sentinel (process-sentinel process))
+    (emacs-jupyter-notebook-ssh-management-cancel process)
+    (funcall stale-sentinel process "finished\n")
+    (should (= success-count 0))
+    (should (= failure-count 1))
+    (should (eq (process-get process 'ejn-management-outcome) 'cancelled))))
+
+(ert-deftest ejn-ir4-management-timeout-cannot-be-disabled ()
+  "Nil/zero timeout customization still installs a finite watchdog."
+  (dolist (configuration '((nil nil) (0 nil) (0 0)))
+    (let ((emacs-jupyter-notebook-management-process-timeout
+           (car configuration))
+          (explicit (cadr configuration))
+          process timer)
+      (unwind-protect
+          (progn
+            (setq process
+                  (emacs-jupyter-notebook-ssh-start-management-operation
+                   "ejn-ir4-fallback-timeout"
+                   (ejn-ir4--never-exiting-command)
+                   #'ignore #'ignore explicit)
+                  timer (process-get process 'ejn-management-timeout))
+            (should (timerp timer))
+            (should (> (float-time (timer--time timer)) (float-time))))
+        (when (processp process)
+          (emacs-jupyter-notebook-ssh-management-cancel process))))))
+
+(ert-deftest ejn-ir4-management-output-flood-is-hard-bounded ()
+  "Noisy stdout/stderr remain bounded, responsive, marked, and disposable."
+  (let* ((emacs-jupyter-notebook-management-output-max-bytes 512)
+         (emacs-jupyter-notebook-management-process-timeout 2)
+         (flood (concat
+                 "i=0; while [ \"$i\" -lt 2000 ]; do "
+                 "printf '0123456789abcdef0123456789abcdef0123456789abcdef\\n'; "
+                 "printf 'fedcba9876543210fedcba9876543210fedcba9876543210\\n' >&2; "
+                 "i=$((i+1)); done; sleep 10"))
+         process stdout stderr stderr-process callback-stderr tick tick-timer)
+    (unwind-protect
+        (progn
+          (setq tick-timer (run-at-time 0.01 nil (lambda () (setq tick t)))
+                process
+                (emacs-jupyter-notebook-ssh-start-management-operation
+                 "ejn-ir4-output-flood"
+                 (list shell-file-name shell-command-switch flood)
+                 (lambda (&rest _) (ert-fail "flood child must be cancelled"))
+                 (lambda (_reason output) (setq callback-stderr output))
+                 2)
+                stdout (process-buffer process)
+                stderr (process-get
+                        process 'emacs-jupyter-notebook-stderr-buffer)
+                stderr-process
+                (process-get process 'ejn-management-stderr-process))
+          (let ((deadline (+ (float-time) 2.0)))
+            (while (and (< (float-time) deadline)
+                        (not (and tick
+                                  (process-get process
+                                               'ejn-management-truncated)
+                                  (process-get stderr-process
+                                               'ejn-management-truncated))))
+              (accept-process-output nil 0.005)))
+          (should tick)
+          (should (process-get process 'ejn-management-truncated))
+          (should (process-get stderr-process 'ejn-management-truncated))
+          (dolist (buffer (list stdout stderr))
+            (should (buffer-live-p buffer))
+            (with-current-buffer buffer
+              (should (<= (emacs-jupyter-notebook-ssh--management-buffer-bytes)
+                          512))
+              (should (string-prefix-p
+                       emacs-jupyter-notebook-ssh--management-truncation-marker
+                       (buffer-string)))))
+          (emacs-jupyter-notebook-ssh-management-cancel process)
+          (should (<= (string-bytes callback-stderr) 512))
+          (should (string-prefix-p
+                   emacs-jupyter-notebook-ssh--management-truncation-marker
+                   callback-stderr))
+          (should-not (process-live-p stderr-process))
+          (should-not (buffer-live-p stdout))
+          (should-not (buffer-live-p stderr))
+          (should-not (process-get process 'ejn-management-stderr-process)))
+      (when (timerp tick-timer) (cancel-timer tick-timer))
+      (when (and (processp process) (process-live-p process))
+        (delete-process process)))
+    ;; The success callback receives the same bounded marker for stdout.
+    (let (success-process callback-stdout)
+      (unwind-protect
+          (progn
+            (setq success-process
+                  (emacs-jupyter-notebook-ssh-start-management-operation
+                   "ejn-ir4-stdout-flood"
+                   (list shell-file-name shell-command-switch
+                         (concat "i=0; while [ \"$i\" -lt 2000 ]; do "
+                                 "printf 'stdout-output-line-0123456789abcdef\\n'; "
+                                 "i=$((i+1)); done"))
+                   (lambda (output) (setq callback-stdout output))
+                   (lambda (&rest _) (ert-fail "stdout flood must succeed"))
+                   2))
+            (let ((deadline (+ (float-time) 2.0)))
+              (while (and (not callback-stdout) (< (float-time) deadline))
+                (accept-process-output nil 0.005)))
+            (should (<= (string-bytes callback-stdout) 512))
+            (should (string-prefix-p
+                     emacs-jupyter-notebook-ssh--management-truncation-marker
+                     callback-stdout)))
+        (when (and (processp success-process)
+                   (process-live-p success-process))
+          (delete-process success-process))))))
+
+(ert-deftest ejn-ir4-management-callback-error-still-disposes ()
+  "An exception from a completion callback cannot leak child resources."
+  (let (process stdout stderr message-seen)
+    (cl-letf (((symbol-function 'message)
+               (lambda (&rest _) (setq message-seen t))))
+      (setq process
+            (emacs-jupyter-notebook-ssh-start-management-operation
+             "ejn-ir4-callback-error"
+             (list shell-file-name shell-command-switch "exit 0")
+             (lambda (&rest _) (error "injected callback failure"))
+             (lambda (&rest _) (ert-fail "successful child must not fail"))
+             1.0)
+            stdout (process-buffer process)
+            stderr (process-get process
+                                'emacs-jupyter-notebook-stderr-buffer))
+      (let ((deadline (+ (float-time) 2.0)))
+        (while (and (not (process-get process 'ejn-management-finished))
+                    (< (float-time) deadline))
+          (accept-process-output process 0.01)))
+      (should message-seen)
+      (should-not (buffer-live-p stdout))
+      (should-not (buffer-live-p stderr))
+      (should-not (process-get process 'ejn-management-timeout)))))
+
+(defun ejn-ir4--source-definitions ()
+  "Return a hash table of project function source forms for IR4 analysis."
+  (let ((table (make-hash-table :test #'eq)))
+    (dolist (file '("emacs-jupyter-notebook.el"
+                    "emacs-jupyter-notebook-ssh.el"))
+      (with-temp-buffer
+        (insert-file-contents
+         (expand-file-name file
+                           (file-name-directory
+                            (locate-library "emacs-jupyter-notebook"))))
+        (goto-char (point-min))
+        (condition-case nil
+            (while t
+              (let ((form (read (current-buffer))))
+                (when (and (consp form) (eq (car form) 'defun))
+                  (puthash (cadr form) form table))))
+          (end-of-file nil))))
+    table))
+
+(defun ejn-ir4--form-callees (form)
+  "Return symbols called by parsed Lisp FORM, excluding quoted data."
+  (let (callees)
+    (cl-labels ((walk
+                 (node)
+                 (when (consp node)
+                   (cond
+                    ((eq (car node) 'quote) nil)
+                    ((eq (car node) 'function)
+                     (cond
+                      ((symbolp (cadr node))
+                       (push (cadr node) callees))
+                      ((and (consp (cadr node))
+                            (eq (caadr node) 'lambda))
+                       (walk (cadr node)))))
+                    (t
+                     (when (symbolp (car node)) (push (car node) callees))
+                     (mapc #'walk (cdr node)))))))
+      (walk form))
+    (delete-dups callees)))
+
+(ert-deftest ejn-ir4-no-sync-ssh-in-interactive-call-graph ()
+  "Stripped-source call graph keeps every IR4 UI root off blocking primitives."
+  (let* ((definitions (ejn-ir4--source-definitions))
+         (roots '(emacs-jupyter-notebook-reconnect-remote-kernel
+                  emacs-jupyter-notebook-fetch-remote-log
+                  emacs-jupyter-notebook-list-remote-processes
+                  emacs-jupyter-notebook-prune-dead-kernels
+                  emacs-jupyter-notebook-clean-orphaned-kernels))
+         (forbidden '(emacs-jupyter-notebook-ssh-run-command
+                      process-file call-process call-process-region
+                      accept-process-output sleep-for sit-for))
+         seen encountered pending)
+    (should (memq 'sleep-for
+                  (ejn-ir4--form-callees
+                   '(function (lambda () (sleep-for 1))))))
+    (should (memq 'sleep-for
+                  (ejn-ir4--form-callees
+                   '(funcall (function sleep-for) 1))))
+    (setq pending (copy-sequence roots))
+    (while pending
+      (let ((symbol (pop pending)))
+        (unless (memq symbol seen)
+          (push symbol seen)
+          (when-let* ((form (gethash symbol definitions)))
+            (dolist (callee (ejn-ir4--form-callees form))
+              (push callee encountered)
+              (when (gethash callee definitions)
+                (push callee pending)))))))
+    (dolist (symbol forbidden)
+      (should-not (memq symbol encountered)))
+    (should (memq 'emacs-jupyter-notebook--management-launch seen))
+    (should (memq 'emacs-jupyter-notebook-ssh-start-management-operation seen))
+    (should (memq 'emacs-jupyter-notebook-ssh-start-process seen))
+    (should-not (memq 'emacs-jupyter-notebook--read-registry-entry seen))))
 
 (provide 'emacs-jupyter-notebook-tests)
 

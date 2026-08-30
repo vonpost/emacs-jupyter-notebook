@@ -319,10 +319,14 @@ and its PIDs stay UNKNOWN (never pruned)."
               remote-file remote-file remote-log))))
 
 (defun emacs-jupyter-notebook-ssh-build-remote-cat-log (profile connection-file)
-  "Return an SSH argv list that prints the log for CONNECTION-FILE."
+  "Return an SSH argv list that prints a bounded tail for CONNECTION-FILE."
   (let ((remote-log (emacs-jupyter-notebook-ssh--quote-remote-path
                      (replace-regexp-in-string "\\.json\\'" ".log" connection-file))))
-    (emacs-jupyter-notebook-ssh-command profile (format "cat %s" remote-log))))
+    (emacs-jupyter-notebook-ssh-command
+     profile
+     (format "tail -c %d < %s"
+             (emacs-jupyter-notebook-ssh--management-output-limit)
+             remote-log))))
 
 (defun emacs-jupyter-notebook-ssh--self-excluding-pattern (pattern)
   "Return PATTERN with its first character bracketed for pkill/grep self-exclusion.
@@ -456,15 +460,230 @@ Signal an error if the command exits non-zero."
 
 (defun emacs-jupyter-notebook-ssh-start-process (name argv &optional sentinel)
   "Start ARGV asynchronously as process NAME and return the process."
-  (let* ((stderr-buffer (generate-new-buffer (format " *%s stderr*" name)))
-         (process (make-process :name name
-                                :buffer (generate-new-buffer (format " *%s*" name))
-                                :command argv
-                                :connection-type 'pipe
-                                :noquery t
-                                :sentinel sentinel
-                                :stderr stderr-buffer)))
-    (process-put process 'emacs-jupyter-notebook-stderr-buffer stderr-buffer)
+  (let ((stdout-buffer (generate-new-buffer (format " *%s*" name)))
+        (stderr-buffer (generate-new-buffer (format " *%s stderr*" name)))
+        process)
+    (condition-case err
+        (progn
+          (setq process
+                (make-process :name name
+                              :buffer stdout-buffer
+                              :command argv
+                              :connection-type 'pipe
+                              :noquery t
+                              :sentinel sentinel
+                              :stderr stderr-buffer))
+          (process-put process 'emacs-jupyter-notebook-stderr-buffer
+                       stderr-buffer)
+          process)
+      (error
+       (when (buffer-live-p stdout-buffer) (kill-buffer stdout-buffer))
+       (when (buffer-live-p stderr-buffer) (kill-buffer stderr-buffer))
+       (signal (car err) (cdr err))))))
+
+(defun emacs-jupyter-notebook-ssh--management-buffer-string (buffer)
+  "Return BUFFER contents, or the empty string when BUFFER is no longer live."
+  (if (buffer-live-p buffer)
+      (with-current-buffer buffer (buffer-string))
+    ""))
+
+(defconst emacs-jupyter-notebook-ssh--management-output-fallback
+  (* 1024 1024)
+  "Finite per-stream output bound used when customization is invalid.")
+
+(defconst emacs-jupyter-notebook-ssh--management-truncation-marker
+  "[EJN management output truncated]\n"
+  "Prefix identifying bounded management command output.")
+
+(defun emacs-jupyter-notebook-ssh--management-output-limit ()
+  "Return a positive output cap large enough to hold the truncation marker."
+  (let ((limit emacs-jupyter-notebook-management-output-max-bytes)
+        (minimum (1+ (string-bytes
+                      emacs-jupyter-notebook-ssh--management-truncation-marker))))
+    (if (and (integerp limit) (>= limit minimum))
+        limit
+      emacs-jupyter-notebook-ssh--management-output-fallback)))
+
+(defun emacs-jupyter-notebook-ssh--management-buffer-bytes ()
+  "Return the byte size of the current management output buffer."
+  (- (or (position-bytes (point-max)) (point-max))
+     (or (position-bytes (point-min)) (point-min))))
+
+(defun emacs-jupyter-notebook-ssh--management-trim-output (limit)
+  "Trim current buffer to its newest bytes within LIMIT and add a marker."
+  (let* ((marker emacs-jupyter-notebook-ssh--management-truncation-marker)
+         (payload-limit (- limit (string-bytes marker)))
+         (excess (max 0 (- (emacs-jupyter-notebook-ssh--management-buffer-bytes)
+                           payload-limit)))
+         (removed 0))
+    ;; Once bounded, EXCESS is normally only the newly arrived chunk.  Walk
+    ;; forward over that prefix rather than rescanning the retained tail.
+    (goto-char (point-min))
+    (while (and (< removed excess) (< (point) (point-max)))
+      (setq removed (+ removed (string-bytes (string (char-after)))))
+      (forward-char))
+    (delete-region (point-min) (point))
+    (goto-char (point-min))
+    (insert marker)))
+
+(defun emacs-jupyter-notebook-ssh--management-tail-string (string byte-limit)
+  "Return the newest complete characters of STRING within BYTE-LIMIT bytes."
+  (if (<= (string-bytes string) byte-limit)
+      string
+    (let ((index (length string))
+          (bytes 0))
+      (while (and (> index 0)
+                  (let ((next
+                         (string-bytes (string (aref string (1- index))))))
+                    (when (<= (+ bytes next) byte-limit)
+                      (setq bytes (+ bytes next))
+                      t)))
+        (setq index (1- index)))
+      (substring string index))))
+
+(defun emacs-jupyter-notebook-ssh--management-output-filter (process output)
+  "Insert PROCESS OUTPUT while retaining a hard-bounded newest-byte tail."
+  (when-let* ((buffer (process-buffer process)))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (let ((inhibit-read-only t)
+              (marker emacs-jupyter-notebook-ssh--management-truncation-marker)
+              (truncated (process-get process 'ejn-management-truncated))
+              (limit (process-get process 'ejn-management-output-limit)))
+          (when (and truncated
+                     (<= (length marker) (buffer-size))
+                     (equal marker
+                            (buffer-substring-no-properties
+                             (point-min) (+ (point-min) (length marker)))))
+            (delete-region (point-min) (+ (point-min) (length marker))))
+          (let ((payload-limit (- limit (string-bytes marker))))
+            (when (> (string-bytes output) payload-limit)
+              ;; Avoid transiently inserting a single enormous process chunk.
+              (erase-buffer)
+              (setq output
+                    (emacs-jupyter-notebook-ssh--management-tail-string
+                     output payload-limit)
+                    truncated t)
+              (process-put process 'ejn-management-truncated t)))
+          (goto-char (point-max))
+          (insert output)
+          (when (or truncated
+                    (> (emacs-jupyter-notebook-ssh--management-buffer-bytes)
+                       limit))
+            (emacs-jupyter-notebook-ssh--management-trim-output limit)
+            (process-put process 'ejn-management-truncated t)))))))
+
+(defun emacs-jupyter-notebook-ssh--management-install-output-filters (process)
+  "Install bounded stdout and stderr filters for management PROCESS."
+  (let* ((limit (emacs-jupyter-notebook-ssh--management-output-limit))
+         (stderr-buffer
+          (process-get process 'emacs-jupyter-notebook-stderr-buffer))
+         (stderr-process (and (buffer-live-p stderr-buffer)
+                              (get-buffer-process stderr-buffer))))
+    (process-put process 'ejn-management-output-limit limit)
+    (set-process-filter process
+                        #'emacs-jupyter-notebook-ssh--management-output-filter)
+    (when (processp stderr-process)
+      (process-put stderr-process 'ejn-management-output-limit limit)
+      (set-process-filter
+       stderr-process #'emacs-jupyter-notebook-ssh--management-output-filter)
+      (process-put process 'ejn-management-stderr-process stderr-process))))
+
+(defun emacs-jupyter-notebook-ssh--management-dispose (process)
+  "Dispose PROCESS and every timer/buffer owned by its management operation."
+  (when-let* ((timer (process-get process 'ejn-management-timeout)))
+    (cancel-timer timer)
+    (process-put process 'ejn-management-timeout nil))
+  (set-process-sentinel process #'ignore)
+  (set-process-filter process #'ignore)
+  (when (process-live-p process)
+    (delete-process process))
+  (when-let* ((stderr-process
+               (process-get process 'ejn-management-stderr-process)))
+    (set-process-sentinel stderr-process #'ignore)
+    (set-process-filter stderr-process #'ignore)
+    (when (process-live-p stderr-process)
+      (delete-process stderr-process))
+    (process-put process 'ejn-management-stderr-process nil))
+  (dolist (buffer (list (process-buffer process)
+                        (process-get
+                         process 'emacs-jupyter-notebook-stderr-buffer)))
+    (when (buffer-live-p buffer) (kill-buffer buffer)))
+  (set-process-buffer process nil)
+  (process-put process 'emacs-jupyter-notebook-stderr-buffer nil)
+  (process-put process 'ejn-management-success nil)
+  (process-put process 'ejn-management-failure nil))
+
+(defun emacs-jupyter-notebook-ssh--management-finish (process outcome)
+  "Finish PROCESS exactly once with OUTCOME.
+OUTCOME is `success', `failed', `timeout', or `cancelled'."
+  (unless (process-get process 'ejn-management-finished)
+    (let* ((stdout (emacs-jupyter-notebook-ssh--management-buffer-string
+                    (process-buffer process)))
+           (stderr (emacs-jupyter-notebook-ssh--management-buffer-string
+                    (process-get
+                     process 'emacs-jupyter-notebook-stderr-buffer)))
+           (success (process-get process 'ejn-management-success))
+           (failure (process-get process 'ejn-management-failure)))
+      (process-put process 'ejn-management-finished t)
+      (process-put process 'ejn-management-outcome outcome)
+      (emacs-jupyter-notebook-ssh--management-dispose process)
+      (condition-case err
+          (if (eq outcome 'success)
+              (funcall success stdout)
+            (funcall failure outcome stderr))
+        (error
+         (message "emacs-jupyter-notebook: management callback failed: %s"
+                  (error-message-string err)))))))
+
+(defun emacs-jupyter-notebook-ssh-management-cancel (process)
+  "Cancel PROCESS locally and notify its failure callback exactly once."
+  (when (processp process)
+    (emacs-jupyter-notebook-ssh--management-finish process 'cancelled)))
+
+(defconst emacs-jupyter-notebook-ssh--management-timeout-fallback 60
+  "Finite watchdog used when the management timeout is misconfigured.")
+
+(defun emacs-jupyter-notebook-ssh--management-timeout (timeout)
+  "Return a positive management deadline for optional TIMEOUT."
+  (let ((candidate (if (null timeout)
+                       emacs-jupyter-notebook-management-process-timeout
+                     timeout)))
+    (if (and (numberp candidate) (> candidate 0))
+        candidate
+      emacs-jupyter-notebook-ssh--management-timeout-fallback)))
+
+(defun emacs-jupyter-notebook-ssh-start-management-operation
+    (name argv success failure &optional timeout)
+  "Start bounded async SSH management ARGV and return its process.
+SUCCESS receives stdout, FAILURE receives a reason symbol and stderr.  Both
+callbacks run at most once; cancelling or timing out never changes durable
+kernel state.  TIMEOUT defaults to
+`emacs-jupyter-notebook-management-process-timeout'; invalid or non-positive
+values use a finite hard fallback, so management children cannot wedge Emacs."
+  (let (process)
+    (setq process
+          (emacs-jupyter-notebook-ssh-start-process
+           name argv
+           (lambda (proc _event)
+             (when (and (memq (process-status proc) '(exit signal))
+                        (not (process-get proc 'ejn-management-finished)))
+               (emacs-jupyter-notebook-ssh--management-finish
+                proc
+                (if (and (eq (process-status proc) 'exit)
+                         (zerop (process-exit-status proc)))
+                    'success
+                  'failed))))))
+    (emacs-jupyter-notebook-ssh--management-install-output-filters process)
+    (process-put process 'ejn-management-success success)
+    (process-put process 'ejn-management-failure failure)
+    (process-put
+     process 'ejn-management-timeout
+     (run-at-time
+      (emacs-jupyter-notebook-ssh--management-timeout timeout) nil
+      (lambda (proc)
+        (emacs-jupyter-notebook-ssh--management-finish proc 'timeout))
+      process))
     process))
 
 (provide 'emacs-jupyter-notebook-ssh)

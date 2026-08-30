@@ -453,6 +453,11 @@ figure or the local viewer is unavailable."
 (defvar-local emacs-jupyter-notebook--kernel-status nil
   "Current kernel status: `busy', `idle', or nil.")
 
+(defvar-local emacs-jupyter-notebook--management-operation nil
+  "Current local SSH management job, or nil.
+The plist contains `:token', `:label', `:started-at', and the current
+`:process'.  It never owns a remote kernel or durable registry state.")
+
 (defvar-local emacs-jupyter-notebook--completion-cache nil
   "Buffer-local LRU cache: hash-table mapping context-key -> reply plist.
 Created lazily by `emacs-jupyter-notebook--completion-cache-ensure'.")
@@ -663,6 +668,7 @@ Returns nil when no context exists or the context is at terminal phase
   "Return the mode-line lighter string for the W6.2 state machine.
 Precedence (highest first):
   tunnel-dead       → \" EJN!\"
+  management        → \" EJN…manage\"
   async-error       → \" EJN✗\"
   async-in-progress → \" EJN…launch\" / \" EJN…retrieve\" /
                        \" EJN…tunnel\" / \" EJN…connect\"
@@ -672,6 +678,7 @@ Precedence (highest first):
   (let ((phase (emacs-jupyter-notebook--async-phase)))
     (cond
      (emacs-jupyter-notebook--tunnel-dead " EJN!")
+     ((emacs-jupyter-notebook--management-active-p) " EJN…manage")
      (emacs-jupyter-notebook--async-last-error " EJN✗")
      ((eq phase 'launch)    " EJN…launch")
      ((eq phase 'probe)     " EJN…probe")
@@ -697,7 +704,8 @@ Precedence (highest first):
 (defun emacs-jupyter-notebook-status-snapshot ()
   "Return a plist describing the current buffer's notebook engine state."
   (let ((entry emacs-jupyter-notebook--session-entry)
-        (context emacs-jupyter-notebook--async-context))
+        (context emacs-jupyter-notebook--async-context)
+        (management emacs-jupyter-notebook--management-operation))
     (list :buffer (buffer-name)
           :file buffer-file-name
           :client (and emacs-jupyter-notebook--client t)
@@ -707,6 +715,10 @@ Precedence (highest first):
           :async-error (plist-get context :error)
           :async-age (when-let* ((started (plist-get context :started-at)))
                        (max 0 (- (float-time) started)))
+          :management-label (plist-get management :label)
+          :management-age
+          (when-let* ((started (plist-get management :started-at)))
+            (max 0 (- (float-time) started)))
           :reconnect-attempt emacs-jupyter-notebook--reconnect-attempt
           :reconnect-next-in
           (when emacs-jupyter-notebook--reconnect-next-at
@@ -738,6 +750,11 @@ Precedence (highest first):
             (if-let* ((age (plist-get snapshot :async-age)))
                 (format "%.1fs" age)
               "none"))
+    (format "Management: %s"
+            (if-let* ((label (plist-get snapshot :management-label)))
+                (format "%s (%.1fs; cancel with C-c j x)" label
+                        (or (plist-get snapshot :management-age) 0.0))
+              "none"))
     (format "Reconnect attempt: %s"
             (or (plist-get snapshot :reconnect-attempt) 0))
     (format "Next reconnect: %s"
@@ -767,6 +784,9 @@ Precedence (highest first):
             suggestions))
     (when-let* ((error (plist-get snapshot :async-error)))
       (push (format "Last async failure: %s" error) suggestions))
+    (when (plist-get snapshot :management-label)
+      (push "Management operation is running: cancel it with `C-c j x'."
+            suggestions))
     (if suggestions
         (concat "Suggested actions:\n- " (string-join (nreverse suggestions) "\n- "))
       "Suggested actions:\n- Engine looks healthy; send the current cell with `C-c j c'.")))
@@ -974,6 +994,9 @@ executes."
   (ignore-errors
     (emacs-jupyter-notebook--cancel-async-context-locally
      emacs-jupyter-notebook--async-context))
+  (ignore-errors
+    (when (emacs-jupyter-notebook--management-active-p)
+      (emacs-jupyter-notebook--cancel-management-operation)))
   (ignore-errors (emacs-jupyter-notebook--clear-buffer-timers))
   (ignore-errors (emacs-jupyter-notebook--heartbeat-cancel))
   (ignore-errors (emacs-jupyter-notebook--cancel-auto-reconnect))
@@ -998,7 +1021,8 @@ executes."
         emacs-jupyter-notebook--completion-cache-order nil
         emacs-jupyter-notebook--completion-pending-key nil
         emacs-jupyter-notebook--completion-pending-id nil
-        emacs-jupyter-notebook--completion-request-counter 0))
+        emacs-jupyter-notebook--completion-request-counter 0
+        emacs-jupyter-notebook--management-operation nil))
 
 (defun emacs-jupyter-notebook--mode-disable-cleanup ()
   "Cleanup invoked from the mode-disable branch.
@@ -1260,6 +1284,113 @@ registry."
           (or (plist-get entry :profile) "")
           (or (plist-get entry :session-id) "")))
 
+(defun emacs-jupyter-notebook--management-active-p (&optional token)
+  "Return non-nil when a management job is active and optionally matches TOKEN."
+  (and emacs-jupyter-notebook--management-operation
+       (or (null token)
+           (eq token
+               (plist-get emacs-jupyter-notebook--management-operation
+                          :token)))))
+
+(defun emacs-jupyter-notebook--management-begin (label)
+  "Begin a buffer-local management job named LABEL and return its token."
+  (when (emacs-jupyter-notebook--management-active-p)
+    (user-error
+     "Management operation already in progress (%s); use C-c j x to cancel"
+     (plist-get emacs-jupyter-notebook--management-operation :label)))
+  (let ((token (gensym "ejn-management-")))
+    (setq emacs-jupyter-notebook--management-operation
+          (list :token token :label label :started-at (float-time)
+                :process nil))
+    (force-mode-line-update t)
+    (message "emacs-jupyter-notebook: %s (C-c j x cancels)" label)
+    token))
+
+(defun emacs-jupyter-notebook--management-finish (token)
+  "Clear the management job identified by TOKEN."
+  (when (emacs-jupyter-notebook--management-active-p token)
+    (setq emacs-jupyter-notebook--management-operation nil)
+    (force-mode-line-update t)))
+
+(defun emacs-jupyter-notebook--management-launch
+    (token name argv success failure &optional timeout)
+  "Launch one management process under TOKEN.
+SUCCESS receives stdout.  FAILURE receives a reason and stderr.  Callbacks
+run only while TOKEN still owns the buffer and this is its current process."
+  (let ((buffer (current-buffer)) process)
+    (condition-case _err
+        (setq process
+              (emacs-jupyter-notebook-ssh-start-management-operation
+               name argv
+               (lambda (output)
+                 (when (buffer-live-p buffer)
+                   (with-current-buffer buffer
+                     (let ((current
+                            (plist-get
+                             emacs-jupyter-notebook--management-operation
+                             :process)))
+                       (when (and
+                              (emacs-jupyter-notebook--management-active-p token)
+                              (or (null current) (eq current process)))
+                         (setq emacs-jupyter-notebook--management-operation
+                               (plist-put
+                                emacs-jupyter-notebook--management-operation
+                                :process nil))
+                         (funcall success output))))))
+               (lambda (reason stderr)
+                 (when (buffer-live-p buffer)
+                   (with-current-buffer buffer
+                     (let ((current
+                            (plist-get
+                             emacs-jupyter-notebook--management-operation
+                             :process)))
+                       (when (and
+                              (emacs-jupyter-notebook--management-active-p token)
+                              (or (null current) (eq current process)))
+                         (setq emacs-jupyter-notebook--management-operation
+                               (plist-put
+                                emacs-jupyter-notebook--management-operation
+                                :process nil))
+                         (funcall failure reason stderr))))))
+               timeout))
+      (error
+       (when (emacs-jupyter-notebook--management-active-p token)
+         (funcall failure 'failed ""))))
+    ;; A test double (or a process that exits immediately) may complete before
+    ;; the starter returns.  Do not overwrite a continuation's newer process.
+    (when (and process
+               (emacs-jupyter-notebook--management-active-p token)
+               (null (plist-get emacs-jupyter-notebook--management-operation
+                                :process)))
+      (setq emacs-jupyter-notebook--management-operation
+            (plist-put emacs-jupyter-notebook--management-operation
+                       :process process)))
+    process))
+
+(defun emacs-jupyter-notebook--management-run
+    (label name argv success failure &optional timeout)
+  "Run one management command with progress and cancellation state."
+  (let ((token (emacs-jupyter-notebook--management-begin label)))
+    (emacs-jupyter-notebook--management-launch
+     token name argv
+     (lambda (output)
+       (emacs-jupyter-notebook--management-finish token)
+       (funcall success output))
+     (lambda (reason stderr)
+       (emacs-jupyter-notebook--management-finish token)
+       (funcall failure reason stderr))
+     timeout)))
+
+(defun emacs-jupyter-notebook--cancel-management-operation ()
+  "Cancel the current local management process without touching durable state."
+  (let* ((job emacs-jupyter-notebook--management-operation)
+         (token (plist-get job :token))
+         (process (plist-get job :process)))
+    (if (processp process)
+        (emacs-jupyter-notebook-ssh-management-cancel process)
+      (emacs-jupyter-notebook--management-finish token)
+      (message "emacs-jupyter-notebook: management operation cancelled"))))
+
 ;;; W11 (B) — non-destructive prune of dead registry entries
 ;;
 ;; Ghost kernels: the reconnect picker used to list every registry entry,
@@ -1357,6 +1488,101 @@ and are never pruned; only a host-confirmed-gone PID yields `dead'."
   "Return the W11 liveness status of ENTRY within CLASSIFICATION (by `eq')."
   (cdr (cl-assoc entry classification :test #'eq)))
 
+(defun emacs-jupyter-notebook--classify-registry-liveness-async
+    (entries token callback)
+  "Classify ENTRIES asynchronously under management TOKEN.
+CALLBACK receives CLASSIFICATION and a terminal reason.  The reason is nil on
+completion or `cancelled'.  Failed/timed-out hosts are classified `unknown'."
+  (let ((groups nil)
+        (result nil))
+    (dolist (entry entries)
+      (let ((pid (plist-get entry :remote-pid)))
+        (if (not pid)
+            (push (cons entry 'unknown) result)
+          (let* ((profile (emacs-jupyter-notebook--entry-profile entry))
+                 (destination
+                  (condition-case nil
+                      (emacs-jupyter-notebook-ssh-destination profile)
+                    (error nil))))
+            (if (not destination)
+                (push (cons entry 'unknown) result)
+              (let ((group (assoc destination groups)))
+                (if group
+                    (setcdr (cdr group) (cons entry (cddr group)))
+                  (push (cons destination (cons profile (list entry)))
+                        groups))))))))
+    (cl-labels
+        ((record-group
+          (host-entries answered alive)
+          (dolist (entry host-entries)
+            (let ((pid (format "%s" (plist-get entry :remote-pid))))
+              (push (cons entry
+                          (cond ((not answered) 'unknown)
+                                ((member pid alive) 'alive)
+                                (t 'dead)))
+                    result))))
+         (next
+          (remaining)
+          (cond
+           ((not (emacs-jupyter-notebook--management-active-p token))
+            nil)
+           ((null remaining)
+            (funcall callback result nil))
+           (t
+            (let* ((group (car remaining))
+                   (profile (cadr group))
+                   (host-entries (cddr group))
+                   (pids (mapcar
+                          (lambda (entry)
+                            (plist-get entry :remote-pid))
+                          host-entries))
+                   (argv
+                    (condition-case nil
+                        (emacs-jupyter-notebook-ssh-build-batch-pid-alive
+                         profile pids)
+                      (error nil))))
+              (if (not argv)
+                  (progn
+                    (record-group host-entries nil nil)
+                    (next (cdr remaining)))
+                (emacs-jupyter-notebook--management-launch
+                 token "ejn-liveness-probe" argv
+                 (lambda (output)
+                   (let* ((lines (split-string output "[\r\n]+" t "[ \t]+"))
+                          (answered (member "__EJN_DONE__" lines))
+                          (alive
+                           (and answered
+                                (cl-remove-if-not
+                                 (lambda (pid)
+                                   (member (format "%s" pid) lines))
+                                 pids))))
+                     (record-group
+                      host-entries answered
+                      (mapcar (lambda (pid) (format "%s" pid)) alive))
+                     (next (cdr remaining))))
+                 (lambda (reason _stderr)
+                   (if (eq reason 'cancelled)
+                       (funcall callback nil 'cancelled)
+                     (record-group host-entries nil nil)
+                     (next (cdr remaining))))
+                 emacs-jupyter-notebook-prune-ssh-timeout)))))))
+      (next groups))))
+
+(defun emacs-jupyter-notebook--registry-liveness-result
+    (entries classification)
+  "Summarize ENTRIES using liveness CLASSIFICATION without doing I/O."
+  (let ((dead nil) (alive 0) (unknown 0) (kept nil))
+    (dolist (entry entries)
+      (pcase (emacs-jupyter-notebook--liveness-status entry classification)
+        ('dead (push entry dead))
+        ('alive (setq alive (1+ alive)) (push entry kept))
+        (_ (setq unknown (1+ unknown)) (push entry kept))))
+    (list :pruned (length dead)
+          :alive alive
+          :unknown unknown
+          :kept-entries (nreverse kept)
+          :pruned-entries (nreverse dead))))
+
 (defun emacs-jupyter-notebook--prune-dead-registry-entries (&optional file probe-fn)
   "Prune registry entries whose remote kernel is confirmed DEAD.  W11(B).
 Load the registry from FILE, classify liveness via PROBE-FN, and rewrite
@@ -1368,77 +1594,83 @@ when at least one entry is actually pruned.  Return a plist
   (let* ((entries (emacs-jupyter-notebook-registry-load file))
          (classification (emacs-jupyter-notebook--classify-registry-liveness
                           entries probe-fn))
-         (dead nil) (alive 0) (unknown 0) (kept nil))
-    (dolist (entry entries)
-      (pcase (emacs-jupyter-notebook--liveness-status entry classification)
-        ('dead (push entry dead))
-        ('alive (setq alive (1+ alive)) (push entry kept))
-        (_ (setq unknown (1+ unknown)) (push entry kept))))
-    (setq kept (nreverse kept))
-    (setq dead (nreverse dead))
-    (when dead
-      (emacs-jupyter-notebook-registry-save kept file))
-    (list :pruned (length dead)
-          :alive alive
-          :unknown unknown
-          :kept-entries kept
-          :pruned-entries dead)))
+         (result (emacs-jupyter-notebook--registry-liveness-result
+                  entries classification)))
+    (when (plist-get result :pruned-entries)
+      (emacs-jupyter-notebook-registry-save
+       (plist-get result :kept-entries) file))
+    result))
+
+(defun emacs-jupyter-notebook--choose-registry-entry (entries)
+  "Prompt for and return one entry from ENTRIES."
+  (unless entries
+    (user-error "No kernel sessions found in registry"))
+  (let* ((choices (mapcar
+                   (lambda (entry)
+                     (cons (emacs-jupyter-notebook--registry-entry-label entry)
+                           entry))
+                   entries))
+         (current (emacs-jupyter-notebook--current-file-registry-entry))
+         (current-key (and current
+                           (or (plist-get current :session-id)
+                               (plist-get current :profile))))
+         (default-entry
+          (and current-key
+               (cl-find-if
+                (lambda (entry)
+                  (equal current-key
+                         (or (plist-get entry :session-id)
+                             (plist-get entry :profile))))
+                entries)))
+         (default (and default-entry
+                       (car (rassq default-entry choices))))
+         (prompt (if default
+                     (format "Reconnect kernel (default %s): " default)
+                   "Reconnect kernel: "))
+         (choice (completing-read prompt choices nil t nil nil default)))
+    (or (cdr (assoc choice choices))
+        (error "No registry entry selected"))))
 
 (defun emacs-jupyter-notebook--read-registry-entry ()
-  "Read and return a registry entry for reconnect.
-W6.8: always offer a chooser interactively, with the current file's
-entry pre-selected as the default initial-input.  If the registry has
-exactly one entry, that entry is the default; the chooser still runs so
-the user can confirm or pick another.
+  "Read one registry entry without performing remote work."
+  (let ((entries (emacs-jupyter-notebook-registry-load)))
+    (emacs-jupyter-notebook--choose-registry-entry entries)))
 
-W11(B): before presenting choices, probe liveness and DROP entries whose
-remote kernel a host confirmed dead — those ghosts are also removed from
-the durable registry, so only live/unknown entries are offered.  The
-whole probe is guarded: any failure falls back to showing every entry
-unchanged, so a flaky probe can never block reconnect."
+(defun emacs-jupyter-notebook--read-registry-entry-async (callback)
+  "Probe the registry asynchronously, then invoke CALLBACK with a chosen entry."
   (let ((entries (emacs-jupyter-notebook-registry-load)))
     (unless entries
       (user-error "No kernel sessions found in registry"))
-    (let* ((classification
-            (condition-case _err
-                (emacs-jupyter-notebook--classify-registry-liveness entries)
-              (error nil)))
-           (dead (cl-remove-if-not
-                  (lambda (e)
-                    (eq 'dead (emacs-jupyter-notebook--liveness-status
-                               e classification)))
-                  entries))
-           (survivors (cl-remove-if (lambda (e) (memq e dead)) entries)))
-      ;; Drop confirmed-dead ghosts from the durable registry too.
-      (when dead
-        (emacs-jupyter-notebook-registry-save survivors)
-        (message "emacs-jupyter-notebook: pruned %d dead kernel entr%s from picker"
-                 (length dead) (if (= (length dead) 1) "y" "ies")))
-      (unless survivors
-        (user-error "All registered kernels are dead; start a fresh one"))
-      (let* ((choices (mapcar (lambda (entry)
-                                (cons (emacs-jupyter-notebook--registry-entry-label
-                                       entry)
-                                      entry))
-                              survivors))
-             (current (emacs-jupyter-notebook--current-file-registry-entry))
-             (current-key (and current
-                               (or (plist-get current :session-id)
-                                   (plist-get current :profile))))
-             (default-entry (and current-key
-                                 (cl-find-if
-                                  (lambda (e)
-                                    (equal current-key
-                                           (or (plist-get e :session-id)
-                                               (plist-get e :profile))))
-                                  survivors)))
-             (default (and default-entry (car (rassq default-entry choices))))
-             (prompt (if default
-                         (format "Reconnect kernel (default %s): " default)
-                       "Reconnect kernel: "))
-             (choice (completing-read prompt choices nil t nil nil default)))
-        (or (cdr (assoc choice choices))
-            (error "No registry entry selected"))))))
+    (let ((token (emacs-jupyter-notebook--management-begin
+                  "checking registered kernels")))
+      (emacs-jupyter-notebook--classify-registry-liveness-async
+       entries token
+       (lambda (classification reason)
+         (emacs-jupyter-notebook--management-finish token)
+         (cond
+          ((eq reason 'cancelled)
+           (message "emacs-jupyter-notebook: reconnect selection cancelled"))
+          (t
+           (let* ((result (emacs-jupyter-notebook--registry-liveness-result
+                           entries classification))
+                  (dead (plist-get result :pruned-entries))
+                  (survivors (plist-get result :kept-entries)))
+             (when dead
+               (emacs-jupyter-notebook-registry-save survivors)
+               (message
+                "emacs-jupyter-notebook: pruned %d dead kernel entr%s from picker"
+                (length dead) (if (= (length dead) 1) "y" "ies")))
+             (if (null survivors)
+                 (message
+                  "emacs-jupyter-notebook: all registered kernels are dead")
+               (condition-case err
+                   (funcall callback
+                            (emacs-jupyter-notebook--choose-registry-entry
+                             survivors))
+                 (quit nil)
+                 (error
+                  (message "emacs-jupyter-notebook: picker failed: %s"
+                           (error-message-string err)))))))))))))
 
 ;; W4.7: the synchronous `--retrieve-connection-file' that polled with
 ;; `sleep-for' has been removed.  The async retrieve in
@@ -3286,13 +3518,12 @@ non-nil, do not send a Jupyter shutdown request to the current client."
     (setq context (emacs-jupyter-notebook--async-launch context))
     context))
 
-;;;###autoload
-(defun emacs-jupyter-notebook-reconnect-remote-kernel (entry &optional callback error-callback)
-  "Reconnect current buffer to an existing remote kernel ENTRY asynchronously.
-  CALLBACK and ERROR-CALLBACK are optional completion hooks."
-  (interactive (list (emacs-jupyter-notebook--read-registry-entry)))
-  (let ((interactivep (called-interactively-p 'interactive))
-        (profile-name (plist-get entry :profile)))
+(defun emacs-jupyter-notebook--reconnect-selected-entry
+    (entry callback error-callback interactivep)
+  "Reconnect to ENTRY after an asynchronous picker has selected it.
+CALLBACK and ERROR-CALLBACK are completion hooks.  INTERACTIVEP controls the
+fresh-kernel recovery prompt for a confirmed dead or mismatched kernel."
+  (let ((profile-name (plist-get entry :profile)))
     ;; Explicit reconnect supersedes a stale reconnect attempt without a
     ;; second prompt.  It never supersedes a start attempt silently.
     (emacs-jupyter-notebook--ensure-no-async-operation t)
@@ -3309,6 +3540,22 @@ non-nil, do not send a Jupyter shutdown request to the current client."
                     "The registered kernel is gone (possibly after its idle "
                     "timeout); start a fresh kernel on the same profile? ")))
          (emacs-jupyter-notebook-retry-fresh-kernel profile-name))))))
+
+;;;###autoload
+(defun emacs-jupyter-notebook-reconnect-remote-kernel
+    (&optional entry callback error-callback)
+  "Reconnect current buffer to remote kernel ENTRY asynchronously.
+CALLBACK and ERROR-CALLBACK are optional completion hooks.  Interactively,
+probe registered kernels without blocking, then present the reconnect picker."
+  (interactive)
+  (let ((interactivep (called-interactively-p 'interactive)))
+    (if entry
+        (emacs-jupyter-notebook--reconnect-selected-entry
+         entry callback error-callback interactivep)
+      (emacs-jupyter-notebook--read-registry-entry-async
+       (lambda (selected)
+         (emacs-jupyter-notebook--reconnect-selected-entry
+          selected callback error-callback interactivep))))))
 
 (defun emacs-jupyter-notebook--cold-start-p ()
   "Return non-nil when sending would trigger a cold remote-kernel start.
@@ -3566,6 +3813,10 @@ the human-readable string shown in the status buffer."
       (push (cons "Cancel the failed async operation"
                   'emacs-jupyter-notebook-cancel-operation)
             actions))
+    (when (plist-get snapshot :management-label)
+      (push (cons "Cancel the management operation"
+                  'emacs-jupyter-notebook-cancel-operation)
+            actions))
     (when (plist-get snapshot :client)
       (push (cons "Send the current cell"
                   'emacs-jupyter-notebook-send-cell)
@@ -3584,6 +3835,11 @@ the human-readable string shown in the status buffer."
     (format "Kernel status: %s" (or (plist-get snapshot :kernel-status) "unknown"))
     (format "Tunnel: %s" (plist-get snapshot :tunnel-state))
     (format "Async phase: %s" (or (plist-get snapshot :async-phase) "none"))
+    (format "Management: %s"
+            (if-let* ((label (plist-get snapshot :management-label)))
+                (format "%s (%.1fs; cancel with C-c j x)" label
+                        (or (plist-get snapshot :management-age) 0.0))
+              "none"))
     (format "Async error: %s" (or (plist-get snapshot :async-error) "none"))
     (format "Remote host: %s" (or (plist-get snapshot :remote-host) "unknown"))
     (format "Remote PID: %s" (or (plist-get snapshot :remote-pid) "unknown"))
@@ -3763,21 +4019,30 @@ After each append the buffer is truncated to
          (connection-file (plist-get entry :remote-connection-file)))
     (unless connection-file
       (user-error "Current EJN session has no remote connection file"))
-    (emacs-jupyter-notebook--display-command-output
-     "*ejn-log*"
-     (emacs-jupyter-notebook-ssh-run-command
-      (emacs-jupyter-notebook-ssh-build-remote-cat-log
-       (emacs-jupyter-notebook--entry-profile entry) connection-file)))))
+    (emacs-jupyter-notebook--management-run
+     "fetching remote log" "ejn-fetch-log"
+     (emacs-jupyter-notebook-ssh-build-remote-cat-log
+      (emacs-jupyter-notebook--entry-profile entry) connection-file)
+     (lambda (output)
+       (emacs-jupyter-notebook--display-command-output "*ejn-log*" output)
+       (message "emacs-jupyter-notebook: remote log fetched"))
+     (lambda (reason _stderr)
+       (message "emacs-jupyter-notebook: remote log fetch %s" reason)))))
 
 (defun emacs-jupyter-notebook-list-remote-processes (&optional profile-name)
   "List likely remote EJN kernel processes for PROFILE-NAME."
   (interactive (list (emacs-jupyter-notebook--read-profile-name)))
   (let ((profile (emacs-jupyter-notebook--read-host-profile
                   (or profile-name emacs-jupyter-notebook-default-profile))))
-    (emacs-jupyter-notebook--display-command-output
-     "*ejn-remote-processes*"
-     (emacs-jupyter-notebook-ssh-run-command
-      (emacs-jupyter-notebook-ssh-build-remote-ps-command profile)))))
+    (emacs-jupyter-notebook--management-run
+     "listing remote processes" "ejn-list-processes"
+     (emacs-jupyter-notebook-ssh-build-remote-ps-command profile)
+     (lambda (output)
+       (emacs-jupyter-notebook--display-command-output
+        "*ejn-remote-processes*" output)
+       (message "emacs-jupyter-notebook: remote processes listed"))
+     (lambda (reason _stderr)
+       (message "emacs-jupyter-notebook: process listing %s" reason)))))
 
 (defun emacs-jupyter-notebook-prune-dead-kernels ()
   "Prune registry entries whose remote kernel is confirmed DEAD.  W11(B).
@@ -3793,13 +4058,29 @@ files) see `emacs-jupyter-notebook-clean-orphaned-kernels'."
   (let ((entries (emacs-jupyter-notebook-registry-load)))
     (if (not entries)
         (message "emacs-jupyter-notebook: registry is empty; nothing to prune")
-      (let* ((result (emacs-jupyter-notebook--prune-dead-registry-entries))
-             (pruned (plist-get result :pruned))
-             (alive (plist-get result :alive))
-             (unknown (plist-get result :unknown)))
-        (message "emacs-jupyter-notebook: pruned %d dead kernel entr%s; %d live remain%s"
-                 pruned (if (= pruned 1) "y" "ies") alive
-                 (if (> unknown 0) (format " (%d unverified)" unknown) ""))))))
+      (let ((token (emacs-jupyter-notebook--management-begin
+                    "checking registered kernels for pruning")))
+        (emacs-jupyter-notebook--classify-registry-liveness-async
+         entries token
+         (lambda (classification reason)
+           (emacs-jupyter-notebook--management-finish token)
+           (if (eq reason 'cancelled)
+               (message "emacs-jupyter-notebook: registry prune cancelled")
+             (let* ((result
+                     (emacs-jupyter-notebook--registry-liveness-result
+                      entries classification))
+                    (pruned (plist-get result :pruned))
+                    (alive (plist-get result :alive))
+                    (unknown (plist-get result :unknown)))
+               (when (> pruned 0)
+                 (emacs-jupyter-notebook-registry-save
+                  (plist-get result :kept-entries)))
+               (message
+                "emacs-jupyter-notebook: pruned %d dead kernel entr%s; %d live remain%s"
+                pruned (if (= pruned 1) "y" "ies") alive
+                (if (> unknown 0)
+                    (format " (%d unverified)" unknown)
+                  ""))))))))))
 
 (defun emacs-jupyter-notebook-clean-orphaned-kernels (&optional profile-name force)
   "Clean all EJN kernel files and processes in PROFILE-NAME's remote cache.
@@ -3815,9 +4096,13 @@ Lisp callers do not see the prompt and proceed unconditionally."
            (format "Clean EJN kernels in %s on %s? "
                    (plist-get profile :remote-cache-dir)
                    (emacs-jupyter-notebook-ssh-destination profile)))
-      (emacs-jupyter-notebook-ssh-run-command
-       (emacs-jupyter-notebook-ssh-build-remote-cleanup-all profile))
-      (message "emacs-jupyter-notebook: requested remote orphan cleanup"))))
+      (emacs-jupyter-notebook--management-run
+       "cleaning remote orphaned kernels" "ejn-clean-orphans"
+       (emacs-jupyter-notebook-ssh-build-remote-cleanup-all profile)
+       (lambda (_output)
+         (message "emacs-jupyter-notebook: requested remote orphan cleanup"))
+       (lambda (reason _stderr)
+         (message "emacs-jupyter-notebook: orphan cleanup %s" reason))))))
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-clear-results ()
@@ -3833,7 +4118,9 @@ Lisp callers do not see the prompt and proceed unconditionally."
 (defun emacs-jupyter-notebook-cancel-operation ()
   "Cancel the current buffer's in-progress operation.
 
-W5.3: two branches.
+W5.3/IR4: three branches.
+- If an asynchronous management command is running, cancel its local child and
+  deadline.  This never changes the registry or sends a kernel termination.
 - If an async context is in progress (launch / retrieve / tunnel /
   connect), cancel it via `--cancel-async-operation' — the evaluation
   branch is NOT taken because there is no live kernel to interrupt.  A
@@ -3849,6 +4136,8 @@ W5.3: two branches.
 If neither is in progress, signal a `user-error'."
   (interactive)
   (cond
+   ((emacs-jupyter-notebook--management-active-p)
+    (emacs-jupyter-notebook--cancel-management-operation))
    ;; W5.5: only treat the async branch as live when an actual phase is in
    ;; flight.  A successful connect leaves `--async-context' set at phase
    ;; `done', which previously caused cancel-during-evaluation to take the
