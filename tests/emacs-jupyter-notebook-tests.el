@@ -8783,6 +8783,104 @@ session does not pay an O(history) erase+reinsert on every stream flush."
         (funcall idle-callback))
       (should-not opened))))
 
+(ert-deftest ejn-ir2-pending-clear-display-replaces-old-figure ()
+  "A replacement display after clear(wait) keeps only its new figure state."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks source handle))
+           (clear (cadr (assoc "clear_output" callbacks)))
+           (display (cadr (assoc "display_data" callbacks)))
+           (emacs-jupyter-notebook-viewer-auto-open t)
+           (old-pickle "old-pickle")
+           (new-pickle "new-pickle")
+           (timers nil)
+           (opened nil)
+           old-file)
+      (unwind-protect
+          (cl-letf (((symbol-function 'run-with-idle-timer)
+                     (lambda (_delay _repeat function &rest _args)
+                       (let ((timer (run-at-time 100 nil #'ignore)))
+                         (push (cons timer function) timers)
+                         timer)))
+                    ((symbol-function 'create-image)
+                     (lambda (data &optional _type _data-p &rest _props)
+                       (list 'image :type 'png :data data)))
+                    ((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
+                     (lambda (pickle) (push pickle opened)))
+                    ((symbol-function 'jupyter-message-content)
+                     (lambda (message)
+                       (pcase message
+                         ('clear-message '(:wait t))
+                         ('display-message
+                          `(:data (:image/png ,(base64-encode-string "new-image" t)
+                                   :application/x-ejn-mpl-pickle ,new-pickle)))))))
+            (ejn-panel-set-image handle '(image :type png :data "old-image"))
+            (emacs-jupyter-notebook--maybe-stash-pickle
+             source handle (list emacs-jupyter-notebook-mpl-pickle-mime-type old-pickle))
+            (setq old-file (plist-get (cdr (car (ejn-panel-entry-images handle))) :file))
+            (funcall clear 'clear-message)
+            (funcall display 'display-message)
+            (let* ((entry (ejn-panel-entry-snapshot handle))
+                   (new-file (plist-get (cdr (car (ejn-panel-entry-images handle))) :file)))
+              (should-not (file-exists-p old-file))
+              (should (file-exists-p new-file))
+              (should (equal (plist-get entry :mpl-pickle) new-pickle))
+              (should (timerp (plist-get entry :pickle-open-timer)))
+              (dolist (timer (nreverse timers))
+                (funcall (cdr timer)))
+              (should (equal opened (list new-pickle)))))
+        (dolist (timer timers)
+          (ignore-errors (cancel-timer (car timer))))))))
+
+(ert-deftest ejn-ir2-pending-clear-text-display-removes-stale-image ()
+  "A no-pickle text replacement after clear(wait) forces stale-image removal."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks source handle))
+           (clear (cadr (assoc "clear_output" callbacks)))
+           (display (cadr (assoc "display_data" callbacks)))
+           (emacs-jupyter-notebook-viewer-auto-open t)
+           idle-callback
+           old-file
+           opened)
+      (unwind-protect
+          (cl-letf (((symbol-function 'run-with-idle-timer)
+                     (lambda (_delay _repeat function &rest _args)
+                       (setq idle-callback function)
+                       (run-at-time 100 nil #'ignore)))
+                    ((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
+                     (lambda (pickle) (setq opened pickle)))
+                    ((symbol-function 'jupyter-message-content)
+                     (lambda (message)
+                       (pcase message
+                         ('clear-message '(:wait t))
+                         ('display-message '(:data (:text/plain "replacement")))))))
+            (ejn-panel-set-image handle '(image :type png :data "old-image"))
+            (setq old-file (plist-get (cdr (car (ejn-panel-entry-images handle))) :file))
+            (emacs-jupyter-notebook--maybe-stash-pickle
+             source handle '(:application/x-ejn-mpl-pickle "old-pickle"))
+            (funcall clear 'clear-message)
+            (funcall display 'display-message)
+            (emacs-jupyter-notebook-panel-flush-now panel)
+            (should-not (file-exists-p old-file))
+            (should-not (ejn-panel-entry-pickle handle))
+            (should-not (plist-get (ejn-panel-entry-snapshot handle)
+                                   :pickle-open-timer))
+            (with-current-buffer panel
+              (should (string-match-p "replacement" (buffer-string)))
+              (should-not (text-property-not-all
+                           (point-min) (point-max) 'display nil)))
+            (funcall idle-callback)
+            (should-not opened))
+        (with-current-buffer panel
+          (when-let ((timer (plist-get (ejn-panel-entry-snapshot handle)
+                                       :pickle-open-timer)))
+            (cancel-timer timer)))))))
+
 (ert-deftest ejn-ir2-exit-cleanup-is-local-only ()
   "The normal-exit artifact reaper leaves registry, SSH, and kernels alone."
   (with-temp-buffer
@@ -8906,6 +9004,121 @@ session does not pay an O(history) erase+reinsert on every stream flush."
             (with-current-buffer panel
               (should-not emacs-jupyter-notebook-panel--entries)))
         (setq emacs-jupyter-notebook--evaluation-request nil)))))
+
+;;; IR3 — total history and artifact retention budgets
+
+(ert-deftest ejn-ir3-entry-budget-evicts-oldest ()
+  "The entry cap retires the oldest history entry and leaves one marker."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook-panel-max-history-entries 2)
+          (emacs-jupyter-notebook-panel-max-total-text-bytes 100)
+          (emacs-jupyter-notebook-panel-max-total-artifact-bytes 100)
+          (panel (ejn-panel-ensure (current-buffer))))
+      (let ((first (ejn-panel-start-entry panel '("x.py" . 1) "first"))
+            (second (ejn-panel-start-entry panel '("x.py" . 2) "second"))
+            (third (ejn-panel-start-entry panel '("x.py" . 3) "third")))
+        (should-not (ejn-panel-entry-live-p first))
+        (should (ejn-panel-entry-live-p second))
+        (should (ejn-panel-entry-live-p third))
+        (with-current-buffer panel
+          (setq emacs-jupyter-notebook-panel--view 'history)
+          (emacs-jupyter-notebook-panel-flush-now panel)
+          (let ((text (buffer-string)))
+            (should (= 1 (how-many "\\[older output evicted\\]" (point-min) (point-max))))
+            (should-not (string-match-p "first" text))))))))
+
+(ert-deftest ejn-ir3-text-budget-is-global ()
+  "Source code and output text share one panel-wide retention budget."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook-panel-max-history-entries 10)
+          (emacs-jupyter-notebook-panel-max-total-text-bytes 5)
+          (emacs-jupyter-notebook-panel-max-total-artifact-bytes 100)
+          (panel (ejn-panel-ensure (current-buffer))))
+      (let ((first (ejn-panel-start-entry panel '("x.py" . 1) "abc"))
+            (second (ejn-panel-start-entry panel '("x.py" . 2) "")))
+        (ejn-panel-append-text second "def")
+        (should-not (ejn-panel-entry-live-p first))
+        (should (ejn-panel-entry-live-p second))
+        (with-current-buffer panel
+          (should (= (emacs-jupyter-notebook-panel--total-text-bytes) 3)))))))
+
+(ert-deftest ejn-ir3-artifact-budget-deletes-files ()
+  "The artifact cap deletes evicted image files and releases their entry."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook-panel-max-history-entries 10)
+          (emacs-jupyter-notebook-panel-max-total-text-bytes 100)
+          (emacs-jupyter-notebook-panel-max-total-artifact-bytes 5)
+          (panel (ejn-panel-ensure (current-buffer))))
+      (let* ((first (ejn-panel-start-entry panel '("x.py" . 1) "first"))
+             (second (ejn-panel-start-entry panel '("x.py" . 2) "second")))
+        (ejn-panel-set-image first '(image :type png :data "aaaa"))
+        (let ((old-file (plist-get (cdr (car (ejn-panel-entry-images first))) :file)))
+          (ejn-panel-set-image second '(image :type png :data "bbbb"))
+          (should-not (file-exists-p old-file))
+          (should-not (ejn-panel-entry-live-p first))
+          (should (ejn-panel-entry-live-p second))
+          (with-current-buffer panel
+            (should (= (emacs-jupyter-notebook-panel--total-artifact-bytes) 4)))
+          ;; MIME payloads are in the same global artifact budget as files.
+          (let ((pickle-only (ejn-panel-start-entry panel '("x.py" . 3) "pickle")))
+            (ejn-panel-set-pickle pickle-only "oversize")
+            (should-not (ejn-panel-entry-live-p pickle-only)))
+          ;; File deletion between existence and attribute checks is harmless.
+          (let ((racy-file (make-temp-file "ejn-ir3-race-")))
+            (unwind-protect
+                (progn
+                  (cl-letf (((symbol-function 'file-attributes)
+                             (lambda (&rest _) (signal 'file-error '("gone")))))
+                    (should (= 0 (emacs-jupyter-notebook-panel--image-artifact-bytes
+                                  (list 'image :file racy-file)))))
+                  (cl-letf (((symbol-function 'file-attributes)
+                             (lambda (&rest _) nil)))
+                    (should (= 0 (emacs-jupyter-notebook-panel--image-artifact-bytes
+                                  (list 'image :file racy-file))))))
+              (delete-file racy-file))))))))
+
+(ert-deftest ejn-ir3-latest-cell-survives-history-eviction ()
+  "Eviction removes stale history before a cell's latest result."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook-panel-max-history-entries 2)
+          (emacs-jupyter-notebook-panel-max-total-text-bytes 100)
+          (emacs-jupyter-notebook-panel-max-total-artifact-bytes 100)
+          (panel (ejn-panel-ensure (current-buffer)))
+          (key '("x.py" . 1)))
+      (let ((old (ejn-panel-start-entry panel key "old"))
+            (other (ejn-panel-start-entry panel '("x.py" . 2) "other"))
+            (new (ejn-panel-start-entry panel key "new")))
+        (ejn-panel-append-text old "old output")
+        (ejn-panel-append-text other "other output")
+        (ejn-panel-append-text new "new output")
+        (should-not (ejn-panel-entry-live-p old))
+        (should (ejn-panel-entry-live-p new))
+        (with-current-buffer panel
+          (setq emacs-jupyter-notebook-panel--view 'latest)
+          (emacs-jupyter-notebook-panel-flush-now panel)
+          (let ((text (buffer-string)))
+            (should (string-match-p "new output" text))
+            (should-not (string-match-p "old output" text))))))))
+
+(ert-deftest ejn-ir3-inline-images-use-creation-order ()
+  "The inline preview cap chooses the newest entry, not source order."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook-panel-max-history-entries 10)
+          (emacs-jupyter-notebook-panel-max-total-text-bytes 100)
+          (emacs-jupyter-notebook-panel-max-total-artifact-bytes 100)
+          (emacs-jupyter-notebook-panel-max-inline-images 1)
+          (panel (ejn-panel-ensure (current-buffer))))
+      ;; The first entry sorts AFTER the newer entry by source position.
+      (let ((older (ejn-panel-start-entry panel '("x.py" . 100) "older"))
+            (newer (ejn-panel-start-entry panel '("x.py" . 1) "newer")))
+        (ejn-panel-set-image older '(image :type png :data "old-image"))
+        (ejn-panel-set-image newer '(image :type png :data "new-image-first"))
+        (ejn-panel-set-image newer '(image :type png :data "new-image-final"))
+        (with-current-buffer panel
+          (setq emacs-jupyter-notebook-panel--view 'latest)
+          (emacs-jupyter-notebook-panel-flush-now panel)
+          (should (equal emacs-jupyter-notebook-panel--inline-image-specs
+                         (last (ejn-panel-entry-images newer)))))))))
 
 (provide 'emacs-jupyter-notebook-tests)
 

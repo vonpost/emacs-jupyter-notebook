@@ -136,6 +136,25 @@ Can be overridden per-profile with :jupyter-command in the profile plist."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
+(defcustom emacs-jupyter-notebook-panel-max-history-entries 200
+  "Maximum number of result entries retained by one panel.
+When this or either total-retention budget is exceeded, the panel retires
+the oldest history entries and their local artifacts."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-panel-max-total-text-bytes (* 20 1024 1024)
+  "Maximum total byte size of text retained by one result panel."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-panel-max-total-artifact-bytes (* 100 1024 1024)
+  "Maximum total byte size of image and MIME artifacts retained by one panel.
+This includes the actual bytes of panel-owned image files and matplotlib
+pickle MIME payloads."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
 (defcustom emacs-jupyter-notebook-image-max-width 800
   "Maximum image width for inline image results, in pixels."
   :type 'integer

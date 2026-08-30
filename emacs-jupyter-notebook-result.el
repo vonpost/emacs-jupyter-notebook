@@ -241,6 +241,9 @@ before a future implementation chooses to reuse entry ids.")
 (defvar-local emacs-jupyter-notebook-panel--force-full-render nil
   "Non-nil when the next flush must rebuild the complete panel view.")
 
+(defvar-local emacs-jupyter-notebook-panel--history-evicted-p nil
+  "Non-nil once this panel has evicted retained history entries.")
+
 ;;; Panel mode
 
 (defvar emacs-jupyter-notebook-panel-mode-map
@@ -602,8 +605,12 @@ no source-buffer marker is registered, e.g. in tests)."
                            collect (cdr seg))))
 
 (defun emacs-jupyter-notebook-panel--bounded-inline-specs (entries)
-  "Return the newest bounded subset of image specs visible in ENTRIES."
-  (let* ((specs (emacs-jupyter-notebook-panel--image-specs entries))
+  "Return the newest bounded subset of image specs visible in ENTRIES.
+Newness follows entry creation ids, rather than source-position display order."
+  (let* ((creation-order
+          (sort (copy-sequence entries)
+                (lambda (a b) (< (plist-get a :id) (plist-get b :id)))))
+         (specs (emacs-jupyter-notebook-panel--image-specs creation-order))
          (max emacs-jupyter-notebook-panel-max-inline-images))
     (if (and (integerp max) (> max 0))
         (last specs (min max (length specs)))
@@ -767,6 +774,10 @@ entry is visible; latest-per-cell view goes to the top."
                (format "Output panel — view: %s   (H toggle, RET visit, q bury)\n\n"
                        emacs-jupyter-notebook-panel--view)
                'face 'emacs-jupyter-notebook-result-header-face))
+      (when (and (eq emacs-jupyter-notebook-panel--view 'history)
+                 emacs-jupyter-notebook-panel--history-evicted-p)
+        (insert (propertize "[older output evicted]\n\n"
+                            'face 'emacs-jupyter-notebook-result-header-face)))
       (dolist (entry entries)
         (emacs-jupyter-notebook-panel--insert-entry
          entry emacs-jupyter-notebook-panel--inline-image-specs))
@@ -850,6 +861,106 @@ returned unchanged.  The file is mode 0600 and written without coding."
     (when (eq (car seg) 'image)
       (emacs-jupyter-notebook-panel--retire-image panel (cdr seg)))))
 
+(defun emacs-jupyter-notebook-panel--entry-text-bytes (entry)
+  "Return the retained source and output text byte count for ENTRY."
+  (+ (let ((code (plist-get entry :code)))
+       (if (stringp code) (string-bytes code) 0))
+     (cl-loop for segment in (plist-get entry :outputs)
+              when (eq (car segment) 'text)
+              sum (string-bytes (cdr segment)))))
+
+(defun emacs-jupyter-notebook-panel--image-artifact-bytes (image)
+  "Return retained artifact bytes for IMAGE, using its actual file size."
+  (let* ((props (cdr-safe image))
+         (file (plist-get props :file))
+         (data (plist-get props :data)))
+    (cond
+     ((and (stringp file) (file-exists-p file))
+      ;; Accounting must not expose a local cleanup race to an output callback.
+      (condition-case nil
+          (let ((size (file-attribute-size (file-attributes file))))
+            (if (and (numberp size) (>= size 0)) size 0))
+        (file-error 0)
+        (error 0)))
+     ((stringp data) (string-bytes data))
+     (t 0))))
+
+(defun emacs-jupyter-notebook-panel--entry-artifact-bytes (entry)
+  "Return retained image and MIME artifact bytes for ENTRY."
+  (+ (cl-loop for segment in (plist-get entry :outputs)
+              when (eq (car segment) 'image)
+              sum (emacs-jupyter-notebook-panel--image-artifact-bytes
+                   (cdr segment)))
+     (let ((pickle (plist-get entry :mpl-pickle)))
+       (if (stringp pickle) (string-bytes pickle) 0))))
+
+(defun emacs-jupyter-notebook-panel--total-text-bytes ()
+  "Return the total retained text byte count in the current panel."
+  (cl-loop for cell in emacs-jupyter-notebook-panel--entries
+           sum (emacs-jupyter-notebook-panel--entry-text-bytes (cdr cell))))
+
+(defun emacs-jupyter-notebook-panel--total-artifact-bytes ()
+  "Return the total retained image and MIME artifact bytes in this panel."
+  (cl-loop for cell in emacs-jupyter-notebook-panel--entries
+           sum (emacs-jupyter-notebook-panel--entry-artifact-bytes (cdr cell))))
+
+(defun emacs-jupyter-notebook-panel--over-retention-budget-p ()
+  "Return non-nil when the current panel exceeds any configured budget."
+  (or (> (length emacs-jupyter-notebook-panel--entries)
+         emacs-jupyter-notebook-panel-max-history-entries)
+      (> (emacs-jupyter-notebook-panel--total-text-bytes)
+         emacs-jupyter-notebook-panel-max-total-text-bytes)
+      (> (emacs-jupyter-notebook-panel--total-artifact-bytes)
+         emacs-jupyter-notebook-panel-max-total-artifact-bytes)))
+
+(defun emacs-jupyter-notebook-panel--oldest-evictable-cell ()
+  "Return the oldest cell that is not the latest result for its cell key.
+When every retained entry is current, return the absolute oldest cell so
+configured budgets remain hard limits."
+  (let ((latest-ids (make-hash-table :test 'equal)))
+    (dolist (cell (reverse emacs-jupyter-notebook-panel--entries))
+      (let ((entry (cdr cell)))
+        (when (and (plist-get entry :cell-key)
+                   (not (gethash (plist-get entry :cell-key) latest-ids)))
+          (puthash (plist-get entry :cell-key) (car cell) latest-ids))))
+    (or (cl-find-if
+         (lambda (cell)
+           (let ((key (plist-get (cdr cell) :cell-key)))
+             (or (null key)
+                 (not (eql (car cell) (gethash key latest-ids))))))
+         emacs-jupyter-notebook-panel--entries)
+        (car emacs-jupyter-notebook-panel--entries))))
+
+(defun emacs-jupyter-notebook-panel--retire-entry (panel cell)
+  "Retire CELL's artifacts and remove it from PANEL's retained history."
+  (let* ((entry (cdr cell))
+         (images (ejn-panel-entry-images entry)))
+    (emacs-jupyter-notebook-panel--retire-outputs panel
+                                                   (plist-get entry :outputs))
+    (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer entry))
+    (setq entry (plist-put entry :outputs nil))
+    (setq entry (plist-put entry :mpl-pickle nil))
+    (setcdr cell entry)
+    (setq emacs-jupyter-notebook-panel--inline-image-specs
+          (cl-set-difference emacs-jupyter-notebook-panel--inline-image-specs
+                             images :test #'equal))
+    (setq emacs-jupyter-notebook-panel--entries
+          (delq cell emacs-jupyter-notebook-panel--entries))))
+
+(defun emacs-jupyter-notebook-panel--enforce-retention-budgets (panel)
+  "Evict oldest history entries from PANEL until all retention budgets hold."
+  (when (buffer-live-p panel)
+    (with-current-buffer panel
+      (let (evicted)
+        (while (and emacs-jupyter-notebook-panel--entries
+                    (emacs-jupyter-notebook-panel--over-retention-budget-p))
+          (when-let ((cell (emacs-jupyter-notebook-panel--oldest-evictable-cell)))
+            (emacs-jupyter-notebook-panel--retire-entry panel cell)
+            (setq evicted t)))
+        (when evicted
+          (setq emacs-jupyter-notebook-panel--history-evicted-p t)
+          (emacs-jupyter-notebook-panel--invalidate-structure panel))))))
+
 (defun emacs-jupyter-notebook-panel--retire-all-artifacts (panel)
   "Flush caches and delete every panel-owned output artifact in PANEL.
 This is local cleanup only.  Call it before discarding entries or during
@@ -879,6 +990,7 @@ normal Emacs exit; it never consults source, registry, SSH, or kernel state."
     (with-current-buffer panel
       (emacs-jupyter-notebook-panel--retire-all-artifacts panel)
       (setq emacs-jupyter-notebook-panel--entries nil)
+      (setq emacs-jupyter-notebook-panel--history-evicted-p nil)
       (cl-incf emacs-jupyter-notebook-panel--generation)
       (emacs-jupyter-notebook-panel--invalidate-structure panel))))
 
@@ -912,6 +1024,7 @@ state appears in place."
       (setq emacs-jupyter-notebook-panel--entries
             (append emacs-jupyter-notebook-panel--entries
                     (list (cons id entry))))
+      (emacs-jupyter-notebook-panel--enforce-retention-budgets panel)
       (emacs-jupyter-notebook-panel--schedule-render panel nil t)
       (emacs-jupyter-notebook-panel--handle panel id cell-key))))
 
@@ -1041,7 +1154,8 @@ colours are preserved and uncoloured spans still get the fallback FACE."
                                    outputs)))
            (setq entry (plist-put entry :pending-clear nil))
            entry))
-       force-full))))
+       force-full)
+      (emacs-jupyter-notebook-panel--enforce-retention-budgets panel))))
 
 (defun ejn-panel-replace-text (handle text)
   "Replace ALL of HANDLE's entry output with TEXT.
@@ -1061,7 +1175,8 @@ replaced whatever figure the entry previously showed."
          (setq entry (plist-put entry :mpl-pickle nil))
          (setq entry (plist-put entry :pending-clear nil))
          entry)
-       t))))
+       t)
+      (emacs-jupyter-notebook-panel--enforce-retention-budgets panel))))
 
 (defun ejn-panel-set-image (handle image-spec)
   "Append IMAGE-SPEC as a new image segment on HANDLE's entry.
@@ -1069,7 +1184,7 @@ W16: no longer erases prior text — a cell that prints AND plots shows
 both, in order, like a notebook.  Multiple figures in one execution each
 get their own segment."
   (when (ejn-panel-entry-live-p handle)
-    (let* ((panel (plist-get handle :panel)))
+    (let ((panel (plist-get handle :panel)))
       (when (ejn-panel-entry-live-p handle)
         (let ((stored (emacs-jupyter-notebook-panel--materialize-image
                        panel image-spec)))
@@ -1084,7 +1199,8 @@ get their own segment."
                                               (list (cons 'image stored)))))
                (setq entry (plist-put entry :pending-clear nil))
                entry))
-           t))))))
+           t)
+          (emacs-jupyter-notebook-panel--enforce-retention-budgets panel))))))
 
 (defun ejn-panel-update-image (handle image-spec)
   "Replace the LAST image segment on HANDLE's entry with IMAGE-SPEC.
@@ -1113,7 +1229,8 @@ so text segments are left untouched and no new segment is created."
                (setq entry (plist-put entry :outputs outputs))
                (setq entry (plist-put entry :pending-clear nil))
                entry))
-           t))))))
+           t)
+          (emacs-jupyter-notebook-panel--enforce-retention-budgets panel))))))
 
 (defun ejn-panel-finish-entry (handle status execution-count)
   "Mark HANDLE's entry as completed with STATUS and EXECUTION-COUNT."
@@ -1177,23 +1294,41 @@ image, so the PNG thumbnail path is untouched.  The interactive viewer
 (W8.5) reads this field to reopen the figure locally.  A nil BASE64 is a
 no-op.  A5: after stashing, prune pickles beyond the newest N entries."
   (when (and (ejn-panel-entry-live-p handle) base64)
-    (emacs-jupyter-notebook-panel--update-entry
-     handle
-     (lambda (entry)
-       (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
-                    entry))
-       (plist-put entry :mpl-pickle base64)))
-    (emacs-jupyter-notebook-panel--prune-pickles (plist-get handle :panel))))
+    (let* ((panel (plist-get handle :panel))
+           (old-entry (ejn-panel-entry-snapshot handle))
+           (force-full (and (plist-get old-entry :pending-clear)
+                            (cl-find 'image (plist-get old-entry :outputs)
+                                     :key #'car))))
+      (emacs-jupyter-notebook-panel--update-entry
+       handle
+       (lambda (entry)
+         (setq entry (emacs-jupyter-notebook-panel--entry-after-pending-clear
+                      panel entry))
+         (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
+                      entry))
+         (plist-put entry :mpl-pickle base64))
+       force-full)
+      (emacs-jupyter-notebook-panel--prune-pickles panel)
+      (emacs-jupyter-notebook-panel--enforce-retention-budgets panel))))
 
 (defun ejn-panel-clear-pickle (handle)
   "Drop any stashed matplotlib pickle on HANDLE's entry (W8.7(d))."
   (when handle
-    (emacs-jupyter-notebook-panel--update-entry
-     handle
-     (lambda (entry)
-       (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
-                    entry))
-       (plist-put entry :mpl-pickle nil)))))
+    (let* ((panel (plist-get handle :panel))
+           (old-entry (ejn-panel-entry-snapshot handle))
+           (force-full (and (plist-get old-entry :pending-clear)
+                            (cl-find 'image (plist-get old-entry :outputs)
+                                     :key #'car))))
+      (emacs-jupyter-notebook-panel--update-entry
+       handle
+       (lambda (entry)
+         (setq entry (emacs-jupyter-notebook-panel--entry-after-pending-clear
+                      panel entry))
+         (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
+                      entry))
+         (plist-put entry :mpl-pickle nil))
+       force-full)
+      (emacs-jupyter-notebook-panel--enforce-retention-budgets panel))))
 
 (defun ejn-panel-entry-pickle (handle)
   "Return the base64 matplotlib-pickle payload stashed on HANDLE's entry, or nil."
