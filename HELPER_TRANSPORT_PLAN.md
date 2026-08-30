@@ -447,21 +447,24 @@ modules.
   - Narrow run: ERT selector `^ejn-ir1-` plus every existing panel test.
   - Non-goal: no image retention or helper work.
 
-- [~] owner=terra-ir2 claimed=2026-08-30 **IR2 Retire cleared artifacts and reject late output before materialization.**
+- [x] sha=9040b4d **IR2 Retire cleared artifacts and reject late output before materialization.**
   - Depends: IR1.
   - Files: `emacs-jupyter-notebook-result.el`,
     `emacs-jupyter-notebook-jupyter.el`, `emacs-jupyter-notebook.el`,
     `tests/emacs-jupyter-notebook-tests.el`.
   - Deliverable: clearing results retires all output files/cache objects before
-    dropping entries.  Every callback checks that its entry handle is live
-    before decoding/writing/stashing.  Late `display_data`,
-    `update_display_data`, stream, and reply callbacks after clear become
-    logged no-ops.  Published artifact cleanup also runs on normal Emacs exit,
-    without touching registry or remote state.
+    dropping entries.  Presentation callbacks check that their entry handle is
+    live before decoding/writing/stashing; matching reply/status/stdin callbacks
+    still settle protocol bookkeeping without reviving presentation.  Deferred
+    viewer opens retain no payload, coalesce per entry, and are cancelled by
+    every artifact-retirement path.  Published artifact cleanup also runs on
+    normal Emacs exit without touching registry or remote state.
   - Tests: `ejn-ir2-clear-deletes-existing-artifacts`,
     `ejn-ir2-late-image-after-clear-creates-no-file`,
-    `ejn-ir2-late-pickle-after-clear-retains-no-bytes`, and
-    `ejn-ir2-exit-cleanup-is-local-only`.
+    `ejn-ir2-late-pickle-after-clear-retains-no-bytes`,
+    `ejn-ir2-pickle-auto-open-coalesces-latest-update`,
+    `ejn-ir2-pending-clear-retires-pickle-and-auto-open`, the clear-during-
+    execution reply/status/stdin tests, and `ejn-ir2-exit-cleanup-is-local-only`.
   - Narrow run: ERT selector `^ejn-ir2-` plus W1 and W18 selectors.
   - Non-goal: do not make current base64 decoding asynchronous here.
 
