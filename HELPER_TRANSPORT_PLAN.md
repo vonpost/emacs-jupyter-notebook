@@ -519,7 +519,7 @@ modules.
   - Narrow run: ERT selector `^ejn-ir4-` plus W4, W11, and W19 selectors.
   - Non-goal: remote smoke tests are not required.
 
-- [~] owner=terra-ir5 claimed=2026-08-31 **IR5 Make automatic reconnect retry ownership and status truthful.**
+- [x] owner=terra-ir5 claimed=2026-08-31 landed=0e40ca8 **IR5 Make automatic reconnect retry ownership and status truthful.**
   - Depends: IR4.
   - Files: `emacs-jupyter-notebook.el`,
     `tests/emacs-jupyter-notebook-tests.el`.
@@ -771,7 +771,7 @@ modules.
     UTF-8/JSON; source objects are not mutated.
   - Narrow run: ERT selector `^ejn-et1-`.
 
-- [~] owner=terra-et2 claimed=2026-08-31 **ET2 Supervise helper process and handshake without blocking Emacs.**
+- [x] owner=terra-et2 claimed=2026-08-31 landed=e24c08a **ET2 Supervise helper process and handshake without blocking Emacs.**
   - Depends: ET1, TH1.
   - Files: `emacs-jupyter-notebook-helper.el`,
     `emacs-jupyter-notebook-vars.el`,
@@ -787,7 +787,7 @@ modules.
     durable-state calls.
   - Narrow run: ERT selector `^ejn-et2-`.
 
-- [ ] **ET3 Add bounded event drain, credit replenishment, requests, and deadlines.**
+- [~] owner=terra-et3 claimed=2026-08-31 **ET3 Add bounded event drain, credit replenishment, requests, and deadlines.**
   - Depends: ET2.
   - Files: `emacs-jupyter-notebook-helper.el`,
     `tests/emacs-jupyter-notebook-helper-process-tests.el`.
@@ -830,7 +830,7 @@ modules.
     and proof no matching process/connection/temp files remain.
   - Narrow run: fixture integration test under 60 seconds.
 
-- [ ] **TH3 Build five-channel stoppable TCP relay fault harness.**
+- [~] owner=terra-th3 claimed=2026-08-31 **TH3 Build five-channel stoppable TCP relay fault harness.**
   - Depends: TH2.
   - Files: `helper/integration_tests/tcp_relays.py`,
     `helper/integration_tests/test_tcp_relays.py`.
