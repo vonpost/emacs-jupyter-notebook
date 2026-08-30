@@ -641,7 +641,7 @@ modules.
   - Narrow run: `PYTHONPATH=helper python3 -m unittest discover -s helper/tests -p 'test_dispatcher.py'`.
   - Non-goal: no `jupyter_client` import in the fake test path.
 
-- [ ] **HT7 Attach `AsyncKernelClient` without owning kernel lifecycle.**
+- [~] owner=terra-ht7 claimed=2026-08-31 **HT7 Attach `AsyncKernelClient` without owning kernel lifecycle.**
   - Depends: HT6, TH2.
   - Files: `helper/ejn_helper/jupyter_backend.py`,
     `helper/integration_tests/test_connect.py`.
@@ -817,7 +817,7 @@ modules.
     and validates deterministic bytes/exit.
   - Narrow run: command documented in fixture README.
 
-- [~] owner=luna-th2 claimed=2026-08-30 **TH2 Build a test-owned local kernel fixture matching production launch.**
+- [x] owner=luna-th2 claimed=2026-08-30 landed=bc59530 **TH2 Build a test-owned local kernel fixture matching production launch.**
   - Depends: HT2.
   - Files: `helper/integration_tests/kernel_fixture.py`,
     `helper/integration_tests/test_kernel_fixture.py`.
