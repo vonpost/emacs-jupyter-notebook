@@ -64,6 +64,9 @@ ignored.
 Events are asynchronous helper-to-Emacs notifications. Every event has a
 numeric helper-local monotonic `seq`, an allowed `event`, and an object
 `data`. Events associated with execution output carry `request_id`.
+The transport queue, not event producers, assigns `seq` immediately before
+wire delivery.  Values therefore increase strictly in observed wire order,
+including when a priority event bypasses ordinary output blocked on credit.
 
 Allowed operations are: `hello`, `ping`, `grant_event_credit`, `connect`,
 `kernel_info`, `execute`, `complete`, `inspect`, `is_complete`,
