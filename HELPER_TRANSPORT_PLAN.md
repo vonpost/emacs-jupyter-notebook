@@ -485,7 +485,7 @@ modules.
   - Narrow run: ERT selector `^ejn-ir3-` plus all panel/image tests.
   - Non-goal: do not silently exempt any MIME payload from a byte budget.
 
-- [~] owner=terra-ir3s claimed=2026-08-30 **IR3S Make streamed text accumulation amortized instead of quadratic.**
+- [x] owner=terra-ir3s claimed=2026-08-30 landed=87469ce **IR3S Make streamed text accumulation amortized instead of quadratic.**
   - Depends: IR3.
   - Files: `emacs-jupyter-notebook-result.el`,
     `tests/emacs-jupyter-notebook-tests.el`.
@@ -503,7 +503,7 @@ modules.
   - Narrow run: ERT selector `^ejn-ir3s-` plus streaming/panel tests.
   - Non-goal: no helper protocol work.
 
-- [ ] **IR4 Remove synchronous management SSH from ordinary UI paths.**
+- [~] owner=terra-ir4 claimed=2026-08-30 **IR4 Remove synchronous management SSH from ordinary UI paths.**
   - Depends: IR3S.
   - Files: `emacs-jupyter-notebook-ssh.el`, `emacs-jupyter-notebook.el`,
     `emacs-jupyter-notebook-vars.el`, `tests/emacs-jupyter-notebook-tests.el`.
@@ -625,7 +625,7 @@ modules.
   - Narrow run: `PYTHONPATH=helper python3 -m unittest discover -s helper/tests -p 'test_artifacts.py'`.
   - Non-goal: no image library and no decoded bitmap allocation.
 
-- [~] owner=terra-ht6 claimed=2026-08-30 **HT6 Add protocol dispatcher using a fake Jupyter backend.**
+- [x] owner=terra-ht6 claimed=2026-08-30 landed=b53ab4c **HT6 Add protocol dispatcher using a fake Jupyter backend.**
   - Depends: HT4, HT5.
   - Files: `helper/ejn_helper/backend.py`,
     `helper/ejn_helper/dispatcher.py`, `helper/tests/fake_backend.py`,
@@ -758,7 +758,7 @@ modules.
 
 ### Phase ET - pure Elisp transport
 
-- [~] owner=luna-et1 claimed=2026-08-30 **ET1 Implement pure unibyte frame codec.**
+- [x] owner=luna-et1 claimed=2026-08-30 landed=f6bbe94 **ET1 Implement pure unibyte frame codec.**
   - Depends: HT1.
   - Files: `emacs-jupyter-notebook-helper-protocol.el`,
     `tests/emacs-jupyter-notebook-helper-protocol-tests.el`.
@@ -817,7 +817,7 @@ modules.
     and validates deterministic bytes/exit.
   - Narrow run: command documented in fixture README.
 
-- [ ] **TH2 Build a test-owned local kernel fixture matching production launch.**
+- [~] owner=luna-th2 claimed=2026-08-30 **TH2 Build a test-owned local kernel fixture matching production launch.**
   - Depends: HT2.
   - Files: `helper/integration_tests/kernel_fixture.py`,
     `helper/integration_tests/test_kernel_fixture.py`.
