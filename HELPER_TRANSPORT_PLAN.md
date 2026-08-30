@@ -468,7 +468,7 @@ modules.
   - Narrow run: ERT selector `^ejn-ir2-` plus W1 and W18 selectors.
   - Non-goal: do not make current base64 decoding asynchronous here.
 
-- [ ] **IR3 Bound total panel history and artifact disk use.**
+- [~] owner=terra-ir3 claimed=2026-08-30 **IR3 Bound total panel history and artifact disk use.**
   - Depends: IR2.
   - Files: `emacs-jupyter-notebook-result.el`,
     `emacs-jupyter-notebook-vars.el`, `tests/emacs-jupyter-notebook-tests.el`.
@@ -583,7 +583,7 @@ modules.
     and Nix build.
   - Non-goal: no protocol loop or kernel launch.
 
-- [~] owner=root-fallback claimed=2026-08-30 **HT3 Implement the pure Python frame codec.**
+- [~] owner=luna-ht3 claimed=2026-08-30 **HT3 Implement the pure Python frame codec.**
   - Depends: HT2.
   - Files: `helper/ejn_helper/framing.py`,
     `helper/tests/test_framing.py`.
@@ -610,7 +610,7 @@ modules.
   - Narrow run: `PYTHONPATH=helper python3 -m unittest discover -s helper/tests -p 'test_flow.py'`.
   - Non-goal: no stdout writes and no sleeps.
 
-- [ ] **HT5 Implement secure artifact spooling.**
+- [~] owner=terra-ht5 claimed=2026-08-30 **HT5 Implement secure artifact spooling.**
   - Depends: HT2.
   - Files: `helper/ejn_helper/artifacts.py`,
     `helper/tests/test_artifacts.py`.
