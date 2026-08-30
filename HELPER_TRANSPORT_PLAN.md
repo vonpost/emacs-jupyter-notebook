@@ -535,7 +535,7 @@ modules.
 
 ### Phase HT - protocol and Python helper
 
-- [~] owner=luna-ht0 claimed=2026-08-30 **HT0 Add canonical local test runners.**
+- [x] sha=614412d **HT0 Add canonical local test runners.**
   - Depends: none.
   - Files: `tests/run-local-tests.el`, `tests/run-local-tests.sh`, `.gitignore`.
   - Deliverable: one source-only ERT runner that discovers local unit test
@@ -548,7 +548,7 @@ modules.
   - Narrow run: `tests/run-local-tests.sh`.
   - Non-goal: no production code.
 
-- [ ] **HT1 Freeze protocol v1 documentation and golden vectors.**
+- [~] owner=luna-ht1 claimed=2026-08-30 **HT1 Freeze protocol v1 documentation and golden vectors.**
   - Depends: HT0.
   - Files: `docs/helper-protocol-v1.md`,
     `tests/fixtures/helper-protocol-v1.json`.
