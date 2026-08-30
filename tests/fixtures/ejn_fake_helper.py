@@ -86,7 +86,11 @@ def record(path, message, state):
 
 def response(message, scenario):
     if message.get("op") == "hello":
-        result = {"version": 1, "build": "fake-helper-1", "capabilities": ["ping", "execute"]}
+        result = {
+            "version": 1,
+            "helper_version": "fake-helper-1",
+            "capabilities": ["ping", "execute"],
+        }
     else:
         result = {"scenario": scenario}
     return encode({"v": 1, "kind": "response", "id": message.get("id", "unknown"), "ok": True, "result": result})
@@ -177,6 +181,13 @@ def read_one_wire_frame(child, deadline):
 
 def self_test():
     script = str(Path(__file__).resolve())
+    hello = decode_frames(response(
+        {"id": "hello-1", "op": "hello"}, "normal"
+    ))[0]
+    if hello.get("result", {}).get("helper_version") != "fake-helper-1":
+        raise SystemExit("self-test failed: hello helper version")
+    if "build" in hello.get("result", {}):
+        raise SystemExit("self-test failed: obsolete hello build field")
     request = encode({"v": 1, "kind": "request", "id": "test-1", "op": "ping", "params": {}})
     scenarios = ("normal", "silent", "garbage", "fragmented", "oversize", "mid-frame-stop", "flood", "late-response", "exit-after-op")
     for scenario in scenarios:
