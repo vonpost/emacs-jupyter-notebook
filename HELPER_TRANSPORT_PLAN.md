@@ -597,7 +597,7 @@ modules.
   - Narrow run: `PYTHONPATH=helper python3 -m unittest discover -s helper/tests -p 'test_framing.py'`.
   - Non-goal: no asyncio or Jupyter import.
 
-- [~] owner=terra-ht4 claimed=2026-08-30 **HT4 Implement credited event queue and stream coalescer.**
+- [x] owner=terra-ht4 claimed=2026-08-30 landed=98123e6 **HT4 Implement credited event queue and stream coalescer.**
   - Depends: HT3.
   - Files: `helper/ejn_helper/flow.py`, `helper/tests/test_flow.py`.
   - Deliverable: byte-exact credits, zero-credit startup, bounded queue,
@@ -625,7 +625,7 @@ modules.
   - Narrow run: `PYTHONPATH=helper python3 -m unittest discover -s helper/tests -p 'test_artifacts.py'`.
   - Non-goal: no image library and no decoded bitmap allocation.
 
-- [ ] **HT6 Add protocol dispatcher using a fake Jupyter backend.**
+- [~] owner=terra-ht6 claimed=2026-08-30 **HT6 Add protocol dispatcher using a fake Jupyter backend.**
   - Depends: HT4, HT5.
   - Files: `helper/ejn_helper/backend.py`,
     `helper/ejn_helper/dispatcher.py`, `helper/tests/fake_backend.py`,
