@@ -787,7 +787,7 @@ modules.
     durable-state calls.
   - Narrow run: ERT selector `^ejn-et2-`.
 
-- [~] owner=terra-et3 claimed=2026-08-31 **ET3 Add bounded event drain, credit replenishment, requests, and deadlines.**
+- [x] owner=terra-et3 claimed=2026-08-31 landed=d1e7d94 **ET3 Add bounded event drain, credit replenishment, requests, and deadlines.**
   - Depends: ET2.
   - Files: `emacs-jupyter-notebook-helper.el`,
     `tests/emacs-jupyter-notebook-helper-process-tests.el`.
@@ -848,7 +848,7 @@ modules.
 Only one EI row is active at a time.  These rows may touch core state and must
 be manager-reviewed for durable-kernel rules.
 
-- [ ] **EI1 Introduce the narrow async backend contract and temporary selector.**
+- [~] owner=terra-ei1 claimed=2026-08-31 **EI1 Introduce the narrow async backend contract and temporary selector.**
   - Depends: IR5, HT7, ET3.
   - Files: `emacs-jupyter-notebook-backend.el`,
     `emacs-jupyter-notebook-jupyter.el`, `emacs-jupyter-notebook-vars.el`,
