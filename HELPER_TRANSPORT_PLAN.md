@@ -548,7 +548,7 @@ modules.
   - Narrow run: `tests/run-local-tests.sh`.
   - Non-goal: no production code.
 
-- [~] owner=luna-ht1 claimed=2026-08-30 **HT1 Freeze protocol v1 documentation and golden vectors.**
+- [x] sha=a1a048c **HT1 Freeze protocol v1 documentation and golden vectors.**
   - Depends: HT0.
   - Files: `docs/helper-protocol-v1.md`,
     `tests/fixtures/helper-protocol-v1.json`,
@@ -564,7 +564,7 @@ modules.
   - Narrow run: `python3 tests/validate-helper-protocol-v1.py`.
   - Non-goal: no Elisp or helper implementation.
 
-- [ ] **HT2 Create the packaged helper skeleton and pinned dev environment.**
+- [~] owner=luna-ht2 claimed=2026-08-30 **HT2 Create the packaged helper skeleton and pinned dev environment.**
   - Depends: HT1.
   - Files: `helper/pyproject.toml`, `helper/ejn_helper/__init__.py`,
     `helper/ejn_helper/__main__.py`, `helper/tests/test_cli.py`, `flake.nix`,
