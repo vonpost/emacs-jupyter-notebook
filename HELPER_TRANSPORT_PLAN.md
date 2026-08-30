@@ -431,7 +431,7 @@ integration starts so helper work is not blamed for pre-existing behavior.
 All IR rows are sequential because they share the monolithic ERT file and core
 modules.
 
-- [~] owner=terra-ir1 claimed=2026-08-30 **IR1 Force full panel renders for structural mutations.**
+- [x] sha=b705a30 **IR1 Force full panel renders for structural mutations.**
   - Depends: none.
   - Files: `emacs-jupyter-notebook-result.el`,
     `emacs-jupyter-notebook.el`, `tests/emacs-jupyter-notebook-tests.el`.
@@ -447,7 +447,7 @@ modules.
   - Narrow run: ERT selector `^ejn-ir1-` plus every existing panel test.
   - Non-goal: no image retention or helper work.
 
-- [ ] **IR2 Retire cleared artifacts and reject late output before materialization.**
+- [~] owner=terra-ir2 claimed=2026-08-30 **IR2 Retire cleared artifacts and reject late output before materialization.**
   - Depends: IR1.
   - Files: `emacs-jupyter-notebook-result.el`,
     `emacs-jupyter-notebook-jupyter.el`, `emacs-jupyter-notebook.el`,
