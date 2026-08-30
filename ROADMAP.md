@@ -1481,6 +1481,11 @@ subplot crops all siblings, killing Emacs reaps the viewer.
 
 ## Future workstreams (not yet scheduled)
 
+- **W20 isolated local Jupyter helper.** Replace the main-thread
+  `emacs-jupyter` transport with a supervised, bounded local helper while
+  preserving the durable remote-kernel/SSH-forward architecture.  The
+  task-level claim ledger, protocol contract, dependency graph, and acceptance
+  tests are in `HELPER_TRANSPORT_PLAN.md`.
 - **Multi-buffer sharing one kernel.** Registry refcount + buffer set per
   session-id + tunnel-share. Requires reconsidering W1.1's kill-buffer-hook
   to refcount instead of unconditionally tearing down.
