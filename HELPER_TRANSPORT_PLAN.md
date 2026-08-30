@@ -468,7 +468,7 @@ modules.
   - Narrow run: ERT selector `^ejn-ir2-` plus W1 and W18 selectors.
   - Non-goal: do not make current base64 decoding asynchronous here.
 
-- [~] owner=terra-ir3 claimed=2026-08-30 **IR3 Bound total panel history and artifact disk use.**
+- [x] sha=20e1e10 **IR3 Bound total panel history and artifact disk use.**
   - Depends: IR2.
   - Files: `emacs-jupyter-notebook-result.el`,
     `emacs-jupyter-notebook-vars.el`, `tests/emacs-jupyter-notebook-tests.el`.
@@ -485,7 +485,7 @@ modules.
   - Narrow run: ERT selector `^ejn-ir3-` plus all panel/image tests.
   - Non-goal: do not silently exempt any MIME payload from a byte budget.
 
-- [ ] **IR3S Make streamed text accumulation amortized instead of quadratic.**
+- [~] owner=terra-ir3s claimed=2026-08-30 **IR3S Make streamed text accumulation amortized instead of quadratic.**
   - Depends: IR3.
   - Files: `emacs-jupyter-notebook-result.el`,
     `tests/emacs-jupyter-notebook-tests.el`.
