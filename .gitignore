@@ -2,3 +2,6 @@
 /.opencode/
 *.elc
 __pycache__/
+# Keep Python bytecode produced by helper tests out of commits, including
+# alternate cache roots used by the canonical local test wrapper.
+*.py[cod]
