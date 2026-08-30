@@ -567,7 +567,7 @@ modules.
   - Narrow run: `python3 tests/validate-helper-protocol-v1.py`.
   - Non-goal: no Elisp or helper implementation.
 
-- [~] owner=luna-ht2 claimed=2026-08-30 **HT2 Create the packaged helper skeleton and pinned dev environment.**
+- [x] sha=4c45638 **HT2 Create the packaged helper skeleton and pinned dev environment.**
   - Depends: HT1.
   - Files: `helper/pyproject.toml`, `helper/ejn_helper/__init__.py`,
     `helper/ejn_helper/__main__.py`, `helper/tests/test_cli.py`, `flake.nix`,
@@ -583,7 +583,7 @@ modules.
     and Nix build.
   - Non-goal: no protocol loop or kernel launch.
 
-- [ ] **HT3 Implement the pure Python frame codec.**
+- [~] owner=root-fallback claimed=2026-08-30 **HT3 Implement the pure Python frame codec.**
   - Depends: HT2.
   - Files: `helper/ejn_helper/framing.py`,
     `helper/tests/test_framing.py`.
