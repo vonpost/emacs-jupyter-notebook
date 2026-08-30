@@ -758,7 +758,7 @@ modules.
 
 ### Phase ET - pure Elisp transport
 
-- [ ] **ET1 Implement pure unibyte frame codec.**
+- [~] owner=luna-et1 claimed=2026-08-30 **ET1 Implement pure unibyte frame codec.**
   - Depends: HT1.
   - Files: `emacs-jupyter-notebook-helper-protocol.el`,
     `tests/emacs-jupyter-notebook-helper-protocol-tests.el`.
@@ -804,7 +804,7 @@ modules.
 
 ### Phase TH - reusable local fault harnesses
 
-- [~] owner=luna-th1 claimed=2026-08-30 **TH1 Build a deterministic fake helper executable for ERT.**
+- [x] sha=b06daea **TH1 Build a deterministic fake helper executable for ERT.**
   - Depends: HT1.
   - Files: `tests/fixtures/ejn_fake_helper.py`,
     `tests/fixtures/README.md`.
