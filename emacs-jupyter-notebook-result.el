@@ -244,6 +244,18 @@ before a future implementation chooses to reuse entry ids.")
 (defvar-local emacs-jupyter-notebook-panel--history-evicted-p nil
   "Non-nil once this panel has evicted retained history entries.")
 
+(defvar-local emacs-jupyter-notebook-panel--retained-text-bytes 0
+  "Cached total source and output text bytes retained by this panel.")
+
+(defvar-local emacs-jupyter-notebook-panel--retained-artifact-bytes 0
+  "Cached total image and MIME artifact bytes retained by this panel.")
+
+(defvar emacs-jupyter-notebook-panel--text-materialization-count nil
+  "Test instrument for text materializations, or nil when disabled.")
+
+(defvar emacs-jupyter-notebook-panel--text-trim-chunk-visits nil
+  "Test instrument for chunks examined by trimming, or nil when disabled.")
+
 ;;; Panel mode
 
 (defvar emacs-jupyter-notebook-panel-mode-map
@@ -408,7 +420,15 @@ membership or entry ordering may have changed."
       (when (buffer-live-p panel)
         (let ((entry (emacs-jupyter-notebook-panel--entry panel id)))
           (when entry
-            (let ((new (funcall updater entry)))
+            (let ((old-text (emacs-jupyter-notebook-panel--entry-text-bytes entry))
+                  (old-artifacts (emacs-jupyter-notebook-panel--entry-artifact-bytes entry))
+                  (new (funcall updater entry)))
+              (with-current-buffer panel
+                (cl-incf emacs-jupyter-notebook-panel--retained-text-bytes
+                         (- (emacs-jupyter-notebook-panel--entry-text-bytes new) old-text))
+                (cl-incf emacs-jupyter-notebook-panel--retained-artifact-bytes
+                         (- (emacs-jupyter-notebook-panel--entry-artifact-bytes new)
+                            old-artifacts)))
               (emacs-jupyter-notebook-panel--set-entry panel id new)
               (emacs-jupyter-notebook-panel--schedule-render
                panel id force-full))))))))
@@ -692,6 +712,106 @@ configured inline previews; placeholder images never call `image-size'."
      'emacs-jupyter-notebook-entry-id (plist-get entry :id)
      'emacs-jupyter-notebook-cell-key (plist-get entry :cell-key))))
 
+(defun emacs-jupyter-notebook-panel--text-state-p (value)
+  "Return non-nil when VALUE is the internal streamed text representation."
+  (and (listp value) (plist-member value :chunks)))
+
+(defun emacs-jupyter-notebook-panel--make-text-state (text)
+  "Return a chunked text state initialized with TEXT."
+  (let* ((chunk (or text ""))
+         (chunks (and (not (string-empty-p chunk)) (list chunk))))
+    (list :chunks chunks
+          :tail chunks
+          :bytes (string-bytes chunk)
+          :cache nil
+          :pending (and (not (string-empty-p chunk)) (list chunk))
+          :ends-newline (string-suffix-p "\n" chunk)
+          :rendered-ends-newline nil)))
+
+(defun emacs-jupyter-notebook-panel--text-state-value (segment)
+  "Materialize SEGMENT's logical text once after its most recent mutation."
+  (let ((value (cdr segment)))
+    (if (not (emacs-jupyter-notebook-panel--text-state-p value))
+        value
+      (or (plist-get value :cache)
+          (let ((text (mapconcat #'identity (plist-get value :chunks) "")))
+            (when (integerp emacs-jupyter-notebook-panel--text-materialization-count)
+              (cl-incf emacs-jupyter-notebook-panel--text-materialization-count))
+            (setcdr segment (plist-put value :cache text))
+            text)))))
+
+(defun emacs-jupyter-notebook-panel--text-state-append (state text)
+  "Append TEXT to STATE in amortized constant time and return STATE."
+  (unless (string-empty-p text)
+    (let ((cell (list text)))
+      (if-let ((tail (plist-get state :tail)))
+          (setcdr tail cell)
+        (setq state (plist-put state :chunks cell)))
+      (setq state (plist-put state :tail cell))
+      (setq state (plist-put state :pending
+                             (cons text (plist-get state :pending))))
+      (setq state (plist-put state :bytes
+                             (+ (plist-get state :bytes) (string-bytes text))))
+      (setq state (plist-put state :cache nil))
+      (setq state (plist-put state :ends-newline (string-suffix-p "\n" text))))
+  state))
+
+(defun emacs-jupyter-notebook-panel--text-state-drop-front (state bytes)
+  "Drop BYTES from STATE's oldest retained chunks and return STATE."
+  (while (and (> bytes 0) (plist-get state :chunks))
+    (let* ((chunks (plist-get state :chunks))
+           (chunk (car chunks))
+           (chunk-bytes (string-bytes chunk)))
+      (when (integerp emacs-jupyter-notebook-panel--text-trim-chunk-visits)
+        (cl-incf emacs-jupyter-notebook-panel--text-trim-chunk-visits))
+      (if (>= bytes chunk-bytes)
+          (progn
+            (setq state (plist-put state :chunks (cdr chunks)))
+            (setq state (plist-put state :bytes (- (plist-get state :bytes)
+                                                    chunk-bytes)))
+            (setq bytes (- bytes chunk-bytes))
+            (when (null (cdr chunks))
+              (setq state (plist-put state :tail nil))))
+        (let ((kept (emacs-jupyter-notebook--last-bytes
+                     chunk (- chunk-bytes bytes))))
+          (setcar chunks kept)
+          (setq state (plist-put state :bytes
+                                 (- (plist-get state :bytes)
+                                    (- chunk-bytes (string-bytes kept)))))
+          (setq bytes 0)))))
+  (setq state (plist-put state :cache nil))
+  ;; Trimming always schedules a structural render, so stale incremental
+  ;; chunks must not keep pre-cap stream strings alive until that render.
+  (setq state (plist-put state :pending nil))
+  state)
+
+(defun emacs-jupyter-notebook-panel--text-segment-bytes (segment)
+  "Return retained byte count for text SEGMENT."
+  (let ((value (cdr segment)))
+    (if (emacs-jupyter-notebook-panel--text-state-p value)
+        (plist-get value :bytes)
+      (string-bytes value))))
+
+(defun emacs-jupyter-notebook-panel--insert-text-segment (segment index)
+  "Insert text SEGMENT and tag its logical content with INDEX."
+  (let* ((content (copy-sequence
+                   (emacs-jupyter-notebook-panel--text-state-value segment)))
+         (start (point)))
+    (unless (string-empty-p content)
+      (add-face-text-property
+       0 (length content) 'emacs-jupyter-notebook-result-face 'append content)
+      (insert content)
+      (add-text-properties
+       start (point) (list 'emacs-jupyter-notebook-text-segment-index index))
+      (unless (string-suffix-p "\n" content)
+        (insert "\n")))
+    (when (emacs-jupyter-notebook-panel--text-state-p (cdr segment))
+      (let ((state (cdr segment)))
+        (setq state (plist-put state :pending nil))
+        (setq state (plist-put state :rendered-ends-newline
+                               (plist-get state :ends-newline)))
+        (setcdr segment state)))))
+
 (defun emacs-jupyter-notebook-panel--insert-entry (entry inline-specs)
   "Insert ENTRY, materializing only images present in INLINE-SPECS."
   (insert (emacs-jupyter-notebook-panel--format-header entry))
@@ -704,15 +824,46 @@ configured inline previews; placeholder images never call `image-size'."
           (cdr seg) index (member (cdr seg) inline-specs))
          (unless (bolp) (insert "\n")))
         ('text
-         (let ((content (copy-sequence (cdr seg))))
-           (unless (string-empty-p content)
-             (add-face-text-property
-              0 (length content) 'emacs-jupyter-notebook-result-face
-              'append content)
-             (insert content)
-             (unless (string-suffix-p "\n" content)
-               (insert "\n"))))))))
-  (insert "\n"))
+         (emacs-jupyter-notebook-panel--insert-text-segment seg index)))))
+  (insert "\n")
+  (plist-put entry :stream-dirty-p nil))
+
+(defun emacs-jupyter-notebook-panel--render-stream-suffix (entry bounds)
+  "Insert ENTRY's pending trailing text chunks at BOUNDS without rebuilding it.
+Return non-nil when the existing rendered text segment could be extended."
+  (let* ((segments (plist-get entry :outputs))
+         (index (1- (length segments)))
+         (segment (car (last segments)))
+         (state (and segment (cdr segment))))
+    (when (and (eq (car-safe segment) 'text)
+               (emacs-jupyter-notebook-panel--text-state-p state)
+               (plist-get state :pending))
+      (let* ((property 'emacs-jupyter-notebook-text-segment-index)
+             (start (text-property-any (car bounds) (cdr bounds) property index)))
+        (when start
+          (let* ((end (next-single-property-change start property nil (cdr bounds)))
+                 (suffix (mapconcat #'identity (nreverse (copy-sequence
+                                                           (plist-get state :pending))) ""))
+                 (old-auto-newline (not (plist-get state :rendered-ends-newline)))
+                 (new-ends-newline (plist-get state :ends-newline))
+                 (insert-start end))
+            (goto-char end)
+            (insert suffix)
+            (add-face-text-property insert-start (point)
+                                    'emacs-jupyter-notebook-result-face 'append)
+            (add-text-properties insert-start (point) (list property index))
+            ;; The full renderer owns one separator newline for a text segment
+            ;; that did not end in one.  Adjust that separator in place.
+            (cond
+             ((and old-auto-newline new-ends-newline (eq (char-after) ?\n))
+              (delete-char 1))
+             ((and (not old-auto-newline) (not new-ends-newline))
+              (insert "\n")))
+            (setq state (plist-put state :pending nil))
+            (setq state (plist-put state :rendered-ends-newline new-ends-newline))
+            (setcdr segment state)
+            (plist-put entry :stream-dirty-p nil)
+            t))))))
 
 (defun emacs-jupyter-notebook-panel--entry-bounds (id)
   "Return the rendered buffer bounds for entry ID, or nil."
@@ -742,6 +893,8 @@ section, which means ordering or view membership changed unexpectedly."
         (let ((entry (cl-find id visible :key (lambda (e) (plist-get e :id))))
               (bounds (emacs-jupyter-notebook-panel--entry-bounds id)))
           (cond
+           ((and entry bounds (plist-get entry :stream-dirty-p)
+                 (emacs-jupyter-notebook-panel--render-stream-suffix entry bounds)))
            ((and entry bounds)
             (save-excursion
               (goto-char (car bounds))
@@ -811,7 +964,9 @@ entry is visible; latest-per-cell view goes to the top."
   (let ((props (cl-loop for (key value) on (cdr image) by #'cddr
                         unless (memq key '(:data :file))
                         collect key and collect value)))
-    (cons 'image (append props (list :file file)))))
+    (cons 'image (append props (list :file file
+                                    :ejn-artifact-bytes
+                                    (string-bytes (plist-get (cdr image) :data)))))))
 
 (defun emacs-jupyter-notebook-panel--materialize-image (panel image)
   "Move IMAGE's inline data to a private file owned by PANEL.
@@ -819,7 +974,15 @@ Specs that already refer to a file, or do not contain string data, are
 returned unchanged.  The file is mode 0600 and written without coding."
   (let ((data (and (consp image) (plist-get (cdr image) :data))))
     (if (not (stringp data))
-        image
+        (if (plist-member (cdr image) :ejn-artifact-bytes)
+            image
+          (let ((copy (copy-sequence image)))
+            (setcdr copy
+                    (append (cdr copy)
+                            (list :ejn-artifact-bytes
+                                  (emacs-jupyter-notebook-panel--image-artifact-bytes
+                                   image))))
+            copy))
       (let* ((directory
               (emacs-jupyter-notebook-panel--ensure-image-directory panel))
              (file (make-temp-file
@@ -863,11 +1026,7 @@ returned unchanged.  The file is mode 0600 and written without coding."
 
 (defun emacs-jupyter-notebook-panel--entry-text-bytes (entry)
   "Return the retained source and output text byte count for ENTRY."
-  (+ (let ((code (plist-get entry :code)))
-       (if (stringp code) (string-bytes code) 0))
-     (cl-loop for segment in (plist-get entry :outputs)
-              when (eq (car segment) 'text)
-              sum (string-bytes (cdr segment)))))
+  (or (plist-get entry :retained-text-bytes) 0))
 
 (defun emacs-jupyter-notebook-panel--image-artifact-bytes (image)
   "Return retained artifact bytes for IMAGE, using its actual file size."
@@ -887,22 +1046,42 @@ returned unchanged.  The file is mode 0600 and written without coding."
 
 (defun emacs-jupyter-notebook-panel--entry-artifact-bytes (entry)
   "Return retained image and MIME artifact bytes for ENTRY."
+  (or (plist-get entry :artifact-bytes) 0))
+
+(defun emacs-jupyter-notebook-panel--recompute-entry-text-bytes (entry)
+  "Recompute ENTRY's logical source and output bytes for test introspection."
+  (+ (let ((code (plist-get entry :code)))
+       (if (stringp code) (string-bytes code) 0))
+     (cl-loop for segment in (plist-get entry :outputs)
+              when (eq (car segment) 'text)
+              sum (emacs-jupyter-notebook-panel--text-segment-bytes segment))))
+
+(defun emacs-jupyter-notebook-panel--recompute-entry-artifact-bytes (entry)
+  "Recompute ENTRY's artifact bytes for test introspection only."
   (+ (cl-loop for segment in (plist-get entry :outputs)
               when (eq (car segment) 'image)
-              sum (emacs-jupyter-notebook-panel--image-artifact-bytes
-                   (cdr segment)))
+              ;; Image segments are `(image . IMAGE-SPEC)', so the image
+              ;; symbol in IMAGE-SPEC precedes its property list.
+              sum (or (plist-get (cdr (cdr segment)) :ejn-artifact-bytes) 0))
      (let ((pickle (plist-get entry :mpl-pickle)))
        (if (stringp pickle) (string-bytes pickle) 0))))
 
+(defun emacs-jupyter-notebook-panel--recompute-totals ()
+  "Return recomputed text/artifact totals for test introspection."
+  (list :text (cl-loop for cell in emacs-jupyter-notebook-panel--entries
+                       sum (emacs-jupyter-notebook-panel--recompute-entry-text-bytes
+                            (cdr cell)))
+        :artifacts (cl-loop for cell in emacs-jupyter-notebook-panel--entries
+                            sum (emacs-jupyter-notebook-panel--recompute-entry-artifact-bytes
+                                 (cdr cell)))))
+
 (defun emacs-jupyter-notebook-panel--total-text-bytes ()
   "Return the total retained text byte count in the current panel."
-  (cl-loop for cell in emacs-jupyter-notebook-panel--entries
-           sum (emacs-jupyter-notebook-panel--entry-text-bytes (cdr cell))))
+  emacs-jupyter-notebook-panel--retained-text-bytes)
 
 (defun emacs-jupyter-notebook-panel--total-artifact-bytes ()
   "Return the total retained image and MIME artifact bytes in this panel."
-  (cl-loop for cell in emacs-jupyter-notebook-panel--entries
-           sum (emacs-jupyter-notebook-panel--entry-artifact-bytes (cdr cell))))
+  emacs-jupyter-notebook-panel--retained-artifact-bytes)
 
 (defun emacs-jupyter-notebook-panel--over-retention-budget-p ()
   "Return non-nil when the current panel exceeds any configured budget."
@@ -935,6 +1114,10 @@ configured budgets remain hard limits."
   "Retire CELL's artifacts and remove it from PANEL's retained history."
   (let* ((entry (cdr cell))
          (images (ejn-panel-entry-images entry)))
+    (cl-decf emacs-jupyter-notebook-panel--retained-text-bytes
+             (emacs-jupyter-notebook-panel--entry-text-bytes entry))
+    (cl-decf emacs-jupyter-notebook-panel--retained-artifact-bytes
+             (emacs-jupyter-notebook-panel--entry-artifact-bytes entry))
     (emacs-jupyter-notebook-panel--retire-outputs panel
                                                    (plist-get entry :outputs))
     (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer entry))
@@ -982,7 +1165,9 @@ normal Emacs exit; it never consults source, registry, SSH, or kernel state."
                  (file-directory-p emacs-jupyter-notebook-panel--image-directory))
         (ignore-errors
           (delete-directory emacs-jupyter-notebook-panel--image-directory t)))
-      (setq emacs-jupyter-notebook-panel--image-directory nil))))
+      (setq emacs-jupyter-notebook-panel--image-directory nil)
+      (setq emacs-jupyter-notebook-panel--retained-text-bytes 0
+            emacs-jupyter-notebook-panel--retained-artifact-bytes 0))))
 
 (defun ejn-panel-clear-all (panel)
   "Retire all PANEL artifacts and entries, invalidating their handles."
@@ -990,6 +1175,8 @@ normal Emacs exit; it never consults source, registry, SSH, or kernel state."
     (with-current-buffer panel
       (emacs-jupyter-notebook-panel--retire-all-artifacts panel)
       (setq emacs-jupyter-notebook-panel--entries nil)
+      (setq emacs-jupyter-notebook-panel--retained-text-bytes 0
+            emacs-jupyter-notebook-panel--retained-artifact-bytes 0)
       (setq emacs-jupyter-notebook-panel--history-evicted-p nil)
       (cl-incf emacs-jupyter-notebook-panel--generation)
       (emacs-jupyter-notebook-panel--invalidate-structure panel))))
@@ -1018,12 +1205,17 @@ state appears in place."
                         ;; and `(image . SPEC)' conses, rendered interleaved
                         ;; in arrival order like a real notebook cell.
                         :outputs nil
+                        :output-text-bytes 0
+                        :retained-text-bytes (string-bytes (or code ""))
+                        :artifact-bytes 0
                         :pickle-open-timer nil
                         :pickle-open-token nil
                         :pending-clear nil)))
       (setq emacs-jupyter-notebook-panel--entries
             (append emacs-jupyter-notebook-panel--entries
                     (list (cons id entry))))
+      (cl-incf emacs-jupyter-notebook-panel--retained-text-bytes
+               (plist-get entry :retained-text-bytes))
       (emacs-jupyter-notebook-panel--enforce-retention-budgets panel)
       (emacs-jupyter-notebook-panel--schedule-render panel nil t)
       (emacs-jupyter-notebook-panel--handle panel id cell-key))))
@@ -1053,7 +1245,7 @@ entry plist."
   (let ((entry (if (plist-get handle-or-entry :panel)
                    (ejn-panel-entry-snapshot handle-or-entry)
                  handle-or-entry)))
-    (mapconcat #'cdr
+    (mapconcat #'emacs-jupyter-notebook-panel--text-state-value
                (cl-remove-if-not (lambda (seg) (eq (car seg) 'text))
                                  (plist-get entry :outputs))
                "")))
@@ -1067,30 +1259,38 @@ entry plist."
             (cl-remove-if-not (lambda (seg) (eq (car seg) 'image))
                               (plist-get entry :outputs)))))
 
-(defun emacs-jupyter-notebook-panel--trim-outputs (outputs)
-  "Return OUTPUTS with total text bounded by `...-result-max-bytes'.
-Trims the OLDEST text first (drops leading segments, then truncates the
-front of the first survivor) so the newest output is always retained.
-Image segments are never dropped by the byte cap."
-  (let ((max-bytes emacs-jupyter-notebook-result-max-bytes))
-    (let ((total (cl-loop for seg in outputs
-                          when (eq (car seg) 'text)
-                          sum (string-bytes (cdr seg)))))
-      (if (<= total max-bytes)
-          outputs
-        (let ((excess (- total max-bytes))
-              keep)
-          (dolist (seg outputs)
-            (if (or (not (eq (car seg) 'text)) (<= excess 0))
-                (push seg keep)
-              (let ((bytes (string-bytes (cdr seg))))
-                (cond
-                 ((>= excess bytes) (cl-decf excess bytes)) ; drop whole segment
-                 (t (push (cons 'text (emacs-jupyter-notebook--last-bytes
-                                       (cdr seg) (- bytes excess)))
-                          keep)
-                    (setq excess 0))))))
-          (nreverse keep))))))
+(defun emacs-jupyter-notebook-panel--entry-reset-output-accounting (entry)
+  "Clear ENTRY's output accounting while preserving its source-code bytes."
+  (setq entry (plist-put entry :output-text-bytes 0))
+  (setq entry (plist-put entry :retained-text-bytes
+                         (string-bytes (or (plist-get entry :code) ""))))
+  (plist-put entry :artifact-bytes 0))
+
+(defun emacs-jupyter-notebook-panel--entry-trim-text (entry)
+  "Trim ENTRY's oldest text chunks to its per-entry byte budget."
+  (let ((old-total (plist-get entry :output-text-bytes))
+        (removed 0)
+        (excess (- (plist-get entry :output-text-bytes)
+                   emacs-jupyter-notebook-result-max-bytes)))
+    (when (> excess 0)
+      (dolist (segment (plist-get entry :outputs))
+        (when (and (> excess 0) (eq (car segment) 'text))
+          (let* ((before (emacs-jupyter-notebook-panel--text-segment-bytes segment))
+                 (state (cdr segment))
+                 (drop (min excess before)))
+            (if (emacs-jupyter-notebook-panel--text-state-p state)
+                (setcdr segment
+                        (emacs-jupyter-notebook-panel--text-state-drop-front state drop))
+              (setcdr segment (emacs-jupyter-notebook--last-bytes state (- before drop))))
+            (cl-incf removed
+                     (- before
+                        (emacs-jupyter-notebook-panel--text-segment-bytes segment)))
+            (setq excess (- excess drop)))))
+      (setq entry (plist-put entry :output-text-bytes (- old-total removed)))
+      (setq entry (plist-put entry :retained-text-bytes
+                             (+ (string-bytes (or (plist-get entry :code) ""))
+                                (plist-get entry :output-text-bytes)))))
+    entry))
 
 (defun emacs-jupyter-notebook-panel--entry-after-pending-clear (panel entry)
   "Return ENTRY after applying a pending clear_output(wait=True).
@@ -1104,6 +1304,8 @@ accepting the next output.  This also cancels a queued auto-viewer handoff."
                      entry))
         (setq entry (plist-put entry :outputs nil))
         (setq entry (plist-put entry :mpl-pickle nil))
+        (setq entry (emacs-jupyter-notebook-panel--entry-reset-output-accounting
+                     entry))
         (plist-put entry :pending-clear nil))
     entry))
 
@@ -1121,9 +1323,9 @@ colours are preserved and uncoloured spans still get the fallback FACE."
   (when (and handle text)
     (let* ((panel (plist-get handle :panel))
            (old-entry (ejn-panel-entry-snapshot handle))
-           (force-full (and (plist-get old-entry :pending-clear)
-                            (cl-find 'image (plist-get old-entry :outputs)
-                                     :key #'car)))
+           ;; Applying clear_output(wait=True) replaces the rendered entry,
+           ;; even when it previously contained text only.
+           (force-full (plist-get old-entry :pending-clear))
            (display-text (copy-sequence text)))
       (when face
         (add-face-text-property 0 (length display-text) face t display-text))
@@ -1133,26 +1335,49 @@ colours are preserved and uncoloured spans still get the fallback FACE."
          (setq entry (emacs-jupyter-notebook-panel--entry-after-pending-clear
                       panel entry))
          (let* ((outputs (plist-get entry :outputs))
-                (last-seg (car (last outputs))))
+                (last-seg (car (last outputs)))
+                (before (plist-get entry :output-text-bytes))
+                (after (plist-get entry :output-text-bytes))
+                (carriage-p (string-search "\r" display-text)))
            (if (and last-seg (eq (car last-seg) 'text))
-               ;; Merge into the trailing text segment.
-               (let ((new (concat (cdr last-seg) display-text)))
-                 ;; Collapse carriage-return progress repaints (tqdm) so the
-                 ;; panel shows the latest frame, not every intermediate one.
-                 (when (string-search "\r" display-text)
-                   (setq new (emacs-jupyter-notebook--apply-carriage-returns new)))
-                 (setcdr last-seg new))
-             (setq outputs
-                   (append outputs
-                           (list (cons 'text
-                                       (if (string-search "\r" display-text)
-                                           (emacs-jupyter-notebook--apply-carriage-returns
-                                            display-text)
-                                         display-text))))))
-           (setq entry (plist-put entry :outputs
-                                  (emacs-jupyter-notebook-panel--trim-outputs
-                                   outputs)))
+               (if carriage-p
+                   ;; Carriage returns rewrite an existing terminal line.  They
+                   ;; are uncommon; materialize once to preserve exact W14 semantics.
+                   (let ((resolved (emacs-jupyter-notebook--apply-carriage-returns
+                                    (concat (emacs-jupyter-notebook-panel--text-state-value
+                                             last-seg)
+                                            display-text))))
+                     (setq after (+ (- before
+                                       (emacs-jupyter-notebook-panel--text-segment-bytes
+                                        last-seg))
+                                    (string-bytes resolved)))
+                     (setcdr last-seg (emacs-jupyter-notebook-panel--make-text-state resolved))
+                     (setq force-full t))
+                 (let ((state (cdr last-seg)))
+                   (unless (emacs-jupyter-notebook-panel--text-state-p state)
+                     (setq state (emacs-jupyter-notebook-panel--make-text-state state)))
+                   (setcdr last-seg
+                           (emacs-jupyter-notebook-panel--text-state-append
+                            state display-text))
+                   (setq after (+ after (string-bytes display-text)))))
+             (let ((state (emacs-jupyter-notebook-panel--make-text-state
+                           (if carriage-p
+                               (emacs-jupyter-notebook--apply-carriage-returns display-text)
+                             display-text))))
+               (setq outputs (nconc outputs (list (cons 'text state))))
+               (setq after (+ after (string-bytes (if carriage-p
+                                                        (emacs-jupyter-notebook--apply-carriage-returns display-text)
+                                                      display-text))))))
+           (setq entry (plist-put entry :outputs outputs))
+           (setq entry (plist-put entry :output-text-bytes after))
+           (setq entry (plist-put entry :retained-text-bytes
+                                  (+ (string-bytes (or (plist-get entry :code) "")) after)))
+           (when (> (plist-get entry :output-text-bytes)
+                    emacs-jupyter-notebook-result-max-bytes)
+             (setq entry (emacs-jupyter-notebook-panel--entry-trim-text entry))
+             (setq force-full t))
            (setq entry (plist-put entry :pending-clear nil))
+           (setq entry (plist-put entry :stream-dirty-p (not force-full)))
            entry))
        force-full)
       (emacs-jupyter-notebook-panel--enforce-retention-budgets panel))))
@@ -1169,10 +1394,17 @@ replaced whatever figure the entry previously showed."
          (emacs-jupyter-notebook-panel--retire-outputs
           panel (plist-get entry :outputs))
          (setq entry (plist-put entry :outputs
-                                (list (cons 'text (or text "")))))
+                                (list (cons 'text
+                                            (emacs-jupyter-notebook-panel--make-text-state
+                                             (or text ""))))))
          (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
                       entry))
          (setq entry (plist-put entry :mpl-pickle nil))
+         (setq entry (plist-put entry :output-text-bytes (string-bytes (or text ""))))
+         (setq entry (plist-put entry :retained-text-bytes
+                                (+ (string-bytes (or (plist-get entry :code) ""))
+                                   (plist-get entry :output-text-bytes))))
+         (setq entry (plist-put entry :artifact-bytes 0))
          (setq entry (plist-put entry :pending-clear nil))
          entry)
        t)
@@ -1197,6 +1429,9 @@ get their own segment."
                (setq entry (plist-put entry :outputs
                                       (append outputs
                                               (list (cons 'image stored)))))
+               (setq entry (plist-put entry :artifact-bytes
+                                      (+ (plist-get entry :artifact-bytes)
+                                         (or (plist-get (cdr stored) :ejn-artifact-bytes) 0))))
                (setq entry (plist-put entry :pending-clear nil))
                entry))
            t)
@@ -1219,7 +1454,10 @@ so text segments are left untouched and no new segment is created."
              (setq entry (emacs-jupyter-notebook-panel--entry-after-pending-clear
                           panel entry))
              (let* ((outputs (plist-get entry :outputs))
-                    (last-image (cl-find 'image (reverse outputs) :key #'car)))
+                    (last-image (cl-find 'image (reverse outputs) :key #'car))
+                    (old-image-bytes (and last-image
+                                          (or (plist-get (cdr last-image)
+                                                         :ejn-artifact-bytes) 0))))
                (if last-image
                    (progn
                      (emacs-jupyter-notebook-panel--retire-image
@@ -1227,6 +1465,10 @@ so text segments are left untouched and no new segment is created."
                      (setcdr last-image stored))
                  (setq outputs (append outputs (list (cons 'image stored)))))
                (setq entry (plist-put entry :outputs outputs))
+               (setq entry (plist-put entry :artifact-bytes
+                                      (+ (- (plist-get entry :artifact-bytes)
+                                            (or old-image-bytes 0))
+                                         (or (plist-get (cdr stored) :ejn-artifact-bytes) 0))))
                (setq entry (plist-put entry :pending-clear nil))
                entry))
            t)
@@ -1262,6 +1504,8 @@ If WAIT is non-nil, defer the clear until the next text arrives
            (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
                         entry))
            (setq entry (plist-put entry :mpl-pickle nil))
+           (setq entry (emacs-jupyter-notebook-panel--entry-reset-output-accounting
+                        entry))
            (setq entry (plist-put entry :pending-clear nil))
            entry))
        (not wait)))))
@@ -1285,6 +1529,11 @@ their PNG thumbnail and text are untouched.  A non-positive
                   (setq kept (1+ kept))
                 (let ((entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
                               (cdr cell))))
+                  (cl-decf emacs-jupyter-notebook-panel--retained-artifact-bytes
+                           (string-bytes (plist-get entry :mpl-pickle)))
+                  (setq entry (plist-put entry :artifact-bytes
+                                         (- (plist-get entry :artifact-bytes)
+                                            (string-bytes (plist-get entry :mpl-pickle)))))
                   (setcdr cell (plist-put entry :mpl-pickle nil)))))))))))
 
 (defun ejn-panel-set-pickle (handle base64)
@@ -1306,7 +1555,12 @@ no-op.  A5: after stashing, prune pickles beyond the newest N entries."
                       panel entry))
          (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
                       entry))
-         (plist-put entry :mpl-pickle base64))
+         (let ((old-pickle (plist-get entry :mpl-pickle)))
+           (setq entry (plist-put entry :artifact-bytes
+                                  (+ (- (plist-get entry :artifact-bytes)
+                                        (if (stringp old-pickle) (string-bytes old-pickle) 0))
+                                     (string-bytes base64))))
+           (plist-put entry :mpl-pickle base64)))
        force-full)
       (emacs-jupyter-notebook-panel--prune-pickles panel)
       (emacs-jupyter-notebook-panel--enforce-retention-budgets panel))))
@@ -1326,7 +1580,11 @@ no-op.  A5: after stashing, prune pickles beyond the newest N entries."
                       panel entry))
          (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
                       entry))
-         (plist-put entry :mpl-pickle nil))
+         (let ((old-pickle (plist-get entry :mpl-pickle)))
+           (setq entry (plist-put entry :artifact-bytes
+                                  (- (plist-get entry :artifact-bytes)
+                                     (if (stringp old-pickle) (string-bytes old-pickle) 0))))
+           (plist-put entry :mpl-pickle nil)))
        force-full)
       (emacs-jupyter-notebook-panel--enforce-retention-budgets panel))))
 

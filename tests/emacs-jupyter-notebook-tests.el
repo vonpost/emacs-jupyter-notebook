@@ -2646,10 +2646,9 @@ reliably shows candidates instead of silently requiring a second press."
 
 (ert-deftest ejn-w3.4-capf-returns-fast-even-when-adapter-stalls ()
   ;; Load-bearing W3 test: the adapter is mocked to delay 10 seconds.
-  ;; The capf must still return well under the budget — the adapter is
-  ;; only ever called from the deferred timer, never from the capf
-  ;; itself.  This is the binding-rule guarantee in machine-checkable
-  ;; form.
+  ;; The adapter is only ever called from the deferred timer, never from the
+  ;; capf itself.  Assert that scheduling boundary directly instead of using a
+  ;; scheduler-sensitive wall-clock threshold.
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
     (search-forward "my_obj.met")
     (let ((emacs-jupyter-notebook--client 'mock-client)
@@ -2659,32 +2658,33 @@ reliably shows candidates instead of silently requiring a second press."
           (emacs-jupyter-notebook--completion-pending-id nil)
           (emacs-jupyter-notebook--completion-idle-timer nil)
           (emacs-jupyter-notebook-completion-idle 0.10)
-          (this-command 'self-insert-command))
+          (this-command 'self-insert-command)
+          adapter-called)
       (let ((emacs-jupyter-notebook-jupyter-complete-function
              (lambda (_client _code _pos _callback)
+               (setq adapter-called t)
                (sleep-for 10))))
         (unwind-protect
-            (let ((elapsed (benchmark-elapse
-                             (emacs-jupyter-notebook-completion-at-point))))
-              ;; Budget: 5 ms.  Even on a slow VM the capf body is a few
-              ;; hash-table ops and a timer install — well under that.
-              (should (< elapsed 0.005)))
+            (progn
+              (should-not (emacs-jupyter-notebook-completion-at-point))
+              (should-not adapter-called)
+              (should (timerp emacs-jupyter-notebook--completion-idle-timer)))
           (when (timerp emacs-jupyter-notebook--completion-idle-timer)
             (cancel-timer emacs-jupyter-notebook--completion-idle-timer)))))))
 
 (ert-deftest ejn-w3.4-capf-returns-fast-on-cache-hit ()
-  ;; The cache-hit path must also stay in the few-ms budget.
+  ;; A cache hit is pure local lookup and must not schedule remote work.
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
     (search-forward "my_obj.met")
     (let* ((emacs-jupyter-notebook--client 'mock-client)
            (emacs-jupyter-notebook--completion-cache nil)
            (emacs-jupyter-notebook--completion-cache-order nil)
+           (emacs-jupyter-notebook--completion-idle-timer nil)
            (key (emacs-jupyter-notebook--completion-key)))
       (emacs-jupyter-notebook--completion-cache-put
        key '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10))
-      (let ((elapsed (benchmark-elapse
-                       (emacs-jupyter-notebook-completion-at-point))))
-        (should (< elapsed 0.005))))))
+      (should (emacs-jupyter-notebook-completion-at-point))
+      (should-not emacs-jupyter-notebook--completion-idle-timer))))
 
 ;; Frontend variables introduced for W3.5 tests; the real packages define
 ;; these but we mock them to keep tests independent of the packages.
@@ -9119,6 +9119,182 @@ session does not pay an O(history) erase+reinsert on every stream flush."
           (emacs-jupyter-notebook-panel-flush-now panel)
           (should (equal emacs-jupyter-notebook-panel--inline-image-specs
                          (last (ejn-panel-entry-images newer)))))))))
+
+;;; IR3S — amortized streamed text and cached retention totals
+
+(ert-deftest ejn-ir3s-ten-thousand-chunks-ordered-and-truncated ()
+  "Ordered streamed chunks retain the exact newest bounded tail."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook-result-max-bytes 128)
+          (emacs-jupyter-notebook-panel-max-total-text-bytes 1000)
+          (emacs-jupyter-notebook-panel-max-history-entries 10)
+          (emacs-jupyter-notebook-panel-max-total-artifact-bytes 1000)
+          (panel (ejn-panel-ensure (current-buffer))))
+      (let ((handle (ejn-panel-start-entry panel '("x.py" . 1) "")))
+        (dotimes (index 10000)
+          (ejn-panel-append-text handle (format "%04d" index)))
+        (let* ((entry (ejn-panel-entry-snapshot handle))
+               (state (cdr (car (plist-get entry :outputs)))))
+          (should-not (plist-get state :pending))
+          (should (= (plist-get state :bytes) 128))
+          (should (= (cl-loop for chunk in (plist-get state :chunks)
+                              sum (string-bytes chunk))
+                     128)))
+        (should (= (length (ejn-panel-entry-text handle)) 128))
+        (should (equal (ejn-panel-entry-text handle)
+                       (apply #'concat
+                              (cl-loop for index from 9968 to 9999
+                                       collect (format "%04d" index)))))
+        (with-current-buffer panel
+          (should (= 128 emacs-jupyter-notebook-panel--retained-text-bytes)))))))
+
+(ert-deftest ejn-ir3s-stream-appends-do-not-materialize-retained-text ()
+  "Appending chunks does not materialize the accumulated stream each time."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "")))
+      (let ((emacs-jupyter-notebook-panel--text-materialization-count 0))
+        (dotimes (_ 1000)
+          (ejn-panel-append-text handle "x"))
+        (should (= emacs-jupyter-notebook-panel--text-materialization-count 0))
+        (ejn-panel-entry-text handle)
+        (should (= emacs-jupyter-notebook-panel--text-materialization-count 1))))))
+
+(ert-deftest ejn-ir3s-at-cap-stream-trim-visits-one-oldest-chunk-per-append ()
+  "At-cap one-byte streams trim in constant queue work without materializing."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook-result-max-bytes 8)
+          (panel (ejn-panel-ensure (current-buffer))))
+      (let ((handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+            (emacs-jupyter-notebook-panel--text-materialization-count 0)
+            (emacs-jupyter-notebook-panel--text-trim-chunk-visits 0))
+        (dotimes (_ 8)
+          (ejn-panel-append-text handle "x"))
+        (dotimes (_ 1000)
+          (ejn-panel-append-text handle "x"))
+        (should (= emacs-jupyter-notebook-panel--text-trim-chunk-visits 1000))
+        (should (= emacs-jupyter-notebook-panel--text-materialization-count 0))))))
+
+(ert-deftest ejn-ir3s-incremental-flush-inserts-only-stream-suffix ()
+  "A dirty stream flush extends its text segment without deleting the entry."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (deletes 0)
+           (real-delete (symbol-function 'delete-region)))
+      (ejn-panel-append-text handle "first")
+      (emacs-jupyter-notebook-panel-flush-now panel)
+      (ejn-panel-append-text handle " second")
+      (cl-letf (((symbol-function 'delete-region)
+                 (lambda (&rest args)
+                   (cl-incf deletes)
+                   (apply real-delete args))))
+        (emacs-jupyter-notebook-panel-flush-now panel))
+      (should (= deletes 0))
+      (with-current-buffer panel
+        (should (string-match-p "first second" (buffer-string)))))))
+
+(ert-deftest ejn-ir3s-pending-clear-text-replaces-rendered-stream ()
+  "Deferred clear forces a structural render before the next text suffix."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "")))
+      (ejn-panel-append-text handle "old text")
+      (emacs-jupyter-notebook-panel-flush-now panel)
+      (ejn-panel-clear-entry handle t)
+      (ejn-panel-append-text handle "new text")
+      (emacs-jupyter-notebook-panel-flush-now panel)
+      (with-current-buffer panel
+        (should (string-match-p "new text" (buffer-string)))
+        (should-not (string-match-p "old text" (buffer-string)))))))
+
+(ert-deftest ejn-ir3s-multibyte-trim-uses-actual-retained-byte-count ()
+  "A byte cap never leaves cached totals in the middle of a UTF-8 character."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook-result-max-bytes 5)
+          (emacs-jupyter-notebook-panel-max-total-text-bytes 100)
+          (panel (ejn-panel-ensure (current-buffer))))
+      (let ((handle (ejn-panel-start-entry panel '("x.py" . 1) "z")))
+        ;; Seven bytes: trimming two bytes drops "a" and then the next
+        ;; complete two-byte character, leaving four output bytes.
+        (ejn-panel-append-text handle "a\u00e9\u00e9\u00e9")
+        (should (equal (ejn-panel-entry-text handle) "\u00e9\u00e9"))
+        (with-current-buffer panel
+          (should (= emacs-jupyter-notebook-panel--retained-text-bytes 5))
+          (should (= (plist-get (ejn-panel-entry-snapshot handle)
+                                :output-text-bytes)
+                     4))
+          (should (equal (emacs-jupyter-notebook-panel--recompute-totals)
+                         '(:text 5 :artifacts 0))))))))
+
+(ert-deftest ejn-ir3s-full-render-consumes-pending-chunks-and-clear-releases-them ()
+  "Flush materializes a dirty stream once, and clear drops its retained state."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "")))
+      (ejn-panel-append-text handle "pending")
+      (emacs-jupyter-notebook-panel-flush-now panel)
+      (let* ((entry (ejn-panel-entry-snapshot handle))
+             (state (cdr (car (plist-get entry :outputs)))))
+        (should-not (plist-get state :pending))
+        (should (stringp (plist-get state :cache))))
+      (ejn-panel-clear-entry handle)
+      (let ((entry (ejn-panel-entry-snapshot handle)))
+        (should-not (plist-get entry :outputs))
+        (should (= (plist-get entry :output-text-bytes) 0))))))
+
+(ert-deftest ejn-ir3s-cached-totals-match-recomputed-after-mutations ()
+  "Cached panel totals track text, image, pickle, replacement, and clear deltas."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "code")))
+      (cl-labels ((assert-totals ()
+                    (with-current-buffer panel
+                      (let ((totals (emacs-jupyter-notebook-panel--recompute-totals)))
+                        (should (= emacs-jupyter-notebook-panel--retained-text-bytes
+                                   (plist-get totals :text)))
+                        (should (= emacs-jupyter-notebook-panel--retained-artifact-bytes
+                                   (plist-get totals :artifacts)))))))
+        (assert-totals)
+        (ejn-panel-append-text handle "stream")
+        (assert-totals)
+        (ejn-panel-set-image handle '(image :type png :data "image"))
+        (assert-totals)
+        (ejn-panel-set-pickle handle "pickle")
+        (assert-totals)
+        (ejn-panel-replace-text handle "replacement")
+        (assert-totals)
+        (ejn-panel-clear-entry handle)
+        (assert-totals)))))
+
+(ert-deftest ejn-ir3s-artifact-stats-happen-at-admission-not-on-stream ()
+  "Streaming text does not re-stat retained image files for budget checks."
+  (with-temp-buffer
+    (let* ((file (make-temp-file "ejn-ir3s-image-"))
+           (panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (stats 0)
+           (real-attributes (symbol-function 'file-attributes)))
+      (unwind-protect
+          (cl-letf (((symbol-function 'file-attributes)
+                     (lambda (&rest args)
+                       (cl-incf stats)
+                       (apply real-attributes args))))
+            (ejn-panel-set-image handle (list 'image :type 'png :file file))
+            (let ((admission-stats stats))
+              (dotimes (_ 100)
+                (ejn-panel-append-text handle "x"))
+              (should (= stats admission-stats))))
+        (ignore-errors (delete-file file))))))
+
+(ert-deftest ejn-ir3s-carriage-return-across-chunks-remains-correct ()
+  "A terminal-style carriage return in a later chunk replaces the old line."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "")))
+      (ejn-panel-append-text handle "10%")
+      (ejn-panel-append-text handle "\r100%")
+      (should (equal (ejn-panel-entry-text handle) "100%")))))
 
 (provide 'emacs-jupyter-notebook-tests)
 
