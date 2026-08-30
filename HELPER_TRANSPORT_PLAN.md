@@ -551,16 +551,17 @@ modules.
 - [~] owner=luna-ht1 claimed=2026-08-30 **HT1 Freeze protocol v1 documentation and golden vectors.**
   - Depends: HT0.
   - Files: `docs/helper-protocol-v1.md`,
-    `tests/fixtures/helper-protocol-v1.json`.
+    `tests/fixtures/helper-protocol-v1.json`,
+    `tests/validate-helper-protocol-v1.py`.
   - Deliverable: copy the authoritative contract above into a standalone spec.
     Golden vectors include zero/one-byte prefix boundaries, Unicode, embedded
     newline/NUL escaping, maximum legal frames, one-byte-oversize prefixes,
     every envelope kind, every error code, and credit byte accounting including
     the four-byte prefix.  Store large-vector recipes/lengths, not a 256 KiB
     blob in git.
-  - Tests: a small standard-library validator proves fixture JSON validity,
+  - Tests: the standard-library-only validator proves fixture JSON validity,
     unique IDs/names, exact prefix hex, and declared encoded lengths.
-  - Narrow run: validator documented at the top of the fixture.
+  - Narrow run: `python3 tests/validate-helper-protocol-v1.py`.
   - Non-goal: no Elisp or helper implementation.
 
 - [ ] **HT2 Create the packaged helper skeleton and pinned dev environment.**
