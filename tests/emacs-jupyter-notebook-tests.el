@@ -8530,6 +8530,92 @@ session does not pay an O(history) erase+reinsert on every stream flush."
                  "second more"
                  (buffer-substring-no-properties (point-min) (point-max))))))))
 
+;; IR1: structural invalidation must win over queued content-only updates.
+(ert-deftest ejn-ir1-toggle-with-pending-dirty-forces-full-render ()
+  "Toggling views rebuilds all rendered entries despite a queued dirty entry."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (old (ejn-panel-start-entry panel '("x.py" . 1) "old cell"))
+           (latest (ejn-panel-start-entry panel '("x.py" . 1) "latest cell"))
+           (region (ejn-panel-start-entry panel nil "region evaluation")))
+      (ejn-panel-append-text old "old output")
+      (ejn-panel-append-text latest "latest output")
+      (ejn-panel-append-text region "region output")
+      (emacs-jupyter-notebook-panel-flush-now panel)
+      ;; Only LATEST is dirty, which used to select the incremental path and
+      ;; leave OLD and REGION absent after switching to history.
+      (ejn-panel-append-text latest " pending")
+      (with-current-buffer panel
+        (emacs-jupyter-notebook-panel-toggle-view)
+        (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+          (should (string-match-p "view: history" text))
+          (should (string-match-p "old output" text))
+          (should (string-match-p "latest output pending" text))
+          (should (string-match-p "region output" text)))
+        (dolist (handle (list old latest region))
+          (should (text-property-any
+                   (point-min) (point-max)
+                   'emacs-jupyter-notebook-entry-id
+                   (plist-get handle :id))))))))
+
+(ert-deftest ejn-ir1-clear-with-pending-dirty-leaves-empty-panel ()
+  "Clearing results removes every rendered entry despite queued dirty content."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (first (ejn-panel-start-entry panel '("x.py" . 1) "first cell"))
+           (second (ejn-panel-start-entry panel '("x.py" . 2) "second cell")))
+      (ejn-panel-append-text first "first output")
+      (ejn-panel-append-text second "second output")
+      (emacs-jupyter-notebook-panel-flush-now panel)
+      ;; Leaving only FIRST dirty exposed the old incremental clear bug: the
+      ;; unmarked SECOND section remained in the visible buffer.
+      (ejn-panel-append-text first " pending")
+      (emacs-jupyter-notebook-clear-results)
+      (with-current-buffer panel
+        (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+          (should (string-match-p "view: latest" text))
+          (should-not (string-match-p "first output" text))
+          (should-not (string-match-p "second output" text)))
+        (should-not (text-property-not-all
+                     (point-min) (point-max)
+                     'emacs-jupyter-notebook-entry-id nil))))))
+
+(ert-deftest ejn-ir1-reordered-cells-rebuild-visible-order ()
+  "Moving a cell rebuilds latest-view order despite queued dirty content."
+  (ejn-test-with-temp-buffer "# %% A\na = 1\n# %% B\nb = 2\n"
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           first-key
+           second-key)
+      (goto-char (point-min))
+      (setq first-key (emacs-jupyter-notebook--cell-key-for (point)))
+      (search-forward "# %% B")
+      (beginning-of-line)
+      (setq second-key (emacs-jupyter-notebook--cell-key-for (point)))
+      (let ((first (ejn-panel-start-entry panel first-key "first cell"))
+            (second (ejn-panel-start-entry panel second-key "second cell")))
+        (ejn-panel-append-text first "first output")
+        (ejn-panel-append-text second "second output")
+        (emacs-jupyter-notebook-panel-flush-now panel)
+        ;; Queue a content update, then move B above A.  The rendered panel
+        ;; must follow the source markers, not merely replace SECOND in place.
+        (ejn-panel-append-text second " pending")
+        (goto-char (point-min))
+        (search-forward "# %% B")
+        (beginning-of-line)
+        (emacs-jupyter-notebook-move-cell-up 1)
+        (emacs-jupyter-notebook-panel-flush-now panel)
+        (with-current-buffer panel
+          (let* ((text (buffer-substring-no-properties (point-min) (point-max)))
+                 (second-pos (string-match "second cell" text))
+                 (first-pos (string-match "first cell" text)))
+            (should second-pos)
+            (should first-pos)
+            (should (< second-pos first-pos))
+            (should (string-match-p "second output pending" text))))))))
+
 (provide 'emacs-jupyter-notebook-tests)
 
 ;;; emacs-jupyter-notebook-tests.el ends here

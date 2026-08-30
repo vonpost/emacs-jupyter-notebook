@@ -400,6 +400,15 @@ state the entries are in at flush time."
                  delay nil
                  #'emacs-jupyter-notebook-panel--flush panel)))))))
 
+(defun emacs-jupyter-notebook-panel--invalidate-structure (panel)
+  "Schedule a complete PANEL render after its visible layout changes.
+
+Use this for changes to the current view, its visible entry membership, or
+the source-cell ordering that determines latest-view order.  Content-only
+updates continue to carry an entry id through `--schedule-render' and can use
+the incremental renderer."
+  (emacs-jupyter-notebook-panel--schedule-render panel nil t))
+
 (defun emacs-jupyter-notebook-panel--flush (panel)
   "Flush pending changes for PANEL by re-rendering."
   (when (buffer-live-p panel)
@@ -1099,6 +1108,9 @@ above it yields an `equal' key."
     (user-error "Not in an EJN output panel"))
   (setq emacs-jupyter-notebook-panel--view
         (if (eq emacs-jupyter-notebook-panel--view 'history) 'latest 'history))
+  ;; A pending content update may name an entry that is absent from one view
+  ;; or leave other entries unrendered in the newly selected view.
+  (emacs-jupyter-notebook-panel--invalidate-structure (current-buffer))
   (emacs-jupyter-notebook-panel-flush-now (current-buffer))
   (message "EJN panel view: %s" emacs-jupyter-notebook-panel--view))
 

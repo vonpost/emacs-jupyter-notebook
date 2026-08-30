@@ -1133,6 +1133,8 @@ only the fringe indicators need clearing on a structural cell edit."
   (interactive "p")
   (emacs-jupyter-notebook--clear-all-cell-artifacts)
   (code-cells-move-cell-up (or arg 1))
+  (when-let ((panel (emacs-jupyter-notebook-panel-buffer (current-buffer))))
+    (emacs-jupyter-notebook-panel--invalidate-structure panel))
   (emacs-jupyter-notebook-cell-goto-code-start))
 
 (defun emacs-jupyter-notebook-move-cell-down (&optional arg)
@@ -1140,6 +1142,8 @@ only the fringe indicators need clearing on a structural cell edit."
   (interactive "p")
   (emacs-jupyter-notebook--clear-all-cell-artifacts)
   (code-cells-move-cell-down (or arg 1))
+  (when-let ((panel (emacs-jupyter-notebook-panel-buffer (current-buffer))))
+    (emacs-jupyter-notebook-panel--invalidate-structure panel))
   (emacs-jupyter-notebook-cell-goto-code-start))
 
 (defun emacs-jupyter-notebook-send-cell-and-advance ()
@@ -3824,6 +3828,7 @@ Lisp callers do not see the prompt and proceed unconditionally."
     (when (buffer-live-p panel)
       (with-current-buffer panel
         (setq emacs-jupyter-notebook-panel--entries nil)
+        (emacs-jupyter-notebook-panel--invalidate-structure panel)
         (emacs-jupyter-notebook-panel-flush-now panel)))))
 
 (defun emacs-jupyter-notebook-cancel-operation ()
