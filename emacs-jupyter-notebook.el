@@ -3827,8 +3827,7 @@ Lisp callers do not see the prompt and proceed unconditionally."
   (let ((panel (emacs-jupyter-notebook-panel-buffer (current-buffer))))
     (when (buffer-live-p panel)
       (with-current-buffer panel
-        (setq emacs-jupyter-notebook-panel--entries nil)
-        (emacs-jupyter-notebook-panel--invalidate-structure panel)
+        (ejn-panel-clear-all panel)
         (emacs-jupyter-notebook-panel-flush-now panel)))))
 
 (defun emacs-jupyter-notebook-cancel-operation ()

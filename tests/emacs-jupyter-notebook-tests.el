@@ -8616,6 +8616,297 @@ session does not pay an O(history) erase+reinsert on every stream flush."
             (should (< second-pos first-pos))
             (should (string-match-p "second output pending" text))))))))
 
+;;; IR2 — artifact retirement and late callback quarantine
+
+(ert-deftest ejn-ir2-clear-deletes-existing-artifacts ()
+  "Clearing retires image files, image caches, and pickle bytes before entries vanish."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
+           file directory)
+      (ejn-panel-set-image handle '(image :type png :data "image-bytes"))
+      (ejn-panel-set-pickle handle "pickle-bytes")
+      (setq file (plist-get (cdr (car (ejn-panel-entry-images handle))) :file)
+            directory (file-name-directory file))
+      (should (file-exists-p file))
+      (should (ejn-panel-entry-pickle handle))
+      (emacs-jupyter-notebook-clear-results)
+      (should-not (file-exists-p file))
+      (should-not (file-directory-p directory))
+      (should-not (ejn-panel-entry-live-p handle))
+      (with-current-buffer panel
+        (should-not emacs-jupyter-notebook-panel--entries)
+        (should-not emacs-jupyter-notebook-panel--inline-image-specs)))))
+
+(ert-deftest ejn-ir2-late-image-after-clear-creates-no-file ()
+  "A late image callback after clear never decodes or materializes a file."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks source handle))
+           (display (cadr (assoc "display_data" callbacks)))
+           (update (cadr (assoc "update_display_data" callbacks)))
+           (stream (cadr (assoc "stream" callbacks)))
+           (message-reads 0)
+           (render-calls 0))
+      (emacs-jupyter-notebook-clear-results)
+      (cl-letf (((symbol-function 'jupyter-message-content)
+                 (lambda (_msg)
+                   (cl-incf message-reads)
+                   '(:data (:image/png "aW1hZ2UtYnl0ZXM="))))
+                ((symbol-function 'emacs-jupyter-notebook--render-mime-result)
+                 (lambda (_data) (cl-incf render-calls) (ert-fail "late image decoded"))))
+        (funcall display 'late-message)
+        (funcall update 'late-message)
+        (funcall stream 'late-message))
+      (should (= message-reads 0))
+      (should (= render-calls 0))
+      (with-current-buffer panel
+        (should-not emacs-jupyter-notebook-panel--image-directory)
+        (should-not emacs-jupyter-notebook-panel--entries)))))
+
+(ert-deftest ejn-ir2-late-pickle-after-clear-retains-no-bytes ()
+  "A late display cannot stash pickle bytes after its entry was retired."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks source handle))
+           (display (cadr (assoc "display_data" callbacks)))
+           (stashes 0))
+      (emacs-jupyter-notebook-clear-results)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--maybe-stash-pickle)
+                 (lambda (&rest _) (cl-incf stashes)))
+                ((symbol-function 'jupyter-message-content)
+                 (lambda (_msg)
+                   '(:data (:application/x-ejn-mpl-pickle "pickle-bytes")))))
+        (funcall display 'late-message))
+      (should (= stashes 0))
+      (should-not (ejn-panel-entry-pickle handle))
+      (with-current-buffer panel
+        (should-not emacs-jupyter-notebook-panel--entries)))))
+
+(ert-deftest ejn-ir2-clear-before-idle-pickle-open-does-not-materialize ()
+  "A queued auto-viewer handoff reads a live entry only when it actually runs."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
+           (emacs-jupyter-notebook-viewer-auto-open t)
+           idle-callback
+           opened)
+      (cl-letf (((symbol-function 'run-with-idle-timer)
+                 (lambda (_delay _repeat function &rest _args)
+                   (setq idle-callback function)))
+                ((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
+                 (lambda (base64) (setq opened base64))))
+        (emacs-jupyter-notebook--maybe-stash-pickle
+         source handle '(:application/x-ejn-mpl-pickle "pickle-bytes"))
+        (should idle-callback)
+        (should (equal (ejn-panel-entry-pickle handle) "pickle-bytes"))
+        (emacs-jupyter-notebook-clear-results)
+        (funcall idle-callback))
+      (should-not opened)
+      (should-not (ejn-panel-entry-pickle handle)))))
+
+(ert-deftest ejn-ir2-pickle-auto-open-coalesces-latest-update ()
+  "Rapid pickle updates retain one pending handoff and open only the newest."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
+           (emacs-jupyter-notebook-viewer-auto-open t)
+           (timers nil)
+           (cancelled 0)
+           (opened nil)
+           (real-cancel (symbol-function 'cancel-timer)))
+      (unwind-protect
+          (cl-letf (((symbol-function 'run-with-idle-timer)
+                     (lambda (_delay _repeat function &rest _args)
+                       (let ((timer (run-at-time 100 nil #'ignore)))
+                         (push (cons timer function) timers)
+                         timer)))
+                    ((symbol-function 'cancel-timer)
+                     (lambda (timer)
+                       (cl-incf cancelled)
+                       (funcall real-cancel timer)))
+                    ((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
+                     (lambda (base64) (push base64 opened))))
+            (emacs-jupyter-notebook--maybe-stash-pickle
+             source handle '(:application/x-ejn-mpl-pickle "old-pickle"))
+            (emacs-jupyter-notebook--maybe-stash-pickle
+             source handle '(:application/x-ejn-mpl-pickle "new-pickle"))
+            (setq timers (nreverse timers))
+            (should (= (length timers) 2))
+            (should (= cancelled 1))
+            (should (eq (plist-get (ejn-panel-entry-snapshot handle)
+                                   :pickle-open-timer)
+                        (caar (last timers))))
+            ;; Even if an already-cancelled callback is dispatched manually,
+            ;; its token can no longer claim the entry's timer slot.
+            (funcall (cdr (car timers)))
+            (funcall (cdr (cadr timers)))
+            (should (equal opened '("new-pickle")))
+            (should-not (plist-get (ejn-panel-entry-snapshot handle)
+                                   :pickle-open-timer)))
+        (dolist (record timers)
+          (ignore-errors (funcall real-cancel (car record))))))))
+
+(ert-deftest ejn-ir2-pending-clear-retires-pickle-and-auto-open ()
+  "The next output after clear_output(wait=t) retires the old figure fully."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
+           (emacs-jupyter-notebook-viewer-auto-open t)
+           idle-callback
+           opened
+           file)
+      (cl-letf (((symbol-function 'run-with-idle-timer)
+                 (lambda (_delay _repeat function &rest _args)
+                   (setq idle-callback function)
+                   (run-at-time 100 nil #'ignore)))
+                ((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
+                 (lambda (base64) (setq opened base64))))
+        (ejn-panel-set-image handle '(image :type png :data "image-bytes"))
+        (setq file (plist-get (cdr (car (ejn-panel-entry-images handle))) :file))
+        (emacs-jupyter-notebook--maybe-stash-pickle
+         source handle '(:application/x-ejn-mpl-pickle "old-pickle"))
+        (ejn-panel-clear-entry handle t)
+        (ejn-panel-append-text handle "replacement")
+        (should-not (file-exists-p file))
+        (should-not (ejn-panel-entry-pickle handle))
+        (should-not (plist-get (ejn-panel-entry-snapshot handle)
+                               :pickle-open-timer))
+        (funcall idle-callback))
+      (should-not opened))))
+
+(ert-deftest ejn-ir2-exit-cleanup-is-local-only ()
+  "The normal-exit artifact reaper leaves registry, SSH, and kernels alone."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
+           (file nil)
+           (durable-calls 0)
+           (remote-calls 0))
+      (ejn-panel-set-image handle '(image :type png :data "image-bytes"))
+      (setq file (plist-get (cdr (car (ejn-panel-entry-images handle))) :file))
+      (should (file-exists-p file))
+      (should (memq #'emacs-jupyter-notebook-panel--cleanup-published-artifacts-on-exit
+                    kill-emacs-hook))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-save)
+                 (lambda (&rest _) (cl-incf durable-calls)))
+                ((symbol-function 'emacs-jupyter-notebook--remove-registry-entry)
+                 (lambda (&rest _) (cl-incf durable-calls)))
+                ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
+                 (lambda (&rest _) (cl-incf remote-calls)))
+                ((symbol-function 'emacs-jupyter-notebook--async-kill-remote-kernel)
+                 (lambda (&rest _) (cl-incf remote-calls)))
+                ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
+                 (lambda (&rest _) (cl-incf remote-calls)))
+                ((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
+                 (lambda (&rest _) (cl-incf remote-calls))))
+        (emacs-jupyter-notebook-panel--cleanup-published-artifacts-on-exit))
+      (should-not (file-exists-p file))
+      (should (= durable-calls 0))
+      (should (= remote-calls 0)))))
+
+(ert-deftest ejn-ir2-clear-during-execution-late-reply-cleans-request-state ()
+  "A matching reply settles request bookkeeping after presentation is cleared."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
+           (request-id 42)
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks
+                       source handle nil request-id))
+           (reply (cadr (assoc "execute_reply" callbacks)))
+           (fringe-calls 0))
+      (setq emacs-jupyter-notebook--evaluation-request
+            (list :request-id request-id :panel-entry handle :cell-key '("x.py" . 1))
+            emacs-jupyter-notebook--evaluation-timer
+            (run-at-time 1000 nil #'ignore))
+      (unwind-protect
+          (progn
+            (emacs-jupyter-notebook-clear-results)
+            (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--message-content-value)
+                       (lambda (&rest _) (ert-fail "retired reply decoded")))
+                      ((symbol-function 'emacs-jupyter-notebook-fringe-set)
+                       (lambda (&rest _) (cl-incf fringe-calls))))
+              (funcall reply 'late-reply))
+            (should-not emacs-jupyter-notebook--evaluation-request)
+            (should-not emacs-jupyter-notebook--evaluation-timer)
+            (should (= fringe-calls 0)))
+        (when (timerp emacs-jupyter-notebook--evaluation-timer)
+          (cancel-timer emacs-jupyter-notebook--evaluation-timer))
+        (setq emacs-jupyter-notebook--evaluation-timer nil
+              emacs-jupyter-notebook--evaluation-request nil)))))
+
+(ert-deftest ejn-ir2-clear-during-execution-idle-updates-kernel-state ()
+  "A matching idle status remains visible to source/kernel bookkeeping after clear."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
+           (request-id 43)
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks
+                       source handle nil request-id))
+           (status (cadr (assoc "status" callbacks))))
+      (setq emacs-jupyter-notebook--kernel-status 'busy
+            emacs-jupyter-notebook--evaluation-request
+            (list :request-id request-id :panel-entry handle :cell-key '("x.py" . 1))
+            emacs-jupyter-notebook--evaluation-timer
+            (run-at-time 1000 nil #'ignore))
+      (unwind-protect
+          (progn
+            (emacs-jupyter-notebook-clear-results)
+            (cl-letf (((symbol-function 'jupyter-message-content)
+                       (lambda (_msg) '(:execution_state "idle"))))
+              (funcall status 'late-idle))
+            (should (eq emacs-jupyter-notebook--kernel-status 'idle))
+            (should emacs-jupyter-notebook--evaluation-request)
+            (should-not emacs-jupyter-notebook--evaluation-timer)
+            (with-current-buffer panel
+              (should-not emacs-jupyter-notebook-panel--entries)))
+        (when (timerp emacs-jupyter-notebook--evaluation-timer)
+          (cancel-timer emacs-jupyter-notebook--evaluation-timer))
+        (setq emacs-jupyter-notebook--evaluation-timer nil
+              emacs-jupyter-notebook--evaluation-request nil
+              emacs-jupyter-notebook--kernel-status nil)))))
+
+(ert-deftest ejn-ir2-input-after-clear-still-replies-without-panel-write ()
+  "A matching input request is answered after clear without reviving panel output."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "input()"))
+           (request-id 44)
+           (callbacks (emacs-jupyter-notebook-jupyter--callbacks
+                       source handle 'client request-id))
+           (input (cadr (assoc "input_request" callbacks)))
+           reply)
+      (setq emacs-jupyter-notebook--evaluation-request
+            (list :request-id request-id :panel-entry handle :cell-key '("x.py" . 1)))
+      (unwind-protect
+          (progn
+            (emacs-jupyter-notebook-clear-results)
+            (cl-letf (((symbol-function 'jupyter-message-content)
+                       (lambda (_msg) '(:prompt "value: " :password nil)))
+                      ((symbol-function 'read-string)
+                       (lambda (&rest _) "answer"))
+                      ((symbol-function 'emacs-jupyter-notebook-jupyter--send-input-reply)
+                       (lambda (client value) (setq reply (list client value))))
+                      ((symbol-function 'ejn-panel-append-text)
+                       (lambda (&rest _) (ert-fail "input revived retired panel"))))
+              (funcall input 'late-input))
+            (should (equal reply '(client "answer")))
+            (with-current-buffer panel
+              (should-not emacs-jupyter-notebook-panel--entries)))
+        (setq emacs-jupyter-notebook--evaluation-request nil)))))
+
 (provide 'emacs-jupyter-notebook-tests)
 
 ;;; emacs-jupyter-notebook-tests.el ends here

@@ -23,7 +23,7 @@
 ;;   (ejn-panel-clear-entry HANDLE)
 ;;
 ;; An entry HANDLE is a plist:
-;;   (:panel PANEL :id N :cell-key KEY)
+;;   (:panel PANEL :id N :generation N :cell-key KEY)
 ;;
 ;; A KEY for cell-bound evaluation is a cons of (file-name . line-start-pos)
 ;; produced by the source buffer's cell tracking.  Region/paragraph/defun
@@ -122,8 +122,11 @@ W8.2: extracts the `application/x-ejn-mpl-pickle' payload and stores it on
 the panel entry, leaving the PNG thumbnail path untouched.  W8.6: when
 `emacs-jupyter-notebook-viewer-auto-open' is non-nil and a pickle is
 present, also hand it to the local viewer.  BUFFER is the source buffer;
-best-effort, never raises out of a callback."
-  (let ((base64 (emacs-jupyter-notebook--select-mpl-pickle data)))
+best-effort, never raises out of a callback.  A retired HANDLE is ignored
+before inspecting DATA, so callers cannot accidentally retain or schedule a
+late pickle payload."
+  (when (ejn-panel-entry-live-p handle)
+    (let ((base64 (emacs-jupyter-notebook--select-mpl-pickle data)))
     (if base64
         (progn
           (ejn-panel-set-pickle handle base64)
@@ -131,19 +134,21 @@ best-effort, never raises out of a callback."
                      (fboundp 'emacs-jupyter-notebook-viewer-open-pickle))
             ;; W8.7(a): NEVER decode base64 + write the temp file on the
             ;; IOPub callback thread — a large figure pickle would freeze
-            ;; Emacs during ordinary result streaming.  Defer the whole
-            ;; hand-off to idle time so the callback returns immediately.
-            (run-with-idle-timer
-             0 nil
-             (lambda ()
+            ;; Emacs during ordinary result streaming.  Coalesce it on the
+            ;; panel entry: rapid display updates produce one latest-payload
+            ;; handoff, and the closure holds no pickle bytes.
+            (ejn-panel-schedule-pickle-open
+             handle
+             (lambda (current-pickle)
                (ignore-errors
                  (when (buffer-live-p buffer)
                    (with-current-buffer buffer
-                     (emacs-jupyter-notebook-viewer-open-pickle base64))))))))
+                     (emacs-jupyter-notebook-viewer-open-pickle
+                      current-pickle))))))))
       ;; W8.7(d): a display with no pickle key replaces any prior figure on
       ;; this entry — drop the stale pickle so `v'/`C-c j I' can't reopen a
       ;; no-longer-visible figure.
-      (ejn-panel-clear-pickle handle))))
+        (ejn-panel-clear-pickle handle)))))
 
 (defun emacs-jupyter-notebook--render-image-data (base64-data)
   "Decode BASE64-DATA and return an image spec."
@@ -197,12 +202,20 @@ Each entry plist supports:
   :status running|ok|error
   :exec-count INTEGER-or-\"*\"
   :timestamp ISO-string
-  :content STRING
-  :image IMAGE-SPEC-or-nil
+  :outputs ordered text/image segments
+  :mpl-pickle BASE64-or-nil
+  :pickle-open-timer TIMER-or-nil
+  :pickle-open-token TOKEN-or-nil
   :pending-clear BOOL")
 
 (defvar-local emacs-jupyter-notebook-panel--next-id 0
   "Monotonic id counter for new entries.")
+
+(defvar-local emacs-jupyter-notebook-panel--generation 0
+  "Generation assigned to newly created entry handles.
+
+Clearing a panel advances this value, retiring every existing handle even
+before a future implementation chooses to reuse entry ids.")
 
 (defvar-local emacs-jupyter-notebook-panel--view 'latest
   "Current view: `latest' or `history'.")
@@ -273,14 +286,20 @@ history-log view appends every evaluation in time order."
   (when (timerp emacs-jupyter-notebook-panel--flush-timer)
     (cancel-timer emacs-jupyter-notebook-panel--flush-timer))
   (setq emacs-jupyter-notebook-panel--flush-timer nil)
-  (dolist (spec emacs-jupyter-notebook-panel--inline-image-specs)
-    (ignore-errors (image-flush spec t)))
-  (setq emacs-jupyter-notebook-panel--inline-image-specs nil)
-  (when (and (stringp emacs-jupyter-notebook-panel--image-directory)
-             (file-directory-p emacs-jupyter-notebook-panel--image-directory))
-    (ignore-errors
-      (delete-directory emacs-jupyter-notebook-panel--image-directory t)))
-  (setq emacs-jupyter-notebook-panel--image-directory nil))
+  (emacs-jupyter-notebook-panel--retire-all-artifacts (current-buffer)))
+
+(defun emacs-jupyter-notebook-panel--cleanup-published-artifacts-on-exit ()
+  "Release panel-owned image files and image-cache objects on Emacs exit.
+This deliberately only touches local panel buffers.  It does not kill a
+panel, inspect the registry, contact SSH, or send any kernel action."
+  (dolist (buffer (buffer-list))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (when (derived-mode-p 'emacs-jupyter-notebook-panel-mode)
+          (emacs-jupyter-notebook-panel--retire-all-artifacts buffer))))))
+
+(add-hook 'kill-emacs-hook
+          #'emacs-jupyter-notebook-panel--cleanup-published-artifacts-on-exit)
 
 ;;; Buffer naming & lookup
 
@@ -356,14 +375,31 @@ with the same basename) so distinct sources always map to distinct panels."
 
 (defun emacs-jupyter-notebook-panel--handle (panel id key)
   "Return a public entry handle for ID in PANEL with cell KEY."
-  (list :panel panel :id id :cell-key key))
+  (list :panel panel :id id
+        :generation (with-current-buffer panel
+                      emacs-jupyter-notebook-panel--generation)
+        :cell-key key))
+
+(defun ejn-panel-entry-live-p (handle)
+  "Return non-nil when HANDLE still names its original live panel entry.
+The generation check turns all handles created before `ejn-panel-clear-all'
+into inert values.  Callback code uses this before decoding or storing any
+payload, so late IOPub output cannot recreate retired local artifacts."
+  (let ((panel (plist-get handle :panel)))
+    (and handle
+         (buffer-live-p panel)
+         (with-current-buffer panel
+           (and (equal (plist-get handle :generation)
+                       emacs-jupyter-notebook-panel--generation)
+                (emacs-jupyter-notebook-panel--entry
+                 panel (plist-get handle :id)))))))
 
 (defun emacs-jupyter-notebook-panel--update-entry (handle updater &optional force-full)
   "Apply UPDATER to the entry referenced by HANDLE and schedule a render.
 UPDATER is called with the current entry plist and must return a new plist.
 When FORCE-FULL is non-nil, rebuild the whole view because image-preview
 membership or entry ordering may have changed."
-  (when handle
+  (when (ejn-panel-entry-live-p handle)
     (let ((panel (plist-get handle :panel))
           (id (plist-get handle :id)))
       (when (buffer-live-p panel)
@@ -373,6 +409,67 @@ membership or entry ordering may have changed."
               (emacs-jupyter-notebook-panel--set-entry panel id new)
               (emacs-jupyter-notebook-panel--schedule-render
                panel id force-full))))))))
+
+(defun emacs-jupyter-notebook-panel--cancel-pickle-open-timer (entry)
+  "Cancel ENTRY's pending auto-viewer timer and return the cleared entry."
+  (when (timerp (plist-get entry :pickle-open-timer))
+    (cancel-timer (plist-get entry :pickle-open-timer)))
+  (setq entry (plist-put entry :pickle-open-timer nil))
+  (plist-put entry :pickle-open-token nil))
+
+(defun emacs-jupyter-notebook-panel--mutate-live-entry (handle updater)
+  "Apply UPDATER to live HANDLE without scheduling a presentation render."
+  (when (ejn-panel-entry-live-p handle)
+    (let ((panel (plist-get handle :panel))
+          (id (plist-get handle :id)))
+      (with-current-buffer panel
+        (when-let ((cell (assq id emacs-jupyter-notebook-panel--entries)))
+          (setcdr cell (funcall updater (cdr cell)))
+          t)))))
+
+(defun emacs-jupyter-notebook-panel--claim-pickle-open-timer (handle token timer)
+  "Return HANDLE's current pickle when TOKEN and TIMER still own its slot.
+The matching slot is cleared atomically before the caller opens the viewer."
+  (let (pickle)
+    (when (emacs-jupyter-notebook-panel--mutate-live-entry
+           handle
+           (lambda (entry)
+             (when (and (eq token (plist-get entry :pickle-open-token))
+                        (eq timer (plist-get entry :pickle-open-timer)))
+               (setq pickle (plist-get entry :mpl-pickle))
+               (setq entry (plist-put entry :pickle-open-timer nil))
+               (setq entry (plist-put entry :pickle-open-token nil)))
+             entry))
+      pickle)))
+
+(defun ejn-panel-schedule-pickle-open (handle opener)
+  "Coalesce HANDLE's deferred pickle open and call OPENER with its live payload.
+Only one idle timer may be pending per entry.  Neither the timer nor OPENER
+captures the pickle bytes; the callback revalidates HANDLE and reads the
+entry payload only after claiming its current timer slot."
+  (when (ejn-panel-entry-live-p handle)
+    (let ((token (list))
+          timer)
+      (when (emacs-jupyter-notebook-panel--mutate-live-entry
+             handle
+             (lambda (entry)
+               (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
+                            entry))
+               (plist-put entry :pickle-open-token token)))
+        (setq timer
+              (run-with-idle-timer
+               0 nil
+               (lambda ()
+                 (when-let ((pickle (emacs-jupyter-notebook-panel--claim-pickle-open-timer
+                                     handle token timer)))
+                   (funcall opener pickle)))))
+        (unless (emacs-jupyter-notebook-panel--mutate-live-entry
+                 handle
+                 (lambda (entry)
+                   (if (eq token (plist-get entry :pickle-open-token))
+                       (plist-put entry :pickle-open-timer timer)
+                     entry)))
+          (cancel-timer timer))))))
 
 ;;; Render scheduling (W2.4 throttle)
 
@@ -753,6 +850,38 @@ returned unchanged.  The file is mode 0600 and written without coding."
     (when (eq (car seg) 'image)
       (emacs-jupyter-notebook-panel--retire-image panel (cdr seg)))))
 
+(defun emacs-jupyter-notebook-panel--retire-all-artifacts (panel)
+  "Flush caches and delete every panel-owned output artifact in PANEL.
+This is local cleanup only.  Call it before discarding entries or during
+normal Emacs exit; it never consults source, registry, SSH, or kernel state."
+  (when (buffer-live-p panel)
+    (with-current-buffer panel
+      (dolist (cell emacs-jupyter-notebook-panel--entries)
+        (emacs-jupyter-notebook-panel--retire-outputs panel
+                                                       (plist-get (cdr cell) :outputs))
+        (let ((entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
+                      (cdr cell))))
+          (setcdr cell (plist-put entry :mpl-pickle nil))))
+      (dolist (spec emacs-jupyter-notebook-panel--inline-image-specs)
+        (ignore-errors (image-flush spec t)))
+      (setq emacs-jupyter-notebook-panel--inline-image-specs nil)
+      ;; Removing the whole private directory also catches an orphan created
+      ;; by a partially failed materialization.
+      (when (and (stringp emacs-jupyter-notebook-panel--image-directory)
+                 (file-directory-p emacs-jupyter-notebook-panel--image-directory))
+        (ignore-errors
+          (delete-directory emacs-jupyter-notebook-panel--image-directory t)))
+      (setq emacs-jupyter-notebook-panel--image-directory nil))))
+
+(defun ejn-panel-clear-all (panel)
+  "Retire all PANEL artifacts and entries, invalidating their handles."
+  (when (buffer-live-p panel)
+    (with-current-buffer panel
+      (emacs-jupyter-notebook-panel--retire-all-artifacts panel)
+      (setq emacs-jupyter-notebook-panel--entries nil)
+      (cl-incf emacs-jupyter-notebook-panel--generation)
+      (emacs-jupyter-notebook-panel--invalidate-structure panel))))
+
 (defun ejn-panel-start-entry (panel cell-key code)
   "Begin a new output entry in PANEL associated with CELL-KEY for CODE.
 Return an entry handle.
@@ -777,6 +906,8 @@ state appears in place."
                         ;; and `(image . SPEC)' conses, rendered interleaved
                         ;; in arrival order like a real notebook cell.
                         :outputs nil
+                        :pickle-open-timer nil
+                        :pickle-open-token nil
                         :pending-clear nil)))
       (setq emacs-jupyter-notebook-panel--entries
             (append emacs-jupyter-notebook-panel--entries
@@ -848,15 +979,20 @@ Image segments are never dropped by the byte cap."
                     (setq excess 0))))))
           (nreverse keep))))))
 
-(defun emacs-jupyter-notebook-panel--outputs-after-pending (panel entry)
-  "Return ENTRY's outputs honoring a pending clear_output(wait=True).
-When the pending clear takes effect, retire its old private image files."
+(defun emacs-jupyter-notebook-panel--entry-after-pending-clear (panel entry)
+  "Return ENTRY after applying a pending clear_output(wait=True).
+When the clear takes effect, retire its images and interactive pickle before
+accepting the next output.  This also cancels a queued auto-viewer handoff."
   (if (plist-get entry :pending-clear)
       (progn
         (emacs-jupyter-notebook-panel--retire-outputs
          panel (plist-get entry :outputs))
-        nil)
-    (plist-get entry :outputs)))
+        (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
+                     entry))
+        (setq entry (plist-put entry :outputs nil))
+        (setq entry (plist-put entry :mpl-pickle nil))
+        (plist-put entry :pending-clear nil))
+    entry))
 
 (defun ejn-panel-append-text (handle text &optional face)
   "Append TEXT (optionally propertized with FACE) to HANDLE's entry.
@@ -881,8 +1017,9 @@ colours are preserved and uncoloured spans still get the fallback FACE."
       (emacs-jupyter-notebook-panel--update-entry
        handle
        (lambda (entry)
-         (let* ((outputs (emacs-jupyter-notebook-panel--outputs-after-pending
-                          panel entry))
+         (setq entry (emacs-jupyter-notebook-panel--entry-after-pending-clear
+                      panel entry))
+         (let* ((outputs (plist-get entry :outputs))
                 (last-seg (car (last outputs))))
            (if (and last-seg (eq (car last-seg) 'text))
                ;; Merge into the trailing text segment.
@@ -919,6 +1056,8 @@ replaced whatever figure the entry previously showed."
           panel (plist-get entry :outputs))
          (setq entry (plist-put entry :outputs
                                 (list (cons 'text (or text "")))))
+         (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
+                      entry))
          (setq entry (plist-put entry :mpl-pickle nil))
          (setq entry (plist-put entry :pending-clear nil))
          entry)
@@ -929,16 +1068,17 @@ replaced whatever figure the entry previously showed."
 W16: no longer erases prior text — a cell that prints AND plots shows
 both, in order, like a notebook.  Multiple figures in one execution each
 get their own segment."
-  (when handle
+  (when (ejn-panel-entry-live-p handle)
     (let* ((panel (plist-get handle :panel)))
-      (when (buffer-live-p panel)
+      (when (ejn-panel-entry-live-p handle)
         (let ((stored (emacs-jupyter-notebook-panel--materialize-image
                        panel image-spec)))
           (emacs-jupyter-notebook-panel--update-entry
            handle
            (lambda (entry)
-             (let ((outputs (emacs-jupyter-notebook-panel--outputs-after-pending
-                             panel entry)))
+             (setq entry (emacs-jupyter-notebook-panel--entry-after-pending-clear
+                          panel entry))
+             (let ((outputs (plist-get entry :outputs)))
                (setq entry (plist-put entry :outputs
                                       (append outputs
                                               (list (cons 'image stored)))))
@@ -952,16 +1092,17 @@ Appends when the entry has no image yet.  W16: this is the
 `update_display_data' semantic — the kernel is updating an existing
 display in place (e.g. an animation frame), not adding a new output —
 so text segments are left untouched and no new segment is created."
-  (when handle
+  (when (ejn-panel-entry-live-p handle)
     (let ((panel (plist-get handle :panel)))
-      (when (buffer-live-p panel)
+      (when (ejn-panel-entry-live-p handle)
         (let ((stored (emacs-jupyter-notebook-panel--materialize-image
                        panel image-spec)))
           (emacs-jupyter-notebook-panel--update-entry
            handle
            (lambda (entry)
-             (let* ((outputs (emacs-jupyter-notebook-panel--outputs-after-pending
-                              panel entry))
+             (setq entry (emacs-jupyter-notebook-panel--entry-after-pending-clear
+                          panel entry))
+             (let* ((outputs (plist-get entry :outputs))
                     (last-image (cl-find 'image (reverse outputs) :key #'car)))
                (if last-image
                    (progn
@@ -1001,6 +1142,8 @@ If WAIT is non-nil, defer the clear until the next text arrives
             panel (plist-get entry :outputs))
            (setq entry (plist-put entry :outputs nil))
            ;; W8.7(d): clearing the entry drops the figure too.
+           (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
+                        entry))
            (setq entry (plist-put entry :mpl-pickle nil))
            (setq entry (plist-put entry :pending-clear nil))
            entry))
@@ -1023,7 +1166,9 @@ their PNG thumbnail and text are untouched.  A non-positive
             (when (plist-get (cdr cell) :mpl-pickle)
               (if (< kept max)
                   (setq kept (1+ kept))
-                (setcdr cell (plist-put (cdr cell) :mpl-pickle nil))))))))))
+                (let ((entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
+                              (cdr cell))))
+                  (setcdr cell (plist-put entry :mpl-pickle nil)))))))))))
 
 (defun ejn-panel-set-pickle (handle base64)
   "Stash BASE64 matplotlib-pickle payload on HANDLE's entry.
@@ -1031,10 +1176,12 @@ W8.2: stored under `:mpl-pickle' independently of the rendered content or
 image, so the PNG thumbnail path is untouched.  The interactive viewer
 (W8.5) reads this field to reopen the figure locally.  A nil BASE64 is a
 no-op.  A5: after stashing, prune pickles beyond the newest N entries."
-  (when (and handle base64)
+  (when (and (ejn-panel-entry-live-p handle) base64)
     (emacs-jupyter-notebook-panel--update-entry
      handle
      (lambda (entry)
+       (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
+                    entry))
        (plist-put entry :mpl-pickle base64)))
     (emacs-jupyter-notebook-panel--prune-pickles (plist-get handle :panel))))
 
@@ -1043,7 +1190,10 @@ no-op.  A5: after stashing, prune pickles beyond the newest N entries."
   (when handle
     (emacs-jupyter-notebook-panel--update-entry
      handle
-     (lambda (entry) (plist-put entry :mpl-pickle nil)))))
+     (lambda (entry)
+       (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
+                    entry))
+       (plist-put entry :mpl-pickle nil)))))
 
 (defun ejn-panel-entry-pickle (handle)
   "Return the base64 matplotlib-pickle payload stashed on HANDLE's entry, or nil."
@@ -1051,7 +1201,7 @@ no-op.  A5: after stashing, prune pickles beyond the newest N entries."
 
 (defun ejn-panel-entry-snapshot (handle)
   "Return the entry plist for HANDLE (debug/test introspection)."
-  (and handle
+  (and (ejn-panel-entry-live-p handle)
        (emacs-jupyter-notebook-panel--entry
         (plist-get handle :panel) (plist-get handle :id))))
 
