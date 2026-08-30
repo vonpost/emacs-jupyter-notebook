@@ -656,7 +656,7 @@ modules.
     helper close to prove kernel survival.
   - Narrow run: local integration selector `test_connect.py` under 45 seconds.
 
-- [~] owner=terra-ht8 claimed=2026-08-31 **HT8 Correlate all Jupyter channels and execution terminal ordering.**
+- [x] owner=terra-ht8 claimed=2026-08-31 landed=06287a8 **HT8 Correlate all Jupyter channels and execution terminal ordering.**
   - Depends: HT7.
   - Files: `helper/ejn_helper/jupyter_backend.py`,
     `helper/ejn_helper/requests.py`,
@@ -672,7 +672,7 @@ modules.
   - Narrow run: `test_requests.py` and `test_execution_order.py`.
   - Non-goal: no output MIME rendering.
 
-- [ ] **HT9 Normalize bounded stream, error, result, display, and artifact events.**
+- [~] owner=terra-ht9 claimed=2026-08-31 **HT9 Normalize bounded stream, error, result, display, and artifact events.**
   - Depends: HT8, HT5.
   - Files: `helper/ejn_helper/outputs.py`,
     `helper/ejn_helper/jupyter_backend.py`,
