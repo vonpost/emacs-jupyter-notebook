@@ -63,9 +63,58 @@
   (should-not (emacs-jupyter-notebook-helper-session-decoder session))
   (should-not (emacs-jupyter-notebook-helper-session-hello-timer session))
   (should-not (emacs-jupyter-notebook-helper-session-partial-timer session))
+  (should-not (emacs-jupyter-notebook-helper-session-decode-timer session))
+  (should-not (emacs-jupyter-notebook-helper-session-drain-timer session))
+  (should-not (emacs-jupyter-notebook-helper-session-ping-timer session))
+  (should-not (emacs-jupyter-notebook-helper-session-control-timer session))
+  (should-not (emacs-jupyter-notebook-helper-session-ping-id session))
+  (should-not (emacs-jupyter-notebook-helper-session-requests session))
+  (should-not (emacs-jupyter-notebook-helper-session-raw-chunks session))
+  (should-not (emacs-jupyter-notebook-helper-session-event-queue session))
+  (should-not (emacs-jupyter-notebook-helper-session-priority-queue session))
   (should-not (emacs-jupyter-notebook-helper-session-ready-callback session))
   (should-not (emacs-jupyter-notebook-helper-session-failure-callback session))
   (should-not (emacs-jupyter-notebook-helper-session-closed-callback session)))
+
+(defun ejn-et3--object (&rest pairs)
+  "Build a JSON object from string/value PAIRS."
+  (let ((object (make-hash-table :test 'equal)))
+    (while pairs
+      (puthash (pop pairs) (pop pairs) object))
+    object))
+
+(defun ejn-et3--event (seq &optional text)
+  "Build one ordinary protocol event with SEQ and TEXT."
+  (ejn-et3--object
+   "v" 1 "kind" "event" "seq" seq "event" "stream" "request_id" "test"
+   "data" (ejn-et3--object "name" "stdout" "text" (or text "x"))))
+
+(defun ejn-et3--feed (session object)
+  "Inject one framed helper OBJECT through SESSION's real process filter."
+  (emacs-jupyter-notebook-helper--filter
+   (emacs-jupyter-notebook-helper-session-process session)
+   (ejn-helper-protocol-encode object ejn-helper-protocol-max-to-emacs-frame)))
+
+(cl-defmacro ejn-et3--with-ready ((session scenario &rest options) &body body)
+  "Start SESSION against TH1 SCENARIO and wait for its hello drain."
+  (declare (indent 1) (debug ((symbolp form &rest form) body)))
+  `(let ((ready nil) (failure nil)
+         (owner (generate-new-buffer " *ejn-et3-owner*"))
+         (emacs-jupyter-notebook-helper-hello-timeout 0.5)
+         (emacs-jupyter-notebook-helper--ping-interval 300)
+         (emacs-jupyter-notebook-helper-command
+          (append (list "python3" ejn-et2--fixture ,scenario) (list ,@options))))
+     (unwind-protect
+         (let ((,session
+                (emacs-jupyter-notebook-helper-start
+                 :buffer owner
+                 :ready-callback (lambda (_session _reason) (setq ready t))
+                 :failure-callback (lambda (_session reason) (setq failure reason)))))
+           (should (ejn-et2--await (lambda () (or ready failure)) 1))
+           (should ready)
+           ,@body)
+       (when (buffer-live-p owner) (kill-buffer owner))
+       (ejn-et2--clean))))
 
 (ert-deftest ejn-et2-normal-hello-is-binary-and-nonblocking ()
   (ejn-et2--with-session (session "normal")
@@ -337,6 +386,285 @@
             (should-not (multibyte-string-p (buffer-string)))))
       (when (process-live-p pipe) (delete-process pipe))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest ejn-et3-filter-defers-event-callbacks-and-isolates-throws ()
+  (let ((events nil)
+        (owner (generate-new-buffer " *ejn-et3-callback-owner*"))
+        (emacs-jupyter-notebook-helper-command (list "python3" ejn-et2--fixture "normal"))
+        (emacs-jupyter-notebook-helper--ping-interval 300))
+    (unwind-protect
+        (let* ((ready nil)
+              (session (emacs-jupyter-notebook-helper-start
+                        :buffer owner
+                        :ready-callback (lambda (&rest _) (setq ready t))
+                        :event-callback
+                        (lambda (_session event)
+                          (push (gethash "seq" event) events)
+                          (when (= (gethash "seq" event) 1) (error "injected callback failure"))))))
+          (should (ejn-et2--await (lambda () ready)))
+          (ejn-et3--feed session (ejn-et3--event 1))
+          (ejn-et3--feed session (ejn-et3--event 2))
+          (should-not events)
+          (should (ejn-et2--await (lambda () (= (length events) 2))))
+          (should (equal (sort events #'<) '(1 2)))
+          (emacs-jupyter-notebook-helper-dispose session "test done")
+          (ejn-et2--assert-no-local-leaks))
+      (when (buffer-live-p owner) (kill-buffer owner))
+      (ejn-et2--clean))))
+
+(ert-deftest ejn-et3-th1-flood-keeps-an-independent-timer-running ()
+  (let ((ticks 0)
+        (timer nil)
+        (events 0)
+        (owner (generate-new-buffer " *ejn-et3-flood-owner*"))
+        (emacs-jupyter-notebook-helper-command
+         (list "python3" ejn-et2--fixture "flood" "--count" "128"))
+        (emacs-jupyter-notebook-helper--ping-interval 300))
+    (unwind-protect
+        (let ((session (emacs-jupyter-notebook-helper-start
+                        :buffer owner :event-callback (lambda (&rest _) (cl-incf events)))))
+          (setq timer (run-at-time 0.005 0.005 (lambda () (cl-incf ticks))))
+          (should (ejn-et2--await
+                   (lambda () (and (= events 128)
+                                    (= (emacs-jupyter-notebook-helper-session-control-acked session) 129))) 2))
+          (should (> ticks 0))
+          (should (eq (emacs-jupyter-notebook-helper-session-state session) 'ready))
+          (emacs-jupyter-notebook-helper-dispose session "test done")
+          (ejn-et2--assert-no-local-leaks))
+      (when (timerp timer) (cancel-timer timer))
+      (when (buffer-live-p owner) (kill-buffer owner))
+      (ejn-et2--clean))))
+
+(ert-deftest ejn-et3-request-timeout-late-and-duplicate-responses-are-bounded ()
+  (let ((callback-count 0)
+        (late-count 0))
+    (ejn-et3--with-ready (session "normal")
+      (let ((id nil))
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper--send-envelope)
+                   (lambda (&rest _) nil)))
+          (setq id (emacs-jupyter-notebook-helper-request
+                    session "ping" (make-hash-table :test 'equal)
+                    (lambda (_session _response error)
+                      (when error (cl-incf callback-count)))
+                    :timeout 0.02)))
+        (should (ejn-et2--await (lambda () (= callback-count 1))))
+        (ejn-et3--feed session
+                        (ejn-et3--object "v" 1 "kind" "response" "id" id "ok" t
+                                         "result" (make-hash-table :test 'equal)))
+        (should (ejn-et2--await
+                 (lambda () (emacs-jupyter-notebook-helper-session-late-responses session)) 1))
+        (setq late-count (length (emacs-jupyter-notebook-helper-session-late-responses session)))
+        (should (= callback-count 1))
+        (dotimes (_ 100)
+          (ejn-et3--feed session
+                          (ejn-et3--object "v" 1 "kind" "response" "id" "duplicate"
+                                           "ok" t "result" (make-hash-table :test 'equal))))
+        (should (ejn-et2--await
+                 (lambda () (> (length (emacs-jupyter-notebook-helper-session-late-responses session)) late-count))))
+        (should (<= (length (emacs-jupyter-notebook-helper-session-late-responses session)) 64))
+        (should (= callback-count 1))))))
+
+(ert-deftest ejn-et3-credit-is-exact-and-responses-run-at-zero-credit ()
+  (let ((request-log (make-temp-file "ejn-et3-credit"))
+        (events 0) (response-count 0))
+    (unwind-protect
+        (let ((owner (generate-new-buffer " *ejn-et3-credit-owner*"))
+              (ready nil)
+              (emacs-jupyter-notebook-helper-command
+               (list "python3" ejn-et2--fixture "normal" "--requests" request-log))
+              (emacs-jupyter-notebook-helper--ping-interval 300))
+          (unwind-protect
+              (let ((session (emacs-jupyter-notebook-helper-start
+                              :buffer owner
+                              :ready-callback (lambda (&rest _) (setq ready t))
+                              :event-callback (lambda (&rest _) (cl-incf events)))))
+                (should (ejn-et2--await (lambda () ready)))
+                (setf (emacs-jupyter-notebook-helper-session-event-credit session) 0)
+                (let ((id (emacs-jupyter-notebook-helper-request
+                           session "ping" (make-hash-table :test 'equal)
+                           (lambda (_session response error)
+                             (should response) (should-not error) (cl-incf response-count))
+                           :timeout 0.5)))
+                  (ignore id)
+                  (should (ejn-et2--await (lambda () (= response-count 1)))))
+                (setf (emacs-jupyter-notebook-helper-session-event-credit session) 262144)
+                (let* ((event (ejn-et3--event 1 "credited"))
+                       (bytes (length (ejn-helper-protocol-encode event 262144))))
+                  (ejn-et3--feed session event)
+                  (should (ejn-et2--await (lambda () (= events 1))))
+                  (should (= (emacs-jupyter-notebook-helper-session-event-credit session) 262144))
+                  (should (ejn-et2--await
+                           (lambda ()
+                             (with-temp-buffer
+                               (insert-file-contents request-log)
+                               (string-match-p (format "\\\"bytes\\\":%d" bytes) (buffer-string)))))))
+                (emacs-jupyter-notebook-helper-dispose session "test done")
+                (ejn-et2--assert-no-local-leaks))
+            (when (buffer-live-p owner) (kill-buffer owner))
+            (ejn-et2--clean)))
+      (when (file-exists-p request-log) (delete-file request-log)))))
+
+(ert-deftest ejn-et3-rejects-pregrant-and-aggregate-over-credit-arrivals ()
+  (let ((owner (generate-new-buffer " *ejn-et3-pregrant-owner*"))
+        (emacs-jupyter-notebook-helper-command (list "python3" ejn-et2--fixture "silent")))
+    (unwind-protect
+        (let ((session (emacs-jupyter-notebook-helper-start :buffer owner)))
+          (ejn-et3--feed session (ejn-et3--event 1))
+          (should (ejn-et2--await (lambda () (emacs-jupyter-notebook-helper-session-disposed session))))
+          (ejn-et2--assert-no-local-leaks))
+      (when (buffer-live-p owner) (kill-buffer owner))
+      (ejn-et2--clean)))
+  (ejn-et3--with-ready (session "normal")
+    (let* ((event (ejn-et3--event 1))
+           (bytes (length (ejn-helper-protocol-encode event 262144))))
+      (setf (emacs-jupyter-notebook-helper-session-event-credit session) bytes)
+      (ejn-et3--feed session event)
+      (ejn-et3--feed session (ejn-et3--event 2))
+      (should (ejn-et2--await (lambda () (emacs-jupyter-notebook-helper-session-disposed session))))
+      (ejn-et2--assert-no-local-leaks))))
+
+(ert-deftest ejn-et3-control-acks-are-ordered-and-never-late-logged ()
+  (ejn-et3--with-ready (session "normal")
+    (should (ejn-et2--await
+             (lambda () (= (emacs-jupyter-notebook-helper-session-control-acked session) 1))))
+    (should-not (emacs-jupyter-notebook-helper-session-late-responses session))
+    (ejn-et3--feed session
+                    (ejn-et3--object "v" 1 "kind" "response"
+                                     "id" (format "ejn-control-%d-1"
+                                                  (emacs-jupyter-notebook-helper-session-id session))
+                                     "ok" t "result" (make-hash-table :test 'equal)))
+    (should (ejn-et2--await (lambda () (emacs-jupyter-notebook-helper-session-disposed session))))
+    (ejn-et2--assert-no-local-leaks))
+  (ejn-et3--with-ready (session "normal")
+    (setf (emacs-jupyter-notebook-helper-session-control-sent session) 2)
+    (ejn-et3--feed session
+                    (ejn-et3--object "v" 1 "kind" "response"
+                                     "id" (format "ejn-control-%d-2"
+                                                  (emacs-jupyter-notebook-helper-session-id session))
+                                     "ok" :false "error" (make-hash-table :test 'equal)))
+    (should (ejn-et2--await (lambda () (emacs-jupyter-notebook-helper-session-disposed session))))))
+
+(ert-deftest ejn-et3-credit-ack-deadline-survives-successful-ping ()
+  (let ((owner (generate-new-buffer " *ejn-et3-credit-deadline-owner*"))
+        (ready nil) (ping-replied nil)
+        (emacs-jupyter-notebook-helper-command
+         (list "python3" ejn-et2--fixture "normal" "--omit-credit-ack"))
+        (emacs-jupyter-notebook-helper--control-ack-timeout 0.12)
+        (emacs-jupyter-notebook-helper--ping-interval 300))
+    (unwind-protect
+        (let ((session (emacs-jupyter-notebook-helper-start
+                        :buffer owner :ready-callback (lambda (&rest _) (setq ready t)))))
+          (should (ejn-et2--await (lambda () ready)))
+          (emacs-jupyter-notebook-helper-request
+           session "ping" (make-hash-table :test 'equal)
+           (lambda (_ response error) (setq ping-replied (and response (not error))))
+           :timeout 0.5)
+          (should (ejn-et2--await (lambda () ping-replied)))
+          (should (ejn-et2--await (lambda () (emacs-jupyter-notebook-helper-session-disposed session)) 1))
+          (ejn-et2--assert-disposed-slots-cleared session)
+          (ejn-et2--assert-no-local-leaks))
+      (when (buffer-live-p owner) (kill-buffer owner))
+      (ejn-et2--clean))))
+
+(ert-deftest ejn-et3-malformed-arrivals-and-priority-reordering-are-safe ()
+  (dolist (object (list (ejn-et3--object "v" 2 "kind" "response" "id" "x" "ok" t "result" (make-hash-table :test 'equal))
+                        (ejn-et3--object "v" 1 "kind" "bogus")
+                        (ejn-et3--object "v" 1 "kind" "response" "id" 1 "ok" t "result" (make-hash-table :test 'equal))
+                        (ejn-et3--object "v" 1 "kind" "response" "id" (make-string 129 #x00e9)
+                                         "ok" t "result" (make-hash-table :test 'equal))
+                        (ejn-et3--object "v" 1 "kind" "event" "seq" 1 "event" "stream"
+                                         "request_id" "" "data" (make-hash-table :test 'equal))
+                        (ejn-et3--object "v" 1 "kind" "event" "seq" 1 "event" "stream"
+                                         "request_id" (make-string 129 #x00e9)
+                                         "data" (make-hash-table :test 'equal))
+                        (ejn-et3--object "v" 1 "kind" "event" "seq" 1 "event" "stream" "data" (make-hash-table :test 'equal))))
+    (ejn-et3--with-ready (session "normal")
+      (ejn-et3--feed session object)
+      (should (ejn-et2--await (lambda () (emacs-jupyter-notebook-helper-session-disposed session))))))
+  (let ((seen nil) (owner (generate-new-buffer " *ejn-et3-order-owner*"))
+        (emacs-jupyter-notebook-helper-command (list "python3" ejn-et2--fixture "normal"))
+        (emacs-jupyter-notebook-helper--ping-interval 300))
+    (unwind-protect
+        (let* ((ready nil)
+               (session (emacs-jupyter-notebook-helper-start
+                         :buffer owner :ready-callback (lambda (&rest _) (setq ready t))
+                         :event-callback (lambda (_ event) (push (gethash "seq" event) seen)))))
+          (should (ejn-et2--await (lambda () ready)))
+          (ejn-et3--feed session (ejn-et3--event 1))
+          (ejn-et3--feed session (ejn-et3--object "v" 1 "kind" "event" "seq" 2 "event" "status"
+                                                   "request_id" "test" "data" (make-hash-table :test 'equal)))
+          (ejn-et3--feed session (ejn-et3--object "v" 1 "kind" "event" "seq" 3
+                                                   "event" "transport_error"
+                                                   "data" (make-hash-table :test 'equal)))
+          (should (ejn-et2--await (lambda () (= (length seen) 3))))
+          (should (equal seen '(1 3 2)))
+          (emacs-jupyter-notebook-helper-dispose session "test done"))
+      (when (buffer-live-p owner) (kill-buffer owner)) (ejn-et2--clean))))
+
+(ert-deftest ejn-et3-rejects-duplicate-and-out-of-order-event-sequences ()
+  (dolist (sequence '(2 1))
+    (ejn-et3--with-ready (session "normal")
+      (setf (emacs-jupyter-notebook-helper-session-last-event-seq session) 2)
+      (ejn-et3--feed session (ejn-et3--event sequence))
+      (should (ejn-et2--await (lambda () (emacs-jupyter-notebook-helper-session-disposed session)))))))
+
+(ert-deftest ejn-et3-queue-and-raw-overflow-fail-through-the-drain ()
+  (ejn-et3--with-ready (session "normal")
+    (setf (emacs-jupyter-notebook-helper-session-event-queue-bytes session)
+          emacs-jupyter-notebook-helper--max-event-queue)
+    (ejn-et3--feed session (ejn-et3--event 1))
+    (should (ejn-et2--await (lambda () (emacs-jupyter-notebook-helper-session-disposed session))))
+    (ejn-et2--assert-no-local-leaks))
+  (ejn-et3--with-ready (session "normal")
+    (emacs-jupyter-notebook-helper--filter
+     (emacs-jupyter-notebook-helper-session-process session)
+     (make-string (1+ ejn-helper-protocol-max-raw-accumulator) ?x))
+    (should-not (emacs-jupyter-notebook-helper-session-disposed session))
+    (should (ejn-et2--await (lambda () (emacs-jupyter-notebook-helper-session-disposed session))))
+    (ejn-et2--assert-no-local-leaks)))
+
+(ert-deftest ejn-et3-death-fails-pending-ping-and-stale-ticks-cannot-revive ()
+  (let ((callbacks 0))
+    (ejn-et3--with-ready (session "normal")
+      (let* ((id "pending")
+             (request (emacs-jupyter-notebook-helper--make-request
+                       :id id :callback (lambda (&rest _) (cl-incf callbacks))))
+             (requests (emacs-jupyter-notebook-helper-session-requests session))
+             (process (emacs-jupyter-notebook-helper-session-process session)))
+        (puthash id request requests)
+        (emacs-jupyter-notebook-helper--sentinel process "killed\n")
+        (should (= callbacks 1))
+        (should (emacs-jupyter-notebook-helper-session-disposed session))
+        (emacs-jupyter-notebook-helper--ping-tick session)
+        (should-not (emacs-jupyter-notebook-helper-session-ping-id session))
+        (ejn-et2--assert-no-local-leaks)))))
+
+(ert-deftest ejn-et3-ping-timeout-disposes-a-live-but-silent-loop ()
+  (ejn-et3--with-ready (session "normal")
+    (let ((emacs-jupyter-notebook-helper--ping-timeout 0.02))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper--send-envelope)
+                 (lambda (&rest _) nil)))
+        (emacs-jupyter-notebook-helper--ping-tick session)
+        (should (ejn-et2--await
+                 (lambda () (emacs-jupyter-notebook-helper-session-disposed session)) 1))))
+    (ejn-et2--assert-no-local-leaks)))
+
+(ert-deftest ejn-et3-ping-reserves-capacity-after-seven-ordinary-requests ()
+  (ejn-et3--with-ready (session "normal")
+    (let ((ordinary 0)
+          (emacs-jupyter-notebook-helper--ping-timeout 0.02))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper--send-envelope)
+                 (lambda (&rest _) nil)))
+        (dotimes (_ 7)
+          (emacs-jupyter-notebook-helper-request
+           session "ping" (make-hash-table :test 'equal)
+           (lambda (&rest _) (cl-incf ordinary)) :timeout 1))
+        (should-error (emacs-jupyter-notebook-helper-request
+                       session "ping" (make-hash-table :test 'equal) (lambda (&rest _))))
+        (emacs-jupyter-notebook-helper--ping-tick session)
+        (should (ejn-et2--await (lambda () (emacs-jupyter-notebook-helper-session-disposed session))))
+        (should (= ordinary 7))))
+    (ejn-et2--assert-no-local-leaks)))
 
 (ert-deftest ejn-et2-supervisor-has-no-durable-state-or-wait-loop ()
   (let ((source (with-temp-buffer

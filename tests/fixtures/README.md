@@ -31,8 +31,10 @@ remains alive without output. `garbage` emits invalid bytes and exits;
 to-Emacs ceiling without allocating a payload; and `mid-frame-stop` exits
 after a partial valid response. `late-response` waits for the bounded
 `--delay-ms` (default 100 ms), then responds and remains usable. `flood`
-emits `--count` bounded legal events (default 100) followed by a correlated
-response. `exit-after-op` defaults to `hello` and exits without a response;
+responds to `hello`, waits for and acknowledges the initial
+`grant_event_credit`, then emits only complete ordinary event frames whose
+total wire bytes fit that grant; it remains available for later grants.
+`exit-after-op` defaults to `hello` and exits without a response;
 `--respond` opts into a response. All subprocesses have a two-second child
 timeout and the outer `timeout` prevents a wedged self-test from waiting
 forever.

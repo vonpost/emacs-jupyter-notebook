@@ -137,9 +137,30 @@ def run(args):
         time.sleep(min(max(args.delay_ms, 1), 5000) / 1000.0)
         write_response(response(first, args.scenario))
     elif args.scenario == "flood":
+        if first.get("op") != "hello":
+            return 0
+        write_response(response(first, args.scenario))
+        credit = read_frame(sys.stdin.buffer)
+        if credit is None or credit.get("op") != "grant_event_credit":
+            return 0
+        record(args.requests, credit, state)
+        write_response(response(credit, args.scenario))
+        granted = credit.get("params", {}).get("bytes", 0)
+        emitted = 0
         for seq in range(min(max(args.count, 1), 1000)):
-            sys.stdout.buffer.write(encode({"v": 1, "kind": "event", "seq": seq, "event": "stream", "request_id": first.get("id", "flood"), "data": {"name": "stdout", "text": "x"}}))
-        write_response(response(first, args.scenario), args.scenario == "fragmented", args.fragment_delay_ms)
+            event = {"v": 1, "kind": "event", "seq": seq, "event": "stream", "request_id": "flood", "data": {"name": "stdout", "text": "x"}}
+            wire = encode(event)
+            if emitted + len(wire) > granted:
+                break
+            sys.stdout.buffer.write(wire)
+            emitted += len(wire)
+        sys.stdout.buffer.flush()
+        while True:
+            message = read_frame(sys.stdin.buffer)
+            if message is None:
+                return 0
+            record(args.requests, message, state)
+            write_response(response(message, args.scenario))
     elif args.scenario == "exit-after-op" and first.get("op") == args.op:
         if args.respond:
             sys.stdout.buffer.write(response(first, args.scenario))
@@ -153,6 +174,8 @@ def run(args):
             if message is None:
                 return 0
             record(args.requests, message, state)
+            if args.omit_credit_ack and message.get("op") == "grant_event_credit":
+                continue
             output = response(message, args.scenario)
             write_response(output, args.scenario == "fragmented", args.fragment_delay_ms)
 
@@ -207,6 +230,24 @@ def self_test():
                 if run == 1: command += ["--respond"]
             child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
+                if scenario == "flood":
+                    hello_request = encode({"v": 1, "kind": "request", "id": "hello-1", "op": "hello", "params": {"versions": [1]}})
+                    grant_request = encode({"v": 1, "kind": "request", "id": "ejn-control-1-1", "op": "grant_event_credit", "params": {"bytes": 262144}})
+                    child.stdin.write(hello_request); child.stdin.flush()
+                    hello_message, _ = read_one_wire_frame(child, time.monotonic() + 3)
+                    if hello_message.get("id") != "hello-1" or not hello_message.get("ok"):
+                        raise SystemExit("self-test failed: flood hello")
+                    child.stdin.write(grant_request); child.stdin.flush()
+                    grant_message, _ = read_one_wire_frame(child, time.monotonic() + 3)
+                    if grant_message.get("id") != "ejn-control-1-1" or not grant_message.get("ok"):
+                        raise SystemExit("self-test failed: flood credit ack")
+                    child.stdin.close(); out, _ = child.communicate(timeout=2); output = bytearray(out)
+                    frames = decode_frames(bytes(output))
+                    if len(frames) != 7 or [frame["seq"] for frame in frames] != list(range(7)):
+                        raise SystemExit("self-test failed: flood content")
+                    if sum(len(encode(frame)) for frame in frames) > 262144:
+                        raise SystemExit("self-test failed: flood credit")
+                    continue
                 child.stdin.write(request); child.stdin.flush()
                 if scenario == "silent":
                     deadline = time.monotonic() + 2
@@ -256,9 +297,6 @@ def self_test():
                 if scenario == "exit-after-op" and run == 1:
                     messages = decode_frames(bytes(output))
                     if len(messages) != 1 or messages[0].get("id") != "test-1": raise SystemExit("self-test failed: exit response")
-                if scenario == "flood":
-                    frames = decode_frames(bytes(output))
-                    if len(frames) != 8 or [frame["seq"] for frame in frames[:7]] != list(range(7)) or frames[-1].get("id") != "test-1": raise SystemExit("self-test failed: flood content")
             finally:
                 if child.poll() is None: child.kill(); child.wait(timeout=2)
                 if temporary is not None:
@@ -276,6 +314,7 @@ def main():
     parser.add_argument("--op", default="hello")
     parser.add_argument("--respond", action="store_true")
     parser.add_argument("--fragment-delay-ms", type=int, default=0)
+    parser.add_argument("--omit-credit-ack", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         self_test()
