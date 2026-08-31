@@ -672,7 +672,7 @@ modules.
   - Narrow run: `test_requests.py` and `test_execution_order.py`.
   - Non-goal: no output MIME rendering.
 
-- [~] owner=terra-ht9 claimed=2026-08-31 **HT9 Normalize bounded stream, error, result, display, and artifact events.**
+- [x] owner=terra-ht9 claimed=2026-08-31 landed=ba25ee8 **HT9 Normalize bounded stream, error, result, display, and artifact events.**
   - Depends: HT8, HT5.
   - Files: `helper/ejn_helper/outputs.py`,
     `helper/ejn_helper/jupyter_backend.py`,
@@ -691,7 +691,7 @@ modules.
     input base64 substring.
   - Narrow run: output unit/integration modules; no test frame over 262144.
 
-- [ ] **HT10 Implement bounded auxiliary requests.**
+- [~] owner=luna-ht10 claimed=2026-08-31 **HT10 Implement bounded auxiliary requests.**
   - Depends: HT9.
   - Files: `helper/ejn_helper/jupyter_backend.py`,
     `helper/tests/test_aux_requests.py`,
