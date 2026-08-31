@@ -1016,10 +1016,15 @@ be manager-reviewed for durable-kernel rules.
   - Narrow run: ERT selector `^ejn-ei1r-` plus all existing adapter/panel tests.
   - Non-goal: no helper process connection in this row.
 
-- [~] owner=terra-ei2 claimed=2026-08-31 **EI2 Connect/finalize through the helper backend.**
+- [x] owner=terra-ei2 claimed=2026-08-31 landed=6d0a73f **EI2 Connect/finalize through the helper backend.**
   - Depends: EI1R, HT13.
   - Files: `emacs-jupyter-notebook-helper-backend.el`,
+    `emacs-jupyter-notebook-backend.el`,
     `emacs-jupyter-notebook.el`,
+    `helper/ejn_helper/jupyter_backend.py`, `helper/ejn_helper/runtime.py`,
+    `helper/tests/test_dispatcher.py`, `helper/tests/test_lifecycle.py`,
+    `helper/tests/test_runtime.py`,
+    `tests/emacs-jupyter-notebook-backend-tests.el`, and
     `tests/emacs-jupyter-notebook-helper-backend-tests.el`.
   - Deliverable: register a `helper` EI1 backend which owns one helper session
     and a mode-0700 per-session artifact directory.  The core starts and
@@ -1029,15 +1034,18 @@ be manager-reviewed for durable-kernel rules.
     finalization.  Helper callbacks are deferred out of the initiating stack
     even when a test double replies synchronously.  Attempt and backend-session
     identity gate every callback, timer, PID-probe result, and late reply.
-  - Busy-kernel boundary: the existing core connect timer arbitrates before the
-    helper request's longer hard deadline.  On reconnect, a timed-out verify
+  - Busy-kernel boundary: strict finite deadlines satisfy core arbitration
+    (at most 45s) < Python backend (150s) < dispatcher (160s) < Emacs helper
+    request (180s).  On reconnect, a timed-out core verify
     retains the attached helper while the bounded remote-PID probe runs: alive
     or identity-unverified finalizes as connected/busy; mismatch, confirmed
     dead, and unreachable remain distinct failures.  A fresh start still
     hard-fails verification timeout.  A late correlated `kernel_info` reply may
-    move the same installed session from busy to idle; it cannot revive a
-    failed or superseded attempt.
-  - Cleanup/durability: every failure and supersede retires helper requests,
+    move the same installed session from busy to idle before the finite helper
+    deadline; it cannot revive a failed or superseded attempt.  Expiry after a
+    PID-proven busy adoption retires only the obsolete readiness request and
+    preserves that installed local session.
+  - Cleanup/durability: every fatal/pre-adoption failure and supersede retires helper requests,
     sends local `close`/disposes the helper, tears down tunnel and timers, and
     removes only that attempt's temporary artifact directory.  It never sends
     helper `shutdown`, never terminates the remote kernel, and never deletes or
@@ -1045,6 +1053,12 @@ be manager-reviewed for durable-kernel rules.
     the remote connection file.  Successful finalization preserves the existing
     registry-save-before-client-install ordering.  Formatter/watchdog setup is
     best-effort after finalization through backend-neutral silent execute.
+    Process/protocol transport death is a distinct exact-once session signal;
+    after adoption it marks core transport dead and schedules the existing
+    bounded reconnect loop even when the connect request is already terminal.
+    The legacy auxiliary heartbeat is not armed for helper sessions before EI5;
+    helper/tunnel lifecycle signals provide the EI2 failure surface without
+    manufacturing misses from an operation the adapter does not yet support.
   - Tests: exact successful phase/order and save/install ordering; synchronous
     fake callbacks; helper start/hello/connect/verify error and timeout at every
     boundary; connect attached but verify pending; fresh timeout; every busy PID
@@ -1056,21 +1070,42 @@ be manager-reviewed for durable-kernel rules.
     reject legacy adapter calls and synchronous waits on the helper path.
   - Narrow run: ERT selector `^ejn-ei2-` plus W13/W15/W19 selectors.
 
-- [ ] **EI3 Replace singleton evaluation state with serialized request ledger.**
+- [~] owner=terra-ei3 claimed=2026-08-31 **EI3 Replace singleton evaluation state with serialized request ledger.**
   - Depends: EI2.
   - Files: `emacs-jupyter-notebook.el`,
     `emacs-jupyter-notebook-result.el`,
-    `tests/emacs-jupyter-notebook-helper-backend-tests.el`.
+    `emacs-jupyter-notebook-events.el`,
+    `emacs-jupyter-notebook-jupyter.el`,
+    `emacs-jupyter-notebook-helper-backend.el`,
+    `emacs-jupyter-notebook-vars.el`,
+    `tests/emacs-jupyter-notebook-helper-backend-tests.el`,
+    `tests/emacs-jupyter-notebook-backend-tests.el`, and the existing W5/W13
+    evaluation tests in `tests/emacs-jupyter-notebook-tests.el`.
   - Deliverable: buffer-local hash ledger plus FIFO queue and one active user
-    execution.  Enqueue creates panel/fringe running/queued state but sends only
-    when no active execution.  Timeout arms on `dispatched`; terminal advances
-    queue.  Cancel queued removes without interrupt; cancel active sends one
-    interrupt.  All callbacks correlate request and entry generation.
-    Code over `EJN_MAX_CODE_BYTES` is rejected before JSON serialization and
-    never creates a misleading running entry.
-  - Tests: A/B ordering, B has no timer before dispatch, A terminal dispatches
-    B once, cancel A/B, same-cell and different-cell reruns, late A events,
-    buffer kill, source edits preserving cell keys, and no source mutation.
+    execution.  Reserve ledger/FIFO order before asynchronous completeness
+    checks so replies cannot reorder user intent.  Enqueue creates
+    panel/fringe queued state but sends only when no active execution.  Timeout
+    arms on `dispatched`; a correlated `execute_reply` plus correlated
+    `status=idle`, in either order, makes the request terminal and advances the
+    queue exactly once.  Cancel queued removes without interrupt; cancel active
+    sends one interrupt and cannot overlap the next request while the outcome
+    remains unknown.  All callbacks and helper/legacy events correlate the
+    ledger record, backend request ID, and panel-entry generation.  Install a
+    real backend event sink and map helper request IDs to ledger IDs with a
+    bounded per-session table.  Silent formatter/watchdog setup uses the same
+    serial queue and reaches a terminal decision before user dispatch.  Code
+    over the shared `EJN_MAX_CODE_BYTES` value is rejected before panel entry or
+    JSON serialization and never creates a misleading running entry.  Remove
+    the old singleton variables and tests rather than adding compatibility
+    aliases.
+  - Tests: A/B invocation order even with reversed completeness replies; B has
+    no timer before dispatch; reply/idle terminal ordering in both directions;
+    duplicate terminal events advance once; active and queued cancellation;
+    same-cell and different-cell reruns; late A events; clear-results while A
+    runs; synchronous backend callbacks; helper-to-ledger ID translation;
+    setup gating; oversize rejection before panel/backend; buffer kill; source
+    edits preserving captured code/cell keys; no source mutation; and rewrites
+    of the old W5/W13 singleton tests to assert the ledger contract directly.
   - Narrow run: ERT selector `^ejn-ei3-` plus W5/W13 evaluation tests.
 
 - [ ] **EI4 Route normalized text/display/artifact events to the panel.**
