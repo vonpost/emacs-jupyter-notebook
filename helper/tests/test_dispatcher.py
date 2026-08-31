@@ -288,6 +288,29 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.dispatcher.late_completions, 1)
         self.assertEqual(self.dispatcher.late_events, 1)
 
+    async def test_kernel_info_override_does_not_extend_ordinary_operation_deadline(self):
+        await self.connect()
+        dispatcher = Dispatcher(
+            self.backend,
+            self.responses.append,
+            event_queue=EventQueue(),
+            loop=self.loop,
+            request_timeout=0.01,
+            operation_timeouts={"kernel_info": 0.08},
+        )
+        dispatcher.negotiated = True
+        dispatcher.connected = True
+        self.backend.queue_plan("kernel_info", FakePlan(delay=1.0))
+        self.backend.queue_plan("execute", FakePlan(delay=1.0))
+        dispatcher.dispatch(request("slow-info", "kernel_info"))
+        dispatcher.dispatch(request("slow-execute", "execute", {"code": "x"}))
+        info_timer = dispatcher._inflight["slow-info"].timer
+        execute_timer = dispatcher._inflight["slow-execute"].timer
+        now = self.loop.time()
+        self.assertGreater(info_timer.when() - now, 0.04)
+        self.assertLess(execute_timer.when() - now, 0.04)
+        dispatcher.dispose()
+
     async def test_duplicate_backend_completion_emits_one_response(self):
         await self.connect()
         self.backend.queue_plan(

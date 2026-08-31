@@ -66,6 +66,9 @@ class LifecycleBackendTests(unittest.IsolatedAsyncioTestCase):
             def execute(self, _code):
                 return "execute-1"
 
+            def kernel_info(self):
+                return "kernel-info-1"
+
         for name in self.queues:
             async def getter(self, timeout, name=name):
                 try:
@@ -87,7 +90,12 @@ class LifecycleBackendTests(unittest.IsolatedAsyncioTestCase):
         else:
             sys.modules["jupyter_client"] = self._old_module
 
-    async def _connected(self, *, deadline: float = 0.15):
+    async def _connected(
+        self,
+        *,
+        deadline: float = 0.15,
+        operation_deadlines: dict[str, float] | None = None,
+    ):
         root = Path(self.directory.name)
         connection = root / "connection.json"
         connection.write_text(
@@ -108,7 +116,9 @@ class LifecycleBackendTests(unittest.IsolatedAsyncioTestCase):
         )
         artifacts = root / "artifacts"
         artifacts.mkdir(mode=0o700, exist_ok=True)
-        backend = JupyterBackend(deadline=deadline)
+        backend = JupyterBackend(
+            deadline=deadline, operation_deadlines=operation_deadlines
+        )
         complete = asyncio.get_running_loop().create_future()
         backend.start(
             "connect",
@@ -183,6 +193,29 @@ class LifecycleBackendTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual((await asyncio.wait_for(execute, 1)).result, {"status": "ok"})
         self.assertFalse(backend._transport_failed)
+
+    async def test_kernel_info_deadline_override_leaves_other_operations_at_default(self):
+        backend, _client = await self._connected(
+            deadline=0.01, operation_deadlines={"kernel_info": 0.08}
+        )
+        self.assertEqual(backend._operation_deadline("execute"), 0.01)
+        self.assertEqual(backend._operation_deadline("kernel_info"), 0.08)
+
+        _token, kernel_info = await self._request(backend, "kernel_info")
+        _token, execute = await self._request(backend, "execute")
+        execute_result = await asyncio.wait_for(execute, 1)
+        self.assertEqual(execute_result.error.code, "timeout")
+        self.assertFalse(kernel_info.done())
+        kernel_info_result = await asyncio.wait_for(kernel_info, 1)
+        self.assertEqual(kernel_info_result.error.code, "timeout")
+
+    async def test_operation_deadline_overrides_are_finite_and_kernel_info_only(self):
+        for invalid in (False, 0, float("nan"), float("inf")):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    JupyterBackend(operation_deadlines={"kernel_info": invalid})
+        with self.assertRaises(ValueError):
+            JupyterBackend(operation_deadlines={"execute": 0.1})
 
     async def test_shutdown_requires_reply_and_terminal_liveness_then_retires_local_state(self):
         backend, client = await self._connected()

@@ -39,6 +39,7 @@ _AUX_OMIT = object()
 MAX_INPUT_PROMPT_BYTES = 4_096
 MAX_INPUT_VALUE_BYTES = 65_536
 INPUT_ID_BYTES = 16
+_DEADLINE_OPERATIONS = frozenset({"kernel_info"})
 
 
 def _bounded_utf8_size(value: str, ceiling: int) -> int:
@@ -316,7 +317,12 @@ class _TaskCancellation:
 class JupyterBackend:
     """Attach to an existing local kernel without ever owning its lifetime."""
 
-    def __init__(self, *, deadline: float = 10.0) -> None:
+    def __init__(
+        self,
+        *,
+        deadline: float = 10.0,
+        operation_deadlines: Mapping[str, float] | None = None,
+    ) -> None:
         if (
             isinstance(deadline, bool)
             or not isinstance(deadline, (int, float))
@@ -324,7 +330,20 @@ class JupyterBackend:
             or deadline <= 0
         ):
             raise ValueError("deadline must be finite and positive")
+        deadlines: dict[str, float] = {}
+        for operation, operation_deadline in (operation_deadlines or {}).items():
+            if operation not in _DEADLINE_OPERATIONS:
+                raise ValueError("operation deadline names an unsupported operation")
+            if (
+                isinstance(operation_deadline, bool)
+                or not isinstance(operation_deadline, (int, float))
+                or not math.isfinite(operation_deadline)
+                or operation_deadline <= 0
+            ):
+                raise ValueError("operation deadlines must be finite and positive")
+            deadlines[operation] = float(operation_deadline)
         self.deadline = float(deadline)
+        self.operation_deadlines = deadlines
         self.client = None
         self.closed = False
         self._tasks: set[asyncio.Task[None]] = set()
@@ -345,6 +364,10 @@ class JupyterBackend:
         self._output_attachment: OutputAttachment | None = None
         self._heartbeat_interval = min(1.0, max(0.05, self.deadline / 4))
         self._heartbeat_timeout = min(1.0, max(0.05, self.deadline / 2))
+
+    def _operation_deadline(self, operation: str) -> float:
+        """Return the finite local deadline for one backend operation."""
+        return self.operation_deadlines.get(operation, self.deadline)
 
     @staticmethod
     def _connection(path_value: object) -> dict:
@@ -455,7 +478,7 @@ class JupyterBackend:
         task = asyncio.current_task()
         assert task is not None
         deadline = asyncio.get_running_loop().call_later(
-            self.deadline, self._expire_operation, task
+            self._operation_deadline(operation), self._expire_operation, task
         )
         try:
             # One operation deadline cancels this operation task directly.  It

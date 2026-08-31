@@ -100,6 +100,22 @@
         (ejn-ei1-test--run-timers)
         (should (equal seen '((:type outer-event))))))))
 
+(ert-deftest ejn-ei1-transport-failure-sink-is-owner-bound-and-exactly-once ()
+  "Session-level failure survives terminal requests without duplicate delivery."
+  (let ((owner (generate-new-buffer " *ejn-ei1-failure-owner*")) seen)
+    (unwind-protect
+        (let ((session
+               (emacs-jupyter-notebook-backend-session-create
+                nil owner
+                (lambda (failed-session reason)
+                  (push (list (current-buffer) failed-session reason) seen)))))
+          (emacs-jupyter-notebook-backend-session-notify-transport-failure
+           session "lost")
+          (emacs-jupyter-notebook-backend-session-notify-transport-failure
+           session "duplicate")
+          (should (equal seen (list (list owner session "lost")))))
+      (when (buffer-live-p owner) (kill-buffer owner)))))
+
 (ert-deftest ejn-ei1-callbacks-and-events-run-in-the-session-owner ()
   "Timer and transport callback context cannot leak across source buffers."
   (let ((owner (generate-new-buffer " *ejn-ei1-owner-context*"))
@@ -215,6 +231,21 @@
       (should (eq (emacs-jupyter-notebook-backend-session-mark-attached session)
                   session))
       (should (emacs-jupyter-notebook-backend-session-attached-p session)))))
+
+(ert-deftest ejn-ei1-installed-state-is-explicit-and-local-only ()
+  "Core adoption is distinct from attachment and clears on local close."
+  (ejn-ei1-test-with-fake-backend
+      ((lambda (_session _request operation _payload success _failure _emit)
+         (when (eq operation 'close-local) (funcall success nil))))
+    (let ((session (emacs-jupyter-notebook-backend-session-create)))
+      (should-error (emacs-jupyter-notebook-backend-session-mark-installed session))
+      (emacs-jupyter-notebook-backend-session-mark-attached session)
+      (should (eq (emacs-jupyter-notebook-backend-session-mark-installed session)
+                  session))
+      (should (emacs-jupyter-notebook-backend-session-installed-p session))
+      (emacs-jupyter-notebook-backend-close-local session #'ignore #'ignore)
+      (ejn-ei1-test--run-timers)
+      (should-not (emacs-jupyter-notebook-backend-session-installed-p session)))))
 
 (ert-deftest ejn-ei1-contract-superseded-session-drops-late-callback ()
   "Closing A before creating B prevents A's retained callback reaching B."

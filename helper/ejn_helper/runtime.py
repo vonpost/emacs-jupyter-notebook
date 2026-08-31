@@ -23,6 +23,12 @@ EJN_MAX_RAW_ACCUMULATOR = 1_048_576
 EJN_PARTIAL_FRAME_TIMEOUT = 5.0
 EJN_RUNTIME_ERROR_BYTES = 4_096
 EJN_LOCAL_CLOSE_TIMEOUT = 1.0
+EJN_STARTUP_KERNEL_INFO_BACKEND_DEADLINE = 150.0
+EJN_STARTUP_KERNEL_INFO_DISPATCHER_DEADLINE = 160.0
+# This mirrors the helper adapter's bounded request deadline.  The core busy
+# arbitration is separately configured and must remain below the backend
+# deadline; it is not allowed to make this request unbounded.
+EJN_EMACS_KERNEL_INFO_DEADLINE = 180.0
 
 
 class AsyncWriter(Protocol):
@@ -76,7 +82,15 @@ class ProtocolRuntime:
         self.partial_timeout = float(partial_timeout)
         self.read_size = read_size
         self.decoder = Decoder(EJN_MAX_RAW_ACCUMULATOR, EJN_MAX_RAW_ACCUMULATOR)
-        self.backend = backend if backend is not None else JupyterBackend()
+        self.backend = (
+            backend
+            if backend is not None
+            else JupyterBackend(
+                operation_deadlines={
+                    "kernel_info": EJN_STARTUP_KERNEL_INFO_BACKEND_DEADLINE
+                }
+            )
+        )
         self._responses: deque[bytes] = deque()
         self._response_bytes = 0
         self._inflight_response_bytes = 0
@@ -95,7 +109,13 @@ class ProtocolRuntime:
     def _default_dispatcher(
         backend: Backend, response_callback: Callable[[dict], None]
     ) -> Dispatcher:
-        return Dispatcher(backend, response_callback)
+        return Dispatcher(
+            backend,
+            response_callback,
+            operation_timeouts={
+                "kernel_info": EJN_STARTUP_KERNEL_INFO_DISPATCHER_DEADLINE
+            },
+        )
 
     @property
     def response_bytes(self) -> int:

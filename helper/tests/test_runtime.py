@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import io
+import re
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from ejn_helper.backend import BackendCompletion, BackendEvent
 from ejn_helper.flow import EJN_MAX_PRIORITY_QUEUE, EJN_MAX_RESPONSE_FRAME
 from ejn_helper.framing import Decoder, encode
-from ejn_helper.runtime import ProtocolRuntime
+from ejn_helper.jupyter_backend import JupyterBackend
+from ejn_helper.runtime import (
+    EJN_EMACS_KERNEL_INFO_DEADLINE,
+    EJN_STARTUP_KERNEL_INFO_BACKEND_DEADLINE,
+    EJN_STARTUP_KERNEL_INFO_DISPATCHER_DEADLINE,
+    ProtocolRuntime,
+)
 
 
 class _Writer:
@@ -123,6 +131,51 @@ def _decode(frames: list[bytes]) -> list[dict]:
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_default_startup_kernel_info_deadline_hierarchy(self):
+        runtime = ProtocolRuntime(asyncio.StreamReader(), _Writer())
+        self.assertIsInstance(runtime.backend, JupyterBackend)
+        self.assertEqual(
+            runtime.backend.operation_deadlines["kernel_info"],
+            EJN_STARTUP_KERNEL_INFO_BACKEND_DEADLINE,
+        )
+        self.assertEqual(
+            runtime.dispatcher.operation_timeouts["kernel_info"],
+            EJN_STARTUP_KERNEL_INFO_DISPATCHER_DEADLINE,
+        )
+        self.assertLess(
+            EJN_STARTUP_KERNEL_INFO_BACKEND_DEADLINE,
+            EJN_STARTUP_KERNEL_INFO_DISPATCHER_DEADLINE,
+        )
+        self.assertLess(
+            EJN_STARTUP_KERNEL_INFO_DISPATCHER_DEADLINE,
+            EJN_EMACS_KERNEL_INFO_DEADLINE,
+        )
+
+    async def test_emacs_source_uses_the_tested_kernel_info_deadline(self):
+        root = Path(__file__).resolve().parents[2]
+        adapter = (root / "emacs-jupyter-notebook-helper-backend.el").read_text()
+        match = re.search(
+            r"\(defconst\s+emacs-jupyter-notebook-helper-backend--verify-timeout\s+([0-9.]+)",
+            adapter,
+        )
+        self.assertIsNotNone(match)
+        self.assertEqual(float(match.group(1)), EJN_EMACS_KERNEL_INFO_DEADLINE)
+
+    async def test_injected_dispatcher_factory_keeps_two_argument_contract(self):
+        backend = _Backend()
+        received = []
+
+        def factory(current_backend, response_callback):
+            received.append((current_backend, response_callback))
+            return ProtocolRuntime._default_dispatcher(current_backend, response_callback)
+
+        runtime = ProtocolRuntime(
+            asyncio.StreamReader(), _Writer(), backend=backend, dispatcher_factory=factory
+        )
+        self.assertEqual(len(received), 1)
+        self.assertIs(received[0][0], backend)
+        self.assertIs(runtime.backend, backend)
+
     async def _run(self, chunks: list[bytes], *, partial_timeout=0.05):
         reader = asyncio.StreamReader()
         for chunk in chunks:

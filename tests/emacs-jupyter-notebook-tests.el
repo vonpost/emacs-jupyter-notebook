@@ -10788,7 +10788,10 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                      :phase 'connect :entry entry :session-id "s"
                      :origin-buffer (current-buffer)
                      :reconnect-owner 'automatic))
+           (client (emacs-jupyter-notebook-backend-session-create
+                    nil (current-buffer)))
            (timer (run-at-time 600 nil #'ignore)))
+      (emacs-jupyter-notebook-backend-session-mark-attached client)
       (setq emacs-jupyter-notebook--async-context context
             emacs-jupyter-notebook--reconnect-attempt 4
             emacs-jupyter-notebook--reconnect-next-at (+ (float-time) 600)
@@ -10808,7 +10811,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                  #'ignore))
         (emacs-jupyter-notebook--async-connect-finalize
          context (current-buffer) entry '(:shell_port 1)
-         "/tmp/ejn-ir5-local.json" 'mock-client))
+         "/tmp/ejn-ir5-local.json" client))
       (should (= emacs-jupyter-notebook--reconnect-attempt 0))
       (should-not emacs-jupyter-notebook--reconnect-next-at)
       (should-not emacs-jupyter-notebook--reconnect-schedule-token)

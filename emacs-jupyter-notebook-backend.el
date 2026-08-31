@@ -22,7 +22,10 @@
   data
   owner-buffer
   event-sink
+  failure-sink
+  failure-emitted
   attached
+  installed
   closed
   requests
   timers
@@ -84,16 +87,20 @@ keeping that dependency behind the backend boundary."
         ('legacy (emacs-jupyter-notebook-backend--legacy-dispatch))
         (_ (error "No emacs-jupyter-notebook backend is configured for %S" backend)))))
 
-(defun emacs-jupyter-notebook-backend-session-create (&optional event-sink owner-buffer)
+(defun emacs-jupyter-notebook-backend-session-create
+    (&optional event-sink owner-buffer failure-sink)
   "Create an opaque backend session owned by OWNER-BUFFER.
 
 EVENT-SINK receives normalized event plists as `(SESSION EVENT)'.  Creating a
 session allocates no remote or durable resource; `backend-connect' performs
-the asynchronous attachment."
+the asynchronous attachment.  FAILURE-SINK receives `(SESSION REASON)' once
+when the adapter proves its local transport is unusable independently of any
+single request."
   (emacs-jupyter-notebook-backend--make-session
    :backend emacs-jupyter-notebook-backend
    :owner-buffer (or owner-buffer (current-buffer))
    :event-sink event-sink
+   :failure-sink failure-sink
    :requests (make-hash-table :test #'eql)
    :timers nil
    :dispatch-depth 0))
@@ -121,6 +128,24 @@ out."
   "Return non-nil when SESSION has usable local channel handles."
   (and (emacs-jupyter-notebook-backend--session-live-p session)
        (emacs-jupyter-notebook-backend-session-attached session)))
+
+(defun emacs-jupyter-notebook-backend-session-mark-installed (session)
+  "Record that SESSION is now the core's installed local transport.
+
+Attachment only says that local channels exist.  Installation is a later,
+backend-neutral lifecycle boundary: the core sets it after durable registry
+persistence, immediately before assigning the session as the buffer's current
+client.  It lets a backend retire a delayed readiness probe without tearing
+down a session that has already been adopted for a busy remote kernel."
+  (unless (emacs-jupyter-notebook-backend-session-attached-p session)
+    (error "Cannot install an unattached backend session"))
+  (setf (emacs-jupyter-notebook-backend-session-installed session) t)
+  session)
+
+(defun emacs-jupyter-notebook-backend-session-installed-p (session)
+  "Return non-nil when SESSION is the core-installed local transport."
+  (and (emacs-jupyter-notebook-backend--session-live-p session)
+       (emacs-jupyter-notebook-backend-session-installed session)))
 
 (defun emacs-jupyter-notebook-backend--close-timeout ()
   "Return a finite local-close acknowledgement deadline."
@@ -198,6 +223,38 @@ barrier even when a dispatcher replied synchronously or re-entrantly."
            (emacs-jupyter-notebook-backend-request-callback request))
          (emacs-jupyter-notebook-backend-request-id request) value)))))
 
+(defun emacs-jupyter-notebook-backend-request-fail (request reason)
+  "Terminally fail REQUEST without changing its session's local ownership.
+
+This is for a backend operation whose result is no longer required after the
+core adopted an attached session.  It consumes the generic request and defers
+its error callback as usual, but deliberately does not close or dispose the
+session.  Transport failures remain the adapter's responsibility and must use
+its normal failure path."
+  (unless (emacs-jupyter-notebook-backend-request-p request)
+    (error "Not an emacs-jupyter-notebook backend request"))
+  (emacs-jupyter-notebook-backend--finish request reason t))
+
+(defun emacs-jupyter-notebook-backend-session-notify-transport-failure
+    (session reason)
+  "Notify SESSION's owner once that its local transport failed with REASON.
+
+This lifecycle signal is independent of request completion: an installed
+session may lose its helper after the connect request already became terminal.
+Like ordinary callbacks, a reentrant notification is deferred out of the
+backend dispatch stack and consumer errors cannot escape into the transport."
+  (unless (emacs-jupyter-notebook-backend-session-p session)
+    (error "Not an emacs-jupyter-notebook backend session"))
+  (when (and (emacs-jupyter-notebook-backend--session-live-p session)
+             (not (emacs-jupyter-notebook-backend-session-failure-emitted session)))
+    (setf (emacs-jupyter-notebook-backend-session-failure-emitted session) t)
+    (let ((sink (emacs-jupyter-notebook-backend-session-failure-sink session)))
+      (when sink
+        (if (> (or (emacs-jupyter-notebook-backend-session-dispatch-depth session) 0) 0)
+            (emacs-jupyter-notebook-backend--defer session sink session reason)
+          (emacs-jupyter-notebook-backend--call-in-owner
+           session sink session reason))))))
+
 (defun emacs-jupyter-notebook-backend--emit (session event)
   "Deliver normalized EVENT to SESSION's sink when it is still locally live.
 
@@ -268,7 +325,8 @@ never terminate the durable remote kernel."
                       (when (timerp deadline)
                         (cancel-timer deadline))
                       (setf (emacs-jupyter-notebook-backend-session-data session) nil
-                            (emacs-jupyter-notebook-backend-session-attached session) nil)
+                            (emacs-jupyter-notebook-backend-session-attached session) nil
+                            (emacs-jupyter-notebook-backend-session-installed session) nil)
                       (emacs-jupyter-notebook-backend--defer-close
                        session (if failure-p error-callback callback) id value))))
       ;; Retire before the legacy disposer runs so re-entrant and late replies
