@@ -20,7 +20,12 @@
             pname = "ejn-helper";
             version = "0.1.0";
             pyproject = true;
-            src = ./helper;
+            # Keep the repository root available during checks: helper tests
+            # import helper.tests and share fixtures with the Emacs tests.
+            src = ./.;
+            postUnpack = ''
+              sourceRoot="$sourceRoot/helper"
+            '';
 
             build-system = [ python.pkgs.setuptools ];
             dependencies = with python.pkgs; [
@@ -31,7 +36,7 @@
             nativeCheckInputs = [ python.pkgs.ipykernel ];
             checkPhase = ''
               runHook preCheck
-              python -m unittest discover -s tests -p 'test_*.py'
+              PYTHONPATH=$PWD/.. python -m unittest discover -s tests -p 'test_*.py'
               runHook postCheck
             '';
             pythonImportsCheck = [ "ejn_helper" ];
