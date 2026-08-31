@@ -24,6 +24,210 @@ _PORTS = ("shell_port", "iopub_port", "stdin_port", "control_port", "hb_port")
 _CHANNELS = ("shell", "iopub", "stdin", "control")
 _LOGGER = logging.getLogger(__name__)
 
+# Auxiliary replies are user-facing data and must not be allowed to turn a
+# single completion/doc request into an unbounded response.
+MAX_COMPLETION_MATCHES = 256
+MAX_COMPLETION_ITEM_BYTES = 4096
+MAX_DOCUMENTATION_BYTES = 16_384
+MAX_AUX_MAPPING_ITEMS = 128
+MAX_AUX_RESPONSE_BYTES = 48_000
+MAX_AUX_NESTING = 3
+MAX_AUX_INTEGER = 2**53 - 1
+MAX_AUX_CURSOR = 524_288
+_AUX_OMIT = object()
+
+
+def _take_aux_text(
+    value: str, raw_ceiling: int, wire_ceiling: int
+) -> tuple[str, int, bool]:
+    """Clip VALUE by raw UTF-8 and worst-case JSON wire bytes.
+
+    Work is proportional to the admitted prefix.  In particular this never
+    encodes or scans the full hostile string before enforcing a bound.
+    """
+    output = []
+    raw_bytes = 0
+    wire_bytes = 0
+    for character in value:
+        codepoint = ord(character)
+        if 0xD800 <= codepoint <= 0xDFFF:
+            raise BackendError("protocol-error")
+        if codepoint <= 0x7F:
+            raw_size = 1
+        elif codepoint <= 0x7FF:
+            raw_size = 2
+        elif codepoint <= 0xFFFF:
+            raw_size = 3
+        else:
+            raw_size = 4
+        if codepoint <= 0x1F:
+            wire_size = 6
+        elif character in {'"', "\\"}:
+            wire_size = 2
+        else:
+            wire_size = raw_size
+        if raw_bytes + raw_size > raw_ceiling or wire_bytes + wire_size > wire_ceiling:
+            break
+        output.append(character)
+        raw_bytes += raw_size
+        wire_bytes += wire_size
+    return "".join(output), wire_bytes, len(output) != len(value)
+
+
+class _AuxBudget:
+    def __init__(self, remaining: int = MAX_AUX_RESPONSE_BYTES) -> None:
+        self.remaining = remaining
+        self.items_remaining = MAX_AUX_MAPPING_ITEMS
+        self.truncated = False
+
+    def admit_item(self) -> bool:
+        if self.items_remaining <= 0:
+            self.truncated = True
+            return False
+        self.items_remaining -= 1
+        return True
+
+    def text(
+        self, value: object, ceiling: int, *, omit_if_truncated: bool = False
+    ) -> str | None:
+        if not isinstance(value, str):
+            raise BackendError("protocol-error")
+        clipped, wire_bytes, shortened = _take_aux_text(
+            value, ceiling, self.remaining
+        )
+        self.remaining -= wire_bytes
+        self.truncated |= shortened
+        if shortened and omit_if_truncated:
+            return None
+        return clipped
+
+
+def _bounded_value(value: object, budget: _AuxBudget, depth: int) -> object:
+    if not budget.admit_item():
+        return _AUX_OMIT
+    if isinstance(value, str):
+        return budget.text(value, MAX_DOCUMENTATION_BYTES)
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if abs(value) > MAX_AUX_INTEGER:
+            raise BackendError("protocol-error")
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise BackendError("protocol-error")
+        return value
+    if depth >= MAX_AUX_NESTING:
+        budget.truncated = True
+        return "[truncated]"
+    if isinstance(value, Mapping):
+        result = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= MAX_AUX_MAPPING_ITEMS or budget.remaining <= 0:
+                budget.truncated = True
+                break
+            safe_key = budget.text(key, 1024, omit_if_truncated=True)
+            if safe_key is None:
+                continue
+            safe_value = _bounded_value(item, budget, depth + 1)
+            if safe_value is _AUX_OMIT:
+                break
+            result[safe_key] = safe_value
+        return result
+    if isinstance(value, list):
+        result = []
+        for item in value[:MAX_AUX_MAPPING_ITEMS]:
+            if budget.remaining <= 0:
+                budget.truncated = True
+                break
+            safe_item = _bounded_value(item, budget, depth + 1)
+            if safe_item is _AUX_OMIT:
+                break
+            result.append(safe_item)
+        if len(value) > len(result):
+            budget.truncated = True
+        return result
+    raise BackendError("protocol-error")
+
+
+def _normalize_auxiliary(operation: str | None, content: Mapping[str, object]) -> dict:
+    """Validate and cap one shell auxiliary reply before it reaches EJN."""
+    budget = _AuxBudget()
+    if operation == "kernel_info":
+        result = _bounded_value(content, budget, 0)
+        if not isinstance(result, dict):
+            raise BackendError("protocol-error")
+        if budget.truncated:
+            result["_ejn_truncated"] = True
+        return result
+    if operation == "complete":
+        matches = content.get("matches")
+        if not isinstance(matches, list):
+            raise BackendError("protocol-error")
+        bounded_matches = []
+        for item in matches[:MAX_COMPLETION_MATCHES]:
+            if budget.remaining <= 0:
+                budget.truncated = True
+                break
+            if not isinstance(item, str):
+                raise BackendError("protocol-error")
+            bounded_matches.append(budget.text(item, MAX_COMPLETION_ITEM_BYTES))
+        result = {"matches": bounded_matches}
+        if len(matches) > len(bounded_matches):
+            budget.truncated = True
+        for field in ("cursor_start", "cursor_end"):
+            value = content.get(field)
+            if type(value) is not int or value < 0 or value > MAX_AUX_CURSOR:
+                raise BackendError("protocol-error")
+            result[field] = value
+        if result["cursor_start"] > result["cursor_end"]:
+            raise BackendError("protocol-error")
+        status = content.get("status", "ok")
+        if not isinstance(status, str) or status not in {"ok", "error"}:
+            raise BackendError("protocol-error")
+        result["status"] = status
+        if "metadata" in content:
+            if not isinstance(content["metadata"], Mapping):
+                raise BackendError("protocol-error")
+            result["metadata"] = _bounded_value(content["metadata"], budget, 0)
+        if budget.truncated:
+            result["_ejn_truncated"] = True
+        return result
+    if operation == "inspect":
+        found = content.get("found")
+        if type(found) is not bool:
+            raise BackendError("protocol-error")
+        result = {"found": found}
+        if "data" in content:
+            if not isinstance(content["data"], Mapping):
+                raise BackendError("protocol-error")
+            result["data"] = _bounded_value(content["data"], budget, 0)
+        if "metadata" in content:
+            if not isinstance(content["metadata"], Mapping):
+                raise BackendError("protocol-error")
+            result["metadata"] = _bounded_value(content["metadata"], budget, 0)
+        if "status" in content:
+            status = content["status"]
+            if not isinstance(status, str) or status not in {"ok", "error"}:
+                raise BackendError("protocol-error")
+            result["status"] = status
+        if budget.truncated:
+            result["_ejn_truncated"] = True
+        return result
+    if operation == "is_complete":
+        status = content.get("status")
+        if not isinstance(status, str) or status not in {"complete", "incomplete", "invalid", "unknown"}:
+            raise BackendError("protocol-error")
+        result = {"status": status}
+        if "indent" in content:
+            if not isinstance(content["indent"], str):
+                raise BackendError("protocol-error")
+            result["indent"] = budget.text(content["indent"], 4096)
+        if budget.truncated:
+            result["_ejn_truncated"] = True
+        return result
+    raise BackendError("protocol-error")
+
 
 @dataclass(slots=True)
 class _Pending:
@@ -37,6 +241,8 @@ class _Pending:
     idle_content: Mapping[str, object] | None = None
     status_delivered: bool = False
     idle_received: bool = False
+    reply_type: str = "kernel_info_reply"
+    auxiliary: str | None = None
 
 
 class _TaskCancellation:
@@ -188,6 +394,8 @@ class JupyterBackend:
                 result = {"attached": True}
             elif operation == "kernel_info":
                 result = await self._kernel_info()
+            elif operation in {"complete", "inspect", "is_complete"}:
+                result = await self._auxiliary(operation, params)
             elif operation == "execute":
                 result = await self._execute(params, event_callback)
             else:
@@ -254,7 +462,50 @@ class JupyterBackend:
         self._ensure_connected()
         assert self.client is not None
         message_id = self.client.kernel_info()
-        pending = _Pending(asyncio.get_running_loop().create_future())
+        pending = _Pending(
+            asyncio.get_running_loop().create_future(),
+            reply_type="kernel_info_reply",
+            auxiliary="kernel_info",
+        )
+        self._register_pending(message_id, pending)
+        try:
+            return await pending.future
+        finally:
+            self._unregister_pending(message_id, pending)
+
+    async def _auxiliary(self, operation: str, params: Mapping[str, object]) -> dict:
+        self._ensure_connected()
+        assert self.client is not None
+        code = params.get("code")
+        if not isinstance(code, str):
+            raise BackendError("invalid-request")
+        cursor = params.get("cursor_pos")
+        if operation in {"complete", "inspect"} and (
+            type(cursor) is not int or cursor < 0 or cursor > len(code) or cursor > MAX_AUX_CURSOR
+        ):
+            raise BackendError("invalid-request")
+        try:
+            if operation == "complete":
+                message_id = self.client.complete(code, cursor)
+                reply_type = "complete_reply"
+            elif operation == "inspect":
+                detail = params.get("detail_level", 0)
+                if type(detail) is not int or detail not in (0, 1):
+                    raise BackendError("invalid-request")
+                message_id = self.client.inspect(code, cursor, detail)
+                reply_type = "inspect_reply"
+            else:
+                message_id = self.client.is_complete(code)
+                reply_type = "is_complete_reply"
+        except BackendError:
+            raise
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise BackendError("invalid-request") from exc
+        pending = _Pending(
+            asyncio.get_running_loop().create_future(),
+            reply_type=reply_type,
+            auxiliary=operation,
+        )
         self._register_pending(message_id, pending)
         try:
             return await pending.future
@@ -365,10 +616,18 @@ class JupyterBackend:
 
     def _route_shell(self, pending: _Pending, message: Mapping[str, object]) -> None:
         if pending.state is None:
-            if message.get("msg_type") != "kernel_info_reply":
+            if message.get("msg_type") != pending.reply_type:
                 return
-            content = message.get("content", {})
-            pending.future.set_result(content if isinstance(content, dict) else {})
+            content = message.get("content")
+            if not isinstance(content, Mapping):
+                pending.future.set_exception(BackendError("protocol-error"))
+                return
+            try:
+                result = _normalize_auxiliary(pending.auxiliary, content)
+            except BackendError as exc:
+                pending.future.set_exception(exc)
+                return
+            pending.future.set_result(result)
             return
         if pending.state.accept_shell(message):
             self._deliver_event(
