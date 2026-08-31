@@ -7,6 +7,8 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'emacs-jupyter-notebook-backend)
+(require 'emacs-jupyter-notebook-events)
+(require 'emacs-jupyter-notebook-jupyter)
 
 (defvar emacs-jupyter-notebook--client)
 (declare-function emacs-jupyter-notebook-restart-kernel
@@ -401,6 +403,196 @@
                 (setq eager t))))
         (end-of-file nil)))
     (should-not eager)))
+
+(defun ejn-ei1r-test--snapshot (source handle)
+  "Return the user-visible event state for SOURCE and HANDLE."
+  (list :text (ejn-panel-entry-text handle)
+        :status (plist-get (ejn-panel-entry-snapshot handle) :status)
+        :fringe (with-current-buffer source
+                  (emacs-jupyter-notebook-fringe-state (plist-get handle :cell-key)))
+        :kernel (with-current-buffer source emacs-jupyter-notebook--kernel-status)))
+
+(defun ejn-ei1r-test--run-event (event &optional legacy)
+  "Apply EVENT to a fresh source/panel pair, optionally via legacy translation."
+  (let ((source (generate-new-buffer " *ejn-ei1r-source*")))
+    (unwind-protect
+        (with-current-buffer source
+          (insert "# %%\nx = 1\n")
+          (setq-local emacs-jupyter-notebook--kernel-status nil)
+          (let* ((panel (ejn-panel-ensure source))
+                 (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
+                 (context (list :buffer source :entry-handle handle :request-id nil))
+                 (normalized
+                  (if legacy
+                      (let ((content (plist-get event :legacy-content))
+                            (type (plist-get event :legacy-type)))
+                        (cl-letf (((symbol-function 'jupyter-message-content)
+                                   (lambda (_message) content)))
+                          (emacs-jupyter-notebook-jupyter--legacy-event type 'legacy)))
+                    (plist-get event :normalized))))
+            (cl-letf (((symbol-function 'emacs-jupyter-notebook-events--schedule-input)
+                       (lambda (&rest _ignored) :scheduled)))
+              (emacs-jupyter-notebook-events-dispatch context normalized))
+            (ejn-ei1r-test--snapshot source handle)))
+      (when (buffer-live-p source) (kill-buffer source)))))
+
+(ert-deftest ejn-ei1r-normalized-events-match-legacy-translation ()
+  "Every normalized event has exactly one legacy translation and behavior."
+  (dolist
+      (event
+       (list
+        (list :normalized '(:type stream :name "stdout" :text "stream\n")
+              :legacy-type "stream" :legacy-content '(:name "stdout" :text "stream\n") :text "stream\n")
+        (list :normalized '(:type clear :wait nil)
+              :legacy-type "clear_output" :legacy-content '(:wait nil) :text "")
+        (list :normalized '(:type result :data (:text/plain "42"))
+              :legacy-type "execute_result" :legacy-content '(:data (:text/plain "42")) :text "42")
+        (list :normalized '(:type display :data (:text/plain "shown"))
+              :legacy-type "display_data" :legacy-content '(:data (:text/plain "shown")) :text "shown")
+        (list :normalized '(:type update-display :data (:text/plain "updated"))
+              :legacy-type "update_display_data" :legacy-content '(:data (:text/plain "updated")) :text "updated")
+        (list :normalized '(:type error :traceback ("one" "two"))
+              :legacy-type "error" :legacy-content '(:traceback ("one" "two")) :text "one\ntwo")
+        (list :normalized '(:type execute-reply :status "ok" :execution-count 3)
+              :legacy-type "execute_reply" :legacy-content '(:status "ok" :execution_count 3)
+              :text "" :status 'ok :fringe 'ok)
+        (list :normalized '(:type status :execution-state "busy")
+              :legacy-type "status" :legacy-content '(:execution_state "busy") :text "" :kernel 'busy)
+        (list :normalized '(:type status :execution-state "idle")
+              :legacy-type "status" :legacy-content '(:execution_state "idle") :text "" :kernel 'idle)
+        (list :normalized '(:type input-request :prompt "value: " :password t)
+              :legacy-type "input_request" :legacy-content '(:prompt "value: " :password t) :text "value: ")
+        (list :normalized '(:type truncation :text "[truncated]\n")
+              :legacy-type nil :legacy-content nil :text "[truncated]\n")))
+    (let ((direct (ejn-ei1r-test--run-event event))
+          (translated (if (plist-get event :legacy-type)
+                          (ejn-ei1r-test--run-event event t)
+                        (ejn-ei1r-test--run-event event))))
+      (should (equal direct translated))
+      (should (equal (plist-get direct :text) (plist-get event :text)))
+      (should (eq (plist-get direct :status) (or (plist-get event :status) 'running)))
+      (should (eq (plist-get direct :fringe) (plist-get event :fringe)))
+      (should (eq (plist-get direct :kernel) (plist-get event :kernel))))))
+
+(ert-deftest ejn-ei1r-reducer-drops-malformed-late-and-retired-events ()
+  "Malformed events log; late/retired output cannot recreate presentation."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x"))
+           (context (list :buffer source :entry-handle handle :request-id 9))
+           messages)
+      (cl-letf (((symbol-function 'message)
+                 (lambda (format-string &rest args)
+                   (push (apply #'format format-string args) messages))))
+        (setq emacs-jupyter-notebook--evaluation-request '(:request-id 9))
+        (should-not (emacs-jupyter-notebook-events-dispatch context '(:type display)))
+        (setq emacs-jupyter-notebook--evaluation-request '(:request-id 10))
+        (should (equal (emacs-jupyter-notebook-events-dispatch
+                        context '(:type stream :text "late"))
+                       '((:action ignore))))
+        (ejn-panel-clear-all panel)
+        (should (equal (emacs-jupyter-notebook-events-dispatch
+                        (list :buffer source :entry-handle handle)
+                        '(:type display :data (:text/plain "retired")))
+                       '((:action ignore))))
+        (should-not (emacs-jupyter-notebook-events-dispatch context '(:type unknown)))
+        (should (cl-some (lambda (text) (string-match-p "event reducer failed" text))
+                         messages))))))
+
+(ert-deftest ejn-ei1r-reducer-errors-are-logged-not-swallowed ()
+  "An injected reducer exception is visible in the bounded diagnostic path."
+  (let (messages)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-events-reduce)
+               (lambda (&rest _) (error "injected reducer failure")))
+              ((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (push (apply #'format format-string args) messages))))
+      (should-not (emacs-jupyter-notebook-events-dispatch nil '(:type stream)))
+      (should (string-match-p "injected reducer failure" (car messages))))))
+
+(ert-deftest ejn-ei1r-clear-wait-and-input-are-deferred-and-owned ()
+  "Clear wait survives, and input never reads/replies in the callback turn."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x"))
+           (context (list :buffer source :entry-handle handle :request-id nil))
+           scheduled timer prompt reply)
+      (ejn-panel-append-text handle "old")
+      (emacs-jupyter-notebook-events-dispatch context '(:type clear :wait t))
+      (should (equal (ejn-panel-entry-text handle) "old"))
+      (should (plist-get (ejn-panel-entry-snapshot handle) :pending-clear))
+      (let ((real-run-at-time (symbol-function 'run-at-time)))
+        (cl-letf (((symbol-function 'run-at-time)
+                   (lambda (_delay _repeat function &rest args)
+                     (setq scheduled (lambda () (apply function args)))
+                     (setq timer (funcall real-run-at-time 100 nil #'ignore))))
+                  ((symbol-function 'read-passwd)
+                   (lambda (value) (setq prompt value) "secret")))
+          (emacs-jupyter-notebook-events-dispatch
+           (plist-put (copy-sequence context) :input-reply
+                      (lambda (value) (setq reply (copy-sequence value))))
+           '(:type input-request :prompt "Password: " :password t))
+          (should-not prompt)
+          (should-not reply)
+          (funcall scheduled)
+          (should (equal prompt "Password: "))
+          (should (equal reply "secret"))))
+      (when (timerp timer) (cancel-timer timer)))))
+
+(ert-deftest ejn-ei1r-result-display-and-update-have-distinct-semantics ()
+  "Result replaces text, display appends, and update replaces in place."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x"))
+           (context (list :buffer source :entry-handle handle :request-id nil)))
+      (ejn-panel-append-text handle "old")
+      (emacs-jupyter-notebook-events-dispatch context '(:type result :data (:text/plain "result")))
+      (should (equal (ejn-panel-entry-text handle) "result"))
+      (emacs-jupyter-notebook-events-dispatch context '(:type display :data (:text/plain " display")))
+      (should (equal (ejn-panel-entry-text handle) "result display"))
+      (emacs-jupyter-notebook-events-dispatch context '(:type update-display :data (:text/plain "update")))
+      (should (equal (ejn-panel-entry-text handle) "update")))))
+
+(ert-deftest ejn-ei1r-watch-output-suppresses-execute-reply-error-fallback ()
+  "Watch output counts as a result before execute-reply error fallback."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x"))
+           (context (list :buffer source :entry-handle handle :request-id nil
+                          :had-result nil)))
+      (emacs-jupyter-notebook-events-dispatch
+       context
+       '(:type execute-reply :status "error" :execution-count 4
+         :watch-text "\n[watch]\nx: 1\n"
+         :ename "ValueError" :evalue "boom"))
+      (should (equal (ejn-panel-entry-text handle) "\n[watch]\nx: 1\n"))
+      (should-not (string-match-p "ValueError" (ejn-panel-entry-text handle)))
+      (should (eq (plist-get (ejn-panel-entry-snapshot handle) :status) 'error)))))
+
+(ert-deftest ejn-ei1r-retired-legacy-output-logs-at-a-bounded-rate ()
+  "Retired legacy output is rejected before decode with a capped diagnostic."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x"))
+           (stream (cadr (assoc "stream"
+                                (emacs-jupyter-notebook-jupyter--callbacks source handle))))
+           (emacs-jupyter-notebook-jupyter--late-callback-log-count 0)
+           messages)
+      (ejn-panel-clear-all panel)
+      (cl-letf (((symbol-function 'message)
+                 (lambda (format-string &rest args)
+                   (push (apply #'format format-string args) messages)))
+                ((symbol-function 'jupyter-message-content)
+                 (lambda (&rest _) (ert-fail "retired output decoded"))))
+        (dotimes (_ (1+ emacs-jupyter-notebook-jupyter--late-callback-log-limit))
+          (funcall stream 'retired-stream))
+        (should (= (length messages)
+                   emacs-jupyter-notebook-jupyter--late-callback-log-limit))))))
 
 (provide 'emacs-jupyter-notebook-backend-tests)
 

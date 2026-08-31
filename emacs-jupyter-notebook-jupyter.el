@@ -18,11 +18,12 @@
 ;;; Code:
 
 (require 'cl-lib)
-(require 'ansi-color)
 (require 'eieio)                        ; oset/make-instance (W15-B)
 (require 'subr-x)
 (require 'emacs-jupyter-notebook-vars)
 (require 'emacs-jupyter-notebook-result)
+(require 'emacs-jupyter-notebook-events)
+(require 'emacs-jupyter-notebook-backend)
 
 (declare-function jupyter-kernel "jupyter-kernel" (&rest args))
 (declare-function jupyter-client "jupyter-client" (kernel &optional client-class))
@@ -33,7 +34,6 @@
 (declare-function jupyter-input-reply "jupyter-messages" (&rest args))
 (declare-function jupyter-is-complete-request "jupyter-messages" (&rest args))
 (declare-function jupyter-message-content "jupyter-messages" (msg))
-(declare-function jupyter-message-data "jupyter-messages" (msg mimetype))
 (declare-function jupyter-message-subscribed "jupyter-monads" (dreq cbs))
 (declare-function jupyter-run-with-state "jupyter-monads" (state mvalue))
 (declare-function jupyter-sent "jupyter-monads" (dreq))
@@ -71,10 +71,6 @@
 (defun emacs-jupyter-notebook-jupyter--message-content-value (msg key)
   "Return KEY from MSG content."
   (plist-get (jupyter-message-content msg) key))
-
-(defun emacs-jupyter-notebook-jupyter--result-mime-data (msg)
-  "Return the MIME data plist from result MSG, or nil."
-  (plist-get (jupyter-message-content msg) :data))
 
 (defun emacs-jupyter-notebook-jupyter--send-input-reply (client value)
   "Send an input_reply with VALUE through CLIENT."
@@ -129,10 +125,6 @@
                 lines)))
       (concat "\n[watch]\n" (string-join (nreverse lines) "\n") "\n"))))
 
-(defun emacs-jupyter-notebook-jupyter--ansi (text)
-  "Apply ANSI color escapes in TEXT for panel display."
-  (when text (ansi-color-apply text)))
-
 (defun emacs-jupyter-notebook-jupyter--callback-entry-live-p (type handle)
   "Return non-nil when TYPE may still mutate HANDLE's presentation entry.
 Late callbacks are expected after `clear-results'.  Log a bounded diagnostic
@@ -147,262 +139,71 @@ or pickle storage can happen."
                type))
     nil))
 
-(defun emacs-jupyter-notebook-jupyter--request-current-p (buffer request-id)
-  "Return non-nil when REQUEST-ID is still current for live BUFFER.
-Callbacks built without a request id remain usable by direct adapter callers
-and the existing unit-test seam."
-  (and (buffer-live-p buffer)
-       (with-current-buffer buffer
-         (or (null request-id)
-             (let ((current-id (plist-get emacs-jupyter-notebook--evaluation-request
-                                          :request-id)))
-               (and current-id (equal current-id request-id)))))))
+(defun emacs-jupyter-notebook-jupyter--legacy-event (message-type msg)
+  "Translate legacy MESSAGE-TYPE and MSG into one normalized event plist."
+  (let* ((content (and (fboundp 'jupyter-message-content)
+                       (jupyter-message-content msg)))
+         (value (lambda (key)
+                  (if content
+                      (plist-get content key)
+                    ;; Existing adapter callers may stub this narrow seam
+                    ;; without loading emacs-jupyter in deterministic ERT.
+                    (emacs-jupyter-notebook-jupyter--message-content-value msg key)))))
+    (pcase message-type
+      ("input_request" (list :type 'input-request :prompt (funcall value :prompt)
+                             :password (funcall value :password)))
+      ("clear_output" (list :type 'clear :wait (funcall value :wait)))
+      ("stream" (list :type 'stream :text (funcall value :text)
+                      :name (funcall value :name)))
+      ("execute_result" (list :type 'result :data (funcall value :data)))
+      ("display_data" (list :type 'display :data (funcall value :data)))
+      ("update_display_data" (list :type 'update-display :data (funcall value :data)))
+      ("error" (list :type 'error :traceback (funcall value :traceback)
+                     :ename (funcall value :ename) :evalue (funcall value :evalue)))
+      ("execute_reply" (list :type 'execute-reply :status (funcall value :status)
+                             :execution-count (funcall value :execution_count)
+                             :watch-text (emacs-jupyter-notebook-jupyter--watch-results-text
+                                          (funcall value :user_expressions))
+                             :ename (funcall value :ename) :evalue (funcall value :evalue)))
+      ("status" (list :type 'status :execution-state (funcall value :execution_state)))
+      (_ (error "Unsupported legacy Jupyter message type: %s" message-type)))))
 
 (defun emacs-jupyter-notebook-jupyter--callbacks (buffer entry-handle &optional client request-id)
-  "Return execution callbacks that drive panel ENTRY-HANDLE in BUFFER.
-
-Stream/execute_result/display_data/update_display_data/error/clear_output/
-execute_reply/status all flow through the panel API; the source BUFFER
-is not mutated.  The optional CLIENT is used to reply to input_request
-prompts.
-
-W5.5: REQUEST-ID, when non-nil, is the W5.1 request-id assigned to this
-evaluation.  `execute_reply' and `status=idle' use it to correlate so a
-late reply or a stale idle from a superseded evaluation cannot clear the
-current `--evaluation-request' / `--evaluation-timer' or overwrite the
-panel/fringe state set by the timeout or `cancel-operation' paths."
+  "Return legacy callbacks which only translate then dispatch normalized events."
   (let ((had-result nil))
-    `(("input_request"
-       ,(lambda (msg)
-          (condition-case nil
-              (when (emacs-jupyter-notebook-jupyter--request-current-p
-                     buffer request-id)
-                (let* ((content (jupyter-message-content msg))
-                     (prompt (or (plist-get content :prompt) ""))
-                     (password (plist-get content :password)))
-                ;; Input is protocol control flow, not presentation.  A
-                ;; cleared panel must still answer a matching kernel prompt.
-                (when (ejn-panel-entry-live-p entry-handle)
-                  (ejn-panel-append-text entry-handle prompt))
-                (let ((value (condition-case nil
-                                 (if (eq password t)
-                                     (read-passwd prompt)
-                                   (read-string prompt))
-                               (quit ""))))
-                  (when client
-                    (emacs-jupyter-notebook-jupyter--send-input-reply client value))
-                  (when (eq password t)
-                    (clear-string value)))))
-            (error nil))))
-      ("clear_output"
-       ,(lambda (msg)
-          (condition-case nil
-              (when (emacs-jupyter-notebook-jupyter--callback-entry-live-p
-                     "clear_output" entry-handle)
-                (let ((wait (plist-get (jupyter-message-content msg) :wait)))
-                  (ejn-panel-clear-entry entry-handle wait)))
-            (error nil))))
-      ("stream"
-       ,(lambda (msg)
-          (condition-case nil
-              (when (emacs-jupyter-notebook-jupyter--callback-entry-live-p
-                     "stream" entry-handle)
-                (let ((text (emacs-jupyter-notebook-jupyter--message-content-value msg :text))
-                      (name (emacs-jupyter-notebook-jupyter--message-content-value msg :name)))
-                  (when (and text (not (string-empty-p text)))
-                    (setq had-result t)
-                    (ejn-panel-append-text
-                     entry-handle
-                     (emacs-jupyter-notebook-jupyter--ansi text)
-                     (when (equal name "stderr")
-                       'emacs-jupyter-notebook-result-error-face)))))
-            (error nil))))
-      ("execute_result"
-       ,(lambda (msg)
-          (condition-case nil
-              (when (emacs-jupyter-notebook-jupyter--callback-entry-live-p
-                     "execute_result" entry-handle)
-                (when-let ((data (emacs-jupyter-notebook-jupyter--result-mime-data msg)))
-                ;; W8.2: stash the matplotlib pickle payload (if any) before
-                ;; rendering the PNG thumbnail; the two are independent.
-                (emacs-jupyter-notebook--maybe-stash-pickle buffer entry-handle data)
-                (when-let ((rendered (emacs-jupyter-notebook--render-mime-result data)))
-                  (setq had-result t)
-                  (if (get-text-property 0 'display rendered)
-                      (ejn-panel-set-image
-                       entry-handle (get-text-property 0 'display rendered))
-                    (ejn-panel-replace-text
-                     entry-handle
-                     (emacs-jupyter-notebook-jupyter--ansi rendered))))))
-            (error nil))))
-      ("display_data"
-       ,(lambda (msg)
-          (condition-case nil
-              (when (emacs-jupyter-notebook-jupyter--callback-entry-live-p
-                     "display_data" entry-handle)
-                (let ((data (emacs-jupyter-notebook-jupyter--result-mime-data msg)))
-                  (when data
-                  ;; W8.2: stash the matplotlib pickle payload (if any).
-                  (emacs-jupyter-notebook--maybe-stash-pickle buffer entry-handle data)
-                  (let ((rendered (emacs-jupyter-notebook--render-mime-result data)))
-                    (setq had-result t)
-                    (cond
-                     ((null rendered)
-                      (ejn-panel-append-text
-                       entry-handle "[unsupported output format]"))
-                     ((get-text-property 0 'display rendered)
-                      (ejn-panel-set-image
-                       entry-handle (get-text-property 0 'display rendered)))
-                     (t
-                      (ejn-panel-append-text
-                       entry-handle
-                       (emacs-jupyter-notebook-jupyter--ansi rendered))))))))
-            (error nil))))
-      ("update_display_data"
-       ,(lambda (msg)
-          (condition-case nil
-              (when (emacs-jupyter-notebook-jupyter--callback-entry-live-p
-                     "update_display_data" entry-handle)
-                (let ((data (emacs-jupyter-notebook-jupyter--result-mime-data msg)))
-                  (when data
-                  ;; W8.2: refresh the stashed matplotlib pickle payload.
-                  (emacs-jupyter-notebook--maybe-stash-pickle buffer entry-handle data)
-                  (let ((rendered (emacs-jupyter-notebook--render-mime-result data)))
-                    (setq had-result t)
-                    (cond
-                     ((null rendered)
-                      (ejn-panel-replace-text
-                       entry-handle "[unsupported output format]"))
-                     ((get-text-property 0 'display rendered)
-                      ;; W16: update-in-place — the kernel is refreshing an
-                      ;; existing display, not adding a new output segment.
-                      (ejn-panel-update-image
-                       entry-handle (get-text-property 0 'display rendered)))
-                     (t
-                      (ejn-panel-replace-text
-                       entry-handle
-                       (emacs-jupyter-notebook-jupyter--ansi rendered))))))))
-            (error nil))))
-      ("error"
-       ,(lambda (msg)
-          (condition-case nil
-              (when (emacs-jupyter-notebook-jupyter--callback-entry-live-p
-                     "error" entry-handle)
-                (let* ((content (jupyter-message-content msg))
-                     (traceback (plist-get content :traceback))
-                     (ename (or (plist-get content :ename) "Error"))
-                     (evalue (or (plist-get content :evalue) ""))
-                     (text (if traceback
-                               (string-join traceback "\n")
-                             (format "%s: %s" ename evalue))))
-                (setq had-result t)
-                ;; Python tracebacks arrive with ANSI colour SGR escapes
-                ;; (highlighted frame, red error class, etc.).  Route
-                ;; through `--ansi' so they render as faces rather than
-                ;; literal `\x1b[0;31m' garbage in the panel.
-                (ejn-panel-append-text
-                 entry-handle
-                 (emacs-jupyter-notebook-jupyter--ansi text)
-                 'emacs-jupyter-notebook-result-error-face)))
-            (error nil))))
-      ("execute_reply"
-       ,(lambda (msg)
-          (condition-case nil
-              ;; W5.5 + W13-M2: correlate this reply with the buffer's current
-              ;; in-flight request.  Clearing the SHARED eval slot/timer stays
-              ;; gated on `is-current' — only the current reply owns them.  But
-              ;; a reply's OWN panel entry is finalized whenever it is still
-              ;; running, so a reply superseded by a send to a DIFFERENT cell no
-              ;; longer leaves that cell's entry/fringe stuck at "running"
-              ;; forever (the W13-M2 bug).  Two cases are still left alone: a
-              ;; newer in-flight run of the SAME cell (it owns the entry/fringe,
-              ;; so a stale same-cell reply is dropped as before), and an entry
-              ;; already finalized abnormally by cancel/timeout (its terminal
-              ;; status must not be overwritten by a late reply).
-              (let* ((cur (and (buffer-live-p buffer)
-                               (with-current-buffer buffer
-                                 emacs-jupyter-notebook--evaluation-request)))
-                     (current-id (plist-get cur :request-id))
-                     (current-key (plist-get cur :cell-key))
-                     (cell-key (plist-get entry-handle :cell-key))
-                     (is-current (or (null request-id)
-                                     (and current-id (equal current-id request-id))))
-                     (superseded-same-cell
-                      (and (not is-current) current-key (equal current-key cell-key)))
-                     (entry-live (ejn-panel-entry-live-p entry-handle))
-                     (was-running
-                      (and entry-live
-                           (eq (plist-get (ejn-panel-entry-snapshot entry-handle) :status)
-                               'running))))
-                (when is-current
-                  (when (buffer-live-p buffer)
-                    (with-current-buffer buffer
-                      (when (timerp emacs-jupyter-notebook--evaluation-timer)
-                        (cancel-timer emacs-jupyter-notebook--evaluation-timer))
-                      (setq emacs-jupyter-notebook--evaluation-timer nil)
-                      (setq emacs-jupyter-notebook--evaluation-request nil))))
-                ;; Only presentation is gated on ENTRY-LIVE.  The matching
-                ;; request's timer/context cleanup above must survive clear.
-                (when (and was-running (not superseded-same-cell))
-                  (let* ((status-s (emacs-jupyter-notebook-jupyter--message-content-value
-                                    msg :status))
-                         (count (emacs-jupyter-notebook-jupyter--message-content-value
-                                 msg :execution_count))
-                         (watch-text (emacs-jupyter-notebook-jupyter--watch-results-text
-                                      (emacs-jupyter-notebook-jupyter--message-content-value
-                                       msg :user_expressions)))
-                         (status-sym (cond ((equal status-s "ok") 'ok)
-                                           ((equal status-s "error") 'error)
-                                           (t 'ok))))
-                    (when watch-text
-                      (setq had-result t)
-                      (ejn-panel-append-text entry-handle watch-text))
-                    (unless had-result
-                      (when (equal status-s "error")
-                        (ejn-panel-append-text
-                         entry-handle
-                         (emacs-jupyter-notebook-jupyter--ansi
-                          (format "%s: %s"
-                                  (or (emacs-jupyter-notebook-jupyter--message-content-value
-                                       msg :ename) "Error")
-                                  (or (emacs-jupyter-notebook-jupyter--message-content-value
-                                       msg :evalue) "")))
-                         'emacs-jupyter-notebook-result-error-face)))
-                    (ejn-panel-finish-entry entry-handle status-sym count)
-                    (when (and cell-key (buffer-live-p buffer))
-                      (with-current-buffer buffer
-                        (emacs-jupyter-notebook-fringe-set
-                         cell-key status-sym count))))))
-            (error nil))))
-      ("status"
-       ,(lambda (msg)
-          (condition-case nil
-              ;; Status owns source/kernel bookkeeping rather than panel
-              ;; presentation, so it remains active after `clear-results'.
-              (when (buffer-live-p buffer)
-                (with-current-buffer buffer
-                  (let ((state (emacs-jupyter-notebook-jupyter--message-content-value
-                                msg :execution_state)))
-                    (setq emacs-jupyter-notebook--kernel-status
-                          (cond ((equal state "busy") 'busy)
-                                ((equal state "idle") 'idle)
-                                (t nil)))
-                    ;; W5.5: only cancel the evaluation timer on idle when
-                    ;; the current request matches.  A stale idle from a
-                    ;; superseded execute would otherwise disarm the
-                    ;; timeout for a newer hung evaluation.
-                    (when (equal state "idle")
-                      (let ((current-id (plist-get
-                                         emacs-jupyter-notebook--evaluation-request
-                                         :request-id)))
-                        (when (or (null current-id)
-                                  (null request-id)
-                                  (equal current-id request-id))
-                          (when (timerp emacs-jupyter-notebook--evaluation-timer)
-                            (cancel-timer emacs-jupyter-notebook--evaluation-timer))
-                          (setq emacs-jupyter-notebook--evaluation-timer nil))))
-                    (force-mode-line-update t))))
-            (error nil)))))))
+    (cl-labels ((dispatch (message-type msg)
+                  (emacs-jupyter-notebook-events-dispatch
+                   (list :buffer buffer :entry-handle entry-handle :request-id request-id
+                         :had-result had-result
+                         :set-had-result (lambda (_value) (setq had-result t))
+                         :input-reply (and client
+                                           (lambda (value)
+                                             (emacs-jupyter-notebook-jupyter--send-input-reply
+                                              client value))) )
+                   ;; Retired output must be rejected before asking
+                   ;; emacs-jupyter to decode MIME/base64.  execute_reply still
+                   ;; reaches the reducer with a shape-only event so matching
+                   ;; request/timer bookkeeping can settle after panel clear.
+                   (cond
+                    ((member message-type '("clear_output" "stream" "execute_result"
+                                             "display_data" "update_display_data" "error"))
+                     (if (emacs-jupyter-notebook-jupyter--callback-entry-live-p
+                          message-type entry-handle)
+                         (emacs-jupyter-notebook-jupyter--legacy-event message-type msg)
+                       (list :type (cdr (assoc message-type
+                                                '(("clear_output" . clear)
+                                                  ("stream" . stream)
+                                                  ("execute_result" . result)
+                                                  ("display_data" . display)
+                                                  ("update_display_data" . update-display)
+                                                  ("error" . error)))))))
+                    ((and (not (ejn-panel-entry-live-p entry-handle))
+                          (equal message-type "execute_reply"))
+                     '(:type execute-reply))
+                    (t (emacs-jupyter-notebook-jupyter--legacy-event message-type msg))))))
+      (mapcar (lambda (type) (list type (lambda (msg) (dispatch type msg))))
+              '("input_request" "clear_output" "stream" "execute_result" "display_data"
+                "update_display_data" "error" "execute_reply" "status")))))
 
 (defvar emacs-jupyter-notebook-jupyter-connect-function
   #'emacs-jupyter-notebook-jupyter--connect
