@@ -51,7 +51,9 @@ class BackendCompletion:
         return cls(error=error)
 
 
-EventCallback: TypeAlias = Callable[[BackendEvent], None]
+# ``False`` means the dispatcher did not admit the event.  Producers that do
+# not own an unpublished resource may ignore the return value.
+EventCallback: TypeAlias = Callable[[BackendEvent], bool]
 CompletionCallback: TypeAlias = Callable[[BackendCompletion], None]
 
 
@@ -76,7 +78,8 @@ class Backend(Protocol):
 
         This method must return without blocking.  All correlated events must
         be delivered before completion; callbacks after completion are late
-        and the dispatcher deliberately ignores them.
+        and the dispatcher deliberately rejects them.  An event callback
+        returns whether the local transport admitted the event.
         """
 
     def close(self) -> None:

@@ -140,9 +140,16 @@ class BackendReaderTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.connection_path = path
+        artifact_dir = Path(self._directory.name) / "artifacts"
+        artifact_dir.mkdir(mode=0o700, exist_ok=True)
         backend = JupyterBackend(deadline=0.2)
         future = asyncio.get_running_loop().create_future()
-        backend.start("connect", {"connection_file": str(path)}, lambda _event: None, future.set_result)
+        backend.start(
+            "connect",
+            {"connection_file": str(path), "artifact_dir": str(artifact_dir)},
+            lambda _event: None,
+            future.set_result,
+        )
         connected = await asyncio.wait_for(future, 1)
         self.assertIsNone(connected.error)
         self.addAsyncCleanup(self._close_backend, backend)
@@ -360,7 +367,12 @@ class BackendReaderTests(unittest.IsolatedAsyncioTestCase):
             future = asyncio.get_running_loop().create_future()
             backend.start(
                 "connect",
-                {"connection_file": str(self.connection_path)},
+                {
+                    "connection_file": str(self.connection_path),
+                    "artifact_dir": str(
+                        Path(self._directory.name) / "artifacts"
+                    ),
+                },
                 lambda _event: None,
                 future.set_result,
             )

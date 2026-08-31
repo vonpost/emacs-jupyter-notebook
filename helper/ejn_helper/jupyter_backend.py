@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import math
 import os
 import stat
@@ -14,12 +15,14 @@ from pathlib import Path
 from typing import Mapping
 
 from .backend import BackendCompletion, BackendError, BackendEvent
+from .outputs import OutputAttachment, OutputNormalizer
 from .requests import ExecutionState
 
 
 _LOOPBACK = {"127.0.0.1", "::1"}
 _PORTS = ("shell_port", "iopub_port", "stdin_port", "control_port", "hb_port")
 _CHANNELS = ("shell", "iopub", "stdin", "control")
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -29,6 +32,11 @@ class _Pending:
     future: asyncio.Future[dict]
     state: ExecutionState | None = None
     event_callback: object | None = None
+    output_attachment: OutputAttachment | None = None
+    finishing: bool = False
+    idle_content: Mapping[str, object] | None = None
+    status_delivered: bool = False
+    idle_received: bool = False
 
 
 class _TaskCancellation:
@@ -64,6 +72,10 @@ class JupyterBackend:
         self._retired_tasks: list[asyncio.Task] = []
         self._timed_out_tasks: set[asyncio.Task[None]] = set()
         self._transport_failed = False
+        # One coordinator covers every connect/reattach generation.  Its
+        # queue, worker, and retained-byte budget must never multiply.
+        self._outputs = OutputNormalizer()
+        self._output_attachment: OutputAttachment | None = None
         self._heartbeat_interval = min(1.0, max(0.05, self.deadline / 4))
         self._heartbeat_timeout = min(1.0, max(0.05, self.deadline / 2))
 
@@ -219,6 +231,13 @@ class JupyterBackend:
         except ImportError as exc:
             raise BackendError("transport-error") from exc
         self._stop_channels()
+        artifact_dir = params.get("artifact_dir")
+        if not isinstance(artifact_dir, str):
+            raise BackendError("invalid-request")
+        try:
+            self._output_attachment = self._outputs.attach(artifact_dir)
+        except Exception as exc:
+            raise BackendError("invalid-request") from exc
         client = AsyncKernelClient()
         client.load_connection_info(connection)
         self.client = client
@@ -253,6 +272,7 @@ class JupyterBackend:
             asyncio.get_running_loop().create_future(),
             ExecutionState(message_id),
             event_callback,
+            self._output_attachment,
         )
         self._register_pending(message_id, pending)
         try:
@@ -362,12 +382,48 @@ class JupyterBackend:
             return
         message_type = message.get("msg_type")
         content = message.get("content", {})
-        if message_type == "status" and state.accept_iopub(message):
-            self._deliver_event(pending.event_callback, "status", content)
+        if pending.idle_received:
+            # Jupyter can emit a stale correlated output after idle.  It is
+            # never allowed to overtake the terminal status on this request.
+            if message_type in {
+                "stream",
+                "error",
+                "execute_result",
+                "display_data",
+                "update_display_data",
+                "clear_output",
+            }:
+                _LOGGER.debug("dropping correlated IOPub output received after idle")
+            return
+        if message_type in {
+            "stream",
+            "error",
+            "execute_result",
+            "display_data",
+            "update_display_data",
+            "clear_output",
+        }:
+            if pending.output_attachment is not None:
+                self._outputs.submit(
+                    pending.output_attachment,
+                    state.jupyter_id,
+                    message,
+                    lambda event: self._output_event(pending, event),
+                )
+        elif message_type == "status" and state.accept_iopub(message):
+            # The terminal status must follow every earlier IOPub output for
+            # this execution.  Output normalization is deliberately queued so
+            # its worker, not the channel reader, delivers the idle event.
+            pending.idle_received = True
+            pending.idle_content = content if isinstance(content, Mapping) else {}
+            if not self._outputs.has_pending(
+                pending.output_attachment, state.jupyter_id
+            ):
+                self._deliver_event(
+                    pending.event_callback, "status", pending.idle_content
+                )
+                pending.status_delivered = True
             self._finish_execution(pending)
-        elif message_type == "stream":
-            # HT9 owns stream validation, truncation, and MIME normalization.
-            self._deliver_event(pending.event_callback, "stream", content)
 
     def _route_stdin(self, pending: _Pending, message: Mapping[str, object]) -> None:
         state = pending.state
@@ -382,18 +438,49 @@ class JupyterBackend:
 
     def _finish_execution(self, pending: _Pending) -> None:
         result = pending.state.complete() if pending.state is not None else None
-        if result is not None and not pending.future.done():
+        if result is None or pending.future.done() or pending.finishing:
+            return
+        pending.finishing = True
+        task = asyncio.create_task(self._complete_after_output(pending, result))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _complete_after_output(self, pending: _Pending, result: dict) -> None:
+        if pending.state is not None and pending.output_attachment is not None:
+            await self._outputs.finish(
+                pending.output_attachment, pending.state.jupyter_id
+            )
+        if not pending.future.done():
+            if not pending.status_delivered:
+                self._deliver_event(
+                    pending.event_callback, "status", pending.idle_content or {}
+                )
             pending.future.set_result(result)
 
+    def _output_event(self, pending: _Pending, event: BackendEvent) -> bool:
+        if not pending.future.done():
+            admitted = self._deliver_event(
+                pending.event_callback, event.name, event.data
+            )
+            if not admitted and pending.state is not None:
+                # EventQueue already retained its one truncation marker. Stop
+                # normalizing later output for this request and let the
+                # current worker roll back an unpublished artifact lease.
+                self._outputs.cancel(
+                    pending.output_attachment, pending.state.jupyter_id
+                )
+            return admitted
+        return False
+
     @staticmethod
-    def _deliver_event(callback, name: str, data: object) -> None:
+    def _deliver_event(callback, name: str, data: object) -> bool:
         if not callable(callback):
-            return
+            return False
         try:
-            callback(BackendEvent(name, data if isinstance(data, Mapping) else {}))
+            return callback(BackendEvent(name, data if isinstance(data, Mapping) else {})) is not False
         except Exception:
             # The client callback must not take down a shared channel reader.
-            pass
+            return False
 
     def _register_pending(self, message_id: str, pending: _Pending) -> None:
         self._pending[message_id] = pending
@@ -407,6 +494,15 @@ class JupyterBackend:
         task = asyncio.current_task()
         if task is not None and self._pending_by_task.get(task) == (message_id, pending):
             self._pending_by_task.pop(task, None)
+        if pending.state is not None:
+            failed = pending.future.cancelled()
+            if pending.future.done() and not failed:
+                try:
+                    failed = pending.future.exception() is not None
+                except asyncio.CancelledError:
+                    failed = True
+            if failed:
+                self._outputs.cancel(pending.output_attachment, pending.state.jupyter_id)
 
     def _cancel_operation(self, task: asyncio.Task[None]) -> None:
         record = self._pending_by_task.pop(task, None)
@@ -460,6 +556,8 @@ class JupyterBackend:
                 pass
         self._channels_started = False
         self.client = None
+        self._outputs.retire(self._output_attachment)
+        self._output_attachment = None
 
     def _reap_retired_tasks(self) -> None:
         """Drop finished reader references without hiding still-live tasks."""
@@ -483,6 +581,7 @@ class JupyterBackend:
             task.cancel()
         self._retired_tasks.extend(tasks)
         self._stop_channels()
+        self._outputs.close()
         self._connecting = False
 
     async def wait_closed(self) -> None:
@@ -492,5 +591,7 @@ class JupyterBackend:
             tasks = tuple(self._retired_tasks) + tuple(self._tasks) + tuple(self._readers)
             self._retired_tasks.clear()
             if not tasks:
+                await self._outputs.wait_closed()
                 return
-            await asyncio.gather(*tasks, return_exceptions=True)
+            else:
+                await asyncio.gather(*tasks, return_exceptions=True)

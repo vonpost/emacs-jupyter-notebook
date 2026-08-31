@@ -4,6 +4,7 @@ import os
 import stat
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -223,6 +224,16 @@ class ArtifactStoreTests(unittest.TestCase):
         self.assertEqual(result.path.read_bytes(), b"owned by Emacs")
         with self.assertRaises(ArtifactIOError):
             store.store_base64(self.encode(b"after close"))
+
+    def test_discard_uses_store_lease_not_an_advertised_path(self):
+        outside = self.root / "outside"
+        outside.write_bytes(b"outside-data")
+        with ArtifactStore(self.directory) as store:
+            published = store.store_base64(self.encode(b"unhanded"))
+            forged_path = replace(published, path=outside)
+            self.assertTrue(store.discard(forged_path))
+        self.assertFalse(published.path.exists())
+        self.assertEqual(outside.read_bytes(), b"outside-data")
 
 
 if __name__ == "__main__":

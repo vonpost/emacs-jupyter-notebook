@@ -148,6 +148,17 @@ execution events also require `request_id`. Stream data has `name` and
 events carry their corresponding state/status fields. Invalid required fields
 map to `invalid-request` or `invalid-event`.
 
+For MIME events, `data` remains the Jupyter MIME bundle shape: a selected
+artifact MIME has a nested reference value `{path,bytes,sha256}` in place of
+the original base64 value, while `text/plain` remains a bounded string.
+`metadata` is copied through a JSON-safe normalizer: at most 32 values across
+two nested container levels and 8192 UTF-8 string bytes; unsupported or
+excess values are omitted and `_ejn_metadata_truncated:true` is added. An
+`execute_result` may carry a bounded non-negative integer `execution_count`.
+An oversized transient `display_id` is omitted and represented as
+`transient.display_id_omitted:true`; it is never shortened, so distinct IDs
+cannot become one update key.
+
 User and silent-setup executions share one serialized execution gate, while
 silent setup creates no panel entry. At most 8 requests await responses. On
 transport ambiguity, dispatched/busy becomes `outcome-unknown`; code is

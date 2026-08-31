@@ -448,10 +448,10 @@ class Dispatcher:
 
     def _backend_event(
         self, request_id: str, record: _Inflight, item: object
-    ) -> None:
+    ) -> bool:
         if self._inflight.get(request_id) is not record or record.terminal:
             self.late_events += 1
-            return
+            return False
         try:
             if (
                 not isinstance(item, BackendEvent)
@@ -466,13 +466,19 @@ class Dispatcher:
                 "request_id": request_id,
                 "data": copy.deepcopy(dict(item.data)),
             }
-            self.event_queue.enqueue(event)
+            disposition = self.event_queue.enqueue(event)
+            # An ordinary event dropped under queue pressure has not crossed
+            # the helper/Emacs ownership boundary.  Artifact producers use
+            # this result to discard their private publication lease while the
+            # queue still guarantees the request's truncation marker.
+            return disposition.queued
         except FlowControlError as exc:
             self._finish_error(request_id, record, exc.code, cancel=True)
         except BaseException:
             self._finish_error(
                 request_id, record, "protocol-error", cancel=True
             )
+        return False
 
     def _backend_complete(
         self, request_id: str, record: _Inflight, item: object

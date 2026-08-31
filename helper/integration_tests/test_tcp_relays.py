@@ -145,9 +145,16 @@ class TcpRelayTests(unittest.IsolatedAsyncioTestCase):
             kernel_pid = fixture.kernel_pid
             await asyncio.to_thread(fixture.evaluate, "relay_preserved_state = 719", 8)
             connection_path = await relay.start()
+            artifact_dir = connection_path.parent / "artifacts"
+            artifact_dir.mkdir(mode=0o700)
             backend = JupyterBackend(deadline=6)
             connected = await self._backend_request(
-                backend, "connect", {"connection_file": str(connection_path)}
+                backend,
+                "connect",
+                {
+                    "connection_file": str(connection_path),
+                    "artifact_dir": str(artifact_dir),
+                },
             )
             self.assertIsNone(connected.error)
             reply = await self._backend_request(
@@ -170,7 +177,12 @@ class TcpRelayTests(unittest.IsolatedAsyncioTestCase):
             await relay.restart()
             backend = JupyterBackend(deadline=6)
             connected = await self._backend_request(
-                backend, "connect", {"connection_file": str(relay.connection_path)}
+                backend,
+                "connect",
+                {
+                    "connection_file": str(relay.connection_path),
+                    "artifact_dir": str(artifact_dir),
+                },
             )
             self.assertIsNone(connected.error)
             reply = await self._backend_request(

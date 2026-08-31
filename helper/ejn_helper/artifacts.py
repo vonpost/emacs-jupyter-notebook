@@ -8,7 +8,7 @@ import hashlib
 import os
 import secrets
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO
 
@@ -43,6 +43,17 @@ class PublishedArtifact:
     path: Path
     byte_count: int
     sha256: str
+    _lease: _PublicationLease = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _PublicationLease:
+    """Store-private identity for a publication not yet handed to Emacs."""
+
+    store_token: object = field(repr=False, compare=False)
+    relative_name: str = field(repr=False)
+    device: int = field(repr=False)
+    inode: int = field(repr=False)
 
 
 def _write_all(stream: BinaryIO, data: bytes) -> None:
@@ -160,6 +171,9 @@ class ArtifactStore:
         self._directory_fd = descriptor
         self._max_bytes = max_bytes
         self._expected_uid = expected_uid
+        # This identity is deliberately never serialized into a backend event.
+        # A caller that only has an advertised path cannot ask us to unlink it.
+        self._lease_token = object()
 
     @property
     def directory(self) -> Path:
@@ -209,6 +223,44 @@ class ArtifactStore:
         ):
             raise ArtifactDirectoryError("artifact directory is no longer safe")
 
+    def discard(self, published: PublishedArtifact) -> bool:
+        """Discard a publication that never crossed the local admission gate.
+
+        ``published`` must be the exact object returned by this store.  The
+        lookup uses only the store-minted relative name through the pinned
+        directory descriptor and also pins the originally published inode.
+        It therefore never follows or trusts an event's advertised path.
+        """
+        if not isinstance(published, PublishedArtifact):
+            raise ArtifactIOError("artifact discard needs a store publication")
+        lease = published._lease
+        if lease.store_token is not self._lease_token:
+            raise ArtifactIOError("artifact discard belongs to another store")
+        directory_fd = self._require_open()
+        self._validate_pinned_directory(directory_fd)
+        try:
+            metadata = os.stat(
+                lease.relative_name, dir_fd=directory_fd, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise ArtifactIOError("artifact discard failed") from exc
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino) != (lease.device, lease.inode)
+        ):
+            # A same-directory race must not turn an internal cleanup into an
+            # unlink of a replacement file.
+            return False
+        try:
+            os.unlink(lease.relative_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise ArtifactIOError("artifact discard failed") from exc
+        return True
+
     @staticmethod
     def _random_name(prefix: str) -> str:
         return f"{prefix}{secrets.token_hex(16)}"
@@ -230,7 +282,9 @@ class ArtifactStore:
         file_fd: int | None = None
         stream: BinaryIO | None = None
         partial_created = False
-        published = False
+        published_created = False
+        completed = False
+        result: PublishedArtifact | None = None
         byte_count = 0
         digest = hashlib.sha256()
 
@@ -277,7 +331,24 @@ class ArtifactStore:
                 src_dir_fd=directory_fd,
                 dst_dir_fd=directory_fd,
             )
-            published = True
+            published_created = True
+            metadata = os.stat(
+                published_name, dir_fd=directory_fd, follow_symlinks=False
+            )
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ArtifactIOError("artifact publication is not a regular file")
+            result = PublishedArtifact(
+                path=self._directory / published_name,
+                byte_count=byte_count,
+                sha256=digest.hexdigest(),
+                _lease=_PublicationLease(
+                    self._lease_token,
+                    published_name,
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ),
+            )
+            completed = True
         except ArtifactError:
             raise
         except (OSError, ValueError) as exc:
@@ -293,16 +364,20 @@ class ArtifactStore:
                     os.close(file_fd)
                 except OSError:
                     pass
-            if partial_created and not published:
+            if partial_created and not published_created:
                 try:
                     os.unlink(partial_name, dir_fd=directory_fd)
                 except FileNotFoundError:
                     pass
                 except OSError:
                     pass
+            if published_created and not completed:
+                try:
+                    os.unlink(published_name, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
 
-        return PublishedArtifact(
-            path=self._directory / published_name,
-            byte_count=byte_count,
-            sha256=digest.hexdigest(),
-        )
+        assert result is not None
+        return result

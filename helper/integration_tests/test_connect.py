@@ -20,6 +20,14 @@ from ejn_helper.jupyter_backend import JupyterBackend
 from kernel_fixture import LocalKernelFixture
 
 
+def _connect_params(connection_path: Path, artifact_dir: Path) -> dict[str, str]:
+    artifact_dir.mkdir(mode=0o700, exist_ok=True)
+    return {
+        "connection_file": str(connection_path),
+        "artifact_dir": str(artifact_dir),
+    }
+
+
 class ConnectTests(unittest.IsolatedAsyncioTestCase):
     async def _completion(self, backend, operation, params):
         future = asyncio.get_running_loop().create_future()
@@ -29,39 +37,46 @@ class ConnectTests(unittest.IsolatedAsyncioTestCase):
     @unittest.skipUnless(LocalKernelFixture.available(), "jupyter_client unavailable")
     async def test_attach_kernel_info_close_and_kernel_survives(self):
         with LocalKernelFixture(startup_timeout=10) as fixture:
-            backend = JupyterBackend(deadline=5)
-            assert fixture.connection_path is not None
-            connected = await self._completion(
-                backend,
-                "connect",
-                {"connection_file": str(fixture.connection_path)},
-            )
-            self.assertIsNone(connected.error)
-            self.assertEqual(connected.result, {"attached": True})
-            info = await self._completion(backend, "kernel_info", {})
-            self.assertIsNone(info.error)
-            manager_pid, kernel_pid = fixture.manager_pid, fixture.kernel_pid
-            self.assertEqual(
-                fixture.evaluate("ejn_survives = 41", timeout=8).get("status"),
-                "ok",
-            )
-            backend.close()
-            backend.close()
-            self.assertEqual(fixture.manager_pid, manager_pid)
-            self.assertEqual(fixture.kernel_pid, kernel_pid)
-            self.assertEqual(
-                fixture.evaluate("assert ejn_survives == 41", timeout=8).get(
-                    "status"
-                ),
-                "ok",
-            )
+            with tempfile.TemporaryDirectory() as directory:
+                backend = JupyterBackend(deadline=5)
+                assert fixture.connection_path is not None
+                connected = await self._completion(
+                    backend,
+                    "connect",
+                    _connect_params(
+                        fixture.connection_path, Path(directory) / "artifacts"
+                    ),
+                )
+                self.assertIsNone(connected.error)
+                self.assertEqual(connected.result, {"attached": True})
+                info = await self._completion(backend, "kernel_info", {})
+                self.assertIsNone(info.error)
+                manager_pid, kernel_pid = fixture.manager_pid, fixture.kernel_pid
+                self.assertEqual(
+                    fixture.evaluate("ejn_survives = 41", timeout=8).get("status"),
+                    "ok",
+                )
+                backend.close()
+                backend.close()
+                self.assertEqual(fixture.manager_pid, manager_pid)
+                self.assertEqual(fixture.kernel_pid, kernel_pid)
+                self.assertEqual(
+                    fixture.evaluate("assert ejn_survives == 41", timeout=8).get(
+                        "status"
+                    ),
+                    "ok",
+                )
 
     async def test_invalid_connection_is_local_failure(self):
         backend = JupyterBackend(deadline=0.1)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "connection.json"
             path.write_text('{"ip":"192.0.2.1"}', encoding="utf-8")
-            result = await self._completion(backend, "connect", {"connection_file": str(path)})
+            result = await self._completion(
+                backend,
+                "connect",
+                _connect_params(path, Path(directory) / "artifacts"),
+            )
         self.assertEqual(getattr(result.error, "code", None), "invalid-request")
         backend.close()
 
@@ -145,7 +160,11 @@ class ConnectTests(unittest.IsolatedAsyncioTestCase):
             path = Path(directory) / "connection.json"
             path.write_text(json.dumps({"ip":"127.0.0.1", "transport":"tcp", "key":"x", "signature_scheme":"hmac-sha256", **dict(zip(("shell_port","iopub_port","stdin_port","control_port","hb_port"), ports))}))
             backend = JupyterBackend(deadline=0.1)
-            result = await self._completion(backend, "connect", {"connection_file": str(path)})
+            result = await self._completion(
+                backend,
+                "connect",
+                _connect_params(path, Path(directory) / "artifacts"),
+            )
             self.assertIn(getattr(result.error, "code", None), {"timeout", "transport-error"})
             self.assertIsNone(backend.client)
             backend.close()
@@ -167,7 +186,11 @@ class ConnectTests(unittest.IsolatedAsyncioTestCase):
                 path = Path(directory) / "connection.json"
                 path.write_text(json.dumps({"ip":"127.0.0.1", "transport":"tcp", "key":"x", "signature_scheme":"hmac-sha256", **dict(zip(("shell_port","iopub_port","stdin_port","control_port","hb_port"), ports))}))
                 backend = JupyterBackend(deadline=0.1)
-                result = await self._completion(backend, "connect", {"connection_file": str(path)})
+                result = await self._completion(
+                    backend,
+                    "connect",
+                    _connect_params(path, Path(directory) / "artifacts"),
+                )
                 self.assertEqual(getattr(result.error, "code", None), "timeout")
                 self.assertIsNone(backend.client)
                 backend.close()
@@ -231,10 +254,11 @@ class ConnectTests(unittest.IsolatedAsyncioTestCase):
                 path = Path(directory) / "connection.json"
                 path.write_text(json.dumps({"ip":"127.0.0.1", "transport":"tcp", "key":"x", "signature_scheme":"hmac-sha256", "shell_port":1, "iopub_port":2, "stdin_port":3, "control_port":4, "hb_port":5}))
                 backend = JupyterBackend(deadline=5); callbacks = []
-                token = backend.start("connect", {"connection_file": str(path)}, lambda _event: None, callbacks.append)
+                params = _connect_params(path, Path(directory) / "artifacts")
+                token = backend.start("connect", params, lambda _event: None, callbacks.append)
                 await asyncio.wait_for(started.wait(), 1)
                 busy = []
-                backend.start("connect", {"connection_file": str(path)}, lambda _event: None, busy.append)
+                backend.start("connect", params, lambda _event: None, busy.append)
                 await asyncio.sleep(0)
                 self.assertEqual(getattr(busy[0].error, "code", None), "busy")
                 token.cancel()
@@ -259,17 +283,29 @@ class ConnectTests(unittest.IsolatedAsyncioTestCase):
         tasks_before = len(asyncio.all_tasks())
         with LocalKernelFixture(startup_timeout=10) as fixture:
             assert fixture.connection_path is not None
-            warm = JupyterBackend(deadline=5)
-            await self._completion(warm, "connect", {"connection_file": str(fixture.connection_path)})
-            warm.close(); await asyncio.sleep(0)
-            fd_before = len(list(Path("/proc/self/fd").iterdir())) if fd_before is not None else None
-            threads_before, tasks_before = len(threading.enumerate()), len(asyncio.all_tasks())
-            for _ in range(5):
-                backend = JupyterBackend(deadline=5)
-                self.assertIsNone((await self._completion(backend, "connect", {"connection_file": str(fixture.connection_path)})).error)
-                backend.close()
-                await asyncio.sleep(0)
-                self.assertEqual(backend._tasks, set())
+            with tempfile.TemporaryDirectory() as directory:
+                artifact_dir = Path(directory) / "artifacts"
+                warm = JupyterBackend(deadline=5)
+                await self._completion(
+                    warm, "connect", _connect_params(fixture.connection_path, artifact_dir)
+                )
+                warm.close(); await asyncio.sleep(0)
+                fd_before = len(list(Path("/proc/self/fd").iterdir())) if fd_before is not None else None
+                threads_before, tasks_before = len(threading.enumerate()), len(asyncio.all_tasks())
+                for _ in range(5):
+                    backend = JupyterBackend(deadline=5)
+                    self.assertIsNone(
+                        (
+                            await self._completion(
+                                backend,
+                                "connect",
+                                _connect_params(fixture.connection_path, artifact_dir),
+                            )
+                        ).error
+                    )
+                    backend.close()
+                    await asyncio.sleep(0)
+                    self.assertEqual(backend._tasks, set())
         if fd_before is not None:
             self.assertLessEqual(len(list(Path("/proc/self/fd").iterdir())), fd_before + 2)
         self.assertLessEqual(len(threading.enumerate()), threads_before + 2)
