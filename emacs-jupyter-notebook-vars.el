@@ -130,6 +130,16 @@ current default directory."
   :type '(repeat string)
   :group 'emacs-jupyter-notebook)
 
+(defcustom emacs-jupyter-notebook-backend 'legacy
+  "Backend implementation used for local Jupyter protocol attachment.
+
+`legacy' uses the existing emacs-jupyter adapter.  It remains the default
+through the transport rollout; selecting another symbol requires a backend
+implementation registered with `emacs-jupyter-notebook-backend-implementations'."
+  :type '(choice (const :tag "Legacy emacs-jupyter adapter" legacy)
+                 (symbol :tag "Registered experimental backend"))
+  :group 'emacs-jupyter-notebook)
+
 (defcustom emacs-jupyter-notebook-helper-hello-timeout 5
   "Maximum seconds allowed for the helper's initial hello response.
 Invalid values fall back to a finite internal deadline."

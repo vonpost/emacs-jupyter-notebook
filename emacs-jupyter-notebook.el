@@ -24,7 +24,7 @@
 (require 'emacs-jupyter-notebook-connection)
 (require 'emacs-jupyter-notebook-ssh)
 (require 'emacs-jupyter-notebook-result)
-(require 'emacs-jupyter-notebook-jupyter)
+(require 'emacs-jupyter-notebook-backend)
 (require 'emacs-jupyter-notebook-viewer)
 
 ;;; W8 — local interactive matplotlib viewer: remote formatter injection
@@ -142,10 +142,15 @@ connect or restart."
     (when client
       (condition-case err
           (progn
-            (emacs-jupyter-notebook-jupyter-execute-silent
-             client emacs-jupyter-notebook--viewer-formatter-snippet)
-            (emacs-jupyter-notebook--log-append
-             'viewer-inject "injected matplotlib pickle formatter into kernel"))
+            (emacs-jupyter-notebook-backend-execute
+             client emacs-jupyter-notebook--viewer-formatter-snippet
+             '(:silent t)
+             (lambda (_request-id _result)
+               (emacs-jupyter-notebook--log-append
+                'viewer-inject "injected matplotlib pickle formatter into kernel"))
+             (lambda (_request-id error-data)
+               (emacs-jupyter-notebook--log-append
+                'viewer-inject "formatter injection failed: %s" error-data))))
         (error
          (emacs-jupyter-notebook--log-append
           'viewer-inject "formatter injection failed: %s"
@@ -277,11 +282,16 @@ logged; watchdog injection must never break a connect or restart."
     (when (and client (integerp timeout) (> timeout 0))
       (condition-case err
           (progn
-            (emacs-jupyter-notebook-jupyter-execute-silent
+            (emacs-jupyter-notebook-backend-execute
              client
-             (format emacs-jupyter-notebook--kernel-idle-watchdog-snippet timeout))
-            (emacs-jupyter-notebook--log-append
-             'kernel-watchdog "injected idle watchdog (timeout=%ss)" timeout))
+             (format emacs-jupyter-notebook--kernel-idle-watchdog-snippet timeout)
+             '(:silent t)
+             (lambda (_request-id _result)
+               (emacs-jupyter-notebook--log-append
+                'kernel-watchdog "injected idle watchdog (timeout=%ss)" timeout))
+             (lambda (_request-id error-data)
+               (emacs-jupyter-notebook--log-append
+                'kernel-watchdog "idle watchdog injection failed: %s" error-data))))
         (error
          (emacs-jupyter-notebook--log-append
           'kernel-watchdog "idle watchdog injection failed: %s"
@@ -427,7 +437,7 @@ figure or the local viewer is unavailable."
     (kill-local-variable 'emacs-jupyter-notebook--saved-imenu-create-index-function-local-p)))
 
 (defvar-local emacs-jupyter-notebook--client nil
-  "Current buffer's emacs-jupyter client object.")
+  "Current buffer's opaque backend session.")
 
 (defvar-local emacs-jupyter-notebook--session-entry nil
   "Current buffer's registry entry plist.")
@@ -593,9 +603,9 @@ resumes on the first tick after the kernel reports non-busy."
                    (when (eq emacs-jupyter-notebook--heartbeat-inflight token)
                      (emacs-jupyter-notebook--heartbeat-on-miss)))))))
       (condition-case _err
-          (emacs-jupyter-notebook-jupyter-kernel-info
-           emacs-jupyter-notebook--client
-           (lambda (reply _error)
+          (emacs-jupyter-notebook-backend-aux
+           emacs-jupyter-notebook--client 'kernel-info nil
+           (lambda (_request-id reply)
              (when (buffer-live-p buffer)
                (with-current-buffer buffer
                  (when (eq emacs-jupyter-notebook--heartbeat-inflight token)
@@ -606,7 +616,15 @@ resumes on the first tick after the kernel reports non-busy."
                    (setq emacs-jupyter-notebook--heartbeat-timeout-timer nil)
                    (if reply
                        (emacs-jupyter-notebook--heartbeat-on-reply)
-                     (emacs-jupyter-notebook--heartbeat-on-miss)))))))
+                     (emacs-jupyter-notebook--heartbeat-on-miss))))))
+           (lambda (_request-id _error)
+             (when (buffer-live-p buffer)
+               (with-current-buffer buffer
+                 (when (eq emacs-jupyter-notebook--heartbeat-inflight token)
+                   (when (timerp emacs-jupyter-notebook--heartbeat-timeout-timer)
+                     (cancel-timer emacs-jupyter-notebook--heartbeat-timeout-timer))
+                   (setq emacs-jupyter-notebook--heartbeat-timeout-timer nil)
+                   (emacs-jupyter-notebook--heartbeat-on-miss))))))
         (error
          (when (buffer-live-p buffer)
            (with-current-buffer buffer
@@ -907,7 +925,8 @@ untouched."
         ;; here, and we do not touch the registry or call shutdown.
         (when client
           (ignore-errors
-            (emacs-jupyter-notebook-jupyter-interrupt client)))
+            (emacs-jupyter-notebook-backend-control
+             client 'interrupt nil #'ignore #'ignore)))
         ;; W6.6: route the timeout into the global log buffer too.
         (emacs-jupyter-notebook--log-append
          'eval-timeout
@@ -921,10 +940,10 @@ untouched."
   "Drop the current buffer's local kernel handles without touching durable state.
 Cancels the in-flight async context's local processes and timers, tears down the
 SSH tunnel process and its stderr buffer, cancels the evaluation timer and the
-completion idle timer, and drops the buffer-local Jupyter client handle.
+completion idle timer, and drops the buffer-local backend session.
 
 This is the disposer used by `kill-buffer-hook' and by the mode-disable
-cleanup.  It does not call `jupyter-shutdown', does not call
+cleanup.  It does not dispatch a backend `shutdown', does not call
 `--cleanup-remote-entry', does not remove the registry entry, and does not
 delete the local connection file.  A CONNECTED kernel and its registry
 entry are the durable reconnect surface and survive buffer kill and mode
@@ -959,8 +978,8 @@ executes."
   (ignore-errors (emacs-jupyter-notebook--cancel-auto-reconnect))
   (ignore-errors
     (when emacs-jupyter-notebook--client
-      (emacs-jupyter-notebook-jupyter-disconnect
-       emacs-jupyter-notebook--client)))
+      (emacs-jupyter-notebook-backend-close-local
+       emacs-jupyter-notebook--client #'ignore #'ignore)))
   (ignore-errors
     (when (processp emacs-jupyter-notebook--tunnel-process)
       (emacs-jupyter-notebook--async-delete-process
@@ -1887,9 +1906,9 @@ it may terminate the kernel that attempt launched."
       (user-error "Kept the in-progress Jupyter connection attempt"))))
 
 (defun emacs-jupyter-notebook--live-client-p ()
-  "Return non-nil when the current buffer owns a live Jupyter client.
+  "Return non-nil when the current buffer owns a live backend session.
 W10: a live `--client' is the ONLY state that must block a fresh start or
-reconnect — leaving it in place would leak a running emacs-jupyter client.
+reconnect — leaving it in place would leak a running local transport.
 A dangling `--session-entry' or SSH `--tunnel-process' with NO client is
 recoverable DEBRIS (see `--clientless-debris-p'), never a live session."
   (and emacs-jupyter-notebook--client t))
@@ -1898,7 +1917,7 @@ recoverable DEBRIS (see `--clientless-debris-p'), never a live session."
   "Return non-nil when the buffer carries reapable connection debris.
 W10 bug: a source buffer was observed live where the remote kernel and
 its SSH tunnel were both alive and `--session-entry' was populated, but
-`--client' was nil (the Jupyter client had dropped) and `--async-context'
+`--client' was nil (the local backend session had dropped) and `--async-context'
 sat at `:phase done'.  The old `--active-session-p' predicate classified
 that state as an active session, so every non-destructive recovery command
 refused it and the buffer was unrecoverable except by nuking the live
@@ -1919,9 +1938,9 @@ so it must not block the non-destructive recovery commands."
 
 (defun emacs-jupyter-notebook--ensure-clean-before-start ()
   "Ensure the current buffer can start or reconnect a kernel without leaking one.
-W10 recovery contract: only a genuinely LIVE client blocks — it must be
+W10 recovery contract: only a genuinely LIVE session blocks — it must be
 shut down (or superseded via `retry-fresh-kernel') first so a running
-emacs-jupyter client is never leaked.  A client-less buffer that still
+local transport is never leaked.  A client-less buffer that still
 carries a dangling `--session-entry' and/or a live SSH tunnel is reapable
 DEBRIS (the wedged state seen live: `--client' nil while entry and tunnel
 linger); reap the LOCAL resources — disposing the stale tunnel and
@@ -2134,7 +2153,8 @@ CONTEXT in place and deliberately does NOT write it back to the buffer, so a
 superseded context cannot be resurrected into the buffer's async slot."
   (when context
     (when-let* ((client (plist-get context :client-unverified)))
-      (ignore-errors (emacs-jupyter-notebook-jupyter-disconnect client)))
+      (ignore-errors
+        (emacs-jupyter-notebook-backend-close-local client #'ignore #'ignore)))
     (ignore-errors (plist-put context :client-unverified nil))))
 
 (defun emacs-jupyter-notebook--async-fail (context error-data)
@@ -2200,7 +2220,7 @@ durable reconnect surface that cancel must never terminate.
 
 Then fails CONTEXT with REASON (default \"Operation cancelled\") — which
 releases its local processes, timers, and temp files — and nils
-`--async-context'.  Never calls `jupyter-shutdown',
+`--async-context'.  Never dispatches a backend `shutdown',
 `--cleanup-remote-entry', or the registry: those terminate a *connected*
 session, which cancel is not."
   ;; Mark cancellation before `--async-fail' invokes the reconnect policy;
@@ -2599,7 +2619,7 @@ to reconnect to.  Arbitrate with a remote PID probe:
                (client (plist-get context :client-unverified)))
           (if (or (plist-get context :owns-kernel)
                   (not pid)
-                  (not client))
+                  (not (emacs-jupyter-notebook-backend-session-attached-p client)))
               (emacs-jupyter-notebook--async-fail
                emacs-jupyter-notebook--async-context
                "Timed out waiting for kernel_info_reply")
@@ -2682,7 +2702,7 @@ to reconnect to.  Arbitrate with a remote PID probe:
                  (local-file (plist-get context :local-file))
                  (buffer (current-buffer)))
             (emacs-jupyter-notebook--async-message
-             context "connecting emacs-jupyter client")
+             context "connecting Jupyter backend")
             (setq emacs-jupyter-notebook--tunnel-process
                   (plist-get context :tunnel-process))
             (emacs-jupyter-notebook--install-tunnel-sentinel
@@ -2696,30 +2716,28 @@ to reconnect to.  Arbitrate with a remote PID probe:
                             #'emacs-jupyter-notebook--async-connect-timeout
                             ctx buffer)))
                 (setq context (emacs-jupyter-notebook--async-put context :timer timer)))
-              ;; W15-B: the adapter attaches WITHOUT blocking and returns the
-              ;; unverified client; the callback fires only when the kernel
-              ;; actually answers kernel-info.  Stash the unverified client so
-              ;; `--async-connect-timeout' can busy-finalize with it.
-              (let ((client (emacs-jupyter-notebook-jupyter-connect-async
-                             local-file
-                             (lambda (client)
-                               ;; Verified: finalize as idle.  If finalize
-                               ;; declines (already busy-finalized or
-                               ;; superseded), a late answer from the
-                               ;; still-installed client means it just
-                               ;; became responsive (W15-B).
-                               (unless (emacs-jupyter-notebook--async-connect-finalize
-                                        ctx buffer entry local-ports local-file client)
-                                 (emacs-jupyter-notebook--connect-verified-late
-                                  buffer client))))))
+              ;; The opaque session is available immediately, while the
+              ;; legacy implementation keeps its unverified EIEIO client
+              ;; private inside it for the busy-kernel timeout arbitration.
+              ;; The verified callback remains fully asynchronous.
+              (let ((session (emacs-jupyter-notebook-backend-session-create
+                              nil buffer)))
                 (setq context (emacs-jupyter-notebook--async-put
-                               context :client-unverified client))
-                ;; Construction failed outright: no client to verify or
-                ;; busy-finalize — fail now rather than wait out the timer.
-                (unless client
-                  (emacs-jupyter-notebook--async-fail
-                   context "Could not attach to the kernel connection file"))))
-            context)
+                               context :client-unverified session))
+                (emacs-jupyter-notebook-backend-connect
+                 session local-file
+                 (lambda (_backend-request-id connected-session)
+                   ;; Verified: finalize as idle.  If finalize declines
+                   ;; (already busy-finalized or superseded), a late answer
+                   ;; means the existing session became responsive (W15-B).
+                   (unless (emacs-jupyter-notebook--async-connect-finalize
+                            ctx buffer entry local-ports local-file connected-session)
+                     (emacs-jupyter-notebook--connect-verified-late
+                      buffer connected-session)))
+                 (lambda (_backend-request-id error-data)
+                   (when (emacs-jupyter-notebook--async-context-live-p ctx)
+                     (emacs-jupyter-notebook--async-fail ctx error-data)))))
+            context))
         (error
          (emacs-jupyter-notebook--async-fail
           context (error-message-string err)))))))
@@ -2811,14 +2829,14 @@ CALLBACK and ERROR-CALLBACK receive the async context.  Durable registry
 state and the remote kernel are left untouched.  OWNER is one of `explicit',
 `evaluation', or `automatic' and defaults to `explicit'."
   (let ((attempt emacs-jupyter-notebook--reconnect-attempt))
-    ;; A stale emacs-jupyter client is only a local handle.  Keeping it is
+    ;; A stale backend session is only a local handle.  Keeping it is
     ;; what made explicit reconnect reject the exact broken state it is
     ;; intended to repair.
     (emacs-jupyter-notebook--release-local-resources)
     (setq emacs-jupyter-notebook--session-entry entry
           emacs-jupyter-notebook--tunnel-dead t
           emacs-jupyter-notebook--reconnect-attempt attempt)
-    (emacs-jupyter-notebook-jupyter--ensure)
+    (emacs-jupyter-notebook-backend-ensure)
     (let* ((profile (emacs-jupyter-notebook--entry-profile entry))
            (context (emacs-jupyter-notebook--async-reconnect-context
                      profile entry callback
@@ -3191,11 +3209,15 @@ arriving after this call is dropped (W3.3)."
                    emacs-jupyter-notebook--completion-pending-id)
         (setq emacs-jupyter-notebook--completion-pending-key key
               emacs-jupyter-notebook--completion-pending-id request-id)
-        (emacs-jupyter-notebook-jupyter-complete
-         emacs-jupyter-notebook--client code cursor-pos
-         (lambda (reply error)
+        (emacs-jupyter-notebook-backend-aux
+         emacs-jupyter-notebook--client 'complete
+         (list :code code :cursor-pos cursor-pos)
+         (lambda (_backend-request-id reply)
            (emacs-jupyter-notebook--completion-on-reply
-            buffer key request-id show-results context reply error)))))))
+            buffer key request-id show-results context reply nil))
+         (lambda (_backend-request-id error)
+           (emacs-jupyter-notebook--completion-on-reply
+            buffer key request-id show-results context nil error)))))))
 
 (defun emacs-jupyter-notebook--completion-schedule-request (&optional show-results)
   "Restart the idle timer that fires an async completion request.
@@ -3294,9 +3316,10 @@ and reports `No completions' rather than doing nothing."
          (buffer (current-buffer))
          (origin-point (point)))
     (message "Requesting completions…")
-    (emacs-jupyter-notebook-jupyter-complete
-     emacs-jupyter-notebook--client code cursor-pos
-     (lambda (reply _error)
+    (emacs-jupyter-notebook-backend-aux
+     emacs-jupyter-notebook--client 'complete
+     (list :code code :cursor-pos cursor-pos)
+     (lambda (_backend-request-id reply)
        (when (buffer-live-p buffer)
          (with-current-buffer buffer
            (if (not (and reply (= (point) origin-point)))
@@ -3306,7 +3329,8 @@ and reports `No completions' rather than doing nothing."
                             reply)))
                (if (and result (nth 2 result) (> (length (nth 2 result)) 0))
                    (apply #'completion-in-region (seq-take result 3))
-                 (message "No completions"))))))))))
+                 (message "No completions")))))))
+     #'ignore)))
 
 (defun emacs-jupyter-notebook-complete-at-point ()
   "Explicit completion command.
@@ -3375,9 +3399,10 @@ in-flight invalidation contract."
          (bounds (emacs-jupyter-notebook-cell-bounds))
          (beg (car bounds))
          (cursor-pos (- (point) beg)))
-    (emacs-jupyter-notebook-jupyter-inspect
-     emacs-jupyter-notebook--client code cursor-pos 0
-     (lambda (reply _error)
+    (emacs-jupyter-notebook-backend-aux
+     emacs-jupyter-notebook--client 'inspect
+     (list :code code :cursor-pos cursor-pos :detail 0)
+     (lambda (_backend-request-id reply)
        (when reply
          (let* ((data (plist-get reply :data))
                 (text (plist-get data :text/plain)))
@@ -3386,7 +3411,8 @@ in-flight invalidation contract."
              ;; escapes; decode them to faces instead of dumping literal
              ;; `\e[0;31m...' into the echo area / *Message* buffer.
              (display-message-or-buffer
-              (string-trim-right (ansi-color-apply text))))))))))
+              (string-trim-right (ansi-color-apply text))))))))
+     (lambda (&rest _ignored) nil)))
 
 ;;; Evaluation
 
@@ -3425,19 +3451,21 @@ CELL-KEY may be nil for region/paragraph/defun evaluation."
     (when cell-key
       (emacs-jupyter-notebook-fringe-set cell-key 'running))
     (prog1
-        (emacs-jupyter-notebook-jupyter-evaluate
-         emacs-jupyter-notebook--client code handle)
+        (emacs-jupyter-notebook-backend-execute
+         emacs-jupyter-notebook--client code (list :entry-handle handle)
+         #'ignore #'ignore)
       (set-buffer-modified-p modified))))
 
 (defun emacs-jupyter-notebook--evaluate-after-completeness-cell (code cell-key)
   "Check CODE completeness and evaluate if complete, posting to CELL-KEY."
   (if (not emacs-jupyter-notebook-check-code-completeness)
       (emacs-jupyter-notebook--evaluate-code-now code cell-key)
-    (emacs-jupyter-notebook-jupyter-is-complete
-     emacs-jupyter-notebook--client code
-     (lambda (reply _error)
+    (emacs-jupyter-notebook-backend-aux
+     emacs-jupyter-notebook--client 'is-complete (list :code code)
+     (lambda (_backend-request-id reply)
        (when (and reply (equal (plist-get reply :status) "complete"))
-         (emacs-jupyter-notebook--evaluate-code-now code cell-key))))))
+         (emacs-jupyter-notebook--evaluate-code-now code cell-key)))
+     #'ignore)))
 
 (defun emacs-jupyter-notebook--evaluate-code (code cell-key)
   "Ensure client then evaluate CODE, posting output to CELL-KEY's entry.
@@ -3478,7 +3506,8 @@ non-nil, do not send a Jupyter shutdown request to the current client."
       (emacs-jupyter-notebook--async-fail context (or reason "Operation cancelled")))
     (when (and emacs-jupyter-notebook--client (not skip-jupyter-shutdown))
       (ignore-errors
-        (emacs-jupyter-notebook-jupyter-shutdown emacs-jupyter-notebook--client)))
+        (emacs-jupyter-notebook-backend-control
+         emacs-jupyter-notebook--client 'shutdown nil #'ignore #'ignore)))
     (when (processp emacs-jupyter-notebook--tunnel-process)
       (emacs-jupyter-notebook--async-delete-process
        emacs-jupyter-notebook--tunnel-process))
@@ -3519,7 +3548,7 @@ non-nil, do not send a Jupyter shutdown request to the current client."
     (user-error "Buffer has no associated file"))
   (emacs-jupyter-notebook--ensure-no-async-operation)
   (emacs-jupyter-notebook--ensure-clean-before-start)
-  (emacs-jupyter-notebook-jupyter--ensure)
+  (emacs-jupyter-notebook-backend-ensure)
   (let* ((profile (emacs-jupyter-notebook--read-host-profile profile-name))
          (session-id (emacs-jupyter-notebook--new-session-id
                       (file-name-base buffer-file-name)))
@@ -3708,13 +3737,13 @@ before sending; a \\[universal-argument] FORCE prefix skips the prompt."
 (defun emacs-jupyter-notebook-interrupt-kernel ()
   "Interrupt the current kernel."
   (interactive)
-  (emacs-jupyter-notebook-jupyter-interrupt
-   (emacs-jupyter-notebook--ensure-client)))
+  (emacs-jupyter-notebook-backend-control
+   (emacs-jupyter-notebook--ensure-client) 'interrupt nil #'ignore #'ignore))
 
 ;;;###autoload
 (defun emacs-jupyter-notebook--reinject-after-restart (client)
   "Re-inject the viewer formatter and idle watchdog once CLIENT's kernel is back.
-W13-Viewer3: `jupyter-restart-kernel' relaunches the kernel asynchronously,
+W13-Viewer3: the backend restart relaunches the kernel asynchronously,
 so firing the silent formatter/watchdog `execute_request's synchronously
 right after the restart call races the teardown — they can be dropped
 against the dying kernel, after which inline figures silently stop carrying
@@ -3724,12 +3753,13 @@ kernel is up and its channels are live.  If the kernel never answers (a
 failed restart) nothing is injected, which is correct — there is no live
 kernel to patch, and the heartbeat will surface the death."
   (when client
-    (emacs-jupyter-notebook-jupyter-kernel-info
-     client
-     (lambda (reply _error)
+    (emacs-jupyter-notebook-backend-aux
+     client 'kernel-info nil
+     (lambda (_backend-request-id reply)
        (when reply
          (emacs-jupyter-notebook--inject-viewer-formatter client)
-         (emacs-jupyter-notebook--inject-idle-watchdog client))))))
+         (emacs-jupyter-notebook--inject-idle-watchdog client)))
+     #'ignore)))
 
 (defun emacs-jupyter-notebook-restart-kernel ()
   "Restart the current kernel through emacs-jupyter.
@@ -3740,8 +3770,11 @@ once the restarted kernel answers a `kernel_info_request', so the injection
 cannot race the async relaunch and be lost."
   (interactive)
   (let ((client (emacs-jupyter-notebook--ensure-client)))
-    (emacs-jupyter-notebook-jupyter-restart client)
-    (emacs-jupyter-notebook--reinject-after-restart client)))
+    (emacs-jupyter-notebook-backend-control
+     client 'restart nil
+     (lambda (_request-id _result)
+       (emacs-jupyter-notebook--reinject-after-restart client))
+     #'ignore)))
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-shutdown-kernel (&optional force)
@@ -3766,7 +3799,7 @@ skips the prompt.  Unlike buffer kill / mode disable, this command is an
 explicit ROADMAP W6.4 kernel terminator: `--cleanup-current-state' kills
 the currently-registered remote kernel and removes its registry entry
 before launching the replacement (that is the whole point — replace the
-current kernel with a fresh one).  Only the in-band `jupyter-shutdown' is
+current kernel with a fresh one).  Only the in-band backend `shutdown' is
 skipped; the out-of-band remote `pkill' and deregistration still run."
   (interactive "P")
   (let* ((profile-name (and (stringp force-or-profile) force-or-profile))
@@ -4213,7 +4246,7 @@ If neither is in progress, signal a `user-error'."
 
 (defun emacs-jupyter-notebook--cancel-evaluation ()
   "Interrupt the in-flight evaluation and clear the request slot.
-Best-effort.  Does NOT call `jupyter-shutdown', does NOT remove the
+Best-effort.  Does NOT dispatch backend `shutdown', does NOT remove the
 registry entry, does NOT touch the local connection file — the remote
 kernel outlives Emacs.  Annotates the panel entry with a \"cancelled\"
 suffix and tags the cell fringe as errored."
@@ -4237,7 +4270,8 @@ suffix and tags the cell fringe as errored."
         (emacs-jupyter-notebook-fringe-set cell-key 'error nil)))
     (when client
       (ignore-errors
-        (emacs-jupyter-notebook-jupyter-interrupt client)))))
+        (emacs-jupyter-notebook-backend-control
+         client 'interrupt nil #'ignore #'ignore)))))
 
 (defun emacs-jupyter-notebook-toggle-panel-view ()
   "Toggle the source buffer's output panel between latest and history views."

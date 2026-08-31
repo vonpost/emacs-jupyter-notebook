@@ -11,6 +11,19 @@
 (require 'cl-lib)
 (require 'benchmark)
 (require 'emacs-jupyter-notebook)
+(require 'emacs-jupyter-notebook-jupyter)
+
+(defun ejn-test-backend-session (&optional raw-client attached)
+  "Create a test backend session with optional legacy RAW-CLIENT data.
+When ATTACHED is non-nil, mark the opaque session as locally attached so
+busy-kernel reconnect arbitration may retain it after verification times out."
+  (let ((session (emacs-jupyter-notebook-backend-session-create
+                  nil (current-buffer))))
+    (when raw-client
+      (setf (emacs-jupyter-notebook-backend-session-data session) raw-client))
+    (when attached
+      (emacs-jupyter-notebook-backend-session-mark-attached session))
+    session))
 
 (defmacro ejn-test-with-temp-buffer (content &rest body)
   "Create a temporary buffer containing CONTENT and evaluate BODY."
@@ -51,6 +64,14 @@
     (and (not (plist-member (cdr spec) :data))
          (stringp file)
          (file-readable-p file))))
+
+(defun ejn-test-drain-zero-delay-timers ()
+  "Run callbacks deferred onto Emacs's zero-delay timer queue.
+
+This is the test equivalent of returning to the command loop; it does not
+wait for wall-clock time or weaken assertions about callback ordering."
+  (dotimes (_ 4)
+    (accept-process-output nil 0)))
 
 (ert-deftest ejn-cell-no-marker-is-whole-buffer ()
   (ejn-test-with-temp-buffer "x = 1\ny = 2\n"
@@ -1299,7 +1320,8 @@ so it cannot fire (and bump misses) after cleanup."
   "W4.5: a successful heartbeat reply keeps `--tunnel-dead' nil and resets
 the miss counter regardless of prior misses."
   (with-temp-buffer
-    (setq emacs-jupyter-notebook--client 'mock-client)
+    (setq emacs-jupyter-notebook--client
+          (ejn-test-backend-session 'mock-client t))
     (setq emacs-jupyter-notebook--heartbeat-misses 1)
     (let ((emacs-jupyter-notebook-heartbeat-misses-allowed 2)
           (emacs-jupyter-notebook-heartbeat-timeout 0.2))
@@ -1307,6 +1329,7 @@ the miss counter regardless of prior misses."
                  (lambda (_client cb)
                    (funcall cb '(:status "ok") nil))))
         (emacs-jupyter-notebook--heartbeat-tick)
+        (ejn-test-drain-zero-delay-timers)
         (should (= 0 emacs-jupyter-notebook--heartbeat-misses))
         (should-not emacs-jupyter-notebook--tunnel-dead)))))
 
@@ -1405,7 +1428,8 @@ Output goes to the panel; the source buffer is untouched."
   (ejn-test-with-temp-buffer "# %%\na = 1\n# %%\nb = 2\n"
     (search-forward "a = 1")
     (let ((before (buffer-string))
-          (emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           captured-code)
       (let ((emacs-jupyter-notebook-jupyter-evaluate-function
              (lambda (_client code _entry)
@@ -1555,7 +1579,8 @@ deactivated the standard region before the interactive form runs."
   (ejn-test-with-temp-buffer "x = 1\ny = 2\n"
     (let ((before (buffer-string))
           (modified (buffer-modified-p))
-          (emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           calls)
       (let ((emacs-jupyter-notebook-jupyter-evaluate-function
              (lambda (_client code entry-handle)
@@ -1627,7 +1652,8 @@ deactivated the standard region before the interactive form runs."
                     ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry) #'ignore)
                     ((symbol-function 'emacs-jupyter-notebook-ssh-start-process) #'ignore))
             (with-temp-buffer
-              (setq emacs-jupyter-notebook--client 'mock)
+              (setq emacs-jupyter-notebook--client
+                    (ejn-test-backend-session 'mock t))
               (setq emacs-jupyter-notebook--session-entry target-entry)
               (setq emacs-jupyter-notebook--tunnel-process nil)
               (emacs-jupyter-notebook-shutdown-kernel)
@@ -1729,7 +1755,8 @@ visible and diagnosable."
                      (lambda (key &optional _file)
                        (setq removed-key key))))
             (with-temp-buffer
-              (setq emacs-jupyter-notebook--client 'mock-client)
+              (setq emacs-jupyter-notebook--client
+                    (ejn-test-backend-session 'mock-client t))
               (setq emacs-jupyter-notebook--session-entry entry)
               (setq emacs-jupyter-notebook--tunnel-dead t)
               (emacs-jupyter-notebook--cleanup-current-state "cleanup")
@@ -1940,7 +1967,8 @@ client) never kills the remote kernel — it is the durable reconnect surface."
       (let ((buffer (generate-new-buffer "ejn-w12-connected")))
         (with-current-buffer buffer
           (emacs-jupyter-notebook-mode 1)
-          (setq emacs-jupyter-notebook--client 'mock-client)
+          (setq emacs-jupyter-notebook--client
+                (ejn-test-backend-session 'mock-client t))
           (setq emacs-jupyter-notebook--async-context
                 (emacs-jupyter-notebook--async-new-context
                  :phase 'done
@@ -2053,7 +2081,8 @@ client) never kills the remote kernel — it is the durable reconnect surface."
 
 (ert-deftest ejn-evaluate-cell-with-existing-client-evaluates-immediately ()
   (ejn-test-with-temp-buffer "# %%\na = 1\n"
-    (let ((emacs-jupyter-notebook--client 'mock-client)
+    (let ((emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           captured)
       (let ((emacs-jupyter-notebook-jupyter-evaluate-function
              (lambda (_client code _entry-handle)
@@ -2079,7 +2108,8 @@ client) never kills the remote kernel — it is the durable reconnect surface."
                            &optional _error-callback owner)
                     (setq reconnect-captured (cons captured-entry callback))
                     (setq reconnect-owner owner)
-                    (setq emacs-jupyter-notebook--client 'mock-client)
+                    (setq emacs-jupyter-notebook--client
+                          (ejn-test-backend-session 'mock-client t))
                     (funcall callback nil))))
         (emacs-jupyter-notebook-send-cell)
         (should (equal (car reconnect-captured) entry))
@@ -2102,7 +2132,8 @@ client) never kills the remote kernel — it is the durable reconnect surface."
                  ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
                   (lambda (profile callback &optional _error-callback)
                     (setq start-captured (cons profile callback))
-                    (setq emacs-jupyter-notebook--client 'mock-client)
+                    (setq emacs-jupyter-notebook--client
+                          (ejn-test-backend-session 'mock-client t))
                     (funcall callback nil))))
         (emacs-jupyter-notebook-send-cell)
         (should (equal (car start-captured) "mydefault"))
@@ -2132,7 +2163,8 @@ client) never kills the remote kernel — it is the durable reconnect surface."
       (should-not eval-called)
       (let ((cb (plist-get emacs-jupyter-notebook--async-context :callback)))
         (should (functionp cb))
-        (setq emacs-jupyter-notebook--client 'mock-client)
+        (setq emacs-jupyter-notebook--client
+              (ejn-test-backend-session 'mock-client t))
         (funcall cb emacs-jupyter-notebook--async-context)
         (should eval-called)))))
 
@@ -2248,7 +2280,8 @@ client) never kills the remote kernel — it is the durable reconnect surface."
   ;; via `completion-in-region'.
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
     (search-forward "my_obj.met")
-    (let* ((emacs-jupyter-notebook--client 'mock-client)
+    (let* ((emacs-jupyter-notebook--client
+            (ejn-test-backend-session 'mock-client t))
            (emacs-jupyter-notebook--completion-pending-key nil)
            (emacs-jupyter-notebook--completion-pending-id nil)
            (emacs-jupyter-notebook--completion-request-counter 0)
@@ -2263,6 +2296,7 @@ client) never kills the remote kernel — it is the durable reconnect surface."
         (cl-letf (((symbol-function 'completion-in-region)
                    (lambda (&rest _args) (setq triggered t))))
           (emacs-jupyter-notebook--request-completion t)
+          (ejn-test-drain-zero-delay-timers)
           (should triggered))))))
 
 (ert-deftest ejn-completion-no-duplicate-request ()
@@ -2291,7 +2325,8 @@ IMMEDIATELY (not via the debounced idle timer) and drives
 reliably shows candidates instead of silently requiring a second press."
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
     (search-forward "my_obj.met")
-    (let ((emacs-jupyter-notebook--client 'mock-client)
+    (let ((emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           (emacs-jupyter-notebook--completion-cache nil)
           (emacs-jupyter-notebook--completion-cache-order nil)
           adapter-code shown)
@@ -2304,6 +2339,7 @@ reliably shows candidates instead of silently requiring a second press."
                                      :cursor_start 7 :cursor_end 10)
                           nil))))
           (emacs-jupyter-notebook-complete-at-point))
+        (ejn-test-drain-zero-delay-timers)
         (should adapter-code)
         (should shown)
         (should (member "method" (nth 2 shown)))))))
@@ -2316,7 +2352,8 @@ reliably shows candidates instead of silently requiring a second press."
   ;; confirming a request is actually sent.
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
     (search-forward "my_obj.met")
-    (let ((emacs-jupyter-notebook--client 'mock-client)
+    (let ((emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           (emacs-jupyter-notebook--completion-cache nil)
           (emacs-jupyter-notebook--completion-cache-order nil)
           (emacs-jupyter-notebook--completion-pending-key nil)
@@ -2530,7 +2567,8 @@ reliably shows candidates instead of silently requiring a second press."
     (unwind-protect
         (progn
           (search-forward "my_obj.met")
-          (let ((emacs-jupyter-notebook--client 'mock-client)
+          (let ((emacs-jupyter-notebook--client
+                 (ejn-test-backend-session 'mock-client t))
                 (emacs-jupyter-notebook--completion-cache nil)
                 (emacs-jupyter-notebook--completion-cache-order nil)
                 (emacs-jupyter-notebook--completion-idle-timer nil)
@@ -2576,7 +2614,8 @@ reliably shows candidates instead of silently requiring a second press."
   ;; not refresh the UI.
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
     (search-forward "my_obj.met")
-    (let ((emacs-jupyter-notebook--client 'mock-client)
+    (let ((emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           (emacs-jupyter-notebook--completion-cache nil)
           (emacs-jupyter-notebook--completion-cache-order nil)
           (emacs-jupyter-notebook--completion-pending-key nil)
@@ -2613,7 +2652,8 @@ reliably shows candidates instead of silently requiring a second press."
   ;; it lands in the cache and the UI refresh runs.
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
     (search-forward "my_obj.met")
-    (let ((emacs-jupyter-notebook--client 'mock-client)
+    (let ((emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           (emacs-jupyter-notebook--completion-cache nil)
           (emacs-jupyter-notebook--completion-cache-order nil)
           (emacs-jupyter-notebook--completion-pending-key nil)
@@ -2631,6 +2671,7 @@ reliably shows candidates instead of silently requiring a second press."
           (funcall captured-callback
                    '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10)
                    nil)
+          (ejn-test-drain-zero-delay-timers)
           (let ((key (emacs-jupyter-notebook--completion-key)))
             (should (gethash key emacs-jupyter-notebook--completion-cache)))
           (should (equal ui-refresh-count 1)))))))
@@ -2643,7 +2684,8 @@ reliably shows candidates instead of silently requiring a second press."
       (python-mode)
       (insert "# %%\nmy_obj.met\n")
       (goto-char (point-max))
-      (setq-local emacs-jupyter-notebook--client 'mock-client)
+      (setq-local emacs-jupyter-notebook--client
+                  (ejn-test-backend-session 'mock-client t))
       (let ((emacs-jupyter-notebook-jupyter-complete-function
              (lambda (_client _code _pos cb) (setq captured-cb cb))))
         (emacs-jupyter-notebook--request-completion t)))
@@ -2713,7 +2755,8 @@ reliably shows candidates instead of silently requiring a second press."
   ;; popup picks up the new candidates from the cache then.
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
     (search-forward "my_obj.met")
-    (let ((emacs-jupyter-notebook--client 'mock-client)
+    (let ((emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           (emacs-jupyter-notebook--completion-cache nil)
           (emacs-jupyter-notebook--completion-cache-order nil)
           (emacs-jupyter-notebook--completion-pending-key nil)
@@ -2730,13 +2773,15 @@ reliably shows candidates instead of silently requiring a second press."
           (funcall captured-cb
                    '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10)
                    nil)
+          (ejn-test-drain-zero-delay-timers)
           (should-not fallback-called))))))
 
 (ert-deftest ejn-w3.5-reply-refreshes-company-via-manual-begin ()
   ;; When company is active, the reply path calls `company-manual-begin'.
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
     (search-forward "my_obj.met")
-    (let ((emacs-jupyter-notebook--client 'mock-client)
+    (let ((emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           (emacs-jupyter-notebook--completion-cache nil)
           (emacs-jupyter-notebook--completion-cache-order nil)
           (emacs-jupyter-notebook--completion-pending-key nil)
@@ -2754,6 +2799,7 @@ reliably shows candidates instead of silently requiring a second press."
           (funcall captured-cb
                    '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10)
                    nil)
+          (ejn-test-drain-zero-delay-timers)
           (should (eq refresh-called 'company-manual)))))))
 
 (ert-deftest ejn-w3.5-reply-refreshes-fallback-completion-in-region ()
@@ -2761,7 +2807,8 @@ reliably shows candidates instead of silently requiring a second press."
   ;; `completion-in-region'.
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
     (search-forward "my_obj.met")
-    (let ((emacs-jupyter-notebook--client 'mock-client)
+    (let ((emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           (emacs-jupyter-notebook--completion-cache nil)
           (emacs-jupyter-notebook--completion-cache-order nil)
           (emacs-jupyter-notebook--completion-pending-key nil)
@@ -2777,6 +2824,7 @@ reliably shows candidates instead of silently requiring a second press."
           (funcall captured-cb
                    '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10)
                    nil)
+          (ejn-test-drain-zero-delay-timers)
           (should fallback-called))))))
 
 (ert-deftest ejn-w3.7-context-changed-drops-reply-entirely ()
@@ -2786,7 +2834,8 @@ reliably shows candidates instead of silently requiring a second press."
   ;; later returned to that context after the kernel state had drifted.
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
     (search-forward "my_obj.met")
-    (let ((emacs-jupyter-notebook--client 'mock-client)
+    (let ((emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           (emacs-jupyter-notebook--completion-cache nil)
           (emacs-jupyter-notebook--completion-cache-order nil)
           (emacs-jupyter-notebook--completion-pending-key nil)
@@ -2865,7 +2914,8 @@ reliably shows candidates instead of silently requiring a second press."
   (ejn-test-with-temp-buffer "# %%\nrange(5)\n"
     (goto-char (point-min))
     (search-forward "range")
-    (let ((emacs-jupyter-notebook--client 'mock-client)
+    (let ((emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
            captured-code
            captured-pos
            captured-detail
@@ -2883,7 +2933,8 @@ reliably shows candidates instead of silently requiring a second press."
           (emacs-jupyter-notebook-inspect-at-point)
           (should-not displayed)
           (funcall inspect-callback
-                   '(:found t :data (:text/plain "range docs")) nil)))
+                   '(:found t :data (:text/plain "range docs")) nil)
+          (ejn-test-drain-zero-delay-timers)))
       (should (equal displayed "range docs"))
       (should (equal captured-code "range(5)\n"))
       (should (= captured-pos 5))
@@ -2896,7 +2947,8 @@ as literal `\\e[0;31m...' sequences into the echo area / *Message*."
   (ejn-test-with-temp-buffer "# %%\nrange(5)\n"
     (goto-char (point-min))
     (search-forward "range")
-    (let ((emacs-jupyter-notebook--client 'mock-client)
+    (let ((emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           displayed inspect-callback)
       (cl-letf (((symbol-function 'display-message-or-buffer)
                  (lambda (m &rest _) (setq displayed m))))
@@ -2907,7 +2959,8 @@ as literal `\\e[0;31m...' sequences into the echo area / *Message*."
                    (list :found t
                          :data (list :text/plain
                                      "\e[0;31mSignature:\e[0m range(stop)\n"))
-                   nil)))
+                   nil)
+          (ejn-test-drain-zero-delay-timers)))
       ;; No raw escape sequence survived, the visible text is intact, and
       ;; the trailing newline was trimmed.
       (should displayed)
@@ -2922,7 +2975,8 @@ nil :data ())' — an EMPTY data plist.  The callback must display nothing
 Pins the real reply shape the happy-path test never exercises."
   (ejn-test-with-temp-buffer "# %%\nnope\n"
     (search-forward "nope")
-    (let ((emacs-jupyter-notebook--client 'mock-client)
+    (let ((emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           displayed inspect-callback)
       (cl-letf (((symbol-function 'display-message-or-buffer)
                  (lambda (m &rest _) (setq displayed m))))
@@ -2969,7 +3023,8 @@ quoted case."
 
 (ert-deftest ejn-evaluate-cell-completeness-check-skips-incomplete-code-async ()
   (ejn-test-with-temp-buffer "# %%\nif True:\n"
-    (let ((emacs-jupyter-notebook--client 'mock-client)
+    (let ((emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           (emacs-jupyter-notebook-check-code-completeness t)
           eval-called
           callback)
@@ -3063,7 +3118,8 @@ quoted case."
 
 (ert-deftest ejn-evaluate-cell-completeness-check-allows-complete-code-async ()
   (ejn-test-with-temp-buffer "# %%\nx = 1\n"
-    (let ((emacs-jupyter-notebook--client 'mock-client)
+    (let ((emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           (emacs-jupyter-notebook-check-code-completeness t)
           eval-called
           callback)
@@ -3076,7 +3132,8 @@ quoted case."
         (emacs-jupyter-notebook-send-cell)
         (should callback)
         (should-not eval-called)
-        (funcall callback '(:status "complete") nil))
+        (funcall callback '(:status "complete") nil)
+        (ejn-test-drain-zero-delay-timers))
       (should eval-called))))
 
 (ert-deftest ejn-status-message-sets-kernel-status ()
@@ -3436,7 +3493,8 @@ tearing down a tunnel whose death-sentinel is armed never spuriously sets
                    (should (functionp callback))
                    (should (functionp error-callback))
                    (setq emacs-jupyter-notebook--tunnel-dead nil)
-                   (setq emacs-jupyter-notebook--client 'mock-client)
+                   (setq emacs-jupyter-notebook--client
+                         (ejn-test-backend-session 'mock-client t))
                    (funcall callback nil))))
         (emacs-jupyter-notebook-send-cell)
         (should reconnect-called)
@@ -3489,7 +3547,8 @@ the evaluate flow."
                    (setq reconnect-called t)
                    (should (functionp callback))
                    (setq emacs-jupyter-notebook--tunnel-dead nil)
-                   (setq emacs-jupyter-notebook--client 'mock-client)
+                   (setq emacs-jupyter-notebook--client
+                         (ejn-test-backend-session 'mock-client t))
                    (funcall callback nil))))
         (emacs-jupyter-notebook-send-cell)
         (should reconnect-called)
@@ -3928,7 +3987,8 @@ the evaluate flow."
   (with-temp-buffer
     (let* ((panel (ejn-panel-ensure (current-buffer)))
            (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
-           (emacs-jupyter-notebook--client 'mock-client)
+           (emacs-jupyter-notebook--client
+            (ejn-test-backend-session 'mock-client t))
            (emacs-jupyter-notebook--evaluation-request
             (list :request-id 1
                   :panel-entry handle
@@ -3946,7 +4006,8 @@ the evaluate flow."
   (with-temp-buffer
     (let* ((panel (ejn-panel-ensure (current-buffer)))
            (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
-           (emacs-jupyter-notebook--client 'mock-client)
+           (emacs-jupyter-notebook--client
+            (ejn-test-backend-session 'mock-client t))
            (emacs-jupyter-notebook--evaluation-request
             (list :request-id 1
                   :panel-entry handle
@@ -3970,7 +4031,8 @@ the evaluate flow."
   (with-temp-buffer
     (let* ((panel (ejn-panel-ensure (current-buffer)))
            (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
-           (emacs-jupyter-notebook--client 'mock-client)
+           (emacs-jupyter-notebook--client
+            (ejn-test-backend-session 'mock-client t))
            (emacs-jupyter-notebook--evaluation-request
             (list :request-id 1
                   :panel-entry handle
@@ -3986,7 +4048,8 @@ the evaluate flow."
   (with-temp-buffer
     (let* ((panel (ejn-panel-ensure (current-buffer)))
            (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
-           (emacs-jupyter-notebook--client 'mock-client)
+           (emacs-jupyter-notebook--client
+            (ejn-test-backend-session 'mock-client t))
            (emacs-jupyter-notebook--evaluation-request
             (list :request-id 1
                   :panel-entry handle
@@ -4033,7 +4096,8 @@ the evaluate flow."
 invoke the interactive command, assert the stub saw the buffer-local
 client."
   (with-temp-buffer
-    (let ((emacs-jupyter-notebook--client 'mock-client)
+    (let ((emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           captured)
       (let ((emacs-jupyter-notebook-jupyter-interrupt-function
              (lambda (client) (setq captured client))))
@@ -4044,7 +4108,8 @@ client."
   "W5.4: `emacs-jupyter-notebook-restart-kernel' calls
 `emacs-jupyter-notebook-jupyter-restart-function'."
   (with-temp-buffer
-    (let ((emacs-jupyter-notebook--client 'mock-client)
+    (let ((emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           ;; W13-Viewer3: re-injection is gated on kernel_info; stub the
           ;; adapter so it does not reach the real (unloaded) emacs-jupyter.
           (emacs-jupyter-notebook-jupyter-kernel-info-function
@@ -4083,7 +4148,8 @@ falling into the async-fail branch."
   (with-temp-buffer
     (let* ((panel (ejn-panel-ensure (current-buffer)))
            (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
-           (emacs-jupyter-notebook--client 'mock-client)
+           (emacs-jupyter-notebook--client
+            (ejn-test-backend-session 'mock-client t))
            ;; Simulate the post-connect-finalize state: context not nil,
            ;; phase is `done'.
            (emacs-jupyter-notebook--async-context
@@ -4233,7 +4299,8 @@ hypothetically did work — the adapter is fire-and-forget."
   (with-temp-buffer
     (let* ((panel (ejn-panel-ensure (current-buffer)))
            (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
-           (emacs-jupyter-notebook--client 'mock-client)
+           (emacs-jupyter-notebook--client
+            (ejn-test-backend-session 'mock-client t))
            (emacs-jupyter-notebook--async-context nil)
            (emacs-jupyter-notebook--evaluation-request
             (list :request-id 1
@@ -4270,7 +4337,8 @@ hypothetically did work — the adapter is fire-and-forget."
   (with-temp-buffer
     (let* ((panel (ejn-panel-ensure (current-buffer)))
            (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
-           (emacs-jupyter-notebook--client 'mock-client)
+           (emacs-jupyter-notebook--client
+            (ejn-test-backend-session 'mock-client t))
            (emacs-jupyter-notebook--async-context nil)
            (emacs-jupyter-notebook--evaluation-request
             (list :request-id 1
@@ -4303,7 +4371,8 @@ hypothetically did work — the adapter is fire-and-forget."
   (with-temp-buffer
     (let* ((panel (ejn-panel-ensure (current-buffer)))
            (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
-           (emacs-jupyter-notebook--client 'mock-client)
+           (emacs-jupyter-notebook--client
+            (ejn-test-backend-session 'mock-client t))
            (emacs-jupyter-notebook--async-context nil)
            (emacs-jupyter-notebook--evaluation-request
             (list :request-id 1
@@ -4323,7 +4392,8 @@ Mock interrupt to a no-op; the interactive cancel path must not block."
   (with-temp-buffer
     (let* ((panel (ejn-panel-ensure (current-buffer)))
            (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
-           (emacs-jupyter-notebook--client 'mock-client)
+           (emacs-jupyter-notebook--client
+            (ejn-test-backend-session 'mock-client t))
            (emacs-jupyter-notebook--async-context nil)
            (emacs-jupyter-notebook--evaluation-request
             (list :request-id 1
@@ -4341,7 +4411,8 @@ Mock interrupt to a no-op; the interactive cancel path must not block."
     (let* ((panel (ejn-panel-ensure (current-buffer)))
            (cell-key '("x.py" . 1))
            (handle (ejn-panel-start-entry panel cell-key "x = 1"))
-           (emacs-jupyter-notebook--client 'mock-client)
+           (emacs-jupyter-notebook--client
+            (ejn-test-backend-session 'mock-client t))
            (emacs-jupyter-notebook--evaluation-request
             (list :request-id 1
                   :panel-entry handle
@@ -4405,6 +4476,7 @@ Mock interrupt to a no-op; the interactive cancel path must not block."
   (let ((entry '(:profile "p" :session-id "session"))
         (local-ports '(:shell_port 1001))
         (local-file "/tmp/test.json")
+        (session nil)
         (emacs-jupyter-notebook--client nil)
         (emacs-jupyter-notebook--session-entry nil)
         saved-entry)
@@ -4415,12 +4487,13 @@ Mock interrupt to a no-op; the interactive cancel path must not block."
                       :entry entry
                       :origin-buffer (current-buffer))))
         (setq emacs-jupyter-notebook--async-context context)
+        (setq session (ejn-test-backend-session 'mock-client t))
         (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
                    (lambda (entry &optional _file)
                      (setq saved-entry entry))))
           (emacs-jupyter-notebook--async-connect-finalize
-           context buffer entry local-ports local-file 'mock-client))
-        (should (eq emacs-jupyter-notebook--client 'mock-client))
+           context buffer entry local-ports local-file session))
+        (should (eq emacs-jupyter-notebook--client session))
         (should (eq (plist-get emacs-jupyter-notebook--async-context :phase) 'done))
         (should (equal (plist-get saved-entry :session-id) "session"))
         (should (equal (plist-get emacs-jupyter-notebook--session-entry :tunnel-ports)
@@ -4491,6 +4564,7 @@ finalize as connected-BUSY: client installed, status busy, phase done,
 registry saved — no failure."
   (with-temp-buffer
     (let* ((buffer (current-buffer))
+           (session (ejn-test-backend-session 'mock-client t))
            (entry '(:profile "p" :session-id "s15" :remote-host "h"
                     :remote-pid 4242
                     :remote-connection-file "/r/k.json"))
@@ -4501,7 +4575,7 @@ registry saved — no failure."
                      :session-id "s15"
                      :local-ports '(:shell_port 1001)
                      :local-file "/tmp/k15.json"
-                     :client-unverified 'mock-client
+                     :client-unverified session
                      :origin-buffer buffer))
            failed)
       (setq emacs-jupyter-notebook--async-context context)
@@ -4515,12 +4589,12 @@ registry saved — no failure."
                   "echo __EJN_ALIVE__; echo __EJN_DONE__")))
         (emacs-jupyter-notebook--async-connect-timeout context buffer)
         (let ((deadline (+ (float-time) 5)))
-          (while (and (not (eq emacs-jupyter-notebook--client 'mock-client))
+          (while (and (not (eq emacs-jupyter-notebook--client session))
                       (not failed)
                       (< (float-time) deadline))
             (accept-process-output nil 0.02))))
       (should-not failed)
-      (should (eq emacs-jupyter-notebook--client 'mock-client))
+      (should (eq emacs-jupyter-notebook--client session))
       (should (eq emacs-jupyter-notebook--kernel-status 'busy))
       (should (eq (plist-get emacs-jupyter-notebook--async-context :phase) 'done)))))
 
@@ -4529,6 +4603,7 @@ registry saved — no failure."
 kernel-dead message; no client installed."
   (with-temp-buffer
     (let* ((buffer (current-buffer))
+           (session (ejn-test-backend-session 'mock-client t))
            (entry '(:profile "p" :session-id "s15d" :remote-host "h"
                     :remote-pid 4243
                     :remote-connection-file "/r/k.json"))
@@ -4537,7 +4612,7 @@ kernel-dead message; no client installed."
                      :profile '(:profile "p" :host "h")
                      :entry entry
                      :session-id "s15d"
-                     :client-unverified 'mock-client
+                     :client-unverified session
                      :origin-buffer buffer))
            fail-reason)
       (setq emacs-jupyter-notebook--async-context context)
@@ -4551,6 +4626,36 @@ kernel-dead message; no client installed."
             (accept-process-output nil 0.02))))
       (should fail-reason)
       (should (string-match-p "no longer alive" fail-reason))
+      (should-not emacs-jupyter-notebook--client))))
+
+(ert-deftest ejn-w15-connect-timeout-unattached-session-does-not-probe-pid ()
+  "W15-B: an opaque but unattached reconnect session must not busy-finalize.
+Even with a recorded live PID, no local channel exists yet, so timeout fails
+directly without starting the busy-kernel PID probe."
+  (with-temp-buffer
+    (let* ((buffer (current-buffer))
+           (session (ejn-test-backend-session 'mock-client nil))
+           (entry '(:profile "p" :session-id "s15u" :remote-host "h"
+                    :remote-pid 4244
+                    :remote-connection-file "/r/k.json"))
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'connect
+                     :profile '(:profile "p" :host "h")
+                     :entry entry
+                     :session-id "s15u"
+                     :client-unverified session
+                     :origin-buffer buffer))
+           (fail-reason nil)
+           (probed nil))
+      (setq emacs-jupyter-notebook--async-context context)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-fail)
+                 (lambda (_ctx err) (setq fail-reason err)))
+                ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
+                 (lambda (&rest _) (setq probed t) nil)))
+        (emacs-jupyter-notebook--async-connect-timeout context buffer))
+      (should fail-reason)
+      (should (string-match-p "kernel_info_reply" fail-reason))
+      (should-not probed)
       (should-not emacs-jupyter-notebook--client))))
 
 (ert-deftest ejn-w15-connect-timeout-fresh-start-fails-hard ()
@@ -4655,7 +4760,8 @@ hooks, so mode enable does not install them."
                (lambda (&rest _)
                  (setq shutdown-called t))))
       (with-temp-buffer
-        (setq emacs-jupyter-notebook--client 'mock-client)
+        (setq emacs-jupyter-notebook--client
+              (ejn-test-backend-session 'mock-client t))
         (emacs-jupyter-notebook--release-local-resources)
         (should-not shutdown-called)
         (should-not emacs-jupyter-notebook--client)))))
@@ -4807,7 +4913,8 @@ explicitly lists it among the things released on mode disable."
                  (setq registry-removed t))))
       (with-temp-buffer
         (emacs-jupyter-notebook-mode 1)
-        (setq emacs-jupyter-notebook--client 'mock-client)
+        (setq emacs-jupyter-notebook--client
+              (ejn-test-backend-session 'mock-client t))
         (setq emacs-jupyter-notebook--session-entry entry)
         (emacs-jupyter-notebook-mode -1)
         (should-not shutdown-called)
@@ -4827,7 +4934,8 @@ process is still disposed and the buffer-local state is still cleared."
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--clear-buffer-timers)
                  (lambda (&rest _) (error "simulated disposer failure"))))
         (setq emacs-jupyter-notebook--tunnel-process proc)
-        (setq emacs-jupyter-notebook--client 'mock-client)
+        (setq emacs-jupyter-notebook--client
+              (ejn-test-backend-session 'mock-client t))
         (setq emacs-jupyter-notebook--kernel-status 'busy)
         (emacs-jupyter-notebook--release-local-resources)
         (should-not (process-live-p proc))
@@ -4967,7 +5075,8 @@ reconnect key)."
                                   (list launch scp tunnel))))
             (with-current-buffer buffer
               (emacs-jupyter-notebook-mode 1)
-              (setq emacs-jupyter-notebook--client 'mock-client)
+              (setq emacs-jupyter-notebook--client
+                    (ejn-test-backend-session 'mock-client t))
               (setq emacs-jupyter-notebook--session-entry entry)
               (setq emacs-jupyter-notebook--tunnel-process tunnel)
               (setq emacs-jupyter-notebook--async-context
@@ -5190,7 +5299,8 @@ durable reconnect surface and must survive buffer kill."
             (let ((buffer (generate-new-buffer "ejn-w17")))
               (with-current-buffer buffer
                 (emacs-jupyter-notebook-mode 1)
-                (setq emacs-jupyter-notebook--client 'mock-client)
+                (setq emacs-jupyter-notebook--client
+                      (ejn-test-backend-session 'mock-client t))
                 (setq emacs-jupyter-notebook--session-entry entry))
               (kill-buffer buffer))
             (should-not shutdown-called)
@@ -6312,6 +6422,7 @@ callback(nil) -> `--async-connect-finalize' seam."
                                           (setq err-surfaced t)))))
           (setq emacs-jupyter-notebook--async-context context)
           (emacs-jupyter-notebook--async-connect context)
+          (ejn-test-drain-zero-delay-timers)
           (should (eq (plist-get emacs-jupyter-notebook--async-context :phase)
                       'error))
           (should-not emacs-jupyter-notebook--client)
@@ -7071,7 +7182,8 @@ a mention that only exists in prose."
 execute adapter (no panel entry) and passes the actual snippet string."
   (with-temp-buffer
     (let ((calls nil)
-          (emacs-jupyter-notebook--client 'mock-client))
+          (emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t)))
       (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
                  (lambda (client code) (push (list client code) calls))))
         (emacs-jupyter-notebook--inject-viewer-formatter))
@@ -7111,7 +7223,8 @@ execute adapter (no panel entry) and passes the actual snippet string."
   "W8.1: a raise from the adapter must not propagate out of injection —
 formatter injection may never break a connect or restart."
   (with-temp-buffer
-    (let ((emacs-jupyter-notebook--client 'mock-client))
+    (let ((emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t)))
       (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
                  (lambda (_client _code) (error "boom"))))
         ;; Should not signal.
@@ -7120,7 +7233,8 @@ formatter injection may never break a connect or restart."
 (ert-deftest ejn-w8.1-inject-produces-no-panel-entry ()
   "W8.1: injecting the snippet creates no panel entry for the source buffer."
   (with-temp-buffer
-    (let ((emacs-jupyter-notebook--client 'mock-client)
+    (let ((emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           (panel (ejn-panel-ensure (current-buffer))))
       (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
                  (lambda (_client _code) nil)))
@@ -7756,7 +7870,8 @@ support cache unset.  Uses `/bin/false' as a stand-in Python that exits 1."
   "W11: injection routes through the silent adapter and embeds the timeout."
   (with-temp-buffer
     (let ((calls nil)
-          (emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           (emacs-jupyter-notebook-kernel-idle-timeout 1234))
       (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
                  (lambda (client code) (push (list client code) calls))))
@@ -7794,7 +7909,8 @@ support cache unset.  Uses `/bin/false' as a stand-in Python that exits 1."
 (ert-deftest ejn-w11-watchdog-swallows-adapter-errors ()
   "W11: a raise from the adapter must not propagate out of injection."
   (with-temp-buffer
-    (let ((emacs-jupyter-notebook--client 'mock-client)
+    (let ((emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           (emacs-jupyter-notebook-kernel-idle-timeout 3600))
       (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
                  (lambda (_client _code) (error "boom"))))
@@ -7820,8 +7936,9 @@ support cache unset.  Uses `/bin/false' as a stand-in Python that exits 1."
                    (lambda (_entry &optional _file) nil))
                   ((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
                    (lambda (_client code) (push code codes))))
-          (emacs-jupyter-notebook--async-connect-finalize
-           context buffer entry local-ports local-file 'mock-client))
+        (emacs-jupyter-notebook--async-connect-finalize
+         context buffer entry local-ports local-file
+         (ejn-test-backend-session 'mock-client t)))
         ;; A watchdog snippet carrying the configured timeout was sent.
         (should (cl-some (lambda (c) (string-match-p "_EJN_WD_TIMEOUT = 7200" c))
                          codes))))))
@@ -7831,7 +7948,8 @@ support cache unset.  Uses `/bin/false' as a stand-in Python that exits 1."
 configured timeout — but only after the restarted kernel answers a
 `kernel_info_request' (mocked here to reply immediately)."
   (with-temp-buffer
-    (let ((emacs-jupyter-notebook--client 'mock-client)
+    (let ((emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           (emacs-jupyter-notebook-kernel-idle-timeout 5400)
           (codes nil))
       (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-restart)
@@ -7840,7 +7958,8 @@ configured timeout — but only after the restarted kernel answers a
                  (lambda (_client callback) (funcall callback '(:status "ok") nil)))
                 ((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
                  (lambda (_client code) (push code codes))))
-        (call-interactively #'emacs-jupyter-notebook-restart-kernel))
+        (call-interactively #'emacs-jupyter-notebook-restart-kernel)
+        (ejn-test-drain-zero-delay-timers))
       (should (cl-some (lambda (c) (string-match-p "_EJN_WD_TIMEOUT = 5400" c))
                        codes)))))
 
@@ -7849,7 +7968,8 @@ configured timeout — but only after the restarted kernel answers a
 No reply (kernel still coming up / failed restart) means NO injection race —
 nothing is sent; a reply triggers both formatter and watchdog injection."
   (with-temp-buffer
-    (let ((emacs-jupyter-notebook--client 'mock-client)
+    (let ((emacs-jupyter-notebook--client
+           (ejn-test-backend-session 'mock-client t))
           (emacs-jupyter-notebook-kernel-idle-timeout 900)
           info-cb sent)
       (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-restart)
@@ -7859,10 +7979,12 @@ nothing is sent; a reply triggers both formatter and watchdog injection."
                 ((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
                  (lambda (_client _code) (setq sent t))))
         (call-interactively #'emacs-jupyter-notebook-restart-kernel)
+        (ejn-test-drain-zero-delay-timers)
         ;; Kernel has not answered yet: nothing injected (no race).
         (should-not sent)
         ;; Kernel comes up and answers kernel_info: injection fires.
         (funcall info-cb '(:status "ok") nil)
+        (ejn-test-drain-zero-delay-timers)
         (should sent)))))
 
 ;;; W11(B) — non-destructive prune of dead registry entries
@@ -8357,6 +8479,7 @@ clears the pending-reconnect timestamp, so the NEXT drop starts from the
 initial delay instead of inheriting this recovery's accumulated attempts."
   (with-temp-buffer
     (let* ((entry '(:profile "p" :session-id "s" :remote-host "h"))
+           (session (ejn-test-backend-session 'mock-client t))
            (context (emacs-jupyter-notebook--async-new-context
                      :phase 'connect :entry entry :session-id "s"
                      :origin-buffer (current-buffer))))
@@ -8374,11 +8497,11 @@ initial delay instead of inheriting this recovery's accumulated attempts."
                  #'ignore))
         (emacs-jupyter-notebook--async-connect-finalize
          context (current-buffer) entry '(:shell_port 1)
-         "/tmp/local.json" 'mock-client))
+         "/tmp/local.json" session))
       (should (= emacs-jupyter-notebook--reconnect-attempt 0))
       (should-not emacs-jupyter-notebook--reconnect-next-at)
       (should-not emacs-jupyter-notebook--tunnel-dead)
-      (should (eq emacs-jupyter-notebook--client 'mock-client)))))
+      (should (eq emacs-jupyter-notebook--client session)))))
 
 (ert-deftest ejn-w19-release-local-resources-disconnects-client-not-kernel ()
   "W19: tearing down local transport disconnects the stale emacs-jupyter
@@ -8390,7 +8513,8 @@ is durable and outlives the local client."
                  (lambda (_client) (setq disconnected t)))
                 ((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
                  (lambda (_client) (setq shutdown t))))
-        (setq emacs-jupyter-notebook--client 'stale-client)
+        (setq emacs-jupyter-notebook--client
+              (ejn-test-backend-session 'stale-client t))
         (emacs-jupyter-notebook--release-local-resources)
         (should disconnected)
         (should-not shutdown)
@@ -8408,7 +8532,8 @@ accumulate ioloop subprocesses."
                      :phase 'connect
                      :origin-buffer (current-buffer)
                      :session-id "s"
-                     :client-unverified 'stale-io-client)))
+                     :client-unverified
+                     (ejn-test-backend-session 'stale-io-client t))))
       (setq emacs-jupyter-notebook--async-context context)
       ;; Keep the test hermetic: `--async-fail' would otherwise emit a real
       ;; warning and force a mode-line redisplay.
@@ -8427,7 +8552,8 @@ ioloop, and does so without resurrecting the context into the buffer slot."
   (let ((disconnected-client nil)
         (context (emacs-jupyter-notebook--async-new-context
                   :phase 'connect
-                  :client-unverified 'stale-io)))
+                  :client-unverified
+                  (ejn-test-backend-session 'stale-io t))))
     (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-disconnect)
                (lambda (client) (setq disconnected-client client))))
       (emacs-jupyter-notebook--cancel-async-context-locally context))

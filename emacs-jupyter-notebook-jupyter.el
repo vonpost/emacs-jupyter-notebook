@@ -59,6 +59,14 @@
   "Number of retired-entry callback drops logged this Emacs session.")
 (declare-function emacs-jupyter-notebook--evaluation-on-timeout
                   "emacs-jupyter-notebook" (request-id))
+(declare-function emacs-jupyter-notebook-backend-session-data
+                  "emacs-jupyter-notebook-backend" (session))
+(declare-function emacs-jupyter-notebook-backend-session-owner-buffer
+                  "emacs-jupyter-notebook-backend" (session))
+(declare-function emacs-jupyter-notebook-backend-session-data--set
+                  "emacs-jupyter-notebook-backend" (value session))
+(declare-function emacs-jupyter-notebook-backend-session-mark-attached
+                  "emacs-jupyter-notebook-backend" (session))
 
 (defun emacs-jupyter-notebook-jupyter--message-content-value (msg key)
   "Return KEY from MSG content."
@@ -761,6 +769,114 @@ Never terminates the remote kernel."
   "Check whether CODE is complete through the configured adapter."
   (funcall emacs-jupyter-notebook-jupyter-is-complete-function
            client code callback))
+
+(defun emacs-jupyter-notebook-jupyter--backend-client (session)
+  "Return SESSION's private legacy client, if it has been attached."
+  (emacs-jupyter-notebook-backend-session-data session))
+
+(defun emacs-jupyter-notebook-jupyter-backend-ensure ()
+  "Validate that the legacy emacs-jupyter implementation is available."
+  (emacs-jupyter-notebook-jupyter--ensure))
+
+(defun emacs-jupyter-notebook-jupyter--backend-store-client (session client)
+  "Store CLIENT inside opaque SESSION at the legacy adapter boundary."
+  (setf (emacs-jupyter-notebook-backend-session-data session) client))
+
+(defun emacs-jupyter-notebook-jupyter--backend-reply (success failure)
+  "Adapt a legacy REPLY/ERROR CALLBACK to contract SUCCESS and FAILURE."
+  (lambda (reply error-data)
+    (if error-data
+        (funcall failure error-data)
+      (funcall success reply))))
+
+(defun emacs-jupyter-notebook-jupyter-backend-dispatch
+    (session _request operation payload success failure emit)
+  "Dispatch one opaque backend OPERATION through the legacy emacs-jupyter API.
+
+This is the sole compatibility implementation during EI1.  It owns all
+legacy-client access; callers above the backend contract never inspect the
+EIEIO client.  SUCCESS and FAILURE are request-terminal callbacks and EMIT
+receives normalized local lifecycle events."
+  (let ((client (emacs-jupyter-notebook-jupyter--backend-client session)))
+    (condition-case err
+        (pcase operation
+          ('connect
+           (let (verified connected)
+             (setq connected
+                   (emacs-jupyter-notebook-jupyter-connect-async
+                    payload
+                    (lambda (raw-client)
+                      (when (and raw-client
+                                 (emacs-jupyter-notebook-backend-session-mark-attached
+                                  session))
+                        (setq verified t)
+                        (emacs-jupyter-notebook-jupyter--backend-store-client
+                         session raw-client)
+                        (funcall emit (list :type 'connected))
+                        (funcall success session)))))
+             ;; The legacy adapter deliberately exposes an unverified client
+             ;; immediately for the busy-kernel timeout arbitration.  It is
+             ;; still opaque to the core as SESSION.
+             (if connected
+                 (when (emacs-jupyter-notebook-backend-session-mark-attached
+                        session)
+                   (emacs-jupyter-notebook-jupyter--backend-store-client
+                    session connected)
+                   (unless verified
+                     (funcall emit (list :type 'connecting))))
+               (unless verified
+                 (funcall failure "Could not attach to the kernel connection file")))))
+          ('close-local
+           (when client
+             (emacs-jupyter-notebook-jupyter-disconnect client))
+           (funcall emit (list :type 'closed-local))
+           (funcall success nil))
+          ('execute
+           (let ((code (plist-get payload :code))
+                 (options (plist-get payload :options)))
+             (if (plist-get options :silent)
+                 (emacs-jupyter-notebook-jupyter-execute-silent client code)
+               (emacs-jupyter-notebook-jupyter-evaluate
+                client code (plist-get options :entry-handle)))
+             (funcall emit (list :type 'execute-sent
+                                 :silent (and (plist-get options :silent) t)))
+             (funcall success nil)))
+          (`(aux . complete)
+           (emacs-jupyter-notebook-jupyter-complete
+            client (plist-get payload :code) (plist-get payload :cursor-pos)
+            (emacs-jupyter-notebook-jupyter--backend-reply success failure)))
+          (`(aux . inspect)
+           (emacs-jupyter-notebook-jupyter-inspect
+            client (plist-get payload :code) (plist-get payload :cursor-pos)
+            (or (plist-get payload :detail) 0)
+            (emacs-jupyter-notebook-jupyter--backend-reply success failure)))
+          (`(aux . is-complete)
+           (emacs-jupyter-notebook-jupyter-is-complete
+            client (plist-get payload :code)
+            (emacs-jupyter-notebook-jupyter--backend-reply success failure)))
+          (`(aux . kernel-info)
+           (emacs-jupyter-notebook-jupyter-kernel-info
+            client (emacs-jupyter-notebook-jupyter--backend-reply success failure)))
+          (`(control . interrupt)
+           (emacs-jupyter-notebook-jupyter-interrupt client)
+           (funcall emit (list :type 'interrupt-sent))
+           (funcall success nil))
+          (`(control . restart)
+           (emacs-jupyter-notebook-jupyter-restart client)
+           (funcall emit (list :type 'restart-sent))
+           (funcall success nil))
+          (`(control . shutdown)
+           (emacs-jupyter-notebook-jupyter-shutdown client)
+           (funcall emit (list :type 'shutdown-sent))
+           (funcall success nil))
+          ('input
+           (emacs-jupyter-notebook-jupyter--send-input-reply
+            client (plist-get payload :value))
+           (funcall emit (list :type 'input-sent
+                               :request-id (plist-get payload :request-id)))
+           (funcall success nil))
+          (_ (funcall failure (format "Unsupported backend operation %S" operation))))
+      (error (funcall failure err)))))
 
 (provide 'emacs-jupyter-notebook-jupyter)
 
