@@ -814,10 +814,11 @@ modules.
     recognize the exact token sequence used by the resolved argv.  Existing
     launcher-shaped registry entries are rejected clearly and left untouched
     rather than adapted.  Once launch is admitted, create a provisional durable
-    entry before waiting for the PID/retrieval/connect phases; remove it only on
-    proof that no kernel was started.  An ambiguous failure or cancellation
-    retains enough deterministic session/path metadata for reconnect or explicit
-    cleanup.
+    entry before starting the SSH launch process.  No generic failure,
+    cancellation, timeout, buffer cleanup, or supersede path removes it, even
+    when local process creation fails; confirmed-dead removal stays behind the
+    explicit prune/cleanup commands.  The provisional entry retains deterministic
+    session, connection, and sidecar paths for reconnect or explicit cleanup.
     Cancellation/failure never kills or broadly matches a remote process; stale
     callbacks cannot promote a provisional entry to ready.
   - Tests: kernelspec success/missing/malformed/oversized/hostile values;
@@ -825,11 +826,10 @@ modules.
     legacy-string rejection; exact shell argv quoting; hard-bounded resolver
     stdout/stderr; phase deadline/cancel/supersede; Linux token and Darwin
     best-effort PID match/mismatch/unverified; private PID-sidecar write/read,
-    malformed/stale identity, and ambiguous-start recovery; launch failure
-    leaves registry and remote files unpromoted when launch is proven not to
-    have started; ambiguous post-admission failure retains a provisional
-    recoverable entry; registry contains no kernelspec environment values.  No
-    synchronous SSH or wait loop is permitted.
+    malformed/stale identity, and ambiguous-start recovery; pre-admission
+    resolution failure leaves the registry untouched; every post-admission
+    failure retains a provisional recoverable entry; registry contains no
+    kernelspec environment values.  No synchronous SSH or wait loop is permitted.
   - Narrow run: focused SSH/async start/reconnect ERT selectors plus source
     no-blocking assertions.
 
