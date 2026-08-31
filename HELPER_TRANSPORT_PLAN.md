@@ -705,7 +705,7 @@ modules.
     operation.
   - Narrow run: aux unit/integration modules.
 
-- [~] owner=terra-ht11 claimed=2026-08-31 **HT11 Implement stdin request/reply safely.**
+- [x] owner=terra-ht11 claimed=2026-08-31 landed=da4e134 **HT11 Implement stdin request/reply safely.**
   - Depends: HT10.
   - Files: `helper/ejn_helper/jupyter_backend.py`,
     `helper/ejn_helper/dispatcher.py`, `docs/helper-protocol-v1.md`,
@@ -724,7 +724,7 @@ modules.
     stale reply, execution cancel while prompting, and helper close.
   - Narrow run: stdin unit/integration modules.
 
-- [ ] **HT12 Prove and implement interrupt/restart/shutdown semantics.**
+- [~] owner=terra-ht12 claimed=2026-08-31 **HT12 Prove and implement interrupt/restart/shutdown semantics.**
   - Depends: HT11, TH2.
   - Files: `helper/integration_tests/test_lifecycle_probe.py`, then
     `helper/ejn_helper/jupyter_backend.py`,
