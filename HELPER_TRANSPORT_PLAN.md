@@ -1156,22 +1156,42 @@ be manager-reviewed for durable-kernel rules.
 
 - [~] owner=terra-ei4v claimed=2026-09-01 **EI4V Move matplotlib viewer payloads to confined pickle files.**
   - Depends: EI4.
-  - Files: `emacs-jupyter-notebook-helper-backend.el`,
+  - Files: `helper/ejn_helper/outputs.py`, `helper/tests/test_outputs.py`,
+    `emacs-jupyter-notebook-helper-backend.el`,
     `emacs-jupyter-notebook-result.el`,
-    `emacs-jupyter-notebook-viewer.el`, `viewer/ejn_viewer.py`,
-    `viewer/test_viewer_gui.py`,
-    `tests/emacs-jupyter-notebook-helper-backend-tests.el`.
+    `emacs-jupyter-notebook-viewer.el`, `emacs-jupyter-notebook-events.el`,
+    `emacs-jupyter-notebook-vars.el`, `emacs-jupyter-notebook.el`,
+    `viewer/ejn_viewer.py`, `viewer/test_viewer_gui.py`,
+    `tests/emacs-jupyter-notebook-helper-backend-tests.el`, and the existing
+    W8 viewer/panel tests in `tests/emacs-jupyter-notebook-tests.el`.
   - Deliverable: panel entries retain pickle artifact metadata/path, never
-    base64.  The local viewer accepts a file-path request, validates the file is
-    regular, owner-only, and confined beneath the EJN artifact root.  Pickle
-    load/figure reconstruction moves off the viewer GUI event tick into one
-    bounded worker.  Panel pickle count/byte eviction deletes retired files,
-    and an already-open viewer receives its own safe lifetime/reference
-    behavior rather than racing deletion.
-  - Tests: base64 canary absent from panel, Elisp process payload, and viewer
-    logs; path traversal/symlink/mode/owner rejection; retirement while viewer
-    request is pending; pickle budget; valid figure round trip using a
-    test-owned local file.  No GUI is required for security/protocol tests.
+    base64.  A rich helper event may carry at most one image descriptor plus
+    one pickle descriptor so the interactive payload never suppresses its PNG
+    thumbnail; all publications in a rejected event are discarded through
+    their pinned leases.  The local viewer uses a private mode-0700 socket
+    directory and bounded structured requests, accepts only an immediate child
+    of the supplied artifact root, and validates the root and file through
+    pinned descriptors/identities before use.  Pickle load/figure
+    reconstruction moves off the viewer GUI event tick into one bounded
+    worker.  Panel pickle count/byte eviction deletes retired files, and a
+    pending/open viewer receives an explicit bounded lease/ack lifetime rather
+    than racing panel deletion; the viewer never unlinks a panel-owned path.
+
+    Python pickle is an arbitrary-code boundary, not made trustworthy by file
+    ownership or hashing.  Interactive pickle loading therefore has a dedicated
+    defcustom defaulting to disabled; `v` and auto-open refuse it until the user
+    explicitly opts in.  Do not add a nominal "restricted unpickler" for
+    Matplotlib's unrestricted object graph.  Static PNG/JPEG display and the
+    external image opener remain available while pickle loading is disabled.
+  - Tests: pickle opt-in disabled by default for manual and auto-open paths;
+    one helper event preserves both PNG and pickle descriptors; base64 canary
+    absent from panel, Elisp process payload, and viewer logs; path traversal,
+    nested name, symlink, hardlink, root/file identity, mode, owner, hash, and
+    size rejection; malformed/oversized socket input; retirement while a
+    viewer request is queued/in flight plus timeout/death/duplicate-ack races;
+    exact pickle count/byte boundaries; a blocked loader proves the socket/GUI
+    pump remains responsive; and valid figure round trip using a test-owned
+    local file.  No GUI is required for security/protocol tests.
   - Narrow run: ERT selector `^ejn-ei4v-` and viewer Python tests.
 
 - [ ] **EI4D Reject compressed-image decoder bombs before Emacs image APIs.**
