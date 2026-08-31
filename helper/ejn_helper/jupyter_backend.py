@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import secrets
 import stat
 from dataclasses import dataclass
 from queue import Empty
@@ -35,6 +36,37 @@ MAX_AUX_NESTING = 3
 MAX_AUX_INTEGER = 2**53 - 1
 MAX_AUX_CURSOR = 524_288
 _AUX_OMIT = object()
+MAX_INPUT_PROMPT_BYTES = 4_096
+MAX_INPUT_VALUE_BYTES = 65_536
+INPUT_ID_BYTES = 16
+
+
+def _bounded_utf8_size(value: str, ceiling: int) -> int:
+    """Count UTF-8 bytes without encoding or copying a sensitive string."""
+    total = 0
+    for character in value:
+        codepoint = ord(character)
+        if 0xD800 <= codepoint <= 0xDFFF:
+            return ceiling + 1
+        if codepoint <= 0x7F:
+            total += 1
+        elif codepoint <= 0x7FF:
+            total += 2
+        elif codepoint <= 0xFFFF:
+            total += 3
+        else:
+            total += 4
+        if total > ceiling:
+            return total
+    return total
+
+
+def _valid_input_id(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == INPUT_ID_BYTES * 2
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _take_aux_text(
@@ -229,6 +261,23 @@ def _normalize_auxiliary(operation: str | None, content: Mapping[str, object]) -
     raise BackendError("protocol-error")
 
 
+def _normalize_input_request(content: object) -> tuple[str, bool]:
+    """Project untrusted Jupyter stdin content onto the fixed EJN schema."""
+    if not isinstance(content, Mapping):
+        return "", False
+    raw_prompt = content.get("prompt")
+    if not isinstance(raw_prompt, str):
+        prompt = ""
+    else:
+        try:
+            prompt, _wire_bytes, _truncated = _take_aux_text(
+                raw_prompt, MAX_INPUT_PROMPT_BYTES, MAX_INPUT_PROMPT_BYTES
+            )
+        except BackendError:
+            prompt = ""
+    return prompt, content.get("password") is True
+
+
 @dataclass(slots=True)
 class _Pending:
     """One helper operation registered before its Jupyter reply can arrive."""
@@ -243,6 +292,15 @@ class _Pending:
     idle_received: bool = False
     reply_type: str = "kernel_info_reply"
     auxiliary: str | None = None
+    input_id: str | None = None
+
+
+@dataclass(slots=True)
+class _InputPrompt:
+    """One stdin request awaiting exactly one local input reply."""
+
+    input_id: str
+    pending: _Pending
 
 
 class _TaskCancellation:
@@ -275,6 +333,7 @@ class JupyterBackend:
         self._readers: set[asyncio.Task[None]] = set()
         self._pending: dict[str, _Pending] = {}
         self._pending_by_task: dict[asyncio.Task[None], tuple[str, _Pending]] = {}
+        self._input_prompts: dict[str, _InputPrompt] = {}
         self._retired_tasks: list[asyncio.Task] = []
         self._timed_out_tasks: set[asyncio.Task[None]] = set()
         self._transport_failed = False
@@ -398,6 +457,8 @@ class JupyterBackend:
                 result = await self._auxiliary(operation, params)
             elif operation == "execute":
                 result = await self._execute(params, event_callback)
+            elif operation == "input_reply":
+                result = self._input_reply(params)
             else:
                 raise BackendError("unsupported")
             completion = BackendCompletion.success(result)
@@ -530,6 +591,43 @@ class JupyterBackend:
             return await pending.future
         finally:
             self._unregister_pending(message_id, pending)
+
+    def _input_reply(self, params: Mapping[str, object]) -> dict:
+        """Send one claimed input value without retaining it after the call."""
+        self._ensure_connected()
+        assert self.client is not None
+        input_id = params.get("input_id")
+        value = params.get("value")
+        if (
+            not _valid_input_id(input_id)
+            or not isinstance(value, str)
+            or _bounded_utf8_size(value, MAX_INPUT_VALUE_BYTES)
+            > MAX_INPUT_VALUE_BYTES
+        ):
+            raise BackendError("invalid-request")
+        prompt = self._input_prompts.pop(input_id, None)
+        if prompt is None or prompt.pending.input_id != input_id:
+            raise BackendError("busy")
+        prompt.pending.input_id = None
+        if prompt.pending.future.done():
+            raise BackendError("busy")
+        try:
+            # AsyncKernelClient.input only writes an input_reply; stdin remains
+            # exclusively consumed by _reader("stdin").  The value is never
+            # retained in local prompt state or returned over EJN.
+            self.client.input(value)
+        except Exception:
+            # The send outcome is ambiguous and the channel can no longer be
+            # trusted for this or any other correlated request.  Fail pending
+            # work promptly; reconnect may create fresh local channels without
+            # taking ownership of the remote kernel.
+            self._fail_transport()
+            raise BackendError("transport-error") from None
+        finally:
+            # Python strings cannot be wiped, but drop our last direct reference
+            # immediately after the synchronous ZMQ send.
+            value = None
+        return {"accepted": True}
 
     def _ensure_connected(self) -> None:
         if self._transport_failed:
@@ -691,9 +789,28 @@ class JupyterBackend:
             and state.accepts(message)
             and message.get("msg_type") == "input_request"
         ):
-            self._deliver_event(
-                pending.event_callback, "input_request", message.get("content", {})
+            if pending.input_id is not None:
+                _LOGGER.debug("dropping duplicate stdin request for live execution")
+                return
+            input_id = None
+            for _attempt in range(4):
+                candidate = secrets.token_hex(INPUT_ID_BYTES)
+                if candidate not in self._input_prompts:
+                    input_id = candidate
+                    break
+            if input_id is None:
+                self._fail_transport()
+                return
+            prompt, password = _normalize_input_request(message.get("content"))
+            pending.input_id = input_id
+            self._input_prompts[input_id] = _InputPrompt(input_id, pending)
+            admitted = self._deliver_event(
+                pending.event_callback,
+                "input_request",
+                {"input_id": input_id, "prompt": prompt, "password": password},
             )
+            if not admitted:
+                self._retire_input_prompt(pending)
 
     def _finish_execution(self, pending: _Pending) -> None:
         result = pending.state.complete() if pending.state is not None else None
@@ -753,6 +870,7 @@ class JupyterBackend:
         task = asyncio.current_task()
         if task is not None and self._pending_by_task.get(task) == (message_id, pending):
             self._pending_by_task.pop(task, None)
+        self._retire_input_prompt(pending)
         if pending.state is not None:
             failed = pending.future.cancelled()
             if pending.future.done() and not failed:
@@ -782,6 +900,15 @@ class JupyterBackend:
     def _remove_pending(self, message_id: str, pending: _Pending) -> None:
         if self._pending.get(message_id) is pending:
             self._pending.pop(message_id, None)
+        self._retire_input_prompt(pending)
+
+    def _retire_input_prompt(self, pending: _Pending) -> None:
+        input_id = pending.input_id
+        pending.input_id = None
+        if input_id is not None:
+            prompt = self._input_prompts.get(input_id)
+            if prompt is not None and prompt.pending is pending:
+                self._input_prompts.pop(input_id, None)
 
     def _fail_transport(self) -> None:
         if self.closed or self._transport_failed:
@@ -808,6 +935,7 @@ class JupyterBackend:
                     pending.future.cancel()
             self._pending.clear()
             self._pending_by_task.clear()
+        self._input_prompts.clear()
         if self.client is not None and self._channels_started:
             try:
                 self.client.stop_channels()

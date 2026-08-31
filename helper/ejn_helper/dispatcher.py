@@ -30,6 +30,8 @@ EJN_PROTOCOL_VERSION = 1
 EJN_MAX_CODE_BYTES = 524_288
 EJN_MAX_REQUEST_ID_BYTES = 256
 EJN_MAX_PATH_BYTES = 4_096
+EJN_MAX_INPUT_ID_BYTES = 32
+EJN_MAX_INPUT_VALUE_BYTES = 65_536
 
 _BACKEND_OPERATIONS = frozenset(
     {
@@ -95,6 +97,15 @@ class _Inflight:
     cancellation: Cancellation | None = None
     cancel_requested: bool = False
     terminal: bool = False
+
+
+@dataclass(slots=True)
+class _PromptLease:
+    """One admitted stdin prompt, indexed by its owning execute request."""
+
+    execution_request_id: str
+    input_id: str
+    reply_request_id: str | None = None
 
 
 def _bounded_utf8_size(value: str, ceiling: int) -> int:
@@ -185,6 +196,7 @@ class Dispatcher:
         self.operation_timeouts = timeouts
         self.max_inflight = max_inflight
         self._inflight: dict[str, _Inflight] = {}
+        self._prompt_leases: dict[str, _PromptLease] = {}
         self.negotiated = False
         self.connected = False
         self.closed = False
@@ -233,6 +245,8 @@ class Dispatcher:
             self._dispatch_credit(request_id, validated)
         elif operation == "close":
             self._dispatch_close(request_id)
+        elif operation == "input_reply":
+            self._dispatch_input_reply(request_id, validated)
         else:
             self._dispatch_backend(request_id, operation, validated)
 
@@ -341,19 +355,22 @@ class Dispatcher:
                 result["detail_level"] = detail
             return result
         if operation == "input_reply":
-            _exact_fields(params, frozenset({"request_id", "value"}))
+            _exact_fields(params, frozenset({"request_id", "input_id", "value"}))
             correlated = params["request_id"]
+            input_id = params["input_id"]
             value = params["value"]
             if (
                 not isinstance(correlated, str)
                 or not correlated
                 or _bounded_utf8_size(correlated, EJN_MAX_REQUEST_ID_BYTES)
                 > EJN_MAX_REQUEST_ID_BYTES
+                or not Dispatcher._valid_input_id(input_id)
                 or not isinstance(value, str)
-                or _has_surrogate(value)
+                or _bounded_utf8_size(value, EJN_MAX_INPUT_VALUE_BYTES)
+                > EJN_MAX_INPUT_VALUE_BYTES
             ):
                 raise _RequestError("invalid-request", "input reply fields are invalid")
-            return {"request_id": correlated, "value": value}
+            return {"request_id": correlated, "input_id": input_id, "value": value}
         return dict(params)
 
     @staticmethod
@@ -363,6 +380,15 @@ class Dispatcher:
         if _bounded_utf8_size(value, EJN_MAX_CODE_BYTES) > EJN_MAX_CODE_BYTES:
             raise _RequestError("invalid-request", "code exceeds the byte limit")
         return value
+
+    @staticmethod
+    def _valid_input_id(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and _bounded_utf8_size(value, EJN_MAX_INPUT_ID_BYTES)
+            == EJN_MAX_INPUT_ID_BYTES
+            and all(character in "0123456789abcdef" for character in value)
+        )
 
     def _dispatch_hello(self, request_id: str, params: dict) -> None:
         if self.negotiated:
@@ -392,20 +418,25 @@ class Dispatcher:
         self._send_success(request_id, {"credit": credit})
 
     def _dispatch_backend(
-        self, request_id: str, operation: str, params: dict
-    ) -> None:
+        self,
+        request_id: str,
+        operation: str,
+        params: dict,
+        *,
+        prompt_lease: _PromptLease | None = None,
+    ) -> bool:
         if operation != "connect" and not self.connected:
             self._send_error(request_id, "busy", "connect is required first")
-            return
+            return False
         if operation == "connect" and (
             self.connected
             or any(item.operation == "connect" for item in self._inflight.values())
         ):
             self._send_error(request_id, "busy", "backend is already connected")
-            return
+            return False
         if len(self._inflight) >= self.max_inflight:
             self._send_error(request_id, "busy", "too many requests are in flight")
-            return
+            return False
 
         loop = self.loop
         if loop is None:
@@ -415,7 +446,7 @@ class Dispatcher:
                 self._send_error(
                     request_id, "transport-error", "dispatcher loop is unavailable"
                 )
-                return
+                return False
         timeout = self.operation_timeouts.get(operation, self.request_timeout)
         try:
             timer = loop.call_later(timeout, self._deadline, request_id)
@@ -423,10 +454,15 @@ class Dispatcher:
             self._send_error(
                 request_id, "transport-error", "dispatcher loop is unavailable"
             )
-            return
+            return False
         typed_operation = cast(BackendOperation, operation)
         record = _Inflight(request_id, typed_operation, timer)
         self._inflight[request_id] = record
+        if prompt_lease is not None:
+            # All local admission checks have passed.  From this point onward a
+            # backend.start failure is outcome-ambiguous, so this lease must
+            # remain consumed rather than permitting a second Jupyter reply.
+            prompt_lease.reply_request_id = request_id
 
         try:
             cancellation = self.backend.start(
@@ -437,7 +473,7 @@ class Dispatcher:
             )
         except BaseException:
             self._finish_error(request_id, record, "transport-error")
-            return
+            return False
         if self._inflight.get(request_id) is record and not record.terminal:
             record.cancellation = cancellation
         elif record.cancel_requested and cancellation is not None:
@@ -445,6 +481,26 @@ class Dispatcher:
                 cancellation.cancel()
             except BaseException:
                 pass
+        return True
+
+    def _dispatch_input_reply(self, request_id: str, params: dict) -> None:
+        """Claim one admitted prompt before its value can reach the backend."""
+        execution_request_id = params["request_id"]
+        lease = self._prompt_leases.get(execution_request_id)
+        execution = self._inflight.get(execution_request_id)
+        if (
+            lease is None
+            or lease.input_id != params["input_id"]
+            or lease.reply_request_id is not None
+            or execution is None
+            or execution.terminal
+            or execution.operation != "execute"
+        ):
+            self._send_error(request_id, "busy", "input prompt is not current")
+            return
+        self._dispatch_backend(
+            request_id, "input_reply", params, prompt_lease=lease
+        )
 
     def _backend_event(
         self, request_id: str, record: _Inflight, item: object
@@ -459,14 +515,21 @@ class Dispatcher:
                 or not isinstance(item.data, Mapping)
             ):
                 raise ValueError
+            data = dict(item.data)
+            if item.name == "input_request":
+                self._admit_input_request(request_id, record, data)
             event = {
                 "v": EJN_PROTOCOL_VERSION,
                 "kind": "event",
                 "event": item.name,
                 "request_id": request_id,
-                "data": copy.deepcopy(dict(item.data)),
+                "data": copy.deepcopy(data),
             }
             disposition = self.event_queue.enqueue(event)
+            if item.name == "input_request" and disposition.queued:
+                self._prompt_leases[request_id] = _PromptLease(
+                    request_id, data["input_id"]
+                )
             # An ordinary event dropped under queue pressure has not crossed
             # the helper/Emacs ownership boundary.  Artifact producers use
             # this result to discard their private publication lease while the
@@ -479,6 +542,31 @@ class Dispatcher:
                 request_id, record, "protocol-error", cancel=True
             )
         return False
+
+    def _admit_input_request(
+        self, request_id: str, record: _Inflight, data: dict
+    ) -> None:
+        """Validate a backend prompt before it becomes transport-visible."""
+        if record.operation != "execute" or set(data) != {
+            "input_id", "prompt", "password"
+        }:
+            raise ValueError
+        input_id = data.get("input_id")
+        prompt = data.get("prompt")
+        password = data.get("password")
+        if (
+            not self._valid_input_id(input_id)
+            or not isinstance(prompt, str)
+            or _has_surrogate(prompt)
+            or _bounded_utf8_size(prompt, 4_096) > 4_096
+            or type(password) is not bool
+        ):
+            raise ValueError
+        old = self._prompt_leases.get(request_id)
+        if old is not None and (
+            old.reply_request_id is None or old.reply_request_id in self._inflight
+        ):
+            raise ValueError
 
     def _backend_complete(
         self, request_id: str, record: _Inflight, item: object
@@ -541,6 +629,8 @@ class Dispatcher:
             return
         record.terminal = True
         record.timer.cancel()
+        if record.operation == "execute":
+            self._retire_prompt_lease(request_id)
         if cancel:
             record.cancel_requested = True
             if record.cancellation is not None:
@@ -588,6 +678,16 @@ class Dispatcher:
                 pass
             self._inflight.pop(request_id, None)
 
+    def _retire_prompt_lease(self, execution_request_id: str) -> None:
+        lease = self._prompt_leases.pop(execution_request_id, None)
+        if lease is None or lease.reply_request_id is None:
+            return
+        reply = self._inflight.get(lease.reply_request_id)
+        if reply is not None and not reply.terminal:
+            self._finish_error(
+                lease.reply_request_id, reply, "busy", cancel=True
+            )
+
     def _dispatch_close(self, request_id: str) -> None:
         # Close the admission gate before cancellation responses can invoke a
         # reentrant response callback and submit work not present in this tuple.
@@ -597,6 +697,7 @@ class Dispatcher:
             self._finish_error(
                 inflight_id, record, "transport-error", cancel=True
             )
+        self._prompt_leases.clear()
         try:
             self.backend.close()
         except BaseException:

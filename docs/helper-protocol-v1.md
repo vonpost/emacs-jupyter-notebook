@@ -137,16 +137,22 @@ Requests require `v`, `kind`, string `id`, string `op`, and object `params`.
 non-negative integer. `connect` requires absolute `connection_file` and
 `artifact_dir` strings. `execute` requires UTF-8 `code` at most
 `EJN_MAX_CODE_BYTES`; `complete` and `inspect` require `code` and integer
-`cursor_pos`; `is_complete` requires `code`; `input_reply` requires string
-`request_id` and `value`. The no-parameter operations use `{}`.
+`cursor_pos`; `is_complete` requires `code`; `input_reply` requires the owning
+execution's string `request_id`, its exact 32-character lowercase-hex
+`input_id`, and a UTF-8 `value` of at most 65536 bytes. The no-parameter
+operations use `{}`.
 
 Responses require string `id` and boolean `ok`; success has an object
 `result`, failure has a short safe `error` with string `code` and `message`.
 Events require integer monotonic `seq`, string `event`, and object `data`;
-execution events also require `request_id`. Stream data has `name` and
-`text`; MIME events have bounded `data` and `metadata`; status and terminal
-events carry their corresponding state/status fields. Invalid required fields
-map to `invalid-request` or `invalid-event`.
+execution events also require `request_id`. An `input_request` has exactly
+`input_id`, `prompt`, and `password`: `input_id` is a fresh 32-character
+lowercase-hex token, `prompt` is at most 4096 UTF-8 bytes, and `password` is a
+boolean. One input reply may claim each token; stale, duplicate, and
+wrong-execution replies are rejected without reaching Jupyter. Stream data has
+`name` and `text`; MIME events have bounded `data` and `metadata`; status and
+terminal events carry their corresponding state/status fields. Invalid required
+fields map to `invalid-request` or `invalid-event`.
 
 For MIME events, `data` remains the Jupyter MIME bundle shape: a selected
 artifact MIME has a nested reference value `{path,bytes,sha256}` in place of

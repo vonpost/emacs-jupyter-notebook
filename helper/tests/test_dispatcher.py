@@ -40,7 +40,11 @@ VALID_PARAMS = {
     "complete": {"code": "pri", "cursor_pos": 3},
     "inspect": {"code": "print", "cursor_pos": 5, "detail_level": 0},
     "is_complete": {"code": "x = 1"},
-    "input_reply": {"request_id": "exec-1", "value": "yes"},
+    "input_reply": {
+        "request_id": "exec-1",
+        "input_id": "0123456789abcdef0123456789abcdef",
+        "value": "yes",
+    },
     "interrupt": {},
     "restart": {},
     "shutdown": {},
@@ -186,7 +190,7 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
             ("inspect", {"code": "x", "cursor_pos": 1, "detail_level": 2}),
             ("is_complete", {"code": None}),
             ("input_reply", {"request_id": "x"}),
-            ("input_reply", {"request_id": "", "value": "x"}),
+            ("input_reply", {"request_id": "", "input_id": "0" * 32, "value": "x"}),
         ]
         for number, (operation, params) in enumerate(invalid_cases):
             with self.subTest(operation=operation, params=params):
@@ -204,7 +208,6 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
             "complete",
             "inspect",
             "is_complete",
-            "input_reply",
             "interrupt",
             "restart",
             "shutdown",
@@ -524,12 +527,20 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
             request(
                 "input-id",
                 "input_reply",
-                {"request_id": surrogate, "value": "value"},
+                {
+                    "request_id": surrogate,
+                    "input_id": "0" * 32,
+                    "value": "value",
+                },
             ),
             request(
                 "input-value",
                 "input_reply",
-                {"request_id": "exec", "value": surrogate},
+                {
+                    "request_id": "exec",
+                    "input_id": "0" * 32,
+                    "value": surrogate,
+                },
             ),
         ]
         for envelope in cases:

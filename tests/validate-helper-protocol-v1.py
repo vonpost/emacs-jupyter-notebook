@@ -26,6 +26,14 @@ def frame(obj):
 def integer(value):
     return type(value) is int
 
+def utf8_size(value, ceiling):
+    if not isinstance(value, str): return ceiling + 1
+    try: return min(len(value.encode("utf-8")), ceiling + 1)
+    except UnicodeEncodeError: return ceiling + 1
+
+def valid_input_id(value):
+    return isinstance(value, str) and len(value) == 32 and all(c in "0123456789abcdef" for c in value)
+
 def materialize(v):
     if v["kind"] not in {"recipe", "recipe-error"}: return v["object"]
     obj = copy.deepcopy(v["template"]); key = "result" if obj["kind"] == "response" else "params"
@@ -47,7 +55,7 @@ def check_object(v, obj):
         if obj["op"] in {"complete", "inspect"} and (not isinstance(p.get("code"), str) or not integer(p.get("cursor_pos"))): fail(v["name"] + ": invalid code/cursor")
         if obj["op"] == "inspect" and not integer(p.get("detail_level")): fail(v["name"] + ": invalid detail level")
         if obj["op"] == "is_complete" and not isinstance(p.get("code"), str): fail(v["name"] + ": is_complete code must be string")
-        if obj["op"] == "input_reply" and (not isinstance(p.get("request_id"), str) or not isinstance(p.get("value"), str)): fail(v["name"] + ": invalid input reply")
+        if obj["op"] == "input_reply" and (set(p) != {"request_id", "input_id", "value"} or not isinstance(p.get("request_id"), str) or not isinstance(p.get("value"), str) or not valid_input_id(p.get("input_id")) or utf8_size(p["value"], 65536) > 65536): fail(v["name"] + ": invalid input reply")
         if obj["op"] == "connect" and (not isinstance(p.get("connection_file"), str) or not isinstance(p.get("artifact_dir"), str) or not os.path.isabs(p["connection_file"]) or not os.path.isabs(p["artifact_dir"])): fail(v["name"] + ": invalid connect paths")
     elif kind == "response":
         if not isinstance(obj.get("id"), str) or not isinstance(obj.get("ok"), bool): fail(v["name"] + ": invalid response fields")
@@ -57,6 +65,9 @@ def check_object(v, obj):
         if not integer(obj.get("seq")) or not isinstance(obj.get("event"), str) or not isinstance(obj.get("data"), dict): fail(v["name"] + ": invalid event fields")
         if obj["event"] not in EVENTS: fail(v["name"] + ": unsupported event")
         if obj["event"] not in {"transport_error"} and not isinstance(obj.get("request_id"), str): fail(v["name"] + ": execution event needs request_id")
+        if obj["event"] == "input_request":
+            data = obj["data"]
+            if set(data) != {"input_id", "prompt", "password"} or not valid_input_id(data.get("input_id")) or not isinstance(data.get("prompt"), str) or utf8_size(data["prompt"], 4096) > 4096 or type(data.get("password")) is not bool: fail(v["name"] + ": invalid input request")
     else: fail(v["name"] + ": unknown envelope kind")
 
 def validate(data):
