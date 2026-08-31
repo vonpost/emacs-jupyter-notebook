@@ -326,7 +326,9 @@ manual dogfood gate:
    base64 sample and no frame exceeds the v1 maximum.
 6. One hundred generated image events leave panel/artifact count and bytes at
    the configured limits after retirement; reopening/scrolling the panel does
-   not rematerialize base64 or recreate retired files.
+   not rematerialize base64 or recreate retired files.  Tiny PNG/JPEG fixtures
+   advertising dimensions beyond the hard pixel ceiling remain external-only
+   placeholders and invoke no Emacs native image decoder API.
 7. With five local TCP relays stopped long enough to trigger liveness failure,
    EJN remains responsive, enters reconnect state, and reconnects through the
    same relay ports after they return.  The local kernel PID is unchanged.
@@ -387,7 +389,7 @@ HT1 -> ET1 -> ET2 -> ET3
 HT1 -> TH1
 HT2 -> TH2 -> TH3
 
-IR5 + HT7 + ET3 -> EI1 -> EI1R -> EI2 -> EI3 -> EI4 -> EI4V -> EI5
+IR5 + HT7 + ET3 -> EI1 -> EI1R -> EI2 -> EI3 -> EI4 -> EI4V -> EI4D -> EI5
 EI5 -> EI6 -> EI7 -> EI8 -> EI9 -> EI10 -> EI11
 
 HT13 + EI11 + TH3 -> AG1 -> AG2 -> AG3 -> AG4 -> AG5
@@ -417,7 +419,7 @@ cross-module integration.
 |---|---|---|
 | Luna - low | `HT0`, `HT1`, `TH1`, `EI11` | Runners, specifications, independent fixtures, and documentation/command resolution |
 | Luna - medium | `HT2`, `HT3`, `HT10`, `ET1`, `TH2`, `EI10` | Bounded leaf implementations with exact contracts and isolated tests |
-| Terra - high | `IR1`, `IR2`, `IR3`, `IR3S`, `IR4`, `IR5`, `HT4`, `HT5`, `HT6`, `HT7`, `HT8`, `HT9`, `HT11`, `HT12`, `HT12R1`, `HT12R2`, `HT12R3`, `HT13`, `ET2`, `ET3`, `TH3`, `EI1`, `EI1R`, `EI2`, `EI3`, `EI4`, `EI4V`, `EI5`, `EI6`, `EI7`, `EI8`, `EI9`, `AG1`, `AG2`, `AG3`, `AG5` | Shared state, async ordering, backpressure, secrets/artifacts, kernel lifecycle, reconnect, or integration gates |
+| Terra - high | `IR1`, `IR2`, `IR3`, `IR3S`, `IR4`, `IR5`, `HT4`, `HT5`, `HT6`, `HT7`, `HT8`, `HT9`, `HT11`, `HT12`, `HT12R1`, `HT12R2`, `HT12R3`, `HT13`, `ET2`, `ET3`, `TH3`, `EI1`, `EI1R`, `EI2`, `EI3`, `EI4`, `EI4V`, `EI4D`, `EI5`, `EI6`, `EI7`, `EI8`, `EI9`, `AG1`, `AG2`, `AG3`, `AG5` | Shared state, async ordering, backpressure, secrets/artifacts, kernel lifecycle, reconnect, or integration gates |
 | Manager/manual | `AG4` | Requires real Doom/remote dogfood, observation over time, and an explicit human go/no-go decision |
 
 This partition covers every ledger row exactly once.  A Luna row is promoted
@@ -1172,8 +1174,40 @@ be manager-reviewed for durable-kernel rules.
     test-owned local file.  No GUI is required for security/protocol tests.
   - Narrow run: ERT selector `^ejn-ei4v-` and viewer Python tests.
 
+- [ ] **EI4D Reject compressed-image decoder bombs before Emacs image APIs.**
+  - Depends: EI4V.
+  - Files: `helper/ejn_helper/image_metadata.py`,
+    `helper/ejn_helper/outputs.py`, `helper/tests/test_image_metadata.py`,
+    `helper/tests/test_outputs.py`, `emacs-jupyter-notebook-helper-backend.el`,
+    `emacs-jupyter-notebook-result.el`, `emacs-jupyter-notebook-vars.el`,
+    `tests/emacs-jupyter-notebook-helper-backend-tests.el`, and the panel image
+    tests in `tests/emacs-jupyter-notebook-tests.el`.
+  - Deliverable: parse PNG IHDR and JPEG SOF dimensions without an image
+    library, decoded bitmap allocation, or an unbounded scan.  The helper
+    records exact width/height and an inline-safe decision on every published
+    image descriptor.  Emacs independently re-reads only a fixed-size header,
+    requires the same MIME magic and dimensions, and enforces hard width,
+    height, and pixel-area ceilings before any call to `create-image`,
+    `image-size`, or another native decoder.  The default configurable inline
+    pixel budget is 4,194,304 pixels and may only lower the hard protocol
+    ceiling.  A malformed, unsupported, mismatched, over-dimension, or
+    over-area original remains a bounded panel-owned external-viewer artifact
+    with a lightweight placeholder; it is never decoded inside Emacs.  Limit
+    helper-mode inline images to PNG and JPEG until an equivalent bounded
+    parser exists for another format.
+  - Tests: minimal valid PNG/JPEG at exact dimension and pixel boundaries;
+    one pixel over; forged tiny compressed files advertising huge dimensions;
+    malformed/truncated headers and JPEG marker storms/SOF beyond the scan
+    limit; helper/Emacs dimension mismatch; MIME-magic mismatch; and a canary
+    around every native image API proving unsafe files never reach it.  Assert
+    unsafe originals still open through the asynchronous external viewer and
+    retire under the existing count/byte budgets.  The parser suite runs on
+    x86_64-linux and aarch64-darwin without `/proc`, GUI, or remote services.
+  - Narrow run: helper image-metadata/output tests plus ERT selector
+    `^ejn-ei4d-` and all panel image tests, each under an external deadline.
+
 - [ ] **EI5 Route completion, inspect, is-complete, heartbeat, and stdin.**
-  - Depends: EI4V, HT10, HT11.
+  - Depends: EI4D, HT10, HT11.
   - Files: `emacs-jupyter-notebook-helper-backend.el`,
     `emacs-jupyter-notebook.el`,
     `tests/emacs-jupyter-notebook-helper-backend-tests.el`.
