@@ -379,7 +379,8 @@ IR1 -> IR2 -> IR3 -> IR3S -> IR4 -> IR5       current-code repair lane
 
 HT0 -> HT1 -> HT2 -> HT3 -> HT4 -> HT6       protocol/Python lane
                    \-> HT5 ----/
-HT6 -> HT7 -> HT8 -> HT9 -> HT10 -> HT11 -> HT12 -> HT13
+HT6 -> HT7 -> HT8 -> HT9 -> HT10 -> HT11 -> HT12
+HT12 -> HT12R1 -> HT12R2 -> HT12R3 -> HT13
 
 HT1 -> ET1 -> ET2 -> ET3
 HT1 -> TH1
@@ -415,7 +416,7 @@ cross-module integration.
 |---|---|---|
 | Luna - low | `HT0`, `HT1`, `TH1`, `EI11` | Runners, specifications, independent fixtures, and documentation/command resolution |
 | Luna - medium | `HT2`, `HT3`, `HT10`, `ET1`, `TH2`, `EI10` | Bounded leaf implementations with exact contracts and isolated tests |
-| Terra - high | `IR1`, `IR2`, `IR3`, `IR3S`, `IR4`, `IR5`, `HT4`, `HT5`, `HT6`, `HT7`, `HT8`, `HT9`, `HT11`, `HT12`, `HT13`, `ET2`, `ET3`, `TH3`, `EI1`, `EI1R`, `EI2`, `EI3`, `EI4`, `EI4V`, `EI5`, `EI6`, `EI7`, `EI8`, `EI9`, `AG1`, `AG2`, `AG3`, `AG5` | Shared state, async ordering, backpressure, secrets/artifacts, kernel lifecycle, reconnect, or integration gates |
+| Terra - high | `IR1`, `IR2`, `IR3`, `IR3S`, `IR4`, `IR5`, `HT4`, `HT5`, `HT6`, `HT7`, `HT8`, `HT9`, `HT11`, `HT12`, `HT12R1`, `HT12R2`, `HT12R3`, `HT13`, `ET2`, `ET3`, `TH3`, `EI1`, `EI1R`, `EI2`, `EI3`, `EI4`, `EI4V`, `EI5`, `EI6`, `EI7`, `EI8`, `EI9`, `AG1`, `AG2`, `AG3`, `AG5` | Shared state, async ordering, backpressure, secrets/artifacts, kernel lifecycle, reconnect, or integration gates |
 | Manager/manual | `AG4` | Requires real Doom/remote dogfood, observation over time, and an explicit human go/no-go decision |
 
 This partition covers every ledger row exactly once.  A Luna row is promoted
@@ -724,7 +725,7 @@ modules.
     stale reply, execution cancel while prompting, and helper close.
   - Narrow run: stdin unit/integration modules.
 
-- [~] owner=terra-ht12 claimed=2026-08-31 **HT12 Prove and implement interrupt/restart/shutdown semantics.**
+- [!] owner=terra-ht12 claimed=2026-08-31 evidence=7fc3aac **HT12 Prove and implement interrupt/restart/shutdown semantics.**
   - Depends: HT11, TH2.
   - Files: `helper/integration_tests/test_lifecycle_probe.py`, then
     `helper/ejn_helper/jupyter_backend.py`,
@@ -748,8 +749,75 @@ modules.
     production launch shape, mark `[!]` with probe output.  Do not add local PID
     signals or let the helper issue SSH.
 
+  **Stop evidence:** the pinned executable probe proves message-mode interrupt
+  works and preserves the same usable kernel, but both
+  `shutdown_request(restart=true)` and `restart=false` terminate only the kernel
+  child.  The `jupyter kernel` launcher remains alive; the connection file is
+  unchanged; no replacement kernel becomes ready.  Base `KernelManager` has no
+  active restarter in this launch shape.  No lifecycle production code was
+  added.
+
+- [~] owner=terra-ht12r1 claimed=2026-08-31 **HT12R1 Prove a direct kernelspec launch and relaunch contract.**
+  - Depends: HT12 stop evidence, TH2.
+  - Files: `helper/integration_tests/direct_kernel_fixture.py`,
+    `helper/integration_tests/test_direct_kernel_lifecycle.py`.
+  - Deliverable: resolve one kernelspec as structured JSON, strictly validate
+    its argv/environment/placeholders, substitute an explicit test-owned
+    connection file, and launch that argv directly without `KernelManager` or a
+    launcher parent.  The tracked PID must be the actual kernel on both supported
+    platforms.  Prove message interrupt, protocol shutdown, and a fresh direct
+    relaunch on the same connection file/ports with a reset namespace.
+  - Tests: malformed/oversized spec rejection; quoting and placeholder cases;
+    exact PID/process exit; interrupt then execute; graceful shutdown; relaunch
+    keeps connection metadata/ports, changes PID where observable, clears the
+    namespace, and accepts a new execute.  Cleanup owns only the test process
+    group and is unconditional.
+  - Narrow run: direct-kernel fixture/probe under an external 90-second timeout.
+  - Stop condition: if the same connection file/ports cannot be reused safely,
+    mark `[!]` with observations before changing production launch code.
+
+- [ ] **HT12R2 Launch the actual remote kernel PID asynchronously.**
+  - Depends: HT12R1.
+  - Files: `emacs-jupyter-notebook-ssh.el`,
+    `emacs-jupyter-notebook.el`, `tests/emacs-jupyter-notebook-tests.el`.
+  - Deliverable: add a bounded asynchronous kernelspec-resolution phase for new
+    starts, parse only the proven structured schema, and build a shell-quoted
+    direct kernelspec argv/environment launch.  The detached PID recorded in the
+    registry is the kernel itself.  PID identity checks recognize the exact
+    connection-file argument used by the resolved argv.  Existing
+    `jupyter kernel` launcher entries are rejected rather than adapted.
+  - Tests: kernelspec success/missing/malformed/oversized/hostile values;
+    placeholder and environment substitution; profile command prefixes; exact
+    shell argv quoting; phase deadline/cancel/supersede; PID match/mismatch;
+    launch failure leaves registry and remote files unpromoted.  No synchronous
+    SSH or wait loop is permitted.
+  - Narrow run: focused SSH/async start/reconnect ERT selectors plus source
+    no-blocking assertions.
+
+- [ ] **HT12R3 Implement proven helper interrupt and shutdown semantics.**
+  - Depends: HT12R2.
+  - Files: `helper/integration_tests/kernel_fixture.py`,
+    `helper/ejn_helper/backend.py`, `helper/ejn_helper/dispatcher.py`,
+    `helper/ejn_helper/jupyter_backend.py`, `helper/tests/test_lifecycle.py`,
+    `helper/integration_tests/test_lifecycle.py`, `docs/helper-protocol-v1.md`,
+    `tests/fixtures/helper-protocol-v1.json`,
+    `tests/validate-helper-protocol-v1.py`.
+  - Deliverable: make the reusable fixture use the proven direct launch.  Add
+    one correlated bounded message-mode interrupt and explicit shutdown that
+    waits for both its control reply and terminal kernel liveness, retires all
+    local channel/request state, and never affects a kernel on close.  Remove
+    the impossible helper `restart` operation from protocol v1; there is no
+    compatibility alias.  The user-facing restart remains an EJN orchestration
+    implemented by EI6.
+  - Tests: reordered/duplicate/late control replies; interrupt a long execution
+    then execute again; shutdown during idle/busy/stdin; timeout/cancel;
+    transport failure at send/reply/liveness boundaries; close leaves the direct
+    kernel alive; shutdown exits it with zero readers/tasks/pending requests.
+  - Narrow run: lifecycle unit/integration plus full helper tests and protocol
+    validator under external deadlines.
+
 - [ ] **HT13 Complete helper main loop, signals, and fault containment.**
-  - Depends: HT12.
+  - Depends: HT12R3.
   - Files: `helper/ejn_helper/__main__.py`,
     `helper/ejn_helper/runtime.py`, `helper/tests/test_runtime.py`.
   - Deliverable: asyncio stdin/stdout loop, binary framing, partial-frame timer,
@@ -973,18 +1041,22 @@ be manager-reviewed for durable-kernel rules.
   - Narrow run: ERT selector `^ejn-ei5-` plus W3/W4/W9 completion tests.
 
 - [ ] **EI6 Route explicit interrupt/restart/shutdown correctly.**
-  - Depends: EI5, HT12.
+  - Depends: EI5, HT12R3.
   - Files: `emacs-jupyter-notebook-helper-backend.el`,
     `emacs-jupyter-notebook.el`,
     `tests/emacs-jupyter-notebook-helper-backend-tests.el`.
-  - Deliverable: interrupt affects active request; restart waits asynchronously
-    for helper-confirmed restart then reinjects formatter/watchdog; shutdown is
-    the only route to helper shutdown op and removes durable entry only after
-    confirmed terminal result.  Close/reconnect/failure cannot dispatch either
-    restart or shutdown.
-  - Tests: fake event ordering/timeouts/late success; static call-site audit;
-    restart reinjection once; shutdown failure preserves registry; close and
-    helper crash assert no terminating op.
+  - Deliverable: interrupt affects only the active request.  Restart explicitly
+    asks the helper to shut down the current kernel, waits for confirmation,
+    asynchronously reuses HT12R2's direct launch with the same connection
+    metadata/ports, records the new kernel PID, reconnects the helper, verifies
+    kernel info, and reinjects formatter/watchdog exactly once.  Shutdown is the
+    only route to the helper shutdown op and removes durable state only after a
+    confirmed terminal result.  Close/reconnect/failure cannot dispatch
+    shutdown or launch a replacement.
+  - Tests: fake event ordering/timeouts/late success; restart failure at every
+    shutdown/launch/reconnect/verify boundary; new PID promotion only after
+    verification; restart reinjection once; shutdown failure preserves
+    registry; close and helper crash assert no terminating or launch op.
   - Narrow run: ERT selector `^ejn-ei6-` plus W1/W5/W11 lifecycle tests.
 
 - [ ] **EI7 Mark ambiguous work outcome-unknown and reconnect without replay.**
