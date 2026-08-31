@@ -337,6 +337,8 @@ class JupyterBackend:
         self._retired_tasks: list[asyncio.Task] = []
         self._timed_out_tasks: set[asyncio.Task[None]] = set()
         self._transport_failed = False
+        self._shutting_down = False
+        self._shutdown_reply_received = False
         # One coordinator covers every connect/reattach generation.  Its
         # queue, worker, and retained-byte budget must never multiply.
         self._outputs = OutputNormalizer()
@@ -413,6 +415,13 @@ class JupyterBackend:
                 BackendCompletion.failure(BackendError("transport-error")),
             )
             return None
+        if self._shutting_down:
+            asyncio.get_running_loop().call_soon(
+                self._deliver,
+                completion_callback,
+                BackendCompletion.failure(BackendError("busy")),
+            )
+            return None
         if operation == "connect" and self._connecting:
             asyncio.get_running_loop().call_soon(
                 self._deliver,
@@ -422,6 +431,10 @@ class JupyterBackend:
             return None
         if operation == "connect":
             self._connecting = True
+        if operation == "shutdown":
+            # Admission closes the local operation gate synchronously, before
+            # the task gets a chance to send the control request.
+            self._shutting_down = True
         task = asyncio.get_running_loop().create_task(
             self._run(operation, params, event_callback, completion_callback)
         )
@@ -438,7 +451,7 @@ class JupyterBackend:
 
     async def _run(self, operation, params, event_callback, completion_callback) -> None:
         completion = None
-        retire_provisional = operation == "connect"
+        retire_provisional = operation in {"connect", "shutdown"}
         task = asyncio.current_task()
         assert task is not None
         deadline = asyncio.get_running_loop().call_later(
@@ -459,6 +472,10 @@ class JupyterBackend:
                 result = await self._execute(params, event_callback)
             elif operation == "input_reply":
                 result = self._input_reply(params)
+            elif operation == "interrupt":
+                result = await self._interrupt()
+            elif operation == "shutdown":
+                result = await self._shutdown()
             else:
                 raise BackendError("unsupported")
             completion = BackendCompletion.success(result)
@@ -490,6 +507,15 @@ class JupyterBackend:
             self._timed_out_tasks.discard(task)
             if operation == "connect":
                 self._connecting = False
+            if operation == "shutdown":
+                # A shutdown request has an irreversible remote outcome once
+                # sent.  Every outcome releases only local channels, never
+                # tries to compensate by signalling the kernel.
+                self._stop_channels()
+            # Completion callbacks are allowed to resume before asyncio runs
+            # this task's done callbacks.  Do not retain a finished operation
+            # across that scheduling turn, especially after terminal shutdown.
+            self._tasks.discard(task)
         if completion is not None and not self.closed:
             self._deliver(completion_callback, completion)
 
@@ -592,6 +618,78 @@ class JupyterBackend:
         finally:
             self._unregister_pending(message_id, pending)
 
+    async def _interrupt(self) -> dict:
+        """Request a correlated protocol interrupt without consuming control."""
+        await self._control_request("interrupt_request", "interrupt_reply", {})
+        return {"interrupted": True}
+
+    async def _shutdown(self) -> dict:
+        """Request explicit terminal shutdown and prove heartbeat liveness ends.
+
+        ``shutdown_reply`` is only an acknowledgement.  The direct launch
+        contract requires a second observation that the actual kernel can no
+        longer answer the client's heartbeat before this reports success.
+        """
+        # ipykernel does not service shutdown control traffic while a shell
+        # execution is blocked.  An explicit shutdown is terminal anyway, so
+        # first use the independently correlated protocol interrupt to make
+        # the control path responsive.  Both sends remain bounded by this
+        # single operation deadline and no OS-level signal is involved.
+        await self._control_request("interrupt_request", "interrupt_reply", {})
+        await self._control_request(
+            "shutdown_request", "shutdown_reply", {"restart": False}
+        )
+        self._shutdown_reply_received = True
+        await self._wait_for_terminal_liveness()
+        return {"shutdown": True}
+
+    async def _control_request(
+        self, request_type: str, reply_type: str, content: Mapping[str, object]
+    ) -> dict:
+        """Send one control request and await its sole-reader-correlated reply."""
+        self._ensure_connected()
+        assert self.client is not None
+        try:
+            sent = self.client.session.send(
+                self.client.control_channel.socket, request_type, content=dict(content)
+            )
+            message_id = sent["header"]["msg_id"]
+            if not isinstance(message_id, str) or not message_id:
+                raise ValueError("control request has no message id")
+        except Exception as exc:
+            # A send failure makes its outcome ambiguous.  Do not attempt a
+            # second control send, and release only the local transport.
+            self._fail_transport()
+            raise BackendError("transport-error") from exc
+        pending = _Pending(
+            asyncio.get_running_loop().create_future(), reply_type=reply_type
+        )
+        self._register_pending(message_id, pending)
+        try:
+            return await pending.future
+        finally:
+            self._unregister_pending(message_id, pending)
+
+    async def _wait_for_terminal_liveness(self) -> None:
+        """Poll the attached client's heartbeat until it reports terminal."""
+        while True:
+            client = self.client
+            if client is None:
+                raise BackendError("transport-error")
+            try:
+                alive = client.is_alive()
+                if inspect.isawaitable(alive):
+                    alive = await asyncio.wait_for(alive, self._heartbeat_timeout)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise BackendError("transport-error") from exc
+            if alive is False:
+                return
+            if alive is not True:
+                raise BackendError("protocol-error")
+            await asyncio.sleep(self._heartbeat_interval)
+
     def _input_reply(self, params: Mapping[str, object]) -> dict:
         """Send one claimed input value without retaining it after the call."""
         self._ensure_connected()
@@ -684,12 +782,10 @@ class JupyterBackend:
     def _route(self, channel: str, message: object) -> None:
         """Route exactly one message from its sole channel reader.
 
-        HT8 intentionally only consumes shell replies and execution terminal
-        IOPub state.  Stdin requests are forwarded as the existing
-        ``input_request`` event but do not send replies (HT11 owns that).  The
-        control reader correlates messages now, while HT10/HT12 add operations
-        that consume control replies.  This keeps all channels single-reader
-        without inventing future protocol semantics here.
+        Shell, IOPub, stdin, and control replies are all consumed here.  This
+        is deliberately the only reader for each channel, including lifecycle
+        requests: using the client's built-in reply wait would race this reader
+        and can steal unrelated control replies.
         """
         if not isinstance(message, Mapping):
             self._fail_transport()
@@ -709,8 +805,38 @@ class JupyterBackend:
             self._route_iopub(pending, message)
         elif channel == "stdin":
             self._route_stdin(pending, message)
-        # Control messages are correlated by this sole reader and intentionally
-        # have no consumer until HT10/HT12 introduce control operations.
+        elif channel == "control":
+            self._route_control(pending, message)
+
+    def _route_control(self, pending: _Pending, message: Mapping[str, object]) -> None:
+        if message.get("msg_type") != pending.reply_type:
+            return
+        content = message.get("content")
+        if not isinstance(content, Mapping):
+            pending.future.set_exception(BackendError("protocol-error"))
+            return
+        if pending.reply_type == "interrupt_reply":
+            if content.get("status") != "ok":
+                pending.future.set_exception(BackendError("protocol-error"))
+                return
+            pending.future.set_result({"status": "ok"})
+            return
+        if pending.reply_type == "shutdown_reply":
+            # The Jupyter messaging contract requires only ``restart`` in a
+            # shutdown reply.  Some kernels also include ``status``; when
+            # present it must not report failure.
+            if (
+                content.get("restart") is not False
+                or content.get("status", "ok") != "ok"
+            ):
+                pending.future.set_exception(BackendError("protocol-error"))
+                return
+            # A control reader may fail as the kernel exits immediately after
+            # the reply.  That is expected only after this exact correlation.
+            self._shutdown_reply_received = True
+            pending.future.set_result({"status": "ok", "restart": False})
+            return
+        pending.future.set_exception(BackendError("protocol-error"))
 
     def _route_shell(self, pending: _Pending, message: Mapping[str, object]) -> None:
         if pending.state is None:
@@ -913,6 +1039,11 @@ class JupyterBackend:
     def _fail_transport(self) -> None:
         if self.closed or self._transport_failed:
             return
+        if self._shutting_down and self._shutdown_reply_received:
+            # After the exact shutdown reply, broken channels are expected as
+            # the direct kernel exits.  The shutdown task owns the bounded
+            # terminal-liveness check and its final local teardown.
+            return
         self._transport_failed = True
         for pending in tuple(self._pending.values()):
             if not pending.future.done():
@@ -932,7 +1063,11 @@ class JupyterBackend:
         if cancel_pending:
             for pending in tuple(self._pending.values()):
                 if not pending.future.done():
-                    pending.future.cancel()
+                    # Channel retirement is a transport outcome, not caller
+                    # cancellation.  Complete every accepted operation so its
+                    # dispatcher record cannot remain stranded until a later
+                    # independent deadline.
+                    pending.future.set_exception(BackendError("transport-error"))
             self._pending.clear()
             self._pending_by_task.clear()
         self._input_prompts.clear()
@@ -943,6 +1078,7 @@ class JupyterBackend:
                 pass
         self._channels_started = False
         self.client = None
+        self._shutdown_reply_received = False
         self._outputs.retire(self._output_attachment)
         self._output_attachment = None
 

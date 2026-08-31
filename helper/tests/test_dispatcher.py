@@ -46,7 +46,6 @@ VALID_PARAMS = {
         "value": "yes",
     },
     "interrupt": {},
-    "restart": {},
     "shutdown": {},
     "close": {},
 }
@@ -209,7 +208,6 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
             "inspect",
             "is_complete",
             "interrupt",
-            "restart",
             "shutdown",
         ]
         for number, operation in enumerate(operations):
@@ -224,6 +222,24 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
             [item.operation for item in self.backend.starts],
             ["connect"] + operations,
         )
+        self.assertFalse(self.dispatcher.connected)
+
+    async def test_restart_is_not_a_protocol_v1_operation(self):
+        await self.connect()
+        self.dispatcher.dispatch(request("restart", "restart", {}))
+        self.assertFalse(self.responses[-1]["ok"])
+        self.assertEqual(self.responses[-1]["error"]["code"], "unsupported")
+        self.assertNotIn(
+            "restart", [item.operation for item in self.backend.starts]
+        )
+
+    async def test_failed_shutdown_clears_attachment_state(self):
+        await self.connect()
+        self.backend.queue_plan("shutdown", FakePlan(error=BackendError("timeout")))
+        self.dispatcher.dispatch(request("shutdown-failed", "shutdown", {}))
+        await asyncio.sleep(0)
+        self.assertFalse(self.responses[-1]["ok"])
+        self.assertEqual(self.responses[-1]["error"]["code"], "timeout")
         self.assertFalse(self.dispatcher.connected)
 
     async def test_duplicate_id_and_inflight_bound(self):

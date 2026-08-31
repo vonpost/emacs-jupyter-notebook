@@ -5,10 +5,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "helper-protocol-v1.json"
-OPS = {"hello", "ping", "grant_event_credit", "connect", "kernel_info", "execute", "complete", "inspect", "is_complete", "input_reply", "interrupt", "restart", "shutdown", "close"}
+OPS = {"hello", "ping", "grant_event_credit", "connect", "kernel_info", "execute", "complete", "inspect", "is_complete", "input_reply", "interrupt", "shutdown", "close"}
 EVENTS = {"stream", "display_data", "execute_result", "clear_output", "status", "execute_reply", "input_request", "transport_error", "output_truncated"}
 ERRORS = {"invalid-request", "invalid-event", "unsupported", "timeout", "protocol-error", "frame-too-large", "credit-exhausted", "transport-error", "busy"}
-NO_PARAMS = {"ping", "kernel_info", "interrupt", "restart", "shutdown", "close"}
+NO_PARAMS = {"ping", "kernel_info", "interrupt", "shutdown", "close"}
 PRIORITY = {"status", "execute_reply", "input_request", "transport_error", "output_truncated"}
 ENCODING = {"ensure_ascii": False, "sort_keys": True, "separators": [",", ":"]}
 LIMITS = {

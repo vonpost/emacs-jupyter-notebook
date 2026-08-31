@@ -43,7 +43,6 @@ _BACKEND_OPERATIONS = frozenset(
         "is_complete",
         "input_reply",
         "interrupt",
-        "restart",
         "shutdown",
     }
 )
@@ -327,7 +326,6 @@ class Dispatcher:
             "ping",
             "kernel_info",
             "interrupt",
-            "restart",
             "shutdown",
             "close",
         }:
@@ -656,7 +654,11 @@ class Dispatcher:
                 }
         if success and record.operation == "connect":
             self.connected = True
-        if success and record.operation == "shutdown":
+        # A shutdown request is terminal or outcome-unknown after admission.
+        # The backend has released local channels on every completion path, so
+        # retain neither a stale dispatcher attachment nor a false reconnect
+        # promise after timeout/cancellation/transport failure.
+        if record.operation == "shutdown":
             self.connected = False
         try:
             if success:

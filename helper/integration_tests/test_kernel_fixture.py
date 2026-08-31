@@ -11,7 +11,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from kernel_fixture import KernelFixtureError, LocalKernelFixture
+from direct_kernel_fixture import DirectKernelFixtureError
+from kernel_fixture import KernelAppFixture, KernelFixtureError, LocalKernelFixture
 
 
 def _python(*args: str) -> list[str]:
@@ -20,14 +21,14 @@ def _python(*args: str) -> list[str]:
 
 class KernelFixtureTests(unittest.TestCase):
     def test_startup_failure_is_bounded(self) -> None:
-        fixture = LocalKernelFixture(command=_python("-c", "raise SystemExit(7)"), startup_timeout=2)
+        fixture = KernelAppFixture(command=_python("-c", "raise SystemExit(7)"), startup_timeout=2)
         with self.assertRaises(KernelFixtureError):
             fixture.start()
         fixture.cleanup()
         self.assertIsNone(fixture._process)
 
     def test_popen_exec_failure_cleans_private_directory(self) -> None:
-        fixture = LocalKernelFixture(command=["/definitely/missing/ejn-helper"], startup_timeout=1)
+        fixture = KernelAppFixture(command=["/definitely/missing/ejn-helper"], startup_timeout=1)
         with self.assertRaises(FileNotFoundError):
             fixture.start()
         self.assertIsNone(fixture._tempdir)
@@ -36,7 +37,7 @@ class KernelFixtureTests(unittest.TestCase):
         fixture.cleanup()
 
     def test_startup_timeout_is_bounded(self) -> None:
-        fixture = LocalKernelFixture(command=_python("-c", "import time; time.sleep(10)"), startup_timeout=0.1)
+        fixture = KernelAppFixture(command=_python("-c", "import time; time.sleep(10)"), startup_timeout=0.1)
         started = time.monotonic()
         with self.assertRaises(TimeoutError):
             fixture.start()
@@ -50,12 +51,12 @@ class KernelFixtureTests(unittest.TestCase):
             marker_path = marker.name
         child = ("import os,subprocess,sys,time; open(sys.argv[1],'w').write(str(os.getpgid(0))); "
                  "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)']); time.sleep(10)")
-        fixture = LocalKernelFixture(command=_python("-c", child, marker_path), startup_timeout=0.1)
+        fixture = KernelAppFixture(command=_python("-c", child, marker_path), startup_timeout=0.1)
         with self.assertRaises(TimeoutError):
             fixture.start()
         self.assertIsNone(fixture._owned_pgid)
         self.assertIsNone(fixture.manager_pid)
-        self.assertNotIn(fixture.session_id, LocalKernelFixture._owners)
+        self.assertNotIn(fixture.session_id, KernelAppFixture._owners)
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline and not Path(marker_path).read_text().strip():
             time.sleep(0.01)
@@ -66,12 +67,12 @@ class KernelFixtureTests(unittest.TestCase):
 
     def test_cleanup_twice_does_not_signal_and_clears_state(self) -> None:
         process = subprocess.Popen(_python("-c", "import time; time.sleep(10)"), start_new_session=True)
-        fixture = LocalKernelFixture()
+        fixture = KernelAppFixture()
         fixture._process = process
         fixture._owned_pgid = process.pid
         fixture.manager_pid = process.pid
         fixture._owned_session = True
-        LocalKernelFixture._owners[fixture.session_id] = fixture
+        KernelAppFixture._owners[fixture.session_id] = fixture
         fixture.cleanup()
         with patch("kernel_fixture.os.killpg") as killpg:
             fixture.cleanup()
@@ -88,11 +89,11 @@ class KernelFixtureTests(unittest.TestCase):
         self.assertIsNone(fixture._tempdir)
 
     def test_cleanup_reports_a_process_group_that_survives_kill(self) -> None:
-        fixture = LocalKernelFixture()
+        fixture = KernelAppFixture()
         fixture._process = Mock()
         fixture._owned_pgid = 12345
         fixture._owned_session = True
-        LocalKernelFixture._owners[fixture.session_id] = fixture
+        KernelAppFixture._owners[fixture.session_id] = fixture
         with (patch("kernel_fixture.os.killpg"),
               patch.object(fixture, "_wait_group_gone", return_value=False),
               self.assertRaisesRegex(KernelFixtureError, "did not exit")):
@@ -104,10 +105,10 @@ class KernelFixtureTests(unittest.TestCase):
     def test_timeout_validation_and_identity_mutation(self) -> None:
         for kwargs in ({"startup_timeout": 0}, {"startup_timeout": float("inf")}, {"poll_interval": -1}, {"poll_interval": True}):
             with self.assertRaises(ValueError):
-                LocalKernelFixture(**kwargs)
-        fixture = LocalKernelFixture(command=_python("-c", "raise SystemExit(0)"), startup_timeout=1)
+                KernelAppFixture(**kwargs)
+        fixture = KernelAppFixture(command=_python("-c", "raise SystemExit(0)"), startup_timeout=1)
         fixture._owned_session = True
-        LocalKernelFixture._owners[fixture.session_id] = fixture
+        KernelAppFixture._owners[fixture.session_id] = fixture
         original = fixture.session_id
         fixture.session_id = "mutated"
         with self.assertRaises(KernelFixtureError):
@@ -115,32 +116,28 @@ class KernelFixtureTests(unittest.TestCase):
         fixture.session_id = original
         fixture.cleanup()
 
-    def test_default_command_shape_and_no_proc_fallback(self) -> None:
-        fixture = LocalKernelFixture()
+    def test_kernelapp_fixture_retains_launcher_proof_shape(self) -> None:
+        fixture = KernelAppFixture()
         fixture.connection_path = Path("/tmp/ejn-test-connection.json")
         command = fixture._command()
         self.assertIn("KernelManager.connection_file", command[-1])
-        original = Path
-        try:
-            # The implementation must return None rather than enumerate a
-            # nonexistent /proc tree on systems such as Darwin.
-            import kernel_fixture as module
-            saved = module.Path
-            module.Path = lambda value: original("/definitely/no-proc") if value == "/proc" else original(value)
-            fixture._process = type("Process", (), {"pid": 1})()
-            self.assertIsNone(fixture._descendant_pid())
-        finally:
-            module.Path = saved
+
+    def test_default_fixture_is_direct_and_has_no_proc_dependency(self) -> None:
+        fixture = LocalKernelFixture()
+        self.assertFalse(hasattr(fixture, "_descendant_pid"))
+        with self.assertRaises(TypeError):
+            LocalKernelFixture(command=_python("-c", "raise SystemExit(0)"))
 
     def test_foreign_loopback_connection_is_rejected(self) -> None:
-        with self.assertRaises(KernelFixtureError):
+        with self.assertRaises(DirectKernelFixtureError):
             LocalKernelFixture._validate_connection({"ip": "192.0.2.1"})
 
     @unittest.skipUnless(LocalKernelFixture.available(), "local jupyter-client kernel unavailable")
     def test_start_evaluate_cleanup_and_metadata(self) -> None:
         with LocalKernelFixture() as fixture:
-            self.assertTrue(fixture.session_id.startswith("ejn-test-"))
+            self.assertTrue(fixture.session_id.startswith("ejn-direct-"))
             self.assertIsNotNone(fixture.connection)
+            self.assertEqual(fixture.kernel_pid, fixture._process.pid)
             assert fixture.connection is not None
             self.assertIn(fixture.connection.get("ip", fixture.connection.get("host")), {"127.0.0.1", "localhost", "::1"})
             reply = fixture.evaluate("1 + 1", timeout=8)
@@ -165,15 +162,15 @@ class KernelFixtureTests(unittest.TestCase):
             self.assertFalse(path and path.exists())
 
     def test_refuses_foreign_session_cleanup(self) -> None:
-        first = LocalKernelFixture(command=_python("-c", "import time; time.sleep(10)"), startup_timeout=0.05)
+        first = KernelAppFixture(command=_python("-c", "import time; time.sleep(10)"), startup_timeout=0.05)
         first.session_id = "foreign"
         first._owned_session = True
-        LocalKernelFixture._owners["foreign"] = LocalKernelFixture()
+        KernelAppFixture._owners["foreign"] = KernelAppFixture()
         try:
             with self.assertRaises(KernelFixtureError):
                 first.cleanup()
         finally:
-            LocalKernelFixture._owners.pop("foreign", None)
+            KernelAppFixture._owners.pop("foreign", None)
 
 
 if __name__ == "__main__":

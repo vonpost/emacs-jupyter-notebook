@@ -18,7 +18,6 @@
     {"name":"op-is-complete","kind":"frame","object":{"v":1,"kind":"request","id":"op-is-complete","op":"is_complete","params":{"code":"x = 1"}}},
     {"name":"op-input-reply","kind":"frame","object":{"v":1,"kind":"request","id":"op-input","op":"input_reply","params":{"request_id":"exec-1","input_id":"0123456789abcdef0123456789abcdef","value":"yes"}}},
     {"name":"op-interrupt","kind":"frame","object":{"v":1,"kind":"request","id":"op-interrupt","op":"interrupt","params":{}}},
-    {"name":"op-restart","kind":"frame","object":{"v":1,"kind":"request","id":"op-restart","op":"restart","params":{}}},
     {"name":"op-shutdown","kind":"frame","object":{"v":1,"kind":"request","id":"op-shutdown","op":"shutdown","params":{}}},
     {"name":"op-close","kind":"frame","object":{"v":1,"kind":"request","id":"op-close","op":"close","params":{}}},
     {"name":"response-ok","kind":"frame","object":{"v":1,"kind":"response","id":"r-17","ok":true,"result":{}},"declared_payload_length":59,"prefix_hex":"0000003b"},

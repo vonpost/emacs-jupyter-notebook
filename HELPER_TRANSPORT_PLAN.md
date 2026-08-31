@@ -242,7 +242,6 @@ Protocol v1 supports only:
 - `is_complete`
 - `input_reply`
 - `interrupt`
-- `restart`
 - `shutdown`
 - `close`
 
@@ -260,10 +259,12 @@ encoding.  Larger code is rejected locally with an explicit user-facing error;
 it is never split into multiple executions.  Silent setup and user executions
 share one serialization discipline, but silent setup has no panel entry.
 
-`close` is local-only.  `restart` and `shutdown` are permitted only after the
-explicit corresponding EJN user command.  Their exact protocol implementation
-must be proven by `HT12` against a local kernel launched by the same `jupyter
-kernel` parent shape used remotely; no agent guesses these semantics.
+`close` is local-only.  `interrupt` and `shutdown` are permitted only after the
+explicit corresponding EJN user command.  Protocol v1 has no helper `restart`
+operation: EI6 implements the user-facing restart by explicitly shutting down,
+directly relaunching, reconnecting, and verifying a fresh kernel.  HT12/HT12R1
+proved these semantics against both the rejected KernelApp parent shape and the
+adopted direct-kernelspec launch.
 
 ### Execution states
 
@@ -842,7 +843,11 @@ modules.
     `helper/ejn_helper/jupyter_backend.py`, `helper/tests/test_lifecycle.py`,
     `helper/integration_tests/test_lifecycle.py`, `docs/helper-protocol-v1.md`,
     `tests/fixtures/helper-protocol-v1.json`,
-    `tests/validate-helper-protocol-v1.py`.
+    `tests/validate-helper-protocol-v1.py`.  Manager-approved dependent-test
+    updates also cover `helper/tests/test_dispatcher.py`,
+    `tests/emacs-jupyter-notebook-helper-protocol-tests.el`, and
+    `helper/integration_tests/{test_connect.py,test_kernel_fixture.py,
+    test_lifecycle_probe.py}`.
   - Deliverable: make the reusable fixture use the proven direct launch.  Add
     one correlated bounded message-mode interrupt and explicit shutdown that
     waits for both its control reply and terminal kernel liveness, retires all

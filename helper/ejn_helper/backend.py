@@ -14,7 +14,6 @@ BackendOperation: TypeAlias = Literal[
     "is_complete",
     "input_reply",
     "interrupt",
-    "restart",
     "shutdown",
 ]
 

@@ -1,7 +1,9 @@
-"""Test-owned local Jupyter kernel fixture.
+"""Test-owned local Jupyter kernel fixtures.
 
-The fixture deliberately owns a private process group and temporary directory.
-It never searches for or signals processes outside that group.
+``LocalKernelFixture`` is the direct kernelspec process used by normal helper
+integration tests.  ``KernelAppFixture`` remains solely for the historical
+HT12 proof that the old ``jupyter kernel`` launcher cannot restart a child.
+Both own a private process group and never search outside it.
 """
 
 from __future__ import annotations
@@ -20,12 +22,14 @@ from queue import Empty
 from pathlib import Path
 from typing import Any, Sequence
 
+from direct_kernel_fixture import DirectKernelFixture
+
 
 class KernelFixtureError(RuntimeError):
     """A fixture could not start or did not expose valid connection data."""
 
 
-class LocalKernelFixture:
+class KernelAppFixture:
     """Context-managed, test-owned local kernel process.
 
     ``command`` is injectable for deterministic startup failure/timeout tests.
@@ -33,7 +37,7 @@ class LocalKernelFixture:
     kernel application without requiring a shell.
     """
 
-    _owners: dict[str, "LocalKernelFixture"] = {}
+    _owners: dict[str, "KernelAppFixture"] = {}
 
     def __init__(
         self,
@@ -89,7 +93,7 @@ class LocalKernelFixture:
             f"--KernelManager.connection_file={self.connection_path}",
         ]
 
-    def __enter__(self) -> "LocalKernelFixture":
+    def __enter__(self) -> "KernelAppFixture":
         self.start()
         return self
 
@@ -136,7 +140,7 @@ class LocalKernelFixture:
         # start_new_session creates a group whose ID is the child PID on the
         # supported POSIX platforms.  Capture it without a fallible /proc API.
         self._owned_pgid = self._process.pid
-        LocalKernelFixture._owners[self.session_id] = self
+        KernelAppFixture._owners[self.session_id] = self
         self._owned_session = True
         try:
             self._wait_ready(self.startup_timeout)
@@ -194,9 +198,9 @@ class LocalKernelFixture:
                 continue
         return None
 
-    def _owned(self) -> "LocalKernelFixture":
+    def _owned(self) -> "KernelAppFixture":
         if (self.session_id != self._owned_session_id
-                or LocalKernelFixture._owners.get(self.session_id) is not self):
+                or KernelAppFixture._owners.get(self.session_id) is not self):
             raise KernelFixtureError("fixture session is not owned by this instance")
         return self
 
@@ -256,14 +260,14 @@ class LocalKernelFixture:
         """
         if not self._owned_session:
             return
-        owner = LocalKernelFixture._owners.get(self.session_id)
+        owner = KernelAppFixture._owners.get(self.session_id)
         if owner is not None and owner is not self:
             raise KernelFixtureError("refusing cleanup of another fixture session")
         if self.session_id != self._owned_session_id:
             raise KernelFixtureError("refusing cleanup after session identity mutation")
         # Retire the ownership record before signaling so reentrant or
         # repeated cleanup cannot ever target a recycled process group.
-        LocalKernelFixture._owners.pop(self.session_id, None)
+        KernelAppFixture._owners.pop(self.session_id, None)
         self._owned_session = False
         process = self._process
         pgid = self._owned_pgid
@@ -320,3 +324,50 @@ class LocalKernelFixture:
         self._tempdir = None
         if directory is not None:
             directory.cleanup()
+
+
+class _DirectLocalKernelFixture(DirectKernelFixture):
+    """Direct fixture with the small legacy test convenience surface."""
+
+    @property
+    def manager_pid(self) -> int | None:
+        """The direct process is the kernel; there is no launcher parent."""
+        return self.kernel_pid
+
+    def evaluate(self, expression: str, timeout: float = 10.0) -> dict[str, Any]:
+        self._validate_timeout(timeout, "timeout")
+        if self.connection is None:
+            raise KernelFixtureError("direct kernel is not started")
+        try:
+            from jupyter_client import BlockingKernelClient
+        except ImportError as exc:
+            raise KernelFixtureError("jupyter_client is unavailable") from exc
+        client = BlockingKernelClient()
+        client.load_connection_info(self.connection)
+        client.start_channels()
+        try:
+            client.wait_for_ready(timeout=timeout)
+            message_id = client.execute(expression)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                try:
+                    message = client.get_shell_msg(
+                        timeout=max(0.01, deadline - time.monotonic())
+                    )
+                except Empty as exc:
+                    raise TimeoutError("timed out waiting for execute reply") from exc
+                if (
+                    message.get("msg_type") == "execute_reply"
+                    and message.get("parent_header", {}).get("msg_id") == message_id
+                ):
+                    content = message.get("content")
+                    if isinstance(content, dict):
+                        return content
+                    raise KernelFixtureError("invalid execute reply")
+            raise TimeoutError("timed out waiting for execute reply")
+        finally:
+            client.stop_channels()
+
+
+class LocalKernelFixture(_DirectLocalKernelFixture):
+    """Default reusable fixture: one proven direct kernelspec process."""

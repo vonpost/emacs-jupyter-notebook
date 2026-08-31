@@ -12,7 +12,7 @@ import time
 import unittest
 from queue import Empty
 
-from kernel_fixture import LocalKernelFixture
+from kernel_fixture import KernelAppFixture
 
 
 def _wait_message(
@@ -56,9 +56,9 @@ def _wait_status(client, message_id: str, state: str, timeout: float) -> dict:
 class LifecycleProtocolProbe(unittest.TestCase):
     """Record the lifecycle behavior of the exact fixture launch shape."""
 
-    @unittest.skipUnless(LocalKernelFixture.available(), "jupyter_client unavailable")
+    @unittest.skipUnless(KernelAppFixture.available(), "jupyter_client unavailable")
     def test_protocol_interrupt_leaves_the_kernel_usable(self) -> None:
-        with LocalKernelFixture(startup_timeout=10) as fixture:
+        with KernelAppFixture(startup_timeout=10) as fixture:
             from jupyter_client import BlockingKernelClient
 
             assert fixture.connection is not None
@@ -92,9 +92,9 @@ class LifecycleProtocolProbe(unittest.TestCase):
             finally:
                 client.stop_channels()
 
-    @unittest.skipUnless(LocalKernelFixture.available(), "jupyter_client unavailable")
+    @unittest.skipUnless(KernelAppFixture.available(), "jupyter_client unavailable")
     def test_protocol_restart_does_not_restart_under_kernelapp_parent(self) -> None:
-        with LocalKernelFixture(startup_timeout=10) as fixture:
+        with KernelAppFixture(startup_timeout=10) as fixture:
             from jupyter_client import BlockingKernelClient
 
             assert fixture.connection is not None
@@ -150,9 +150,9 @@ class LifecycleProtocolProbe(unittest.TestCase):
                 if fresh_client is not None:
                     fresh_client.stop_channels()
 
-    @unittest.skipUnless(LocalKernelFixture.available(), "jupyter_client unavailable")
+    @unittest.skipUnless(KernelAppFixture.available(), "jupyter_client unavailable")
     def test_protocol_shutdown_stops_child_but_not_kernelapp_parent(self) -> None:
-        with LocalKernelFixture(startup_timeout=10) as fixture:
+        with KernelAppFixture(startup_timeout=10) as fixture:
             from jupyter_client import BlockingKernelClient
 
             assert fixture.connection is not None and fixture._process is not None

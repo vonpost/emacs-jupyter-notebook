@@ -70,7 +70,7 @@ including when a priority event bypasses ordinary output blocked on credit.
 
 Allowed operations are: `hello`, `ping`, `grant_event_credit`, `connect`,
 `kernel_info`, `execute`, `complete`, `inspect`, `is_complete`,
-`input_reply`, `interrupt`, `restart`, `shutdown`, and `close`.
+`input_reply`, `interrupt`, `shutdown`, and `close`.
 
 Allowed events are: `stream`, `display_data`, `execute_result`,
 `clear_output`, `status`, `execute_reply`, `input_request`,
@@ -112,8 +112,18 @@ input requests, transport errors, and the truncation marker are never dropped.
 `attached`; liveness is then checked with bounded `kernel_info`. `ping` is
 local helper liveness and does not touch Jupyter. `execute` accepts at most
 `EJN_MAX_CODE_BYTES` UTF-8 source bytes and is never split. `close` is
-local-only. `restart` and `shutdown` are sent only after the corresponding
-explicit user command.
+local-only. `interrupt` and `shutdown` are sent only after the corresponding
+explicit user command.  Protocol v1 deliberately has no helper `restart`:
+the direct kernel launch contract cannot restart in place.
+
+`interrupt` completes only after its correlated control-channel
+`interrupt_reply`. `shutdown` first sends that same bounded interrupt so a
+busy or stdin-blocked ipykernel can service control traffic, then sends exactly
+one `shutdown_request` with `restart=false`. It completes only after the
+matching `shutdown_reply` and a bounded heartbeat observation that the kernel
+is no longer alive. The helper then retires its local readers and pending
+requests. A timeout, cancellation, or local transport failure never issues an
+OS signal or any compensating lifecycle request.
 
 The execution ledger is monotonic:
 
