@@ -1070,7 +1070,7 @@ be manager-reviewed for durable-kernel rules.
     reject legacy adapter calls and synchronous waits on the helper path.
   - Narrow run: ERT selector `^ejn-ei2-` plus W13/W15/W19 selectors.
 
-- [~] owner=terra-ei3 claimed=2026-08-31 **EI3 Replace singleton evaluation state with serialized request ledger.**
+- [x] sha=ebd6351 **EI3 Replace singleton evaluation state with serialized request ledger.**
   - Depends: EI2.
   - Files: `emacs-jupyter-notebook.el`,
     `emacs-jupyter-notebook-result.el`,
@@ -1108,19 +1108,43 @@ be manager-reviewed for durable-kernel rules.
     of the old W5/W13 singleton tests to assert the ledger contract directly.
   - Narrow run: ERT selector `^ejn-ei3-` plus W5/W13 evaluation tests.
 
-- [ ] **EI4 Route normalized text/display/artifact events to the panel.**
+- [~] owner=terra-ei4 claimed=2026-08-31 **EI4 Route normalized text/display/artifact events to the panel.**
   - Depends: EI3, HT9.
-  - Files: `emacs-jupyter-notebook-helper-backend.el`,
+  - Files: `emacs-jupyter-notebook-helper.el`,
+    `emacs-jupyter-notebook-helper-backend.el`,
+    `emacs-jupyter-notebook.el`, `emacs-jupyter-notebook-events.el`,
     `emacs-jupyter-notebook-result.el`,
-    `tests/emacs-jupyter-notebook-helper-backend-tests.el`.
+    `tests/emacs-jupyter-notebook-helper-process-tests.el`,
+    `tests/emacs-jupyter-notebook-helper-backend-tests.el`, and the panel/event
+    tests in `tests/emacs-jupyter-notebook-tests.el`.
   - Deliverable: translate helper stream/error/result/clear/display/update/
-    truncation envelopes into EI1R's reducer without re-decoding images.  Add a
-    panel API accepting an already-published confined image file plus
-    MIME/hash/size.  Validate path and size before display.  Entry retirement
-    deletes file exactly once.
-  - Tests: every event, artifact escape/symlink/replacement, clear wait/update,
-    retired/late event, repeated deletion, unsupported/truncated marker,
-    image-cache flush, and 100 artifacts respecting IR3 budgets.
+    truncation envelopes into EI1R's reducer without re-decoding images.  Drain
+    ordinary output, terminal events, and responses in monotonic wire-sequence
+    order: a priority terminal/response may bypass credit pressure but may not
+    overtake an already-received ordinary event for the same execution.
+    Normalize and synchronously dispatch admitted panel events within the
+    bounded drain before replenishing credit; do not allocate one timer per
+    event.  Remove EI3's synthetic reply/idle bridge and retain helper request
+    correlation until real `execute_reply` plus `status=idle` retire it.
+    `display_data` and `update_display_data` must preserve bounded display-id
+    identity and replacement semantics.
+
+    Add a panel API accepting an already-published confined image file plus
+    MIME/hash/size.  The accepted path must be an immediate child of the pinned
+    publication root, a regular non-symlink owned by the current uid with exact
+    mode 0600, the declared bounded size and SHA-256, and a captured device/
+    inode identity.  Accepted publication transfers file lifetime to the panel;
+    helper/session cleanup removes staging state but not panel-owned files.
+    Entry retirement flushes the Emacs image cache and unlinks exactly once only
+    while path identity is unchanged; a replaced path or symlink survives.
+  - Tests: every normalized event and malformed envelope before reducer
+    mutation; helper/ledger/generation correlation; stream then terminal then
+    response ordering (including zero credit); callback completion before
+    credit replenishment; real reply/idle terminality without synthesis;
+    artifact escape/symlink/mode/owner/hash/size/replacement; clear wait/update
+    and display-id replacement; retired/late event; repeated deletion;
+    unsupported/truncated marker; image-cache flush; fixed panel markers; no
+    base64 in Emacs state; and 100 artifacts respecting IR3 count/byte budgets.
   - Narrow run: ERT selector `^ejn-ei4-` plus all panel tests.
 
 - [ ] **EI4V Move matplotlib viewer payloads to confined pickle files.**
