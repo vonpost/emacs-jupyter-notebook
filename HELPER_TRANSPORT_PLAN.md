@@ -691,7 +691,7 @@ modules.
     input base64 substring.
   - Narrow run: output unit/integration modules; no test frame over 262144.
 
-- [~] owner=luna-ht10 claimed=2026-08-31 **HT10 Implement bounded auxiliary requests.**
+- [x] owner=luna-ht10 claimed=2026-08-31 landed=4859717 **HT10 Implement bounded auxiliary requests.**
   - Depends: HT9.
   - Files: `helper/ejn_helper/jupyter_backend.py`,
     `helper/tests/test_aux_requests.py`,
@@ -705,14 +705,21 @@ modules.
     operation.
   - Narrow run: aux unit/integration modules.
 
-- [ ] **HT11 Implement stdin request/reply safely.**
+- [~] owner=terra-ht11 claimed=2026-08-31 **HT11 Implement stdin request/reply safely.**
   - Depends: HT10.
   - Files: `helper/ejn_helper/jupyter_backend.py`,
+    `helper/ejn_helper/dispatcher.py`, `docs/helper-protocol-v1.md`,
+    `tests/fixtures/helper-protocol-v1.json`,
+    `tests/validate-helper-protocol-v1.py`, `helper/tests/test_dispatcher.py`,
     `helper/tests/test_stdin.py`, `helper/integration_tests/test_stdin.py`.
   - Deliverable: correlate input request to execution, expose prompt/password
-    boolean with bounded prompt text, accept one reply, clear password values
-    after send where Python permits, and handle cancel/timeout/helper close.
-    Password values never enter logs or error payloads.
+    boolean with bounded prompt text and a fresh opaque per-prompt `input_id`.
+    An input reply must name both its execution request and exact `input_id`;
+    the dispatcher atomically claims that lease before the backend sends one
+    reply, so an old duplicate cannot answer a later prompt in the same
+    execution.  Clear password values after send where Python permits, and
+    handle cancel/timeout/helper close.  Password values never enter logs,
+    events, success results, or error payloads.
   - Tests: ordinary input, password-shaped input with log capture, duplicate and
     stale reply, execution cancel while prompting, and helper close.
   - Narrow run: stdin unit/integration modules.
