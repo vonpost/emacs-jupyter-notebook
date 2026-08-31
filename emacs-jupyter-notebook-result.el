@@ -1486,6 +1486,14 @@ so text segments are left untouched and no new segment is created."
        entry))
     (emacs-jupyter-notebook-panel-flush-now (plist-get handle :panel))))
 
+(defun ejn-panel-set-entry-status (handle status)
+  "Set live HANDLE to nonterminal STATUS without fabricating an execution count.
+Used by the serialized execution ledger to expose queued work before it is
+actually dispatched to a kernel."
+  (when handle
+    (emacs-jupyter-notebook-panel--update-entry
+     handle (lambda (entry) (plist-put entry :status status)))))
+
 (defun ejn-panel-clear-entry (handle &optional wait)
   "Clear HANDLE's entry content.
 If WAIT is non-nil, defer the clear until the next text arrives

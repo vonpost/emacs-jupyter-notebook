@@ -16,8 +16,12 @@
 (require 'emacs-jupyter-notebook-result)
 
 (defvar emacs-jupyter-notebook--kernel-status nil)
-(defvar emacs-jupyter-notebook--evaluation-timer nil)
-(defvar emacs-jupyter-notebook--evaluation-request nil)
+(declare-function emacs-jupyter-notebook--execution-current-p
+                  "emacs-jupyter-notebook" (id))
+(declare-function emacs-jupyter-notebook--execution-record
+                  "emacs-jupyter-notebook" (id))
+(declare-function emacs-jupyter-notebook--execution-note-event
+                  "emacs-jupyter-notebook" (context event))
 
 (defconst emacs-jupyter-notebook-events--types
   '(stream clear result display update-display error execute-reply status
@@ -31,19 +35,49 @@
     (and (buffer-live-p buffer)
          (with-current-buffer buffer
            (or (null request-id)
-               (equal request-id
-                      (plist-get emacs-jupyter-notebook--evaluation-request
-                                 :request-id)))))))
+               (emacs-jupyter-notebook--execution-current-p request-id))))))
+
+(defun emacs-jupyter-notebook-events--execution-event-admitted-p (context event)
+  "Return non-nil when EVENT may mutate the request named by CONTEXT.
+
+Lifecycle events without a request id are transport-wide and remain admitted.
+Per-execution events require the active ledger record, its captured panel
+generation, and the execute request id admitted by the backend.  A legacy
+terminal callback can arrive while `backend-execute' is still returning that
+id; stage only its terminal evidence and defer all reducer presentation until
+the core has validated admission."
+  (let ((buffer (plist-get context :buffer))
+        (request-id (plist-get context :request-id)))
+    (or (null request-id)
+        (and (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (let* ((record (emacs-jupyter-notebook--execution-record request-id))
+                      (backend-id (plist-get context :backend-request-id))
+                      (generation (plist-get context :panel-generation))
+                      (type (plist-get event :type)))
+                 (and record
+                      (emacs-jupyter-notebook--execution-current-p request-id)
+                      (memq (plist-get record :state) '(dispatched cancelling))
+                      (equal generation (plist-get record :generation))
+                      (cond
+                       ((and backend-id
+                             (plist-get record :backend-request-id)
+                             (equal backend-id
+                                    (plist-get record :backend-request-id)))
+                        t)
+                       ;; Pre-admission terminal evidence is retained by the
+                       ;; core but never reaches panel/status reduction first.
+                       ((and backend-id
+                             (null (plist-get record :backend-request-id))
+                             (eq (plist-get record :state) 'dispatched)
+                             (memq type '(execute-reply status)))
+                        (emacs-jupyter-notebook--execution-note-event context event)
+                        nil)
+                       (t nil)))))))))
 
 (defun emacs-jupyter-notebook-events--entry-live-p (context)
   "Return non-nil when CONTEXT's presentation entry has not been retired."
   (ejn-panel-entry-live-p (plist-get context :entry-handle)))
-
-(defun emacs-jupyter-notebook-events--current-request (context)
-  "Return CONTEXT's source buffer current request, without mutating it."
-  (let ((buffer (plist-get context :buffer)))
-    (and (buffer-live-p buffer)
-         (with-current-buffer buffer emacs-jupyter-notebook--evaluation-request))))
 
 (defun emacs-jupyter-notebook-events--error-text (event)
   "Return display text for normalized error EVENT."
@@ -55,7 +89,7 @@
 
 (defun emacs-jupyter-notebook-events--reply-status (event)
   "Return the panel status symbol encoded by execute-reply EVENT."
-  (if (equal (plist-get event :status) "error") 'error 'ok))
+  (if (equal (plist-get event :status) "ok") 'ok 'error))
 
 (defun emacs-jupyter-notebook-events-reduce (context event)
   "Reduce normalized EVENT with CONTEXT to declarative EJN actions.
@@ -120,13 +154,8 @@ truncation has optional `:text'."
       ('execute-reply
        (let* ((handle (plist-get context :entry-handle))
               (snapshot (and live (ejn-panel-entry-snapshot handle)))
-              (cell-key (plist-get handle :cell-key))
-              (current-request (emacs-jupyter-notebook-events--current-request context))
-              (same-cell (and (not current)
-                              (plist-get current-request :cell-key)
-                              (equal (plist-get current-request :cell-key) cell-key))))
-         (append (when current '((:action settle-request)))
-                 (when (and snapshot (eq (plist-get snapshot :status) 'running)
+              (same-cell nil))
+         (append (when (and current snapshot (memq (plist-get snapshot :status) '(running queued))
                             (not same-cell))
                    (let ((watch (plist-get event :watch-text))
                          (status (emacs-jupyter-notebook-events--reply-status event)))
@@ -143,15 +172,12 @@ truncation has optional `:text'."
                                                   (or (plist-get event :evalue) ""))
                                     :face 'emacs-jupyter-notebook-result-error-face
                                     :result-seen t)))
-                      (list (list :action 'finish :status status
-                                  :execution-count (plist-get event :execution-count)
-                                  :cell-key cell-key))))))))
+                      nil))))))
       ('status
        (let ((state (plist-get event :execution-state)))
          (unless (stringp state)
            (error "Malformed status event :execution-state"))
-         (list (list :action 'status :state state
-                     :settle-idle (and (equal state "idle") current)))))
+         (list (list :action 'status :state state))))
       ('input-request
        (if current
            (list (list :action 'input-request
@@ -211,13 +237,6 @@ buffer or superseded execution cannot receive an input reply."
       ((or 'result 'display 'update-display)
        (emacs-jupyter-notebook-events--render-display
         context (plist-get action :data) (plist-get action :action)))
-      ('settle-request
-       (when (buffer-live-p buffer)
-         (with-current-buffer buffer
-           (when (timerp emacs-jupyter-notebook--evaluation-timer)
-             (cancel-timer emacs-jupyter-notebook--evaluation-timer))
-           (setq emacs-jupyter-notebook--evaluation-timer nil
-                 emacs-jupyter-notebook--evaluation-request nil))))
       ('finish
        (when (ejn-panel-entry-live-p handle)
          (ejn-panel-finish-entry handle (plist-get action :status)
@@ -232,10 +251,6 @@ buffer or superseded execution cannot receive an input reply."
          (with-current-buffer buffer
            (setq emacs-jupyter-notebook--kernel-status
                  (pcase (plist-get action :state) ("busy" 'busy) ("idle" 'idle) (_ nil)))
-           (when (plist-get action :settle-idle)
-             (when (timerp emacs-jupyter-notebook--evaluation-timer)
-               (cancel-timer emacs-jupyter-notebook--evaluation-timer))
-             (setq emacs-jupyter-notebook--evaluation-timer nil))
            (force-mode-line-update t))))
       ('input-request
        ;; Showing the prompt is presentation, but reading and replying happen
@@ -251,13 +266,21 @@ No event error is swallowed: malformed events, stale shape regressions, and
 presentation exceptions produce one bounded `message' diagnostic while the
 transport callback itself remains safe."
   (condition-case err
-      (let ((actions (emacs-jupyter-notebook-events-reduce context event)))
-        (dolist (action actions)
-          (emacs-jupyter-notebook-events--apply context action)
-          (when (plist-get action :result-seen)
-            (when-let ((setter (plist-get context :set-had-result)))
-              (funcall setter t))))
-        actions)
+      (if (not (emacs-jupyter-notebook-events--execution-event-admitted-p
+                context event))
+          '((:action ignore))
+        (let ((actions (emacs-jupyter-notebook-events-reduce context event)))
+          (dolist (action actions)
+            (emacs-jupyter-notebook-events--apply context action)
+            (when (plist-get action :result-seen)
+              (when-let ((setter (plist-get context :set-had-result)))
+                (funcall setter t))))
+          (when (and (not (plist-get context :skip-execution-note))
+                     (memq (plist-get event :type) '(execute-reply status)))
+            (when (buffer-live-p (plist-get context :buffer))
+              (with-current-buffer (plist-get context :buffer)
+                (emacs-jupyter-notebook--execution-note-event context event))))
+          actions))
     (error
      (message "emacs-jupyter-notebook event reducer failed for %S: %s"
               (plist-get event :type) (error-message-string err))

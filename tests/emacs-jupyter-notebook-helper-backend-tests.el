@@ -44,10 +44,10 @@ DISPOSALS receives local-only disposal reasons."
                     (funcall (plist-get arguments :ready-callback) helper nil)
                     helper)))
                ((symbol-function 'emacs-jupyter-notebook-helper-request)
-                (lambda (_helper operation params callback &rest _keys)
+               (lambda (_helper operation params callback &rest _keys)
                   (push (list operation params) ,requests)
                   (push callback ,callbacks)
-                  (length ,callbacks)))
+                  (format "ejn-request-test-%d" (length ,callbacks))))
                ((symbol-function 'emacs-jupyter-notebook-helper-dispose)
                 (lambda (_helper reason) (push reason ,disposals))))
        ,@body)))
@@ -455,6 +455,8 @@ DISPOSALS receives local-only disposal reasons."
                       ((symbol-function 'emacs-jupyter-notebook--heartbeat-start) #'ignore)
                       ((symbol-function 'emacs-jupyter-notebook--inject-viewer-formatter) #'ignore)
                       ((symbol-function 'emacs-jupyter-notebook--inject-idle-watchdog) #'ignore)
+                      ((symbol-function 'emacs-jupyter-notebook--execution-start-setup)
+                       #'ignore)
                       ((symbol-function 'emacs-jupyter-notebook-ssh-start-bounded-process)
                        (lambda (name _argv _limit sentinel)
                          (let* ((stderr (generate-new-buffer " *ejn-ei2-probe-stderr*"))
@@ -586,7 +588,7 @@ DISPOSALS receives local-only disposal reasons."
                        #'ignore)
                       ((symbol-function 'emacs-jupyter-notebook--heartbeat-start)
                        #'ignore)
-                      ((symbol-function 'emacs-jupyter-notebook--inject-viewer-formatter)
+                      ((symbol-function 'emacs-jupyter-notebook--execution-start-setup)
                        (lambda (&rest _) (error "formatter setup failed")))
                       ((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
                        #'ignore)
@@ -815,32 +817,48 @@ DISPOSALS receives local-only disposal reasons."
         (should-not (file-exists-p artifact))
         (should (= 1 (length disposals)))))))
 
-(ert-deftest ejn-ei2-only-silent-setup-execute-is-admitted ()
-  "EI2 cannot silently discard user output or accept later-row operations."
-  (ejn-ei2-test-with-fake-helper (requests callbacks disposals)
-    (ejn-ei2-test-with-session
-      (let (setup-error user-error aux-error control-error)
-        (emacs-jupyter-notebook-backend-connect session "/tmp/c.json" #'ignore #'ignore)
-        (funcall (car callbacks) nil (ejn-ei2-test--attached-response) nil)
-        (funcall (car callbacks) nil (ejn-ei2-test--response) nil)
-        (ejn-ei2-test--run-timers)
+
+(ert-deftest ejn-ei3-helper-execute-and-is-complete-use-v1-operations ()
+  "EI3 admits user execute/is_complete and rejects unrelated helper operations."
+  (with-temp-buffer
+    (let* ((emacs-jupyter-notebook-backend 'helper)
+           (session (emacs-jupyter-notebook-backend-session-create nil (current-buffer)))
+           (state (emacs-jupyter-notebook-helper-backend--make-state :helper 'fake))
+           requests execute-error complete-result readiness-result control-error)
+      (setf (emacs-jupyter-notebook-backend-session-data session) state)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper-request)
+                 (lambda (_helper operation params callback &rest _keys)
+                   (push (list operation params) requests)
+                   (funcall callback 'fake
+                            (ejn-ei2-test--response
+                             (if (equal operation "is_complete")
+                                 (ejn-ei2-test--object "status" "complete")
+                               (ejn-ei2-test--object "status" "ok"
+                                                    "execution_count" 1))) nil)
+                   (format "ejn-request-test-%d" (length requests)))))
         (emacs-jupyter-notebook-backend-execute
-         session "setup()" '(:silent t) #'ignore (lambda (_id e) (setq setup-error e)))
-        (should (equal (caar requests) "execute"))
-        (should (equal (gethash "code" (cadar requests)) "setup()"))
-        (funcall (car callbacks) nil (ejn-ei2-test--response) nil)
-        (emacs-jupyter-notebook-backend-execute
-         session "user()" nil #'ignore (lambda (_id e) (setq user-error e)))
+         session "user()" '(:ledger-id 7) #'ignore
+         (lambda (_id error) (setq execute-error error)))
         (emacs-jupyter-notebook-backend-aux
-         session 'complete '(:code "x" :cursor-pos 1) #'ignore
-         (lambda (_id e) (setq aux-error e)))
+         session 'is-complete '(:code "x")
+         (lambda (_id reply) (setq complete-result reply))
+         (lambda (_id error) (setq complete-result error)))
+        (emacs-jupyter-notebook-backend-aux
+         session 'kernel-info nil
+         (lambda (_id reply) (setq readiness-result reply))
+         (lambda (_id error) (setq readiness-result error)))
         (emacs-jupyter-notebook-backend-control
-         session 'interrupt nil #'ignore (lambda (_id e) (setq control-error e)))
+         session 'interrupt nil #'ignore
+         (lambda (_id error) (setq control-error error)))
         (ejn-ei2-test--run-timers)
-        (should-not setup-error)
-        (dolist (error (list user-error aux-error control-error))
-          (should (string-match-p "unavailable until EI3/EI4"
-                                  (error-message-string error))))))))
+        (ejn-ei2-test--run-timers)
+        (should-not execute-error)
+        (should (equal complete-result '(:status "complete")))
+        (should (hash-table-p readiness-result))
+        (should (equal (mapcar #'car requests)
+                       '("kernel_info" "is_complete" "execute")))
+        (should (string-match-p "unavailable until EI5"
+                                (error-message-string control-error)))))))
 
 (ert-deftest ejn-ei2-transport-events-are-not-normalized-before-ei4 ()
   "Raw helper events do not reach the generic session event sink in EI2."
@@ -864,6 +882,79 @@ DISPOSALS receives local-only disposal reasons."
     (should-not (re-search-forward "\\_<accept-process-output\\_>" nil t))
     (should-not (re-search-forward "emacs-jupyter-notebook-jupyter" nil t))
     (should-not (re-search-forward "emacs-jupyter-notebook-jupyter-" nil t))))
+
+(ert-deftest ejn-ei3-helper-wire-id-map-survives-reentrant-event ()
+  "A string helper wire id is mapped before a reentrant event reaches the sink."
+  (let (seen)
+    (with-temp-buffer
+      (let* ((emacs-jupyter-notebook-backend 'helper)
+             (session (emacs-jupyter-notebook-backend-session-create
+                       (lambda (_session event) (setq seen event)) (current-buffer)))
+             (state (emacs-jupyter-notebook-helper-backend--make-state :helper 'fake)))
+        (setf (emacs-jupyter-notebook-backend-session-data session) state)
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper-request)
+                   (lambda (_helper _operation _params callback &rest _keys)
+                     (emacs-jupyter-notebook-helper-backend--event
+                      session state
+                      (ejn-ei2-test--object "event" "status"
+                                            "request_id" "ejn-request-9-1"
+                                            "data" (make-hash-table :test #'equal)))
+                     (funcall callback 'fake
+                              (ejn-ei2-test--response
+                               (ejn-ei2-test--object "status" "ok"
+                                                    "execution_count" 1))
+                              nil)
+                     "ejn-request-9-1")))
+          (emacs-jupyter-notebook-backend-execute
+           session "x" '(:ledger-id 19) #'ignore #'ignore)
+          (ejn-ei2-test--run-timers)
+          (should (eq (plist-get seen :type) 'helper-correlated))
+          (should (= (plist-get seen :ledger-id) 19))
+          (should (integerp (plist-get seen :backend-request-id)))
+          (should-not (plist-get seen :panel-generation))
+          (should (equal (plist-get seen :helper-request-id) "ejn-request-9-1"))
+          (should (equal (plist-get
+                          (gethash "ejn-request-9-1"
+                                   (emacs-jupyter-notebook-helper-backend-state-request-map state))
+                         :ledger-id)
+                         19))
+          (should (= (hash-table-count
+                      (emacs-jupyter-notebook-helper-backend-state-pending-events state))
+                     0))
+          (emacs-jupyter-notebook-helper-backend-retire-ledger-id session 19)
+          (should-not (gethash "ejn-request-9-1"
+                               (emacs-jupyter-notebook-helper-backend-state-request-map state))))))))
+
+(ert-deftest ejn-ei3-helper-execute-result-normalizes-abort-and-rejects-malformed ()
+  "Helper terminal results preserve error/count instead of manufacturing ok."
+  (let ((ok (ejn-ei2-test--object "status" "ok" "execution_count" 4))
+        (aborted (ejn-ei2-test--object "status" "aborted" "execution_count" 4))
+        (bad (ejn-ei2-test--object "status" "ok")))
+    (should (equal (emacs-jupyter-notebook-helper-backend--execute-result ok)
+                   '(:status "ok" :execution-count 4)))
+    (should (equal (emacs-jupyter-notebook-helper-backend--execute-result aborted)
+                   '(:status "error" :execution-count 4)))
+    (should-error (emacs-jupyter-notebook-helper-backend--execute-result bad))))
+
+(ert-deftest ejn-ei3-helper-correlation-burst-is-bounded-and-disposed ()
+  "Unmapped raw-event bursts retain at most one descriptor per bounded id."
+  (with-temp-buffer
+    (let* ((emacs-jupyter-notebook-backend 'helper)
+           (session (emacs-jupyter-notebook-backend-session-create nil (current-buffer)))
+           (state (emacs-jupyter-notebook-helper-backend--make-state)))
+      (setf (emacs-jupyter-notebook-backend-session-data session) state)
+      (dotimes (index 200)
+        (emacs-jupyter-notebook-helper-backend--event
+         session state
+         (ejn-ei2-test--object "event" "stream"
+                               "request_id" (format "ejn-request-burst-%d" index))))
+      (should (= (hash-table-count
+                  (emacs-jupyter-notebook-helper-backend-state-pending-events state))
+                 128))
+      (emacs-jupyter-notebook-helper-backend--dispose state "test cleanup")
+      (should (= (hash-table-count
+                  (emacs-jupyter-notebook-helper-backend-state-pending-events state))
+                 0)))))
 
 (provide 'emacs-jupyter-notebook-helper-backend-tests)
 

@@ -97,6 +97,7 @@ All commands live under a single prefix, `emacs-jupyter-notebook-prefix-key` (de
 | `C-c j K` | `restart-kernel` |
 | `C-c j S` | `shutdown-kernel` (confirms; `C-u` skips) |
 | `C-c j x` | `cancel-operation` |
+| `C-c j z` | `cancel-queued-execution` (removes the newest unsent request) |
 | `C-c j ?` | `status` (live-refreshing special-mode buffer) |
 | `C-c j L` | `show-log-buffer` |
 | `C-c j o` | `show-output-panel` |

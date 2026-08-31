@@ -486,7 +486,8 @@
               :legacy-type "error" :legacy-content '(:traceback ("one" "two")) :text "one\ntwo")
         (list :normalized '(:type execute-reply :status "ok" :execution-count 3)
               :legacy-type "execute_reply" :legacy-content '(:status "ok" :execution_count 3)
-              :text "" :status 'ok :fringe 'ok)
+              ;; EI3 owns terminal presentation only after correlated idle.
+              :text "" :status 'running :fringe nil)
         (list :normalized '(:type status :execution-state "busy")
               :legacy-type "status" :legacy-content '(:execution_state "busy") :text "" :kernel 'busy)
         (list :normalized '(:type status :execution-state "idle")
@@ -511,14 +512,22 @@
     (let* ((source (current-buffer))
            (panel (ejn-panel-ensure source))
            (handle (ejn-panel-start-entry panel '("x.py" . 1) "x"))
-           (context (list :buffer source :entry-handle handle :request-id 9))
+           (context (list :buffer source :entry-handle handle :request-id 9
+                          :backend-request-id 11
+                          :panel-generation (plist-get handle :generation)))
            messages)
       (cl-letf (((symbol-function 'message)
                  (lambda (format-string &rest args)
                    (push (apply #'format format-string args) messages))))
-        (setq emacs-jupyter-notebook--evaluation-request '(:request-id 9))
+        (emacs-jupyter-notebook--execution-put
+         (list :id 9 :state 'dispatched :backend-request-id 11
+               :generation (plist-get handle :generation)))
+        (setq emacs-jupyter-notebook--execution-active-id 9)
         (should-not (emacs-jupyter-notebook-events-dispatch context '(:type display)))
-        (setq emacs-jupyter-notebook--evaluation-request '(:request-id 10))
+        (clrhash emacs-jupyter-notebook--execution-ledger)
+        (emacs-jupyter-notebook--execution-put
+         (list :id 10 :state 'dispatched))
+        (setq emacs-jupyter-notebook--execution-active-id 10)
         (should (equal (emacs-jupyter-notebook-events-dispatch
                         context '(:type stream :text "late"))
                        '((:action ignore))))
@@ -527,7 +536,9 @@
                         (list :buffer source :entry-handle handle)
                         '(:type display :data (:text/plain "retired")))
                        '((:action ignore))))
-        (should-not (emacs-jupyter-notebook-events-dispatch context '(:type unknown)))
+        (should-not
+         (emacs-jupyter-notebook-events-dispatch
+          (list :buffer source :entry-handle handle) '(:type unknown)))
         (should (cl-some (lambda (text) (string-match-p "event reducer failed" text))
                          messages))))))
 
@@ -588,7 +599,7 @@
       (should (equal (ejn-panel-entry-text handle) "update")))))
 
 (ert-deftest ejn-ei1r-watch-output-suppresses-execute-reply-error-fallback ()
-  "Watch output counts as a result before execute-reply error fallback."
+  "Watch output is retained while EI3 waits for correlated idle to finish."
   (with-temp-buffer
     (let* ((source (current-buffer))
            (panel (ejn-panel-ensure source))
@@ -602,7 +613,16 @@
          :ename "ValueError" :evalue "boom"))
       (should (equal (ejn-panel-entry-text handle) "\n[watch]\nx: 1\n"))
       (should-not (string-match-p "ValueError" (ejn-panel-entry-text handle)))
-      (should (eq (plist-get (ejn-panel-entry-snapshot handle) :status) 'error)))))
+      (should (eq (plist-get (ejn-panel-entry-snapshot handle) :status) 'running)))))
+
+(ert-deftest ejn-ei3-non-ok-reply-status-uses-error-presentation ()
+  "Only exact Jupyter ok status suppresses the reducer's error fallback."
+  (dolist (status '("error" "aborted" "invalid"))
+    (should (eq (emacs-jupyter-notebook-events--reply-status
+                 (list :status status))
+                'error)))
+  (should (eq (emacs-jupyter-notebook-events--reply-status '(:status "ok"))
+              'ok)))
 
 (ert-deftest ejn-ei1r-retired-legacy-output-logs-at-a-bounded-rate ()
   "Retired legacy output is rejected before decode with a capped diagnostic."

@@ -33,6 +33,10 @@
                             (logand (length payload) 255))
             payload)))
 
+(ert-deftest ejn-et1-code-byte-limit-is-the-shared-protocol-contract ()
+  "The Elisp protocol owns the same fixed execute payload ceiling as EI3."
+  (should (= ejn-helper-protocol-max-code-bytes 524288)))
+
 (defun ejn-et1-recipe-object (vector)
   (let* ((template (copy-hash-table (ejn-et1-get vector "template")))
          (key (if (equal (ejn-et1-get template "kind") "response")

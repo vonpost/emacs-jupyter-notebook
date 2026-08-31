@@ -49,16 +49,11 @@
 (defvar jupyter-default-timeout)
 (defvar jupyter-long-timeout)
 (defvar emacs-jupyter-notebook--kernel-status nil)
-(defvar emacs-jupyter-notebook--evaluation-timer nil)
-(defvar emacs-jupyter-notebook--evaluation-request nil)
-(defvar emacs-jupyter-notebook--evaluation-request-counter 0)
 (defconst emacs-jupyter-notebook-jupyter--late-callback-log-limit 20
   "Maximum number of retired-entry callback drops logged per Emacs session.")
 
 (defvar emacs-jupyter-notebook-jupyter--late-callback-log-count 0
   "Number of retired-entry callback drops logged this Emacs session.")
-(declare-function emacs-jupyter-notebook--evaluation-on-timeout
-                  "emacs-jupyter-notebook" (request-id))
 (declare-function emacs-jupyter-notebook-backend-session-data
                   "emacs-jupyter-notebook-backend" (session))
 (declare-function emacs-jupyter-notebook-backend-session-owner-buffer
@@ -168,12 +163,15 @@ or pickle storage can happen."
       ("status" (list :type 'status :execution-state (funcall value :execution_state)))
       (_ (error "Unsupported legacy Jupyter message type: %s" message-type)))))
 
-(defun emacs-jupyter-notebook-jupyter--callbacks (buffer entry-handle &optional client request-id)
+(defun emacs-jupyter-notebook-jupyter--callbacks
+    (buffer entry-handle &optional client request-id backend-request-id)
   "Return legacy callbacks which only translate then dispatch normalized events."
   (let ((had-result nil))
     (cl-labels ((dispatch (message-type msg)
                   (emacs-jupyter-notebook-events-dispatch
                    (list :buffer buffer :entry-handle entry-handle :request-id request-id
+                         :backend-request-id backend-request-id
+                         :panel-generation (plist-get entry-handle :generation)
                          :had-result had-result
                          :set-had-result (lambda (_value) (setq had-result t))
                          :input-reply (and client
@@ -216,6 +214,12 @@ or pickle storage can happen."
 (defvar emacs-jupyter-notebook-jupyter-evaluate-function
   #'emacs-jupyter-notebook-jupyter--evaluate
   "Function used by `emacs-jupyter-notebook-jupyter-evaluate'.")
+
+(defvar emacs-jupyter-notebook-jupyter--ledger-id nil
+  "Dynamically bound execution ledger id for one legacy execute send.")
+
+(defvar emacs-jupyter-notebook-jupyter--backend-request-id nil
+  "Dynamically bound generic backend id for one legacy execute send.")
 
 (defvar emacs-jupyter-notebook-jupyter-execute-silent-function
   #'emacs-jupyter-notebook-jupyter--execute-silent
@@ -346,7 +350,8 @@ a remote PID probe)."
               (error-message-string err))
      nil)))
 
-(defun emacs-jupyter-notebook-jupyter--evaluate (client code entry-handle)
+(defun emacs-jupyter-notebook-jupyter--evaluate
+    (client code entry-handle &optional ledger-id backend-request-id)
   "Evaluate CODE through CLIENT, sending callbacks driving ENTRY-HANDLE.
 
 The caller (the eval entry-point) creates ENTRY-HANDLE on the source
@@ -358,34 +363,13 @@ in the caller's surface."
   (require 'jupyter-messages)
   (require 'jupyter-monads)
   (let* ((buffer (current-buffer))
-         ;; W5.5: compute request-id BEFORE building callbacks so it can
-         ;; be threaded into the closures for execute_reply / status
-         ;; correlation.
-         (request-id (cl-incf emacs-jupyter-notebook--evaluation-request-counter))
          (callbacks (emacs-jupyter-notebook-jupyter--callbacks
-                     buffer entry-handle client request-id))
+                     buffer entry-handle client
+                     (or ledger-id emacs-jupyter-notebook-jupyter--ledger-id)
+                     (or backend-request-id
+                         emacs-jupyter-notebook-jupyter--backend-request-id)))
          (watch-expressions
-          (emacs-jupyter-notebook-jupyter--watch-expressions-plist))
-         (cell-key (plist-get entry-handle :cell-key)))
-    (when (timerp emacs-jupyter-notebook--evaluation-timer)
-      (cancel-timer emacs-jupyter-notebook--evaluation-timer))
-    ;; W5.1: record the in-flight request so the timeout, cancel, and
-    ;; future-reply paths can correlate this dispatch with its panel
-    ;; entry.  Cleared by `execute_reply' (in --callbacks) on normal
-    ;; completion, and by the timeout/cancel paths on abnormal exits.
-    (setq emacs-jupyter-notebook--evaluation-request
-          (list :request-id request-id
-                :panel-entry entry-handle
-                :cell-key cell-key
-                :started-at (float-time)))
-    (setq emacs-jupyter-notebook--evaluation-timer
-          (run-at-time
-           emacs-jupyter-notebook-evaluation-timeout nil
-           (lambda ()
-             (when (buffer-live-p buffer)
-               (with-current-buffer buffer
-                 (emacs-jupyter-notebook--evaluation-on-timeout
-                  request-id))))))
+          (emacs-jupyter-notebook-jupyter--watch-expressions-plist)))
     (jupyter-run-with-state
      client
      (jupyter-sent
@@ -527,9 +511,12 @@ Call CALLBACK with the client on success, or nil on failure."
   (funcall emacs-jupyter-notebook-jupyter-connect-async-function
            connection-file callback))
 
-(defun emacs-jupyter-notebook-jupyter-evaluate (client code entry-handle)
+(defun emacs-jupyter-notebook-jupyter-evaluate
+    (client code entry-handle request-id backend-request-id)
   "Evaluate CODE through the configured adapter driving ENTRY-HANDLE."
-  (funcall emacs-jupyter-notebook-jupyter-evaluate-function client code entry-handle))
+  (let ((emacs-jupyter-notebook-jupyter--ledger-id request-id)
+        (emacs-jupyter-notebook-jupyter--backend-request-id backend-request-id))
+    (funcall emacs-jupyter-notebook-jupyter-evaluate-function client code entry-handle)))
 
 (defun emacs-jupyter-notebook-jupyter-kernel-info (client callback)
   "Send a kernel-info request through the configured adapter."
@@ -591,7 +578,7 @@ Never terminates the remote kernel."
       (funcall success reply))))
 
 (defun emacs-jupyter-notebook-jupyter-backend-dispatch
-    (session _request operation payload success failure emit)
+    (session request operation payload success failure emit)
   "Dispatch one opaque backend OPERATION through the legacy emacs-jupyter API.
 
 This is the sole compatibility implementation during EI1.  It owns all
@@ -638,7 +625,9 @@ receives normalized local lifecycle events."
              (if (plist-get options :silent)
                  (emacs-jupyter-notebook-jupyter-execute-silent client code)
                (emacs-jupyter-notebook-jupyter-evaluate
-                client code (plist-get options :entry-handle)))
+                client code (plist-get options :entry-handle)
+                (plist-get options :ledger-id)
+                (emacs-jupyter-notebook-backend-request-id request)))
              (funcall emit (list :type 'execute-sent
                                  :silent (and (plist-get options :silent) t)))
              (funcall success nil)))

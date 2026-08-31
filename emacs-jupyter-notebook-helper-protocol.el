@@ -7,6 +7,8 @@
 (defconst ejn-helper-protocol-max-to-emacs-frame 262144)
 (defconst ejn-helper-protocol-max-to-helper-frame 1048576)
 (defconst ejn-helper-protocol-max-raw-accumulator 1048576)
+(defconst ejn-helper-protocol-max-code-bytes 524288
+  "Maximum UTF-8 source payload accepted for one execute request.")
 
 (define-error 'ejn-helper-protocol-error "EJN helper protocol error")
 (define-error 'ejn-helper-protocol-frame-too-large "EJN frame too large" 'ejn-helper-protocol-error)
