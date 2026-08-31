@@ -862,7 +862,7 @@ modules.
   - Narrow run: lifecycle unit/integration plus full helper tests and protocol
     validator under external deadlines.
 
-- [~] owner=terra-ht13 claimed=2026-08-31 **HT13 Complete helper main loop, signals, and fault containment.**
+- [x] owner=terra-ht13 claimed=2026-08-31 landed=beec019 **HT13 Complete helper main loop, signals, and fault containment.**
   - Depends: HT12R3.
   - Files: `helper/ejn_helper/__main__.py`,
     `helper/ejn_helper/runtime.py`, `helper/tests/test_runtime.py`.  The existing
@@ -1016,19 +1016,44 @@ be manager-reviewed for durable-kernel rules.
   - Narrow run: ERT selector `^ejn-ei1r-` plus all existing adapter/panel tests.
   - Non-goal: no helper process connection in this row.
 
-- [ ] **EI2 Connect/finalize through the helper backend.**
+- [~] owner=terra-ei2 claimed=2026-08-31 **EI2 Connect/finalize through the helper backend.**
   - Depends: EI1R, HT13.
   - Files: `emacs-jupyter-notebook-helper-backend.el`,
     `emacs-jupyter-notebook.el`,
     `tests/emacs-jupyter-notebook-helper-backend-tests.el`.
-  - Deliverable: create artifact directory, start helper, handshake, connect to
-    rewritten local connection file, bounded kernel-info verify, retain current
-    remote-PID busy fallback, then finalize.  Any failure releases helper,
-    tunnel, timers, and local artifacts without durable mutation.  Attempt
-    identity gates every callback.
-  - Tests: fake helper success; helper/tunnel/PID result permutations; timeout
-    at each phase; A superseded by B; busy PID fallback; confirmed dead;
-    registry untouched on every failure.
+  - Deliverable: register a `helper` EI1 backend which owns one helper session
+    and a mode-0700 per-session artifact directory.  The core starts and
+    handshakes the helper, sends `connect` with the rewritten loopback
+    connection file, marks the EI1 session attached only after that response,
+    then sends a separately bounded `kernel_info` verification before normal
+    finalization.  Helper callbacks are deferred out of the initiating stack
+    even when a test double replies synchronously.  Attempt and backend-session
+    identity gate every callback, timer, PID-probe result, and late reply.
+  - Busy-kernel boundary: the existing core connect timer arbitrates before the
+    helper request's longer hard deadline.  On reconnect, a timed-out verify
+    retains the attached helper while the bounded remote-PID probe runs: alive
+    or identity-unverified finalizes as connected/busy; mismatch, confirmed
+    dead, and unreachable remain distinct failures.  A fresh start still
+    hard-fails verification timeout.  A late correlated `kernel_info` reply may
+    move the same installed session from busy to idle; it cannot revive a
+    failed or superseded attempt.
+  - Cleanup/durability: every failure and supersede retires helper requests,
+    sends local `close`/disposes the helper, tears down tunnel and timers, and
+    removes only that attempt's temporary artifact directory.  It never sends
+    helper `shutdown`, never terminates the remote kernel, and never deletes or
+    rewrites the admitted registry entry, its durable local connection file, or
+    the remote connection file.  Successful finalization preserves the existing
+    registry-save-before-client-install ordering.  Formatter/watchdog setup is
+    best-effort after finalization through backend-neutral silent execute.
+  - Tests: exact successful phase/order and save/install ordering; synchronous
+    fake callbacks; helper start/hello/connect/verify error and timeout at every
+    boundary; connect attached but verify pending; fresh timeout; every busy PID
+    classifier and late-verify permutation; A superseded by B; buffer kill and
+    mode disable; registry-save failure; helper/tunnel death; callback after
+    cleanup; exact-once local close; zero helper/timer/process/buffer/artifact
+    leaks; no shutdown or durable deletion; raw helper events are not fed to the
+    reducer before EI4; source text and modified state unchanged; static checks
+    reject legacy adapter calls and synchronous waits on the helper path.
   - Narrow run: ERT selector `^ejn-ei2-` plus W13/W15/W19 selectors.
 
 - [ ] **EI3 Replace singleton evaluation state with serialized request ledger.**
