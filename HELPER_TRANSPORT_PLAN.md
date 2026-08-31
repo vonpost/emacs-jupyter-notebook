@@ -848,7 +848,7 @@ modules.
 Only one EI row is active at a time.  These rows may touch core state and must
 be manager-reviewed for durable-kernel rules.
 
-- [~] owner=terra-ei1 claimed=2026-08-31 **EI1 Introduce the narrow async backend contract and temporary selector.**
+- [x] owner=terra-ei1 claimed=2026-08-31 landed=c09e52e **EI1 Introduce the narrow async backend contract and temporary selector.**
   - Depends: IR5, HT7, ET3.
   - Files: `emacs-jupyter-notebook-backend.el`,
     `emacs-jupyter-notebook-jupyter.el`, `emacs-jupyter-notebook-vars.el`,
