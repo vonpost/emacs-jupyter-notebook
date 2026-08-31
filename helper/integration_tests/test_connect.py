@@ -151,7 +151,7 @@ class ConnectTests(unittest.IsolatedAsyncioTestCase):
                         JupyterBackend._connection(str(path))
                     self.assertEqual(caught.exception.code, "invalid-request")
 
-    async def test_unused_loopback_port_deadlines(self):
+    async def test_unused_loopback_attach_then_kernel_info_reports_transport_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             ports = []
             for _ in range(5):
@@ -160,16 +160,20 @@ class ConnectTests(unittest.IsolatedAsyncioTestCase):
             path = Path(directory) / "connection.json"
             path.write_text(json.dumps({"ip":"127.0.0.1", "transport":"tcp", "key":"x", "signature_scheme":"hmac-sha256", **dict(zip(("shell_port","iopub_port","stdin_port","control_port","hb_port"), ports))}))
             backend = JupyterBackend(deadline=0.1)
-            result = await self._completion(
+            attached = await self._completion(
                 backend,
                 "connect",
                 _connect_params(path, Path(directory) / "artifacts"),
             )
+            self.assertEqual(attached.result, {"attached": True})
+            self.assertIsNone(attached.error)
+            result = await self._completion(backend, "kernel_info", {})
             self.assertIn(getattr(result.error, "code", None), {"timeout", "transport-error"})
-            self.assertIsNone(backend.client)
+            self.assertIsNotNone(backend.client)
             backend.close()
+            self.assertIsNone(backend.client)
 
-    async def test_black_hole_deadlines_and_releases_client(self):
+    async def test_black_hole_attaches_promptly_then_kernel_info_times_out(self):
         handlers = set()
         async def black_hole(reader, writer):
             task = asyncio.current_task(); handlers.add(task)
@@ -186,14 +190,18 @@ class ConnectTests(unittest.IsolatedAsyncioTestCase):
                 path = Path(directory) / "connection.json"
                 path.write_text(json.dumps({"ip":"127.0.0.1", "transport":"tcp", "key":"x", "signature_scheme":"hmac-sha256", **dict(zip(("shell_port","iopub_port","stdin_port","control_port","hb_port"), ports))}))
                 backend = JupyterBackend(deadline=0.1)
-                result = await self._completion(
+                attached = await self._completion(
                     backend,
                     "connect",
                     _connect_params(path, Path(directory) / "artifacts"),
                 )
+                self.assertEqual(attached.result, {"attached": True})
+                self.assertIsNone(attached.error)
+                result = await self._completion(backend, "kernel_info", {})
                 self.assertEqual(getattr(result.error, "code", None), "timeout")
-                self.assertIsNone(backend.client)
+                self.assertIsNotNone(backend.client)
                 backend.close()
+                self.assertIsNone(backend.client)
         finally:
             for server in servers:
                 server.close(); await server.wait_closed()
@@ -235,7 +243,7 @@ class ConnectTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [True])
         backend.close()
 
-    async def test_provisional_client_cancel_stops_channels_once(self):
+    async def test_connect_attaches_promptly_and_kernel_info_is_cancellable(self):
         created = []
         started = asyncio.Event()
 
@@ -244,9 +252,13 @@ class ConnectTests(unittest.IsolatedAsyncioTestCase):
             def load_connection_info(self, _info): pass
             def start_channels(self): self.started += 1; started.set()
             def stop_channels(self): self.stopped += 1
-            async def wait_for_ready(self, timeout=None): await asyncio.sleep(60)
+            async def wait_for_ready(self, timeout=None):
+                raise AssertionError("connect must not wait for kernel readiness")
             def kernel_info(self): return "id"
             async def get_shell_msg(self, timeout): await asyncio.sleep(60)
+            get_iopub_msg = get_shell_msg
+            get_stdin_msg = get_shell_msg
+            get_control_msg = get_shell_msg
         old = sys.modules.get("jupyter_client")
         sys.modules["jupyter_client"] = types.SimpleNamespace(AsyncKernelClient=Client)
         try:
@@ -261,15 +273,20 @@ class ConnectTests(unittest.IsolatedAsyncioTestCase):
                 backend.start("connect", params, lambda _event: None, busy.append)
                 await asyncio.sleep(0)
                 self.assertEqual(getattr(busy[0].error, "code", None), "busy")
-                token.cancel()
+                self.assertEqual(callbacks[0].result, {"attached": True})
+                info = backend.start("kernel_info", {}, lambda _event: None, callbacks.append)
+                assert info is not None
+                await asyncio.sleep(0)
+                info.cancel()
+                info.cancel()
                 for _ in range(3):
                     await asyncio.sleep(0)
                     if not backend._tasks:
                         break
                 self.assertEqual(created[0].started, 1)
-                self.assertEqual(created[0].stopped, 1)
-                self.assertIsNone(backend.client)
-                self.assertEqual(callbacks, [])
+                self.assertEqual(created[0].stopped, 0)
+                self.assertIsNotNone(backend.client)
+                self.assertEqual(callbacks[0].result, {"attached": True})
                 self.assertEqual(backend._tasks, set())
                 backend.close(); self.assertEqual(created[0].stopped, 1)
         finally:

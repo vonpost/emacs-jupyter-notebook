@@ -49,6 +49,31 @@ def decoded(drained):
 
 
 class EventQueueTests(unittest.TestCase):
+    def test_discard_releases_both_lanes_credit_and_truncation_state(self):
+        queue = EventQueue()
+        queue.grant_credit(10)
+        queue.enqueue(stream("buffered", request_id="ordinary"))
+        dropped = queue.enqueue(
+            stream("x" * (EJN_STREAM_CHUNK_BYTES + 1), request_id="discarded")
+        )
+        self.assertTrue(dropped.marker_enqueued)
+        queue.enqueue(event("status", "priority", execution_state="busy"))
+        self.assertGreater(queue.ordinary_count, 0)
+        self.assertGreater(queue.priority_count, 0)
+        self.assertGreater(queue.buffered_bytes, 0)
+
+        queue.discard()
+        self.assertEqual(queue.ordinary_count, 0)
+        self.assertEqual(queue.priority_count, 0)
+        self.assertEqual(queue.buffered_bytes, 0)
+        self.assertEqual(queue.credit, 0)
+
+        # Disposal clears the per-request truncation ledger as well.
+        accepted = queue.enqueue(stream("after", request_id="discarded"))
+        self.assertTrue(accepted.queued)
+        queue.discard()
+        self.assertEqual(queue.buffered_bytes, 0)
+
     def test_zero_credit_startup_blocks_ordinary_but_not_priority(self):
         queue = EventQueue()
         queue.enqueue(stream("ordinary"))
@@ -291,6 +316,10 @@ class EventQueueTests(unittest.TestCase):
         self.assertEqual(queue.ordinary_count, 0)
         self.assertEqual(queue.priority_count, 0)
         self.assertEqual(queue.credit, 0)
+        queue.discard()
+        self.assertTrue(queue.failed)
+        with self.assertRaises(FlowControlError):
+            queue.grant_credit(1)
 
         oversized = event("transport_error", None, message="")
         oversized["data"]["message"] = "x" * (

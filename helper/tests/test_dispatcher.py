@@ -4,7 +4,7 @@ import asyncio
 import json
 import unittest
 
-from ejn_helper.backend import BackendError, BackendEvent
+from ejn_helper.backend import BackendCompletion, BackendError, BackendEvent
 from ejn_helper.dispatcher import (
     EJN_MAX_CODE_BYTES,
     EJN_MAX_INFLIGHT_REQUESTS,
@@ -599,6 +599,16 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
             FakePlan(delay=0.03, ignore_cancellation=True),
         )
         self.dispatcher.dispatch(request("running", "execute", {"code": "work()"}))
+        self.dispatcher.event_queue.enqueue(
+            {
+                "v": 1,
+                "kind": "event",
+                "event": "status",
+                "request_id": "running",
+                "data": {"execution_state": "busy"},
+            }
+        )
+        self.assertGreater(self.dispatcher.event_queue.buffered_bytes, 0)
         self.dispatcher.dispatch(request("close", "close"))
         matching = {
             item["id"]: item
@@ -610,6 +620,7 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.backend.close_calls, 1)
         self.assertTrue(self.backend.closed)
         self.assertEqual(self.backend.cancel_calls, 1)
+        self.assertEqual(self.dispatcher.event_queue.buffered_bytes, 0)
         self.assertNotIn("shutdown", [item.operation for item in self.backend.starts])
         await asyncio.sleep(0.04)
         self.assertEqual(self.dispatcher.late_completions, 1)
@@ -638,6 +649,108 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reentrant_response["error"]["code"], "transport-error")
         self.assertEqual([item.operation for item in backend.starts], ["execute"])
         self.assertEqual(dispatcher.inflight_count, 0)
+
+    async def test_dispose_is_local_idempotent_and_emits_nothing(self):
+        await self.connect()
+        self.backend.queue_plan("execute", FakePlan(delay=1.0))
+        self.dispatcher.dispatch(request("active", "execute", {"code": "x"}))
+        await asyncio.sleep(0)
+        self.dispatcher.event_queue.enqueue(
+            {
+                "v": 1,
+                "kind": "event",
+                "event": "display_data",
+                "request_id": "active",
+                "data": {"text/plain": "retained"},
+            }
+        )
+        self.dispatcher.event_queue.enqueue(
+            {
+                "v": 1,
+                "kind": "event",
+                "event": "status",
+                "request_id": "active",
+                "data": {"execution_state": "busy"},
+            }
+        )
+        self.dispatcher.event_queue.grant_credit(1)
+        self.assertGreater(self.dispatcher.event_queue.buffered_bytes, 0)
+        response_count = len(self.responses)
+        self.dispatcher.dispose()
+        self.dispatcher.dispose()
+        self.assertTrue(self.dispatcher.closed)
+        self.assertFalse(self.dispatcher.connected)
+        self.assertEqual(self.dispatcher.inflight_count, 0)
+        self.assertEqual(len(self.responses), response_count)
+        self.assertEqual(self.backend.close_calls, 1)
+        self.assertEqual(self.backend.cancel_calls, 1)
+        self.assertEqual(self.dispatcher.event_queue.buffered_bytes, 0)
+        self.assertEqual(self.dispatcher.event_queue.credit, 0)
+
+    async def test_dispose_finishes_cleanup_before_classified_failure(self):
+        class ResetRaisesQueue(EventQueue):
+            def reset_request(self, _request_id):
+                raise RuntimeError("private queue failure")
+
+        class ReentrantCancellation:
+            def __init__(self, event_callback, completion_callback):
+                self.calls = 0
+                self.event_callback = event_callback
+                self.completion_callback = completion_callback
+
+            def cancel(self):
+                self.calls += 1
+                # Both callbacks are stale by the time disposal invokes this.
+                self.event_callback(BackendEvent("stream", {"name": "stdout", "text": "late"}))
+                self.completion_callback(BackendCompletion.success({"late": True}))
+                raise RuntimeError("private cancellation failure")
+
+        class DisposalBackend:
+            def __init__(self):
+                self.close_calls = 0
+                self.cancellation = None
+
+            def start(self, _operation, _params, event_callback, completion_callback):
+                self.cancellation = ReentrantCancellation(event_callback, completion_callback)
+                return self.cancellation
+
+            def close(self):
+                self.close_calls += 1
+                raise RuntimeError("private close failure")
+
+        responses = []
+        backend = DisposalBackend()
+        dispatcher = Dispatcher(
+            backend,
+            responses.append,
+            event_queue=ResetRaisesQueue(),
+            loop=self.loop,
+        )
+        dispatcher.negotiated = True
+        dispatcher.connected = True
+        dispatcher.dispatch(request("active", "execute", {"code": "x"}))
+        record = dispatcher._inflight["active"]
+        with self.assertRaises(BackendError) as raised:
+            dispatcher.dispose()
+        self.assertEqual(raised.exception.code, "transport-error")
+        self.assertTrue(dispatcher.closed)
+        self.assertFalse(dispatcher.connected)
+        self.assertEqual(dispatcher.inflight_count, 0)
+        self.assertTrue(record.timer.cancelled())
+        self.assertEqual(backend.cancellation.calls, 1)
+        self.assertEqual(backend.close_calls, 1)
+        self.assertEqual(responses, [])
+        self.assertEqual(dispatcher.event_queue.buffered_bytes, 0)
+        dispatcher.dispose()
+        self.assertEqual(backend.close_calls, 1)
+
+    async def test_dispose_idle_is_idempotent_and_never_emits(self):
+        dispatcher = Dispatcher(self.backend, self.responses.append, loop=self.loop)
+        dispatcher.dispose()
+        dispatcher.dispose()
+        self.assertTrue(dispatcher.closed)
+        self.assertEqual(self.responses, [])
+        self.assertEqual(self.backend.close_calls, 1)
 
 
 if __name__ == "__main__":

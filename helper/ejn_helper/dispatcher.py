@@ -700,12 +700,59 @@ class Dispatcher:
                 inflight_id, record, "transport-error", cancel=True
             )
         self._prompt_leases.clear()
+        failed = False
+        try:
+            self.event_queue.discard()
+        except BaseException:
+            failed = True
         try:
             self.backend.close()
         except BaseException:
-            self._send_error(request_id, "transport-error", "backend close failed")
+            failed = True
+        if failed:
+            self._send_error(request_id, "transport-error", "local close failed")
             return
         self._send_success(request_id, {"closed": True})
+
+    def dispose(self) -> None:
+        """Release local admission state without emitting protocol output.
+
+        EOF and SIGTERM use this path: they cannot manufacture a request id or
+        a close response, and must never make a kernel-lifetime promise.
+        """
+        if self.closed:
+            return
+        self.closed = True
+        self.connected = False
+        records = tuple(self._inflight.items())
+        self._inflight.clear()
+        self._prompt_leases.clear()
+        failed = False
+        for request_id, record in records:
+            record.terminal = True
+            record.timer.cancel()
+            try:
+                self.event_queue.reset_request(request_id)
+            except BaseException:
+                failed = True
+        try:
+            self.event_queue.discard()
+        except BaseException:
+            failed = True
+        for _request_id, record in records:
+            if record.cancellation is not None:
+                try:
+                    record.cancellation.cancel()
+                except BaseException:
+                    failed = True
+        try:
+            self.backend.close()
+        except BaseException:
+            failed = True
+        if failed:
+            # Disposal has already cancelled every local resource.  Surface a
+            # fixed classification to the runtime rather than exception text.
+            raise BackendError("transport-error")
 
     def _send_success(self, request_id: str, result: dict) -> None:
         self._send_response(

@@ -1,6 +1,7 @@
-"""Command-line entry point; protocol implementation lands in later tasks."""
+"""Command-line entry point for the bounded helper protocol runtime."""
 
 import argparse
+import asyncio
 import sys
 
 from . import __version__
@@ -13,28 +14,22 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _require_runtime() -> bool:
-    try:
-        import jupyter_client  # noqa: F401
-        import zmq  # noqa: F401
-    except ImportError:
-        print(
-            "ejn-helper: protocol runtime unavailable; install jupyter_client and pyzmq",
-            file=sys.stderr,
-        )
-        return False
-    return True
-
-
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.version:
         print(__version__)
         return 0
-    if args.protocol and not _require_runtime():
-        return 2
     if args.protocol:
-        return 0
+        try:
+            from .runtime import run_stdio
+
+            return asyncio.run(run_stdio())
+        except BaseException:
+            try:
+                sys.stderr.write("ejn-helper: transport-error\n")
+            except BaseException:
+                pass
+            return 2
     _parser().print_usage(sys.stderr)
     return 2
 

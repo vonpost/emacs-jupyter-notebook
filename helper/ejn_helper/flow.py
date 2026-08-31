@@ -257,6 +257,20 @@ class EventQueue:
             raise FlowControlError("invalid-request", "request id must be non-empty")
         self._truncated_requests.discard(request_id)
 
+    def discard(self) -> None:
+        """Release all buffered events and unspent credit without wire output.
+
+        Local transport disposal owns no peer to receive queued events.  This
+        operation is deliberately idempotent and remains valid after a fatal
+        queue error so shutdown can always release retained payloads.
+        """
+        self._ordinary.clear()
+        self._priority.clear()
+        self._ordinary_bytes = 0
+        self._priority_bytes = 0
+        self._credit = 0
+        self._truncated_requests.clear()
+
     @staticmethod
     def _validate_event(event: dict) -> tuple[str, dict, str | None]:
         if not isinstance(event, dict):

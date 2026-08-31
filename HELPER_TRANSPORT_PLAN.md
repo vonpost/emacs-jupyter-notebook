@@ -868,7 +868,16 @@ modules.
     `helper/ejn_helper/runtime.py`, `helper/tests/test_runtime.py`.  The existing
     CLI contract test `helper/tests/test_cli.py` is an approved dependent-test
     update because protocol mode now remains alive instead of returning from a
-    stub.
+    stub.  Manager-approved lifecycle scope also includes
+    `helper/ejn_helper/dispatcher.py` and `helper/tests/test_dispatcher.py` for
+    an idempotent local-only disposer used by EOF and signals, plus
+    `helper/ejn_helper/flow.py` and `helper/tests/test_flow.py` so that disposer
+    releases all queued event payloads and credit without wire output.  To preserve
+    EI2's busy-kernel recovery boundary, scope also includes
+    `helper/ejn_helper/jupyter_backend.py` and
+    `helper/integration_tests/test_connect.py`: `connect` acknowledges bounded
+    channel attachment without waiting for kernel readiness, while the
+    separate bounded `kernel_info` operation owns readiness verification.
   - Deliverable: asyncio stdin/stdout loop, binary framing, partial-frame timer,
     bounded stderr logging, SIGTERM/EOF cleanup, no orphan tasks, response
     priority over credited events, immediate local ping response, and

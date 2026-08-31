@@ -422,7 +422,7 @@ class JupyterBackend:
                 BackendCompletion.failure(BackendError("busy")),
             )
             return None
-        if operation == "connect" and self._connecting:
+        if operation == "connect" and (self._connecting or self._channels_started):
             asyncio.get_running_loop().call_soon(
                 self._deliver,
                 completion_callback,
@@ -539,10 +539,9 @@ class JupyterBackend:
         client.start_channels()
         self._channels_started = True
         self._transport_failed = False
-        # The enclosing connect operation owns the only request deadline.  In
-        # particular, do not give wait_for_ready a second, equal timeout: that
-        # race used to turn a ready kernel into a spurious transport failure.
-        await client.wait_for_ready()
+        # Attachment is local channel construction only.  A busy/black-holed
+        # kernel must not stall it; the caller's bounded kernel_info request
+        # owns readiness verification and can be cancelled independently.
         self._start_readers()
 
     async def _kernel_info(self) -> dict:
