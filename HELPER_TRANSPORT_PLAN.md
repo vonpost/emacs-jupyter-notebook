@@ -1108,7 +1108,7 @@ be manager-reviewed for durable-kernel rules.
     of the old W5/W13 singleton tests to assert the ledger contract directly.
   - Narrow run: ERT selector `^ejn-ei3-` plus W5/W13 evaluation tests.
 
-- [~] owner=terra-ei4 claimed=2026-08-31 **EI4 Route normalized text/display/artifact events to the panel.**
+- [x] owner=terra-ei4 claimed=2026-08-31 landed=9765cc5 **EI4 Route normalized text/display/artifact events to the panel.**
   - Depends: EI3, HT9.
   - Files: `emacs-jupyter-notebook-helper.el`,
     `emacs-jupyter-notebook-helper-backend.el`,
@@ -1146,8 +1146,13 @@ be manager-reviewed for durable-kernel rules.
     unsupported/truncated marker; image-cache flush; fixed panel markers; no
     base64 in Emacs state; and 100 artifacts respecting IR3 count/byte budgets.
   - Narrow run: ERT selector `^ejn-ei4-` plus all panel tests.
+  - Landed verification: 18 focused EI4 ERTs, 53 combined EI3/EI4 ERTs,
+    and all 658 source-based ERTs pass.  Byte compilation passes with only the
+    two pre-existing optional Evil symbol warnings.  Publication admission is
+    capped at 4 MiB for inline images, canonicalizes Darwin's `/var` alias,
+    securely discards rejected files, and tombstones retired wire IDs.
 
-- [ ] **EI4V Move matplotlib viewer payloads to confined pickle files.**
+- [~] owner=terra-ei4v claimed=2026-09-01 **EI4V Move matplotlib viewer payloads to confined pickle files.**
   - Depends: EI4.
   - Files: `emacs-jupyter-notebook-helper-backend.el`,
     `emacs-jupyter-notebook-result.el`,
