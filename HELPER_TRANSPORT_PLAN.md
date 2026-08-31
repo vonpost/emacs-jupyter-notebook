@@ -864,7 +864,7 @@ be manager-reviewed for durable-kernel rules.
     `jupyter-*` calls outside the legacy adapter.
   - Narrow run: ERT selector `^ejn-ei1-` plus existing adapter tests.
 
-- [~] owner=terra-ei1r claimed=2026-08-31 **EI1R Extract one backend-neutral normalized event reducer.**
+- [x] owner=terra-ei1r claimed=2026-08-31 landed=2d9a3fb **EI1R Extract one backend-neutral normalized event reducer.**
   - Depends: EI1.
   - Files: `emacs-jupyter-notebook-events.el`,
     `emacs-jupyter-notebook-jupyter.el`,
