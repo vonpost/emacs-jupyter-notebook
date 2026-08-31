@@ -836,7 +836,7 @@ modules.
   - Narrow run: focused SSH/async start/reconnect ERT selectors plus source
     no-blocking assertions.
 
-- [~] owner=terra-ht12r3 claimed=2026-08-31 **HT12R3 Implement proven helper interrupt and shutdown semantics.**
+- [x] owner=terra-ht12r3 claimed=2026-08-31 landed=d55a894 **HT12R3 Implement proven helper interrupt and shutdown semantics.**
   - Depends: HT12R2.
   - Files: `helper/integration_tests/kernel_fixture.py`,
     `helper/ejn_helper/backend.py`, `helper/ejn_helper/dispatcher.py`,
@@ -862,10 +862,13 @@ modules.
   - Narrow run: lifecycle unit/integration plus full helper tests and protocol
     validator under external deadlines.
 
-- [ ] **HT13 Complete helper main loop, signals, and fault containment.**
+- [~] owner=terra-ht13 claimed=2026-08-31 **HT13 Complete helper main loop, signals, and fault containment.**
   - Depends: HT12R3.
   - Files: `helper/ejn_helper/__main__.py`,
-    `helper/ejn_helper/runtime.py`, `helper/tests/test_runtime.py`.
+    `helper/ejn_helper/runtime.py`, `helper/tests/test_runtime.py`.  The existing
+    CLI contract test `helper/tests/test_cli.py` is an approved dependent-test
+    update because protocol mode now remains alive instead of returning from a
+    stub.
   - Deliverable: asyncio stdin/stdout loop, binary framing, partial-frame timer,
     bounded stderr logging, SIGTERM/EOF cleanup, no orphan tasks, response
     priority over credited events, immediate local ping response, and
