@@ -136,7 +136,12 @@ truncation has optional `:text'."
          (unless (and (plist-member event :data) (plist-get event :data)
                       (listp (plist-get event :data)))
            (error "Malformed %s event :data" type))
-         (list (list :action type :data (plist-get event :data) :result-seen t))))
+         (list (list :action type :data (plist-get event :data)
+                     :display-id (plist-get event :display-id)
+                     :require-display-id (plist-get event :require-display-id)
+                     :metadata (plist-get event :metadata)
+                     :transient (plist-get event :transient)
+                     :result-seen t))))
       ('error
        (if (and live current)
            (list (list :action 'append
@@ -185,26 +190,61 @@ truncation has optional `:text'."
                        :password (and (plist-get event :password) t)))
          '((:action ignore)))))))
 
-(defun emacs-jupyter-notebook-events--render-display (context data mode)
+(defun emacs-jupyter-notebook-events--render-display
+    (context data mode &optional display-id require-display-id)
   "Apply normalized MIME DATA for CONTEXT using result/display MODE semantics."
   (let ((handle (plist-get context :entry-handle))
         (buffer (plist-get context :buffer)))
-    (when (ejn-panel-entry-live-p handle)
-      (emacs-jupyter-notebook--maybe-stash-pickle buffer handle data)
-      (let ((rendered (emacs-jupyter-notebook--render-mime-result data)))
-        (cond
-         ((null rendered)
-          (if (eq mode 'update-display)
-              (ejn-panel-replace-text handle "[unsupported output format]")
-            (ejn-panel-append-text handle "[unsupported output format]")))
-         ((get-text-property 0 'display rendered)
-          (funcall (if (eq mode 'update-display)
-                       #'ejn-panel-update-image #'ejn-panel-set-image)
-                   handle (get-text-property 0 'display rendered)))
-         ((memq mode '(result update-display))
-          (ejn-panel-replace-text handle (ansi-color-apply rendered)))
-         (t
-          (ejn-panel-append-text handle (ansi-color-apply rendered))))))))
+    ;; HT9 deliberately omits an oversized display id instead of truncating it.
+    ;; Such an update has no safe identity and must not fall back to replacing
+    ;; the last unrelated image or all text in the entry.
+    (when (and (ejn-panel-entry-live-p handle)
+               (not (and (eq mode 'update-display)
+                         require-display-id
+                         (null display-id))))
+      (let ((publication (plist-get data :ejn-published-image)))
+        (if publication
+            (if (eq mode 'update-display)
+                (ejn-panel-update-published-image
+                 handle (plist-get publication :root) (plist-get publication :path)
+                 (plist-get publication :mime) (plist-get publication :sha256)
+                 (plist-get publication :size) (plist-get publication :root-identity)
+                 (plist-get publication :display-id))
+              (ejn-panel-set-published-image
+               handle (plist-get publication :root) (plist-get publication :path)
+               (plist-get publication :mime) (plist-get publication :sha256)
+               (plist-get publication :size) (plist-get publication :root-identity)
+               (plist-get publication :display-id)))
+          (emacs-jupyter-notebook--maybe-stash-pickle buffer handle data)
+          (let ((rendered (emacs-jupyter-notebook--render-mime-result data)))
+            (cond
+             ((null rendered)
+              (if (eq mode 'update-display)
+                  (if display-id
+                      (ejn-panel-update-display-text handle "[unsupported output format]" display-id)
+                    (ejn-panel-replace-text handle "[unsupported output format]"))
+                (if display-id
+                    (ejn-panel-set-display-text handle "[unsupported output format]" display-id)
+                  (ejn-panel-append-text handle "[unsupported output format]"))))
+             ((get-text-property 0 'display rendered)
+              (let ((image (copy-tree (get-text-property 0 'display rendered))))
+                (when display-id
+                  (setcdr image (append (cdr image) (list :ejn-display-id display-id))))
+                (if (eq mode 'update-display)
+                    (ejn-panel-update-image handle image display-id)
+                  (ejn-panel-set-image handle image))))
+             ((memq mode '(result update-display))
+              (let ((text (ansi-color-apply rendered)))
+                (if display-id
+                    (ejn-panel-update-display-text handle text display-id)
+                  (ejn-panel-replace-text handle text))))
+             (t
+              (let ((text (ansi-color-apply rendered)))
+                (if display-id
+                    (ejn-panel-set-display-text handle text display-id)
+                  (ejn-panel-append-text handle text))))))
+          ;; Non-publication rendering has no transfer lease to acknowledge.
+          t)))))
 
 (defun emacs-jupyter-notebook-events--schedule-input (context prompt password)
   "Schedule, rather than perform, the minibuffer input requested by EVENT.
@@ -236,7 +276,9 @@ buffer or superseded execution cannot receive an input reply."
                 (ejn-panel-clear-entry handle (plist-get action :wait))))
       ((or 'result 'display 'update-display)
        (emacs-jupyter-notebook-events--render-display
-        context (plist-get action :data) (plist-get action :action)))
+        context (plist-get action :data) (plist-get action :action)
+        (plist-get action :display-id)
+        (plist-get action :require-display-id)))
       ('finish
        (when (ejn-panel-entry-live-p handle)
          (ejn-panel-finish-entry handle (plist-get action :status)
@@ -269,9 +311,15 @@ transport callback itself remains safe."
       (if (not (emacs-jupyter-notebook-events--execution-event-admitted-p
                 context event))
           '((:action ignore))
-        (let ((actions (emacs-jupyter-notebook-events-reduce context event)))
+        (let ((actions (emacs-jupyter-notebook-events-reduce context event))
+              (publication-admitted t))
           (dolist (action actions)
-            (emacs-jupyter-notebook-events--apply context action)
+            (let ((applied (emacs-jupyter-notebook-events--apply context action)))
+              ;; A publication is not panel-owned until this exact call
+              ;; accepts it.  Do not turn an unknown display-id or stale handle
+              ;; into successful local admission.
+              (when (plist-get (plist-get action :data) :ejn-published-image)
+                (setq publication-admitted (and publication-admitted applied))))
             (when (plist-get action :result-seen)
               (when-let ((setter (plist-get context :set-had-result)))
                 (funcall setter t))))
@@ -280,7 +328,7 @@ transport callback itself remains safe."
             (when (buffer-live-p (plist-get context :buffer))
               (with-current-buffer (plist-get context :buffer)
                 (emacs-jupyter-notebook--execution-note-event context event))))
-          actions))
+          (and publication-admitted actions)))
     (error
      (message "emacs-jupyter-notebook event reducer failed for %S: %s"
               (plist-get event :type) (error-message-string err))

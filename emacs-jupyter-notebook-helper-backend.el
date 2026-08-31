@@ -30,7 +30,8 @@ whether an attached reconnect is usable before this terminal request expiry.")
 (cl-defstruct (emacs-jupyter-notebook-helper-backend-state
                (:constructor emacs-jupyter-notebook-helper-backend--make-state))
   "Local resources owned by one helper backend session."
-  helper artifact-dir artifact-identity request-map pending-events emit closing retired close-timer
+  helper artifact-dir artifact-identity request-map pending-events pending-event-sequence
+  retired-request-ids retired-request-order pending-flush-timer emit closing retired close-timer
   close-success close-failure transport-failure)
 
 (defun emacs-jupyter-notebook-helper-backend--make-object (&rest pairs)
@@ -61,29 +62,28 @@ whether an attached reconnect is usable before this terminal request expiry.")
        (not (emacs-jupyter-notebook-helper-backend-state-retired state))))
 
 (defun emacs-jupyter-notebook-helper-backend--remove-artifacts (state)
-  "Remove only STATE's private local artifact directory."
+  "Remove only STATE's staging files, never panel-transferred publications."
   (let ((directory (emacs-jupyter-notebook-helper-backend-state-artifact-dir state)))
     (unwind-protect
         (condition-case nil
             (let* ((symlink (and (stringp directory) (file-symlink-p directory)))
-                   (attributes (and (stringp directory)
-                                    (not symlink)
-                                    (file-attributes directory)))
-                   (identity (and attributes
-                                  (file-attribute-file-identifier attributes))))
-              ;; A stale pathname must never recursively delete a replacement
-              ;; supplied by another process.  Only our unchanged private
-              ;; directory, or a replacement link itself, is eligible.
+                   (attributes (and (stringp directory) (not symlink)
+                                    (file-attributes directory 'integer)))
+                   (identity (and attributes (file-attribute-file-identifier attributes))))
               (cond
                (symlink (delete-file directory))
-               ((and attributes
-                     (file-directory-p directory)
-                     (equal identity
-                            (emacs-jupyter-notebook-helper-backend-state-artifact-identity
-                             state))
+               ((and attributes (file-directory-p directory)
+                     (equal identity (emacs-jupyter-notebook-helper-backend-state-artifact-identity state))
                      (equal (file-attribute-user-id attributes) (user-uid))
-                     (= (logand (file-modes directory) #o777) #o700))
-                (delete-directory directory t))))
+                     (= (logand (file-modes directory) #o7777) #o700))
+                ;; Python atomically renames completed publications to
+                ;; `ejn-artifact-*'.  Never enumerate or retain those: their
+                ;; panel/crash lifetime is independent of this adapter.  The
+                ;; only local staging names are direct `.ejn-partial-*' files.
+                (dolist (file (directory-files directory t "\\`\\.ejn-partial-"))
+                  (ignore-errors (delete-file file)))
+                (when (null (directory-files directory nil "\\`[^.]"))
+                  (delete-directory directory)))))
           (error nil))
       (setf (emacs-jupyter-notebook-helper-backend-state-artifact-dir state) nil))))
 
@@ -94,11 +94,17 @@ whether an attached reconnect is usable before this terminal request expiry.")
     (when (timerp (emacs-jupyter-notebook-helper-backend-state-close-timer state))
       (cancel-timer (emacs-jupyter-notebook-helper-backend-state-close-timer state)))
     (setf (emacs-jupyter-notebook-helper-backend-state-close-timer state) nil)
+    (when (timerp (emacs-jupyter-notebook-helper-backend-state-pending-flush-timer state))
+      (cancel-timer (emacs-jupyter-notebook-helper-backend-state-pending-flush-timer state)))
+    (setf (emacs-jupyter-notebook-helper-backend-state-pending-flush-timer state) nil)
     (setf (emacs-jupyter-notebook-helper-backend-state-transport-failure state) nil)
     (when (hash-table-p (emacs-jupyter-notebook-helper-backend-state-request-map state))
       (clrhash (emacs-jupyter-notebook-helper-backend-state-request-map state)))
     (when (hash-table-p (emacs-jupyter-notebook-helper-backend-state-pending-events state))
       (clrhash (emacs-jupyter-notebook-helper-backend-state-pending-events state)))
+    (when (hash-table-p (emacs-jupyter-notebook-helper-backend-state-retired-request-ids state))
+      (clrhash (emacs-jupyter-notebook-helper-backend-state-retired-request-ids state)))
+    (setf (emacs-jupyter-notebook-helper-backend-state-retired-request-order state) nil)
     (setf (emacs-jupyter-notebook-helper-backend-state-emit state) nil)
     (let ((helper (emacs-jupyter-notebook-helper-backend-state-helper state)))
       (setf (emacs-jupyter-notebook-helper-backend-state-helper state) nil)
@@ -113,14 +119,21 @@ Return `(DIRECTORY . IDENTITY)'.  No caller receives DIRECTORY until its mode
 has been forced to 0700 and its identity is available for replacement-safe
 cleanup.  A failure after creation removes that just-created directory.
 "
-  (let (directory complete)
+  (let (created directory complete)
     (unwind-protect
         (progn
-          (setq directory (make-temp-file "ejn-helper-artifacts-" t))
+          (setq created (make-temp-file "ejn-helper-artifacts-" t))
           ;; `make-temp-file' honours umask, but artifacts can contain code
           ;; output; force the contract even under a permissive umask.
-          (set-file-modes directory #o700)
-          (let* ((attributes (or (file-attributes directory)
+          (set-file-modes created #o700)
+          ;; Python resolves ordinary ancestor aliases (notably Darwin's
+          ;; /var -> /private/var) before reporting publication paths.  Pin and
+          ;; advertise that same canonical spelling while the freshly-created
+          ;; final component is still known not to be a symlink.
+          (when (file-symlink-p created)
+            (error "helper artifact directory became a symlink"))
+          (setq directory (file-truename created))
+          (let* ((attributes (or (file-attributes directory 'integer)
                                  (error "cannot stat helper artifact directory")))
                  (identity (file-attribute-file-identifier attributes)))
             (unless identity
@@ -128,8 +141,8 @@ cleanup.  A failure after creation removes that just-created directory.
             (setq complete t)
             (cons directory identity)))
       (unless complete
-        (when directory
-          (ignore-errors (delete-directory directory t)))))))
+        (when created
+          (ignore-errors (delete-directory created t)))))))
 
 (defun emacs-jupyter-notebook-helper-backend--close-deadline ()
   "Return a close deadline which fires before the generic close deadline."
@@ -167,26 +180,252 @@ cleanup.  A failure after creation removes that just-created directory.
        (= (hash-table-count result) 1)
        (eq (gethash "closed" result) t)))
 
-(defun emacs-jupyter-notebook-helper-backend--emit-correlated
-    (state helper-id mapping-value)
-  "Synchronously emit one bounded EI3 correlation envelope.
-The envelope is intentionally not an EI4 normalized output event."
+(defun emacs-jupyter-notebook-helper-backend--event-data (event)
+  "Return EVENT's protocol data object, or nil."
+  (let ((data (and (hash-table-p event) (gethash "data" event))))
+    (and (hash-table-p data) data)))
+
+(defun emacs-jupyter-notebook-helper-backend--normalize-event (state event)
+  "Translate one bounded helper EVENT into an EI1R event plist, or signal.
+No generic reducer is called here: the core validates the ledger/backend/
+generation tuple before any presentation mutation.
+"
+  (let* ((name (gethash "event" event)) (data (emacs-jupyter-notebook-helper-backend--event-data event)))
+    (unless data (error "helper event lacks an object payload"))
+    (pcase name
+      ("stream" (let ((text (gethash "text" data)) (stream (gethash "name" data)))
+                  (unless (and (stringp text) (member stream '("stdout" "stderr")))
+                    (error "malformed helper stream"))
+                  (list :type 'stream :text text :name stream)))
+      ("clear_output" (let ((wait (gethash "wait" data)))
+                         (unless (or (eq wait t) (eq wait :false))
+                           (error "malformed helper clear"))
+                         (list :type 'clear :wait (eq wait t))))
+      ("status" (let ((value (gethash "execution_state" data)))
+                   (unless (stringp value) (error "malformed helper status"))
+                   (list :type 'status :execution-state value)))
+      ("execute_reply" (let ((status (gethash "status" data)) (count (gethash "execution_count" data)))
+                           (unless (and (member status '("ok" "error" "aborted"))
+                                        (or (null count) (and (integerp count) (>= count 0))))
+                             (error "malformed helper execute reply"))
+                           (list :type 'execute-reply :status status :execution-count count)))
+      ;; EI5 owns stdin request/reply correlation.  Do not create a prompt
+      ;; with no bounded reply route in EI4.
+      ("input_request" (error "helper stdin is unavailable until EI5"))
+      ("output_truncated" (list :type 'truncation :text "[output truncated]\n"))
+      ((or "display_data" "execute_result" "update_display_data")
+       (let* ((payload (gethash "data" data))
+              (metadata (gethash "metadata" data))
+              (transient (gethash "transient" data))
+              (display-id (and (hash-table-p transient) (gethash "display_id" transient)))
+              ;; HT9 keeps the protocol event name `display_data' and marks
+              ;; Jupyter's `update_display_data' with this bounded boolean.
+              (update-value (gethash "update" data))
+              (update-p (or (equal name "update_display_data")
+                            (eq update-value t)))
+              (mime (and (hash-table-p payload)
+                         (cl-find-if (lambda (key) (gethash key payload))
+                                     '("image/png" "image/jpeg" "image/gif" "image/webp"))))
+              (artifact (and mime (gethash mime payload)))
+              (text (and (hash-table-p payload) (gethash "text/plain" payload)))
+              (type (if (equal name "execute_result") 'result
+                      (if update-p 'update-display 'display))))
+         (unless (hash-table-p payload)
+           (error "malformed helper rich output data"))
+         (unless (hash-table-p metadata)
+           (error "malformed helper rich output metadata"))
+         (unless (or (null transient) (hash-table-p transient))
+           (error "malformed helper transient data"))
+         (unless (memq update-value '(nil t :false))
+           (error "malformed helper update flag"))
+         (when (and (equal name "execute_result") update-p)
+           (error "malformed helper execute result update"))
+         (unless (or (null display-id)
+                     (and (stringp display-id) (<= (string-bytes display-id) 256)))
+           (error "malformed helper display id"))
+         (when (and mime (not (hash-table-p artifact)))
+           (error "malformed helper artifact descriptor"))
+         (cond
+          ((hash-table-p artifact)
+           (let ((path (gethash "path" artifact)) (bytes (gethash "bytes" artifact))
+                 (sha (gethash "sha256" artifact)))
+             (unless (and (stringp path) (integerp bytes) (>= bytes 0) (stringp sha))
+               (error "malformed helper artifact"))
+             (list :type type :data (list :ejn-published-image
+                                          (list :root (emacs-jupyter-notebook-helper-backend-state-artifact-dir state)
+                                                :root-identity (emacs-jupyter-notebook-helper-backend-state-artifact-identity state)
+                                                :path path :mime mime :sha256 sha :size bytes
+                                                :display-id display-id))
+                   :metadata metadata
+                   :transient transient :display-id display-id
+                   :require-display-id update-p)))
+          ((stringp text) (list :type type :data (list :text/plain text)
+                                :metadata metadata
+                                :transient transient :display-id display-id
+                                :require-display-id update-p))
+          (t (error "malformed helper rich output")))))
+      ("transport_error" (list :type 'transport-error))
+      (_ (error "unsupported helper event")))))
+
+(defun emacs-jupyter-notebook-helper-backend--emit-event (state helper-id mapping-value event)
+  "Emit one normalized EI4 event tied to MAPPING-VALUE."
   (when-let ((emit (emacs-jupyter-notebook-helper-backend-state-emit state)))
-    (funcall emit (list :type 'helper-correlated
+    (funcall emit (list :type 'helper-event :event event :helper-request-id helper-id
                         :ledger-id (plist-get mapping-value :ledger-id)
-                        :backend-request-id
-                        (plist-get mapping-value :backend-request-id)
-                        :panel-generation
-                        (plist-get mapping-value :panel-generation)
-                        :helper-request-id helper-id))))
+                        :backend-request-id (plist-get mapping-value :backend-request-id)
+                        :panel-generation (plist-get mapping-value :panel-generation)))))
+
+(defun emacs-jupyter-notebook-helper-backend--raw-publication-path (event)
+  "Return a helper artifact path advertised by raw EVENT, or nil."
+  (let* ((data (emacs-jupyter-notebook-helper-backend--event-data event))
+         (payload (and data (gethash "data" data)))
+         (mime (and (hash-table-p payload)
+                    (cl-find-if (lambda (key) (gethash key payload))
+                                '("image/png" "image/jpeg" "image/gif" "image/webp"))))
+         (artifact (and mime (gethash mime payload))))
+    (and (hash-table-p artifact) (gethash "path" artifact))))
+
+(defun emacs-jupyter-notebook-helper-backend--discard-publication (state path)
+  "Unlink unaccepted helper publication PATH if its pinned identity is intact."
+  (let ((file-name-handler-alist nil)
+        (root (emacs-jupyter-notebook-helper-backend-state-artifact-dir state))
+        (root-identity
+         (emacs-jupyter-notebook-helper-backend-state-artifact-identity state)))
+    (condition-case nil
+        (when (and (stringp root) (file-name-absolute-p root)
+                   (stringp path) (file-name-absolute-p path)
+                   (string-match-p "\\`ejn-artifact-[0-9a-f]\\{32\\}\\'"
+                                   (file-name-nondirectory path)))
+          (let* ((root-name (directory-file-name (expand-file-name root)))
+                 (path-name (expand-file-name path))
+                 (root-attrs (and (not (file-symlink-p root-name))
+                                  (file-attributes root-name 'integer)))
+                 (attrs (and (not (file-symlink-p path-name))
+                             (file-attributes path-name 'integer)))
+                 (identity (and attrs (file-attribute-file-identifier attrs))))
+            (when (and root-attrs attrs identity
+                       (file-directory-p root-name)
+                       (eq (file-attribute-type root-attrs) t)
+                       (equal (file-attribute-user-id root-attrs) (user-uid))
+                       (= (logand (file-modes root-name) #o7777) #o700)
+                       (equal root-identity
+                              (file-attribute-file-identifier root-attrs))
+                       (equal (file-name-directory (directory-file-name path-name))
+                              (file-name-as-directory root-name))
+                       (file-regular-p path-name)
+                       (null (file-attribute-type attrs))
+                       (equal (file-attribute-user-id attrs) (user-uid))
+                       (= (logand (file-modes path-name) #o7777) #o600)
+                       (let ((post-root (and (not (file-symlink-p root-name))
+                                             (file-attributes root-name 'integer)))
+                             (post (and (not (file-symlink-p path-name))
+                                        (file-attributes path-name 'integer))))
+                         (and post-root post
+                              (equal root-identity
+                                     (file-attribute-file-identifier post-root))
+                              (equal identity (file-attribute-file-identifier post)))))
+              (delete-file path-name)
+              t)))
+      (error nil))))
+
+(defun emacs-jupyter-notebook-helper-backend--deliver-mapped-event
+    (state helper-id mapping-value raw-event)
+  "Normalize and synchronously deliver RAW-EVENT for MAPPING-VALUE.
+Return the core's explicit admission result.  An accepted publication becomes
+panel-owned; an individually rejected publication is securely discarded.
+Crash-orphaned publications remain for EI9's confined stale-artifact pruning.
+"
+  (let ((path (emacs-jupyter-notebook-helper-backend--raw-publication-path raw-event))
+        accepted)
+    (unwind-protect
+        (let ((event (emacs-jupyter-notebook-helper-backend--normalize-event state raw-event)))
+          (setq accepted (emacs-jupyter-notebook-helper-backend--emit-event
+                          state helper-id mapping-value event)))
+      (unless accepted
+        (emacs-jupyter-notebook-helper-backend--discard-publication state path)))
+    accepted))
+
+(defun emacs-jupyter-notebook-helper-backend--flush-pending-events (session state)
+  "Deliver every now-mapped bounded early-event FIFO in arrival order.
+This runs once after a reentrant public backend call returns, so generic
+backend deferral cannot be mistaken for panel acceptance.
+"
+  (when (emacs-jupyter-notebook-helper-backend--state-live-p session state)
+    (let ((pending (emacs-jupyter-notebook-helper-backend-state-pending-events state))
+          (mapping (emacs-jupyter-notebook-helper-backend-state-request-map state))
+          ready)
+      (when (and (hash-table-p pending) (hash-table-p mapping))
+        (maphash (lambda (helper-id events)
+                   (when-let ((mapped (gethash helper-id mapping)))
+                     (dolist (sequenced-event events)
+                       (push (vector (car sequenced-event) helper-id mapped
+                                     (cdr sequenced-event))
+                             ready))
+                     (remhash helper-id pending)))
+                 pending)
+        ;; Hash iteration is unspecified.  Restore the original global arrival
+        ;; order before delivering entries from multiple now-mapped ids.
+        (setq ready (sort ready (lambda (left right)
+                                  (< (aref left 0) (aref right 0)))))
+        (dolist (item ready)
+          ;; Admission belongs only to this event's artifact lease.  A rejected
+          ;; or malformed output must never suppress later terminal evidence.
+          (condition-case err
+              (emacs-jupyter-notebook-helper-backend--deliver-mapped-event
+               state (aref item 1) (aref item 2) (aref item 3))
+            (error
+             (message "emacs-jupyter-notebook rejected early helper event: %s"
+                      (error-message-string err)))))))))
+
+(defun emacs-jupyter-notebook-helper-backend--schedule-pending-flush (session state)
+  "Flush early events now, or in one post-dispatch callback when required."
+  (if (> (or (emacs-jupyter-notebook-backend-session-dispatch-depth session) 0) 0)
+      (unless (timerp (emacs-jupyter-notebook-helper-backend-state-pending-flush-timer state))
+        (setf (emacs-jupyter-notebook-helper-backend-state-pending-flush-timer state)
+              (run-at-time
+               0 nil
+               (lambda ()
+                 (setf (emacs-jupyter-notebook-helper-backend-state-pending-flush-timer state) nil)
+                 (emacs-jupyter-notebook-helper-backend--flush-pending-events session state)))))
+    (emacs-jupyter-notebook-helper-backend--flush-pending-events session state)))
+
+(defun emacs-jupyter-notebook-helper-backend--retain-early-event
+    (session state helper-id event)
+  "Boundedly retain reentrant EVENT until HELPER-ID receives its mapping."
+  (let ((publication
+         (emacs-jupyter-notebook-helper-backend--raw-publication-path event)))
+    (cond
+     (publication
+      ;; Never hold an uncorrelated disk artifact merely to support a
+      ;; synchronous test fake.
+      (emacs-jupyter-notebook-helper-backend--discard-publication
+       state publication))
+     ((<= (or (emacs-jupyter-notebook-backend-session-dispatch-depth session) 0) 0)
+      ;; A real process callback cannot run before `helper-request' installs
+      ;; the mapping.  An asynchronous unknown id is late or invalid, not early.
+      nil)
+     (t
+      (let* ((pending
+              (or (emacs-jupyter-notebook-helper-backend-state-pending-events state)
+                  (setf (emacs-jupyter-notebook-helper-backend-state-pending-events state)
+                        (make-hash-table :test #'equal))))
+             (events (gethash helper-id pending)))
+        (when (and (or events (< (hash-table-count pending) 128))
+                   (< (length events) 8))
+          (let ((sequence
+                 (1+ (or (emacs-jupyter-notebook-helper-backend-state-pending-event-sequence
+                          state)
+                         0))))
+            (setf (emacs-jupyter-notebook-helper-backend-state-pending-event-sequence
+                   state)
+                  sequence)
+            (puthash helper-id (append events (list (cons sequence event))) pending))
+          t))))))
 
 (defun emacs-jupyter-notebook-helper-backend--event (session state event)
-  "Handle helper EVENT locally until EI4 owns normalized event delivery."
+  "Normalize helper EVENT and deliver it only through the EI1R admission path."
   (when (emacs-jupyter-notebook-helper-backend--state-live-p session state)
     (let ((kind (and (hash-table-p event) (gethash "event" event))))
-      ;; A helper transport error is meaningful before output/event routing is
-      ;; implemented.  Other raw protocol events are intentionally not fed to
-      ;; EI1R's reducer: they are not normalized EI1R events yet.
       (if (equal kind "transport_error")
           (when-let* ((failure
                        (emacs-jupyter-notebook-helper-backend-state-transport-failure
@@ -194,26 +433,30 @@ The envelope is intentionally not an EI4 normalized output event."
             (funcall failure
                      (emacs-jupyter-notebook-helper-backend--safe-message
                       (gethash "data" event))))
-        ;; EI3 only proves request/session correlation.  EI4 will normalize
-        ;; output; raw payload is deliberately never handed to its reducer.
         (let ((helper-id (gethash "request_id" event)))
           ;; A production helper cannot emit before `helper-request' returns,
-          ;; but a synchronous fake can.  Keep only one inert descriptor per
-          ;; bounded inflight id rather than creating a timer per raw event.
+          ;; but a synchronous fake can.  Keep its bounded FIFO intact until
+          ;; the mapping is installed; one post-dispatch flush handles all ids.
           (when (stringp helper-id)
             (let* ((mapping (emacs-jupyter-notebook-helper-backend-state-request-map state))
+                   (retired (emacs-jupyter-notebook-helper-backend-state-retired-request-ids state))
                    (mapping-value (and (hash-table-p mapping)
                                        (gethash helper-id mapping))))
-              (if mapping-value
-                  (emacs-jupyter-notebook-helper-backend--emit-correlated
-                   state helper-id mapping-value)
-                (let ((pending
-                       (or (emacs-jupyter-notebook-helper-backend-state-pending-events state)
-                           (setf (emacs-jupyter-notebook-helper-backend-state-pending-events state)
-                                 (make-hash-table :test #'equal)))))
-                  (when (or (gethash helper-id pending)
-                            (< (hash-table-count pending) 128))
-                    (puthash helper-id t pending)))))))))))
+              (cond
+               ;; A terminal ledger retirement tombstones its helper wire id.
+               ;; Late output must not masquerade as a reentrant early event
+               ;; and consume the pending-id budget.
+               ((and (hash-table-p retired) (gethash helper-id retired))
+                (emacs-jupyter-notebook-helper-backend--discard-publication
+                 state
+                 (emacs-jupyter-notebook-helper-backend--raw-publication-path event))
+                nil)
+               (mapping-value
+                (emacs-jupyter-notebook-helper-backend--deliver-mapped-event
+                 state helper-id mapping-value event))
+               (t
+                (emacs-jupyter-notebook-helper-backend--retain-early-event
+                 session state helper-id event))))))))))
 
 (defun emacs-jupyter-notebook-helper-backend--request
     (session state op params timeout success failure
@@ -263,13 +506,7 @@ The envelope is intentionally not an EI4 normalized output event."
                                :backend-request-id backend-request-id
                                :panel-generation panel-generation)
                (emacs-jupyter-notebook-helper-backend-state-request-map state))
-      (when-let ((pending (emacs-jupyter-notebook-helper-backend-state-pending-events state)))
-        (when (gethash helper-id pending)
-          (remhash helper-id pending)
-          (emacs-jupyter-notebook-helper-backend--emit-correlated
-           state helper-id
-           (gethash helper-id
-                    (emacs-jupyter-notebook-helper-backend-state-request-map state))))))
+      (emacs-jupyter-notebook-helper-backend--schedule-pending-flush session state))
     helper-id))
 
 (defun emacs-jupyter-notebook-helper-backend--execute-result (result)
@@ -295,7 +532,21 @@ an arbitrary helper object."
         (maphash (lambda (wire-id mapped)
                    (when (equal (plist-get mapped :ledger-id) ledger-id)
                      (push wire-id ids))) mapping)
-        (dolist (wire-id ids) (remhash wire-id mapping))))))
+        (dolist (wire-id ids)
+          (remhash wire-id mapping)
+          (let ((retired
+                 (or (emacs-jupyter-notebook-helper-backend-state-retired-request-ids state)
+                     (setf (emacs-jupyter-notebook-helper-backend-state-retired-request-ids state)
+                           (make-hash-table :test #'equal))))
+                (order (emacs-jupyter-notebook-helper-backend-state-retired-request-order state)))
+            (unless (gethash wire-id retired)
+              (puthash wire-id t retired)
+              (setq order (append order (list wire-id)))
+              (when (> (length order) 128)
+                (remhash (car order) retired)
+                (setq order (cdr order)))
+              (setf (emacs-jupyter-notebook-helper-backend-state-retired-request-order state)
+                    order))))))))
 
 (defun emacs-jupyter-notebook-helper-backend--verification-failure
     (session request reason failure)

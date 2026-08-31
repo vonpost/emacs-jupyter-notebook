@@ -156,25 +156,37 @@ reconnect loop owns replacement of local helper/tunnel state."
     (emacs-jupyter-notebook--schedule-auto-reconnect)))
 
 (defun emacs-jupyter-notebook--backend-event (session event)
-  "Own helper EVENT correlation without routing raw output before EI4.
+  "Synchronously admit normalized helper EVENT through the current EI1R ledger.
 
-EI3 installs a real sink so helper request identities remain session-bound.
-Only a bounded request-id lookup is retained here; EI4 alone is allowed to
-translate raw stream/display payloads into the normalized panel reducer."
+Return an explicit boolean to the helper adapter.  In particular, a rejected
+published image is not locally admitted as a panel artifact."
   (when (and (eq session emacs-jupyter-notebook--client)
-             (eq (plist-get event :type) 'helper-correlated))
+             (eq (plist-get event :type) 'helper-event))
     (let ((ledger-id (plist-get event :ledger-id))
           (backend-id (plist-get event :backend-request-id))
-          (generation (plist-get event :panel-generation)))
-      ;; Keep correlation intentionally inert until EI4.  It is nevertheless
-      ;; identity-checked against the current bounded FIFO/ledger, so a late
-      ;; event from a retired helper request cannot attach to a replacement.
+          (generation (plist-get event :panel-generation))
+          (normalized (plist-get event :event)))
+      ;; Validate ownership before constructing reducer context or touching a
+      ;; panel.  The reducer then records reply/idle terminality synchronously
+      ;; in the helper drain, before ordinary credit is replenished.
       (when (and (emacs-jupyter-notebook--execution-current-p ledger-id)
                  (let ((record (emacs-jupyter-notebook--execution-record ledger-id)))
                    (and (equal backend-id
                                (plist-get record :backend-request-id))
                         (equal generation (plist-get record :generation)))))
-        t))))
+        (let* ((record (emacs-jupyter-notebook--execution-record ledger-id))
+               (actions
+                (emacs-jupyter-notebook-events-dispatch
+                 (list :buffer (current-buffer) :request-id ledger-id
+                       :backend-request-id backend-id :panel-generation generation
+                       :entry-handle (plist-get record :panel-entry)
+                       :cell-key (plist-get record :cell-key))
+                 normalized)))
+          ;; A successful execute-reply may render no panel action but it is
+          ;; still admitted terminal evidence.  Other events must produce a
+          ;; non-ignore action; publication validation failures return nil.
+          (or (memq (plist-get normalized :type) '(execute-reply status))
+              (and actions (not (equal actions '((:action ignore)))))))))))
 
 (defconst emacs-jupyter-notebook--helper-connect-arbitration-maximum 45
   "Maximum core busy-kernel arbitration deadline for the helper backend.
@@ -4094,44 +4106,12 @@ files) return nil so they flow only to the history-log view."
                (emacs-jupyter-notebook-backend-execute
                 client (plist-get record :code)
                 (list :entry-handle handle :ledger-id id)
-                (lambda (backend-id result)
-                  ;; The helper's execute response is produced only after its
-                  ;; own correlated shell/iopub terminal state.  EI4 will add
-                  ;; rich event routing; until then turn this bounded terminal
-                  ;; response into the same ledger evidence without feeding a
-                  ;; raw helper event to the reducer.
-                  (when (and (eq (emacs-jupyter-notebook-backend-session-backend client)
-                                 'helper)
-                             (buffer-live-p buffer))
-                    (with-current-buffer buffer
-                      (let ((deliver
-                             (lambda ()
-                               (when (emacs-jupyter-notebook--execution-current-p id)
-                                 (let ((context (list :request-id id :buffer buffer
-                                                      :backend-request-id backend-id
-                                                      :panel-generation
-                                                      (plist-get (emacs-jupyter-notebook--execution-record id)
-                                                                 :generation))))
-                                   (emacs-jupyter-notebook--execution-note-event
-                                    context
-                                    (list :type 'execute-reply
-                                          :status (plist-get result :status)
-                                          :execution-count
-                                          (plist-get result :execution-count)))
-                                   (emacs-jupyter-notebook--execution-note-event
-                                    context '(:type status :execution-state "idle")))))))
-                        ;; Backend implementations defer normally.  Retaining
-                        ;; this one-turn deferral makes a synchronous fake
-                        ;; harmless: the returned generic id is stored before
-                        ;; its correlated terminal evidence is consumed.
-                        (if (plist-get (emacs-jupyter-notebook--execution-record id)
-                                       :backend-request-id)
-                            (funcall deliver)
-                          (run-at-time 0 nil
-                                       (lambda ()
-                                         (when (buffer-live-p buffer)
-                                           (with-current-buffer buffer
-                                             (funcall deliver))))))))))
+                (lambda (_backend-id _result)
+                  ;; EI4 terminality is driven only by the real, correlated
+                  ;; execute_reply plus status=idle event pair.  The response
+                  ;; remains an operation acknowledgement, never synthetic
+                  ;; terminal evidence.
+                  nil)
                 (lambda (_backend-id reason)
                   (when (and (buffer-live-p buffer)
                              (with-current-buffer buffer

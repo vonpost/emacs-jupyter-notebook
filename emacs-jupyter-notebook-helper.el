@@ -41,7 +41,8 @@
   control-sequence raw-chunks raw-tail raw-bytes decode-prefix decode-remaining
   decode-wire-size decode-timer event-queue event-tail event-queue-bytes
   priority-queue priority-tail priority-queue-bytes drain-timer pending-failure
-  ping-id ping-timer late-responses last-event-seq control-sent control-acked control-timer)
+  ping-id ping-timer late-responses last-event-seq control-sent control-acked control-timer
+  wire-sequence)
 
 (defvar-local emacs-jupyter-notebook--helper-session nil
   "The local helper session currently owned by this source buffer.")
@@ -142,7 +143,8 @@ empty or the executable cannot be found."
         (funcall callback session reason)
       (error
        (message "emacs-jupyter-notebook helper callback failed: %s"
-                (error-message-string err))))))
+                (error-message-string err))
+       nil))))
 
 (defun emacs-jupyter-notebook-helper--append-stderr (session bytes)
   "Append unibyte BYTES to SESSION's bounded stderr buffer."
@@ -207,6 +209,10 @@ empty or the executable cannot be found."
 
 (defun emacs-jupyter-notebook-helper--queue-push (session priority item bytes)
   "Append ITEM of BYTES to SESSION's ordinary or PRIORITY FIFO queue."
+  ;; The two bounded lanes are accounting lanes, not dispatch-priority lanes.
+  ;; Keep the arrival serial on every item so a terminal frame can bypass
+  ;; credit while still never overtaking output already received on stdout.
+  (aset item 3 (cl-incf (emacs-jupyter-notebook-helper-session-wire-sequence session)))
   (let ((cell (list item)))
     (if priority
         (progn
@@ -239,6 +245,17 @@ empty or the executable cannot be found."
           (unless next (setf (emacs-jupyter-notebook-helper-session-event-tail session) nil))
           (cl-decf (emacs-jupyter-notebook-helper-session-event-queue-bytes session) bytes))
         item))))
+
+(defun emacs-jupyter-notebook-helper--queue-next (session)
+  "Pop SESSION's oldest received item across its bounded accounting lanes."
+  (let ((priority (car (emacs-jupyter-notebook-helper-session-priority-queue session)))
+        (ordinary (car (emacs-jupyter-notebook-helper-session-event-queue session))))
+    (cond
+     ((null priority) (emacs-jupyter-notebook-helper--queue-pop session nil))
+     ((null ordinary) (emacs-jupyter-notebook-helper--queue-pop session t))
+     ((< (aref priority 3) (aref ordinary 3))
+      (emacs-jupyter-notebook-helper--queue-pop session t))
+     (t (emacs-jupyter-notebook-helper--queue-pop session nil)))))
 
 (defun emacs-jupyter-notebook-helper--schedule-drain (session)
   "Schedule one callback-capable drain for SESSION."
@@ -491,7 +508,7 @@ local deadline or transport failure; ERROR is then a short local reason."
       (if (> (+ (emacs-jupyter-notebook-helper-session-priority-queue-bytes session) wire-bytes)
              emacs-jupyter-notebook-helper--max-priority-queue)
           (emacs-jupyter-notebook-helper--queue-failure session "helper priority queue exceeded")
-        (emacs-jupyter-notebook-helper--queue-push session t (vector object wire-bytes 'response) wire-bytes))))
+        (emacs-jupyter-notebook-helper--queue-push session t (vector object wire-bytes 'response nil) wire-bytes))))
    ((equal (gethash "kind" object) "event")
     (let ((priority (emacs-jupyter-notebook-helper--priority-event-p object)))
       (cond
@@ -516,7 +533,7 @@ local deadline or transport failure; ERROR is then a short local reason."
           ;; A rejected arrival neither reaches a callback nor earns credit.
           (unless (emacs-jupyter-notebook-helper-session-pending-failure session)
           (emacs-jupyter-notebook-helper--queue-push
-           session priority (vector object wire-bytes (if priority 'priority-event 'event)) wire-bytes)))))))
+           session priority (vector object wire-bytes (if priority 'priority-event 'event) nil) wire-bytes)))))))
    (t (emacs-jupyter-notebook-helper--queue-failure session "unexpected helper envelope"))))
 
 (defun emacs-jupyter-notebook-helper--raw-append (session bytes)
@@ -646,16 +663,21 @@ local deadline or transport failure; ERROR is then a short local reason."
           (emacs-jupyter-notebook-helper--late-response session object))))))
 
 (defun emacs-jupyter-notebook-helper--dispatch-event (session object bytes ordinary)
-  "Run SESSION's event callback and replenish ORDINARY event credit afterward."
+  "Run SESSION's event callback and replenish ORDINARY event credit afterward.
+Return the callback's explicit admission result after the bounded drain work
+has completed; replenishing credit never precedes that decision.
+"
   (unless (and ordinary (emacs-jupyter-notebook-helper-session-disposed session))
-    (emacs-jupyter-notebook-helper--run-callback
-     (emacs-jupyter-notebook-helper-session-event-callback session) session object)
-    (when ordinary
-      (condition-case err
-          (emacs-jupyter-notebook-helper--send-credit session bytes)
-        (error
-         (emacs-jupyter-notebook-helper--fail
-          session (format "cannot replenish helper credit: %s" (error-message-string err))))))))
+    (let ((accepted
+           (emacs-jupyter-notebook-helper--run-callback
+            (emacs-jupyter-notebook-helper-session-event-callback session) session object)))
+      (when ordinary
+        (condition-case err
+            (emacs-jupyter-notebook-helper--send-credit session bytes)
+          (error
+           (emacs-jupyter-notebook-helper--fail
+            session (format "cannot replenish helper credit: %s" (error-message-string err))))))
+      accepted)))
 
 (defun emacs-jupyter-notebook-helper--drain (session)
   "Dispatch a finite batch of decoded messages outside the process filter."
@@ -671,10 +693,9 @@ local deadline or transport failure; ERROR is then a short local reason."
                     (< bytes emacs-jupyter-notebook-helper--filter-max-payload-bytes)
                     (or (emacs-jupyter-notebook-helper-session-priority-queue session)
                         (emacs-jupyter-notebook-helper-session-event-queue session)))
-          ;; Responses and priority terminal events are always selected first;
-          ;; ordinary output credit never blocks their availability.
-          (let* ((item (or (emacs-jupyter-notebook-helper--queue-pop session t)
-                           (emacs-jupyter-notebook-helper--queue-pop session nil)))
+          ;; Priority frames bypass credit admission, but wire order is still
+          ;; global across the two finite lanes.
+          (let* ((item (emacs-jupyter-notebook-helper--queue-next session))
                  (object (aref item 0))
                  (wire-bytes (aref item 1))
                  (kind (aref item 2)))
@@ -838,7 +859,7 @@ buffer disposes the prior local session before the new process is created."
                                frame-limit
                                (emacs-jupyter-notebook-helper--accumulator-limit frame-limit))
                      :state 'starting :hello-id (format "ejn-hello-%d" id)
-                     :event-credit 0 :request-sequence 0 :control-sequence 0
+                     :event-credit 0 :request-sequence 0 :control-sequence 0 :wire-sequence 0
                      :control-sent 0 :control-acked 0 :last-event-seq -1
                      :raw-bytes 0 :event-queue-bytes 0 :priority-queue-bytes 0
                      :ready-callback ready-callback :failure-callback failure-callback

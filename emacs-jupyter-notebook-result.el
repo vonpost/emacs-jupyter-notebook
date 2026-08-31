@@ -250,6 +250,13 @@ before a future implementation chooses to reuse entry ids.")
 (defvar-local emacs-jupyter-notebook-panel--retained-artifact-bytes 0
   "Cached total image and MIME artifact bytes retained by this panel.")
 
+(defconst emacs-jupyter-notebook-panel--max-published-image-bytes 4194304
+  "Maximum bytes accepted for one helper-published panel thumbnail.
+
+Panel admission verifies content in Emacs before display.  Keeping this at
+4 MiB bounds that literal read and SHA-256 work below the UI responsiveness
+budget; larger originals belong in the asynchronous external-viewer path.")
+
 (defvar emacs-jupyter-notebook-panel--text-materialization-count nil
   "Test instrument for text materializations, or nil when disabled.")
 
@@ -999,6 +1006,120 @@ returned unchanged.  The file is mode 0600 and written without coding."
            (ignore-errors (delete-file file))
            (signal (car err) (cdr err))))))))
 
+(defun emacs-jupyter-notebook-panel--published-image-type (mime)
+  "Return the image type accepted for published MIME, or nil."
+  (pcase mime
+    ("image/png" 'png)
+    ("image/jpeg" 'jpeg)
+    ("image/gif" 'gif)
+    ("image/webp" 'webp)
+    (_ nil)))
+
+(defun emacs-jupyter-notebook-panel--published-file-sha256 (path size)
+  "Return PATH's SHA-256 after one bounded literal read of declared SIZE.
+No file-name handler is allowed on the helper's local publication path."
+  (let ((file-name-handler-alist nil)
+        (coding-system-for-read 'no-conversion))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      ;; Read at most one byte beyond the admission ceiling.  A racing growth
+      ;; can therefore fail validation without allocating an unbounded buffer.
+      (insert-file-contents-literally
+       path nil 0 (1+ emacs-jupyter-notebook-panel--max-published-image-bytes))
+      (unless (= (buffer-size) size)
+        (error "published image size changed while reading"))
+      (secure-hash 'sha256 (current-buffer)))))
+
+(defun emacs-jupyter-notebook-panel--published-image-spec (root path mime sha256 size root-identity &optional display-id)
+  "Validate one helper publication and return a panel-owned image spec.
+ROOT is pinned by the helper adapter.  PATH must remain an immediate regular
+child of that exact non-symlink root through validation and transfer.
+"
+  (unless (and (stringp root) (file-name-absolute-p root)
+               (stringp path) (file-name-absolute-p path)
+               (stringp sha256) (string-match-p "\\`[0-9a-f]\\{64\\}\\'" sha256)
+               (integerp size) (>= size 0)
+               (<= size emacs-jupyter-notebook-panel--max-published-image-bytes)
+               root-identity
+               (emacs-jupyter-notebook-panel--published-image-type mime))
+    (error "invalid published image metadata"))
+  (let* ((root-name (directory-file-name (expand-file-name root)))
+         (path-name (expand-file-name path))
+         (root-attrs (and (not (file-symlink-p root-name))
+                          (file-attributes root-name 'integer)))
+         (attrs (and (not (file-symlink-p path-name))
+                     (file-attributes path-name 'integer)))
+         (identity (and attrs (file-attribute-file-identifier attrs))))
+    (unless (and root-attrs (file-directory-p root-name)
+                 (eq (file-attribute-type root-attrs) t)
+                 (equal (file-attribute-user-id root-attrs) (user-uid))
+                 (= (logand (file-modes root-name) #o7777) #o700)
+                 (equal root-identity (file-attribute-file-identifier root-attrs))
+                 (equal (file-name-directory (directory-file-name path-name))
+                        (file-name-as-directory root-name))
+                 attrs identity
+                 (file-regular-p path-name)
+                 (null (file-attribute-type attrs))
+                 (equal (file-attribute-user-id attrs) (user-uid))
+                 (= (logand (file-modes path-name) #o7777) #o600)
+                 (= (file-attribute-size attrs) size)
+                 (string-equal
+                  (emacs-jupyter-notebook-panel--published-file-sha256
+                   path-name size)
+                  sha256)
+                 ;; Hashing is not an ownership transfer until both paths are
+                 ;; still valid, same objects observed before it.
+                 (let ((post-root (and (not (file-symlink-p root-name))
+                                       (file-attributes root-name 'integer)))
+                       (post (and (not (file-symlink-p path-name))
+                                  (file-attributes path-name 'integer))))
+                   (and post-root post
+                        (file-directory-p root-name)
+                        (eq (file-attribute-type post-root) t)
+                        (equal (file-attribute-user-id post-root) (user-uid))
+                        (= (logand (file-modes root-name) #o7777) #o700)
+                        (equal root-identity
+                               (file-attribute-file-identifier post-root))
+                        (file-regular-p path-name)
+                        (null (file-attribute-type post))
+                        (equal (file-attribute-user-id post) (user-uid))
+                        (= (logand (file-modes path-name) #o7777) #o600)
+                        (= (file-attribute-size post) size)
+                        (equal identity (file-attribute-file-identifier post)))))
+      (error "unsafe published image"))
+    (cons 'image (list :type (emacs-jupyter-notebook-panel--published-image-type mime)
+                       :file path-name :ejn-artifact-bytes size
+                       :max-width emacs-jupyter-notebook-image-max-width
+                       :max-height emacs-jupyter-notebook-image-max-height
+                       :ejn-publication-root root-name
+                       :ejn-publication-root-identity root-identity
+                       :ejn-publication-identity identity
+                       :ejn-display-id display-id))))
+
+(defun ejn-panel-set-published-image (handle root path mime sha256 size root-identity &optional display-id)
+  "Append a validated helper-published image to HANDLE.
+On success the panel owns PATH's lifetime; helper disposal must leave it in
+place until this entry is cleared, replaced, evicted, or the panel exits.
+"
+  (when (ejn-panel-entry-live-p handle)
+    (ejn-panel-set-image
+     handle (emacs-jupyter-notebook-panel--published-image-spec
+             root path mime sha256 size root-identity display-id))
+    t))
+
+(defun ejn-panel-update-published-image (handle root path mime sha256 size root-identity &optional display-id)
+  "Replace DISPLAY-ID's panel image with a validated helper publication."
+  (when (ejn-panel-entry-live-p handle)
+    ;; An update with a display id cannot manufacture a new display.  Reject
+    ;; it before accepting a publication so its staging lease is discarded.
+    (when (or (null display-id)
+              (emacs-jupyter-notebook-panel--display-target
+               (plist-get handle :panel) display-id 'image))
+      (ejn-panel-update-image
+       handle (emacs-jupyter-notebook-panel--published-image-spec
+               root path mime sha256 size root-identity display-id) display-id)
+      t)))
+
 (defun emacs-jupyter-notebook-panel--owned-image-file-p (panel file)
   "Return non-nil when FILE belongs to PANEL's private image directory."
   (and (stringp file)
@@ -1014,9 +1135,31 @@ returned unchanged.  The file is mode 0600 and written without coding."
   "Flush IMAGE and delete its private PANEL-owned backing file."
   (when (and (consp image) (eq (car image) 'image))
     (ignore-errors (image-flush image t))
-    (let ((file (plist-get (cdr image) :file)))
-      (when (emacs-jupyter-notebook-panel--owned-image-file-p panel file)
-        (ignore-errors (delete-file file))))))
+    (let* ((props (cdr image))
+           (file (plist-get props :file))
+           (identity (plist-get props :ejn-publication-identity))
+           (published (plist-get props :ejn-publication-root))
+           (root-identity (plist-get props :ejn-publication-root-identity)))
+      (cond
+       ((emacs-jupyter-notebook-panel--owned-image-file-p panel file)
+        (ignore-errors (delete-file file)))
+       ;; Never unlink a replacement or symlink at a former publication path.
+       ((and published root-identity identity (stringp file)
+             (not (file-symlink-p published))
+             (let ((root-attrs (file-attributes published 'integer)))
+               (and root-attrs
+                    (file-directory-p published)
+                    (eq (file-attribute-type root-attrs) t)
+                    (equal (file-attribute-user-id root-attrs) (user-uid))
+                    (= (logand (file-modes published) #o7777) #o700)
+                    (equal root-identity
+                           (file-attribute-file-identifier root-attrs))))
+             (not (file-symlink-p file))
+             (equal identity
+                    (and (file-exists-p file)
+                         (file-attribute-file-identifier
+                          (file-attributes file 'integer)))))
+        (ignore-errors (delete-file file)))))))
 
 (defun emacs-jupyter-notebook-panel--retire-outputs (panel outputs)
   "Retire every image spec in OUTPUTS owned by PANEL."
@@ -1339,7 +1482,11 @@ colours are preserved and uncoloured spans still get the fallback FACE."
                 (before (plist-get entry :output-text-bytes))
                 (after (plist-get entry :output-text-bytes))
                 (carriage-p (string-search "\r" display-text)))
-           (if (and last-seg (eq (car last-seg) 'text))
+           (if (and last-seg (eq (car last-seg) 'text)
+                    ;; A display-id segment is replaceable independently of
+                    ;; ordinary stream output; never merge later streams into it.
+                    (not (and (emacs-jupyter-notebook-panel--text-state-p (cdr last-seg))
+                              (plist-get (cdr last-seg) :display-id))))
                (if carriage-p
                    ;; Carriage returns rewrite an existing terminal line.  They
                    ;; are uncommon; materialize once to preserve exact W14 semantics.
@@ -1381,6 +1528,85 @@ colours are preserved and uncoloured spans still get the fallback FACE."
            entry))
        force-full)
       (emacs-jupyter-notebook-panel--enforce-retention-budgets panel))))
+
+(defun emacs-jupyter-notebook-panel--segment-display-id (segment)
+  "Return SEGMENT's display identity, or nil."
+  (pcase (car-safe segment)
+    ('text (and (emacs-jupyter-notebook-panel--text-state-p (cdr segment))
+                (plist-get (cdr segment) :display-id)))
+    ('image (plist-get (cdr (cdr segment)) :ejn-display-id))))
+
+(defun emacs-jupyter-notebook-panel--display-target (panel display-id &optional kind)
+  "Return `(HANDLE . SEGMENT)' for newest DISPLAY-ID in PANEL.
+When KIND is non-nil, only a segment whose car is KIND can match."
+  (when (and (buffer-live-p panel) (stringp display-id))
+    (with-current-buffer panel
+      (catch 'target
+        (dolist (cell (reverse emacs-jupyter-notebook-panel--entries))
+          (dolist (segment (reverse (plist-get (cdr cell) :outputs)))
+            (when (and (or (null kind) (eq (car segment) kind))
+                       (equal (emacs-jupyter-notebook-panel--segment-display-id segment)
+                              display-id))
+              (throw 'target
+                     (cons (emacs-jupyter-notebook-panel--handle
+                            panel (car cell) (plist-get (cdr cell) :cell-key))
+                           segment)))))))))
+
+(defun ejn-panel-set-display-text (handle text display-id)
+  "Append TEXT as the independently replaceable DISPLAY-ID output segment."
+  (when (and (ejn-panel-entry-live-p handle) (stringp text) (stringp display-id))
+    (let ((panel (plist-get handle :panel))
+          (text (copy-sequence text)))
+      (emacs-jupyter-notebook-panel--update-entry
+       handle
+       (lambda (entry)
+         (setq entry (emacs-jupyter-notebook-panel--entry-after-pending-clear panel entry))
+         (let ((outputs (plist-get entry :outputs)))
+           (setq entry (plist-put entry :outputs
+                                  (append outputs
+                                          (list (cons 'text
+                                                      (plist-put
+                                                       (emacs-jupyter-notebook-panel--make-text-state text)
+                                                       :display-id display-id))))))
+           (setq entry (plist-put entry :output-text-bytes
+                                  (+ (plist-get entry :output-text-bytes) (string-bytes text))))
+           (setq entry (plist-put entry :retained-text-bytes
+                                  (+ (string-bytes (or (plist-get entry :code) ""))
+                                     (plist-get entry :output-text-bytes))))
+           (plist-put entry :pending-clear nil)))
+       t)
+      (emacs-jupyter-notebook-panel--enforce-retention-budgets panel)
+      t)))
+
+(defun ejn-panel-update-display-text (handle text display-id)
+  "Replace the newest panel text output identified by DISPLAY-ID, or return nil."
+  (when (and (ejn-panel-entry-live-p handle) (stringp text) (stringp display-id))
+    (let* ((panel (plist-get handle :panel))
+           (target (emacs-jupyter-notebook-panel--display-target
+                    panel display-id 'text))
+           (target-handle (car-safe target))
+           (target-segment (cdr-safe target)))
+      (when target-segment
+        (let ((text (copy-sequence text)))
+          (emacs-jupyter-notebook-panel--update-entry
+           target-handle
+           (lambda (entry)
+             (let ((before (emacs-jupyter-notebook-panel--text-segment-bytes
+                            target-segment)))
+               (setcdr target-segment
+                       (plist-put
+                        (emacs-jupyter-notebook-panel--make-text-state text)
+                        :display-id display-id))
+               (setq entry (plist-put entry :output-text-bytes
+                                      (+ (- (plist-get entry :output-text-bytes) before)
+                                         (string-bytes text))))
+               (setq entry (plist-put entry :retained-text-bytes
+                                      (+ (string-bytes (or (plist-get entry :code) ""))
+                                         (plist-get entry :output-text-bytes))))
+               entry))
+           t)
+          (emacs-jupyter-notebook-panel--enforce-retention-budgets panel)
+          t)))))
 
 (defun ejn-panel-replace-text (handle text)
   "Replace ALL of HANDLE's entry output with TEXT.
@@ -1437,42 +1663,61 @@ get their own segment."
            t)
           (emacs-jupyter-notebook-panel--enforce-retention-budgets panel))))))
 
-(defun ejn-panel-update-image (handle image-spec)
-  "Replace the LAST image segment on HANDLE's entry with IMAGE-SPEC.
-Appends when the entry has no image yet.  W16: this is the
+(defun ejn-panel-update-image (handle image-spec &optional display-id)
+  "Replace the newest matching panel image segment with IMAGE-SPEC.
+Without DISPLAY-ID, append when the entry has no image yet.  With DISPLAY-ID,
+an absent target is ignored.  W16: this is the
 `update_display_data' semantic — the kernel is updating an existing
 display in place (e.g. an animation frame), not adding a new output —
 so text segments are left untouched and no new segment is created."
   (when (ejn-panel-entry-live-p handle)
-    (let ((panel (plist-get handle :panel)))
-      (when (ejn-panel-entry-live-p handle)
-        (let ((stored (emacs-jupyter-notebook-panel--materialize-image
-                       panel image-spec)))
-          (emacs-jupyter-notebook-panel--update-entry
-           handle
-           (lambda (entry)
-             (setq entry (emacs-jupyter-notebook-panel--entry-after-pending-clear
-                          panel entry))
-             (let* ((outputs (plist-get entry :outputs))
-                    (last-image (cl-find 'image (reverse outputs) :key #'car))
-                    (old-image-bytes (and last-image
-                                          (or (plist-get (cdr last-image)
-                                                         :ejn-artifact-bytes) 0))))
-               (if last-image
-                   (progn
-                     (emacs-jupyter-notebook-panel--retire-image
-                      panel (cdr last-image))
-                     (setcdr last-image stored))
-                 (setq outputs (append outputs (list (cons 'image stored)))))
-               (setq entry (plist-put entry :outputs outputs))
-               (setq entry (plist-put entry :artifact-bytes
-                                      (+ (- (plist-get entry :artifact-bytes)
-                                            (or old-image-bytes 0))
-                                         (or (plist-get (cdr stored) :ejn-artifact-bytes) 0))))
-               (setq entry (plist-put entry :pending-clear nil))
-               entry))
-           t)
-          (emacs-jupyter-notebook-panel--enforce-retention-budgets panel))))))
+    (let* ((panel (plist-get handle :panel))
+           (target (and display-id
+                        (emacs-jupyter-notebook-panel--display-target
+                         panel display-id 'image)))
+           (effective-handle (if target (car target) handle)))
+      (when (or (null display-id) target)
+        (when (ejn-panel-entry-live-p effective-handle)
+          (let ((stored (emacs-jupyter-notebook-panel--materialize-image
+                         panel image-spec)))
+            (emacs-jupyter-notebook-panel--update-entry
+             effective-handle
+             (lambda (entry)
+               (setq entry (emacs-jupyter-notebook-panel--entry-after-pending-clear
+                            panel entry))
+               (let* ((outputs (plist-get entry :outputs))
+                      (last-image
+                       (if display-id
+                           (cl-find-if
+                            (lambda (segment)
+                              (and (eq (car segment) 'image)
+                                   (equal (plist-get (cdr (cdr segment)) :ejn-display-id)
+                                          display-id)))
+                            (reverse outputs))
+                         (cl-find 'image (reverse outputs) :key #'car)))
+                      (old-image-bytes
+                       (and last-image
+                            (or (plist-get (cdr (cdr last-image))
+                                           :ejn-artifact-bytes)
+                                0))))
+                 (if last-image
+                     (progn
+                       (emacs-jupyter-notebook-panel--retire-image
+                        panel (cdr last-image))
+                       (setcdr last-image stored))
+                   (setq outputs (append outputs (list (cons 'image stored)))))
+                 (setq entry (plist-put entry :outputs outputs))
+                 (setq entry
+                       (plist-put
+                        entry :artifact-bytes
+                        (+ (- (plist-get entry :artifact-bytes)
+                              (or old-image-bytes 0))
+                           (or (plist-get (cdr stored) :ejn-artifact-bytes) 0))))
+                 (setq entry (plist-put entry :pending-clear nil))
+                 entry))
+             t)
+            (emacs-jupyter-notebook-panel--enforce-retention-budgets panel)
+            t))))))
 
 (defun ejn-panel-finish-entry (handle status execution-count)
   "Mark HANDLE's entry as completed with STATUS and EXECUTION-COUNT."

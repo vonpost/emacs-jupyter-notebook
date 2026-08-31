@@ -332,6 +332,28 @@ DISPOSALS receives local-only disposal reasons."
       (when (file-directory-p directory)
         (delete-directory directory t)))))
 
+(ert-deftest ejn-ei4-artifact-root-uses-canonical-ancestor-spelling ()
+  "Artifact roots match helper paths across aliases such as Darwin's /var."
+  (let* ((base (make-temp-file "ejn-ei4-root-alias-" t))
+         (real (expand-file-name "real" base))
+         (alias (expand-file-name "alias" base))
+         pair)
+    (unwind-protect
+        (progn
+          (make-directory real)
+          (make-symbolic-link real alias)
+          (let ((temporary-file-directory (file-name-as-directory alias)))
+            (setq pair
+                  (emacs-jupyter-notebook-helper-backend--make-artifact-directory)))
+          (should (string-prefix-p (file-name-as-directory (file-truename real))
+                                   (car pair)))
+          (should-not (string-prefix-p (file-name-as-directory alias) (car pair))))
+      (when (and pair (file-directory-p (car pair)))
+        (delete-directory (car pair) t))
+      (when (file-symlink-p alias) (delete-file alias))
+      (when (file-directory-p real) (delete-directory real t))
+      (when (file-directory-p base) (delete-directory base t)))))
+
 (ert-deftest ejn-ei2-retired-a-callback-cannot-affect-b ()
   "A late A reply is inert after B gets its own backend session."
   (ejn-ei2-test-with-fake-helper (requests callbacks disposals)
@@ -898,7 +920,7 @@ DISPOSALS receives local-only disposal reasons."
                       session state
                       (ejn-ei2-test--object "event" "status"
                                             "request_id" "ejn-request-9-1"
-                                            "data" (make-hash-table :test #'equal)))
+                                            "data" (ejn-ei2-test--object "execution_state" "idle")))
                      (funcall callback 'fake
                               (ejn-ei2-test--response
                                (ejn-ei2-test--object "status" "ok"
@@ -908,11 +930,12 @@ DISPOSALS receives local-only disposal reasons."
           (emacs-jupyter-notebook-backend-execute
            session "x" '(:ledger-id 19) #'ignore #'ignore)
           (ejn-ei2-test--run-timers)
-          (should (eq (plist-get seen :type) 'helper-correlated))
+          (should (eq (plist-get seen :type) 'helper-event))
           (should (= (plist-get seen :ledger-id) 19))
           (should (integerp (plist-get seen :backend-request-id)))
           (should-not (plist-get seen :panel-generation))
           (should (equal (plist-get seen :helper-request-id) "ejn-request-9-1"))
+          (should (equal (plist-get (plist-get seen :event) :type) 'status))
           (should (equal (plist-get
                           (gethash "ejn-request-9-1"
                                    (emacs-jupyter-notebook-helper-backend-state-request-map state))
@@ -943,18 +966,386 @@ DISPOSALS receives local-only disposal reasons."
            (session (emacs-jupyter-notebook-backend-session-create nil (current-buffer)))
            (state (emacs-jupyter-notebook-helper-backend--make-state)))
       (setf (emacs-jupyter-notebook-backend-session-data session) state)
+      (setf (emacs-jupyter-notebook-backend-session-dispatch-depth session) 1)
       (dotimes (index 200)
         (emacs-jupyter-notebook-helper-backend--event
          session state
          (ejn-ei2-test--object "event" "stream"
                                "request_id" (format "ejn-request-burst-%d" index))))
+      (setf (emacs-jupyter-notebook-backend-session-dispatch-depth session) 0)
       (should (= (hash-table-count
                   (emacs-jupyter-notebook-helper-backend-state-pending-events state))
                  128))
       (emacs-jupyter-notebook-helper-backend--dispose state "test cleanup")
       (should (= (hash-table-count
                   (emacs-jupyter-notebook-helper-backend-state-pending-events state))
-                 0)))))
+                     0)))))
+
+(ert-deftest ejn-ei4-helper-normalizes-real-terminal-and-text-events ()
+  "EI4 accepts only bounded helper shapes before they reach the reducer."
+  (let ((state (emacs-jupyter-notebook-helper-backend--make-state)))
+    (should (equal
+             (emacs-jupyter-notebook-helper-backend--normalize-event
+              state (ejn-ei2-test--object "event" "execute_reply"
+                                          "data" (ejn-ei2-test--object
+                                                    "status" "ok" "execution_count" 4)))
+             '(:type execute-reply :status "ok" :execution-count 4)))
+    (should (equal
+             (emacs-jupyter-notebook-helper-backend--normalize-event
+              state (ejn-ei2-test--object "event" "stream"
+                                          "data" (ejn-ei2-test--object
+                                                    "name" "stdout" "text" "x\n")))
+             '(:type stream :text "x\n" :name "stdout")))
+    ;; `execution_count' is legitimately absent in a canonical reply.
+    (should (equal
+             (emacs-jupyter-notebook-helper-backend--normalize-event
+             state (ejn-ei2-test--object "event" "execute_reply"
+                                          "data" (ejn-ei2-test--object "status" "ok")))
+             '(:type execute-reply :status "ok" :execution-count nil)))
+    (should (equal
+             (emacs-jupyter-notebook-helper-backend--normalize-event
+              state (ejn-ei2-test--object "event" "clear_output"
+                                          "data" (ejn-ei2-test--object "wait" :false)))
+             '(:type clear :wait nil)))
+    (should (equal
+             (emacs-jupyter-notebook-helper-backend--normalize-event
+              state (ejn-ei2-test--object "event" "status"
+                                          "data" (ejn-ei2-test--object
+                                                    "execution_state" "busy")))
+             '(:type status :execution-state "busy")))
+    (should (equal
+             (emacs-jupyter-notebook-helper-backend--normalize-event
+              state (ejn-ei2-test--object "event" "output_truncated"
+                                          "data" (ejn-ei2-test--object
+                                                    "dropped_bytes" 12)))
+             '(:type truncation :text "[output truncated]\n")))))
+
+(ert-deftest ejn-ei4-normalizer-rejects-malformed-branch-shapes ()
+  "Every helper output branch rejects malformed shapes before EI1R mutation."
+  (let* ((state (emacs-jupyter-notebook-helper-backend--make-state))
+         (metadata (ejn-ei2-test--object))
+         (text-data (ejn-ei2-test--object "text/plain" "ok"))
+         (rich (lambda (name &rest pairs)
+                 (ejn-ei2-test--object
+                  "event" name "data"
+                  (apply #'ejn-ei2-test--object
+                         "data" text-data "metadata" metadata pairs)))))
+    (should (eq (plist-get
+                 (emacs-jupyter-notebook-helper-backend--normalize-event
+                  state (funcall rich "display_data"))
+                 :type)
+                'display))
+    (should (eq (plist-get
+                 (emacs-jupyter-notebook-helper-backend--normalize-event
+                  state (funcall rich "execute_result"))
+                 :type)
+                'result))
+    (dolist
+        (raw
+         (list
+          (ejn-ei2-test--object "event" "unknown" "data" (ejn-ei2-test--object))
+          (ejn-ei2-test--object "event" "stream" "data"
+                                (ejn-ei2-test--object "name" "log" "text" "x"))
+          (ejn-ei2-test--object "event" "clear_output" "data"
+                                (ejn-ei2-test--object))
+          (ejn-ei2-test--object "event" "status" "data"
+                                (ejn-ei2-test--object "execution_state" 1))
+          (ejn-ei2-test--object "event" "execute_reply" "data"
+                                (ejn-ei2-test--object "status" "maybe"))
+          (ejn-ei2-test--object "event" "input_request" "data"
+                                (ejn-ei2-test--object "prompt" "unsafe"))
+          (ejn-ei2-test--object "event" "display_data" "data"
+                                (ejn-ei2-test--object "data" text-data))
+          (funcall rich "display_data" "transient" "not-an-object")
+          (funcall rich "display_data" "transient"
+                   (ejn-ei2-test--object "display_id" (make-string 257 ?x)))
+          (funcall rich "display_data" "data"
+                   (ejn-ei2-test--object "image/png" "base64-is-not-an-artifact"))
+          (funcall rich "execute_result" "update" t)))
+      (should-error
+       (emacs-jupyter-notebook-helper-backend--normalize-event state raw)))))
+
+(ert-deftest ejn-ei4-reentrant-terminal-fifo-flushes-once-after-dispatch ()
+  "Reply then idle from a synchronous helper fake stay FIFO and post-dispatch."
+  (let (seen)
+    (with-temp-buffer
+      (let* ((emacs-jupyter-notebook-backend 'helper)
+             (session (emacs-jupyter-notebook-backend-session-create
+                       (lambda (_session event)
+                         (setq seen (append seen
+                                            (list (plist-get (plist-get event :event) :type))))
+                         t)
+                       (current-buffer)))
+             (state (emacs-jupyter-notebook-helper-backend--make-state :helper 'fake)))
+        (setf (emacs-jupyter-notebook-backend-session-data session) state)
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper-request)
+                   (lambda (_helper _operation _params callback &rest _keys)
+                     (dolist (event
+                              (list
+                               (ejn-ei2-test--object
+                                "event" "execute_reply" "request_id" "ejn-request-ei4-1"
+                                "data" (ejn-ei2-test--object "status" "ok"))
+                               (ejn-ei2-test--object
+                                "event" "status" "request_id" "ejn-request-ei4-1"
+                                "data" (ejn-ei2-test--object "execution_state" "idle"))))
+                       (emacs-jupyter-notebook-helper-backend--event session state event))
+                     (funcall callback 'fake
+                              (ejn-ei2-test--response
+                               (ejn-ei2-test--object "status" "ok" "execution_count" 1)) nil)
+                     "ejn-request-ei4-1")))
+          (emacs-jupyter-notebook-backend-execute
+           session "x" '(:ledger-id 29) #'ignore #'ignore)
+          (should-not seen)
+          (ejn-ei2-test--run-timers)
+          (should (equal seen '(execute-reply status)))
+          (should (= (hash-table-count
+                      (emacs-jupyter-notebook-helper-backend-state-pending-events state)) 0))
+          (should-not (timerp
+                       (emacs-jupyter-notebook-helper-backend-state-pending-flush-timer state))))))))
+
+(ert-deftest ejn-ei4-early-events-keep-global-order-across-helper-ids ()
+  "Mapped reentrant events restore arrival order across helper request IDs."
+  (let (seen)
+    (with-temp-buffer
+      (let* ((session (emacs-jupyter-notebook-backend-session-create
+                       nil
+                       (current-buffer)))
+             (mapping (make-hash-table :test #'equal))
+             (state (emacs-jupyter-notebook-helper-backend--make-state
+                     :request-map mapping
+                     :emit (lambda (event)
+                             (push (cons (plist-get event :helper-request-id)
+                                         (plist-get (plist-get event :event) :type))
+                                   seen)
+                             t))))
+        (setf (emacs-jupyter-notebook-backend-session-data session) state)
+        (setf (emacs-jupyter-notebook-backend-session-dispatch-depth session) 1)
+        (dolist (spec '(("a" "stream" "a1")
+                        ("b" "stream" "b1")
+                        ("a" "stream" "a2")
+                        ("b" "stream" "b2")))
+          (emacs-jupyter-notebook-helper-backend--event
+           session state
+           (ejn-ei2-test--object
+            "event" (nth 1 spec) "request_id" (car spec)
+            "data" (ejn-ei2-test--object "name" "stdout" "text" (nth 2 spec)))))
+        (setf (emacs-jupyter-notebook-backend-session-dispatch-depth session) 0)
+        (puthash "a" '(:ledger-id 1 :backend-request-id 11) mapping)
+        (puthash "b" '(:ledger-id 2 :backend-request-id 12) mapping)
+        (emacs-jupyter-notebook-helper-backend--flush-pending-events session state)
+        (should (equal (nreverse seen)
+                       '(("a" . stream) ("b" . stream)
+                         ("a" . stream) ("b" . stream))))
+        (should (= (hash-table-count
+                    (emacs-jupyter-notebook-helper-backend-state-pending-events state))
+                   0))))))
+
+(ert-deftest ejn-ei4-rejected-or-malformed-early-output-cannot-drop-terminals ()
+  "One bad early output cannot suppress its later real reply and idle events."
+  (let (seen messages)
+    (with-temp-buffer
+      (let* ((session (emacs-jupyter-notebook-backend-session-create
+                       nil
+                       (current-buffer)))
+             (mapping (make-hash-table :test #'equal))
+             (state (emacs-jupyter-notebook-helper-backend--make-state
+                     :request-map mapping
+                     :emit (lambda (event)
+                             (let ((type (plist-get (plist-get event :event) :type)))
+                               (push type seen)
+                               (not (eq type 'update-display)))))))
+        (setf (emacs-jupyter-notebook-backend-session-data session) state)
+        (setf (emacs-jupyter-notebook-backend-session-dispatch-depth session) 1)
+        (cl-letf (((symbol-function 'message)
+                   (lambda (format-string &rest args)
+                     (push (apply #'format format-string args) messages))))
+          (dolist (event
+                   (list
+                    (ejn-ei2-test--object
+                     "event" "display_data" "request_id" "wire"
+                     "data" (ejn-ei2-test--object
+                              "data" (ejn-ei2-test--object "text/plain" "bad update")
+                              "metadata" (ejn-ei2-test--object)
+                              "update" t))
+                    ;; This malformed item must be isolated rather than aborting
+                    ;; the remainder of the bounded FIFO.
+                    (ejn-ei2-test--object "event" "display_data"
+                                          "request_id" "wire"
+                                          "data" (ejn-ei2-test--object))
+                    (ejn-ei2-test--object
+                     "event" "execute_reply" "request_id" "wire"
+                     "data" (ejn-ei2-test--object "status" "ok"))
+                    (ejn-ei2-test--object
+                     "event" "status" "request_id" "wire"
+                     "data" (ejn-ei2-test--object "execution_state" "idle"))))
+            (emacs-jupyter-notebook-helper-backend--event session state event))
+          (setf (emacs-jupyter-notebook-backend-session-dispatch-depth session) 0)
+          (puthash "wire" '(:ledger-id 1 :backend-request-id 11) mapping)
+          (emacs-jupyter-notebook-helper-backend--flush-pending-events session state))
+        (should (equal (nreverse seen) '(update-display execute-reply status)))
+        (should (= (length messages) 1))
+        (should (string-match-p "rejected early helper event" (car messages)))
+        (should (= (hash-table-count
+                    (emacs-jupyter-notebook-helper-backend-state-pending-events state))
+                   0))))))
+
+(ert-deftest ejn-ei4-unaccepted-helper-publications-are-discarded-safely ()
+  "Rejected and malformed helper publications do not accumulate on disk."
+  (let* ((pair (emacs-jupyter-notebook-helper-backend--make-artifact-directory))
+         (root (car pair))
+         (identity (cdr pair))
+         (mapping '(:ledger-id 1 :backend-request-id 11))
+         (state (emacs-jupyter-notebook-helper-backend--make-state
+                 :artifact-dir root :artifact-identity identity :emit #'ignore))
+         (make-event
+          (lambda (path &optional malformed)
+            (ejn-ei2-test--object
+             "event" "display_data" "request_id" "wire"
+             "data" (ejn-ei2-test--object
+                      "data" (ejn-ei2-test--object
+                              "image/png"
+                              (ejn-ei2-test--object
+                               "path" path "bytes" 4
+                               "sha256" (make-string 64 ?a)))
+                      "metadata" (if malformed "bad" (ejn-ei2-test--object)))))))
+    (unwind-protect
+        (progn
+          (dolist (malformed '(nil t))
+            (let ((path (expand-file-name
+                         (format "ejn-artifact-%032x" (if malformed 2 1)) root)))
+              (with-temp-file path (insert "data"))
+              (set-file-modes path #o600)
+              (if malformed
+                  (should-error
+                   (emacs-jupyter-notebook-helper-backend--deliver-mapped-event
+                    state "wire" mapping (funcall make-event path t)))
+                (should-not
+                 (emacs-jupyter-notebook-helper-backend--deliver-mapped-event
+                  state "wire" mapping (funcall make-event path))))
+              (should-not (file-exists-p path))))
+          ;; Even an unaccepted event cannot ask the adapter to delete a file
+          ;; outside the exact helper publication namespace.
+          (let ((unrelated (expand-file-name "unrelated" root)))
+            (with-temp-file unrelated (insert "keep"))
+            (set-file-modes unrelated #o600)
+            (should-not
+             (emacs-jupyter-notebook-helper-backend--deliver-mapped-event
+              state "wire" mapping (funcall make-event unrelated)))
+            (should (file-exists-p unrelated))))
+      (emacs-jupyter-notebook-helper-backend--dispose state "test cleanup")
+      (when (file-directory-p root) (delete-directory root t)))))
+
+(ert-deftest ejn-ei4-retired-wire-events-never-reenter-early-buffer ()
+  "Late events for a tombstoned helper ID consume no pending-event capacity."
+  (let* ((pair (emacs-jupyter-notebook-helper-backend--make-artifact-directory))
+         (root (car pair))
+         (path (expand-file-name
+                "ejn-artifact-00000000000000000000000000000009" root))
+         seen state)
+    (unwind-protect
+        (with-temp-buffer
+          (let* ((mapping (make-hash-table :test #'equal))
+                 (session (emacs-jupyter-notebook-backend-session-create nil (current-buffer))))
+            (setq state
+                  (emacs-jupyter-notebook-helper-backend--make-state
+                   :artifact-dir root :artifact-identity (cdr pair)
+                   :request-map mapping
+                   :pending-events (make-hash-table :test #'equal)
+                   :emit (lambda (event) (push event seen))))
+            (setf (emacs-jupyter-notebook-backend-session-data session) state)
+            (puthash "retired-wire" '(:ledger-id 9 :backend-request-id 19) mapping)
+            (emacs-jupyter-notebook-helper-backend-retire-ledger-id session 9)
+            (dolist (name '("stream" "status" "display_data"))
+              (emacs-jupyter-notebook-helper-backend--event
+               session state
+               (ejn-ei2-test--object "event" name "request_id" "retired-wire"
+                                     "data" (ejn-ei2-test--object))))
+            (with-temp-file path (insert "late"))
+            (set-file-modes path #o600)
+            (emacs-jupyter-notebook-helper-backend--event
+             session state
+             (ejn-ei2-test--object
+              "event" "display_data" "request_id" "retired-wire"
+              "data" (ejn-ei2-test--object
+                       "data" (ejn-ei2-test--object
+                               "image/png" (ejn-ei2-test--object
+                                            "path" path "bytes" 4
+                                            "sha256" (make-string 64 ?a)))
+                       "metadata" (ejn-ei2-test--object))))
+            (should-not (file-exists-p path))
+            (should-not seen)
+            (should (= (hash-table-count
+                        (emacs-jupyter-notebook-helper-backend-state-pending-events state))
+                       0))
+            (should (gethash
+                     "retired-wire"
+                     (emacs-jupyter-notebook-helper-backend-state-retired-request-ids state)))))
+      (when state (emacs-jupyter-notebook-helper-backend--dispose state "test cleanup"))
+      (when (file-directory-p root) (delete-directory root t)))))
+
+(ert-deftest ejn-ei4-helper-dispose-removes-only-partial-staging ()
+  "Adapter cleanup preserves publications without retaining an unbounded map."
+  (let* ((root (ejn-ei2-test--artifact-directory))
+         (publication (expand-file-name "ejn-artifact-published" root))
+         (staging (expand-file-name ".ejn-partial-staging" root))
+         (state (emacs-jupyter-notebook-helper-backend--make-state
+                 :artifact-dir root
+                 :artifact-identity (file-attribute-file-identifier (file-attributes root)))))
+    (unwind-protect
+        (progn
+          (with-temp-file publication (insert "published"))
+          (set-file-modes publication #o600)
+          (with-temp-file staging (insert "staging"))
+          (emacs-jupyter-notebook-helper-backend--dispose state "test")
+          (should (file-exists-p publication))
+          (should-not (file-exists-p staging)))
+      (ignore-errors (delete-file publication))
+      (ignore-errors (delete-directory root)))))
+
+(ert-deftest ejn-ei4-normalizes-ht9-display-update-and-id ()
+  "HT9's display_data/update flag retains the bounded display identity."
+  (let* ((state (emacs-jupyter-notebook-helper-backend--make-state
+                 :artifact-dir "/tmp/ejn-ei4-root"
+                 :artifact-identity '(7 . 11)))
+         (payload (ejn-ei2-test--object "text/plain" "new"))
+         (transient (ejn-ei2-test--object "display_id" "plot-1"))
+         (raw (ejn-ei2-test--object
+               "event" "display_data"
+               "data" (ejn-ei2-test--object
+                        "data" payload "metadata" (ejn-ei2-test--object)
+                        "transient" transient "update" t)))
+         (normalized (emacs-jupyter-notebook-helper-backend--normalize-event
+                      state raw)))
+    (should (eq (plist-get normalized :type) 'update-display))
+    (should (equal (plist-get normalized :data) '(:text/plain "new")))
+    (should (equal (plist-get normalized :display-id) "plot-1"))
+    (should (eq (plist-get normalized :require-display-id) t))
+    (should (equal (gethash "display_id" (plist-get normalized :transient))
+                   "plot-1"))
+    (let* ((artifact (ejn-ei2-test--object
+                      "path" "/tmp/ejn-ei4-root/ejn-artifact-1"
+                      "bytes" 12 "sha256" (make-string 64 ?a)))
+           (artifact-event
+            (ejn-ei2-test--object
+             "event" "display_data"
+             "data" (ejn-ei2-test--object
+                      "data" (ejn-ei2-test--object "image/png" artifact)
+                      "metadata" (ejn-ei2-test--object))))
+           (publication
+            (plist-get
+             (plist-get
+              (emacs-jupyter-notebook-helper-backend--normalize-event
+               state artifact-event)
+              :data)
+             :ejn-published-image)))
+      (should (equal (plist-get publication :root) "/tmp/ejn-ei4-root"))
+      (should (equal (plist-get publication :root-identity) '(7 . 11)))
+      (should (equal (plist-get publication :path)
+                     "/tmp/ejn-ei4-root/ejn-artifact-1"))
+      (should (= (plist-get publication :size) 12)))
+    (puthash "update" "not-a-boolean" (gethash "data" raw))
+    (should-error
+     (emacs-jupyter-notebook-helper-backend--normalize-event state raw))))
 
 (provide 'emacs-jupyter-notebook-helper-backend-tests)
 

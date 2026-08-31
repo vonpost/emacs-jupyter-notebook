@@ -83,6 +83,13 @@ busy-kernel reconnect arbitration may retain it after verification times out."
          (stringp file)
          (file-readable-p file))))
 
+(defun ejn-ei4-test--content-sha256 (file)
+  "Return SHA-256 of FILE contents, never of its pathname."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally file)
+    (secure-hash 'sha256 (current-buffer))))
+
 (defun ejn-test-drain-zero-delay-timers ()
   "Run callbacks deferred onto Emacs's zero-delay timer queue.
 
@@ -10607,7 +10614,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
           (should (equal (car calls) "user()")))))))
 
 (ert-deftest ejn-ei3-reentrant-helper-execute-does-not-resurrect-record ()
-  "Inline terminal success/failure cannot leave a stale timer or active id."
+  "Inline acknowledgements never synthesize terminality or resurrect records."
   (dolist (outcome '(success failure))
     (with-temp-buffer
       (let ((emacs-jupyter-notebook-backend 'helper)
@@ -10626,6 +10633,19 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                      77)))
           (let ((id (emacs-jupyter-notebook--evaluate-code "x" nil)))
             (ejn-test-drain-zero-delay-timers)
+            (when (eq outcome 'success)
+              ;; EI4 does not manufacture reply/idle evidence from the execute
+              ;; acknowledgement.  The real pair still retires this record.
+              (let ((record (emacs-jupyter-notebook--execution-record id)))
+                (should record)
+                (emacs-jupyter-notebook--execution-note-event
+                 (list :request-id id :backend-request-id 77
+                       :panel-generation (plist-get record :generation))
+                 '(:type execute-reply :status "ok" :execution-count 3))
+                (emacs-jupyter-notebook--execution-note-event
+                 (list :request-id id :backend-request-id 77
+                       :panel-generation (plist-get record :generation))
+                 '(:type status :execution-state "idle"))))
             (should-not (emacs-jupyter-notebook--execution-record id))
             (should-not emacs-jupyter-notebook--execution-active-id)))))))
 
@@ -11122,6 +11142,472 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                        '((:action ignore))))
         (should-not emacs-jupyter-notebook--kernel-status)
         (should-not (plist-get (emacs-jupyter-notebook--execution-record 1) :reply-seen))))))
+
+(ert-deftest ejn-ei4-helper-events-use-real-reducer-terminality-and-retire-wire-map ()
+  "A helper stream/reply/idle path reaches EI1R and retires exactly once."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (panel (ejn-panel-ensure source))
+           (handle (ejn-panel-start-entry panel '("ei4.py" . 1) "x"))
+           (generation (plist-get handle :generation))
+           (mapping (make-hash-table :test #'equal))
+           (state (emacs-jupyter-notebook-helper-backend--make-state
+                   :request-map mapping))
+           (session (emacs-jupyter-notebook-backend-session-create nil source))
+           (record (list :id 41 :state 'dispatched :panel-entry handle
+                         :backend-request-id 71 :generation generation
+                         :reply-seen nil :idle-seen nil)))
+      (setf (emacs-jupyter-notebook-backend-session-backend session) 'helper
+            (emacs-jupyter-notebook-backend-session-data session) state)
+      (puthash "wire-ei4-41"
+               (list :ledger-id 41 :backend-request-id 71 :panel-generation generation)
+               mapping)
+      (emacs-jupyter-notebook--execution-put record)
+      (setq emacs-jupyter-notebook--client session
+            emacs-jupyter-notebook--execution-active-id 41
+            emacs-jupyter-notebook--execution-queue '(41))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--execution-pump) #'ignore))
+        (should
+         (emacs-jupyter-notebook--backend-event
+          session (list :type 'helper-event :helper-request-id "wire-ei4-41"
+                        :ledger-id 41 :backend-request-id 71 :panel-generation generation
+                        :event '(:type stream :name "stdout" :text "first\n"))))
+        (should (equal (ejn-panel-entry-text handle) "first\n"))
+        (emacs-jupyter-notebook--backend-event
+         session (list :type 'helper-event :helper-request-id "wire-ei4-41"
+                       :ledger-id 41 :backend-request-id 71 :panel-generation generation
+                       :event '(:type execute-reply :status "ok")))
+        ;; A response acknowledgement is not fabricated terminal evidence.
+        (should (emacs-jupyter-notebook--execution-record 41))
+        (emacs-jupyter-notebook--backend-event
+         session (list :type 'helper-event :helper-request-id "wire-ei4-41"
+                       :ledger-id 41 :backend-request-id 71 :panel-generation generation
+                       :event '(:type status :execution-state "idle")))
+        (should-not (emacs-jupyter-notebook--execution-record 41))
+        (should-not (gethash "wire-ei4-41" mapping))))))
+
+(ert-deftest ejn-ei4-valid-artifact-routes-helper-to-panel-without-base64 ()
+  "A real HT9 descriptor crosses correlation and transfers exact file ownership."
+  (let* ((pair (emacs-jupyter-notebook-helper-backend--make-artifact-directory))
+         (root (car pair))
+         (root-id (cdr pair))
+         (accepted (expand-file-name
+                    "ejn-artifact-00000000000000000000000000000001" root))
+         (stale (expand-file-name
+                 "ejn-artifact-00000000000000000000000000000002" root))
+         panel state)
+    (unwind-protect
+        (with-temp-buffer
+          (let* ((source (current-buffer))
+                 (_ (dolist (file (list accepted stale))
+                      (with-temp-file file (insert "png!"))
+                      (set-file-modes file #o600)))
+                 (handle (progn
+                           (setq panel (ejn-panel-ensure source))
+                           (ejn-panel-start-entry panel '("route.py" . 1) "plot()")))
+                 (generation (plist-get handle :generation))
+                 (session (emacs-jupyter-notebook-backend-session-create nil source))
+                 (record (list :id 51 :state 'dispatched :panel-entry handle
+                               :backend-request-id 81 :generation generation
+                               :reply-seen nil :idle-seen nil))
+                 (object (lambda (&rest pairs)
+                           (let ((table (make-hash-table :test #'equal)))
+                             (while pairs
+                               (puthash (pop pairs) (pop pairs) table))
+                             table)))
+                 (raw-event
+                  (lambda (path)
+                    (funcall object
+                     "event" "display_data" "request_id" "wire-route"
+                     "data" (funcall object
+                              "data" (funcall object
+                                      "image/png"
+                                      (funcall object
+                                       "path" path "bytes" 4
+                                       "sha256" (ejn-ei4-test--content-sha256 path)))
+                              "metadata" (funcall object)))))
+                 (mapping (list :ledger-id 51 :backend-request-id 81
+                                :panel-generation generation)))
+            (setq state
+                  (emacs-jupyter-notebook-helper-backend--make-state
+                   :artifact-dir root :artifact-identity root-id
+                   :request-map (make-hash-table :test #'equal)))
+            (setf (emacs-jupyter-notebook-backend-session-backend session) 'helper
+                  (emacs-jupyter-notebook-backend-session-data session) state
+                  (emacs-jupyter-notebook-helper-backend-state-emit state)
+                  (lambda (event)
+                    (emacs-jupyter-notebook--backend-event session event)))
+            (emacs-jupyter-notebook--execution-put record)
+            (setq emacs-jupyter-notebook--client session
+                  emacs-jupyter-notebook--execution-active-id 51
+                  emacs-jupyter-notebook--execution-queue '(51))
+            (should
+             (emacs-jupyter-notebook-helper-backend--deliver-mapped-event
+              state "wire-route" mapping (funcall raw-event accepted)))
+            (let* ((image (car (ejn-panel-entry-images handle)))
+                   (props (cdr image)))
+              (should (equal (plist-get props :file) accepted))
+              (should-not (plist-member props :data))
+              (should-not (string-match-p "unsupported output"
+                                          (ejn-panel-entry-text handle))))
+            (should (file-exists-p accepted))
+            ;; The same valid publication under stale ownership is rejected
+            ;; by the core and immediately discarded by the helper adapter.
+            (should-not
+             (emacs-jupyter-notebook-helper-backend--deliver-mapped-event
+              state "wire-route"
+              (plist-put (copy-sequence mapping) :panel-generation (1+ generation))
+              (funcall raw-event stale)))
+            (should-not (file-exists-p stale))
+            (setq emacs-jupyter-notebook--client nil)))
+      (when (buffer-live-p panel) (ejn-panel-clear-all panel))
+      (when state (emacs-jupyter-notebook-helper-backend--dispose state "test cleanup"))
+      (when (file-directory-p root) (delete-directory root t)))))
+
+(ert-deftest ejn-ei4-published-images-pin-identity-and-replace-display-id ()
+  "Published files transfer only after full validation and exact ID replacement."
+  (let* ((root (make-temp-file "ejn-ei4-publication-" t))
+         (first (expand-file-name "ejn-artifact-first" root))
+         (second (expand-file-name "ejn-artifact-second" root))
+         (unknown (expand-file-name "ejn-artifact-unknown" root))
+         (unsafe (expand-file-name "ejn-artifact-unsafe" root))
+         (root-id nil) (panel nil))
+    (unwind-protect
+        (with-temp-buffer
+          (setq panel (ejn-panel-ensure (current-buffer)))
+          (let ((handle (ejn-panel-start-entry panel '("ei4.py" . 2) "plot()"))
+                update-handle)
+            (dolist (pair `((,first . "first") (,second . "second")
+                            (,unknown . "unknown") (,unsafe . "unsafe")))
+              (with-temp-file (car pair) (insert (cdr pair)))
+              (set-file-modes (car pair) #o600))
+            (set-file-modes root #o700)
+            (setq root-id (file-attribute-file-identifier (file-attributes root 'integer)))
+            (let ((first-sha (ejn-ei4-test--content-sha256 first))
+                  (second-sha (ejn-ei4-test--content-sha256 second))
+                  (unknown-sha (ejn-ei4-test--content-sha256 unknown)))
+              ;; A pathname digest is not an artifact digest.
+              (should-error
+               (ejn-panel-set-published-image
+                handle root first "image/png" (secure-hash 'sha256 first)
+                (file-attribute-size (file-attributes first 'integer)) root-id
+                "pathname-hash"))
+              (should (ejn-panel-set-published-image
+                       handle root first "image/png" first-sha
+                       (file-attribute-size (file-attributes first 'integer)) root-id "display-ei4"))
+              (should (equal (plist-get (cdr (car (ejn-panel-entry-images handle)))
+                                        :ejn-display-id)
+                             "display-ei4"))
+              (setq update-handle
+                    (ejn-panel-start-entry panel '("ei4.py" . 20) "update()"))
+              (should (ejn-panel-update-published-image
+                       update-handle root second "image/png" second-sha
+                       (file-attribute-size (file-attributes second 'integer)) root-id "display-ei4"))
+              (should-not (file-exists-p first))
+              (should (equal (plist-get (cdr (car (ejn-panel-entry-images handle))) :file)
+                             second))
+              (should-not (ejn-panel-entry-images update-handle))
+              ;; Text display updates retain the same bounded display id;
+              ;; they find an older entry but never replace unrelated output.
+              (let ((context (list :buffer (current-buffer) :entry-handle handle))
+                    (update-context
+                     (list :buffer (current-buffer) :entry-handle update-handle)))
+                (should (emacs-jupyter-notebook-events-dispatch
+                         context '(:type display :data (:text/plain "text-first")
+                                        :display-id "text-ei4"
+                                        :metadata (:isolated t)
+                                        :transient (:display_id "text-ei4"))))
+                (should (emacs-jupyter-notebook-events-dispatch
+                         update-context '(:type update-display :data (:text/plain "text-second")
+                                        :display-id "text-ei4"
+                                        :metadata (:isolated t)
+                                        :transient (:display_id "text-ei4"))))
+                (should (string-match-p "text-second" (ejn-panel-entry-text handle)))
+                (should-not (string-match-p "text-first" (ejn-panel-entry-text handle)))
+                (let ((before (ejn-panel-entry-text handle)))
+                  ;; HT9 marks an oversized display id as omitted.  An update
+                  ;; with no usable identity must not fall back to replacing
+                  ;; unrelated text or the most recent image.
+                  (emacs-jupyter-notebook-events-dispatch
+                   update-context '(:type update-display :data (:text/plain "must-not-clobber")
+                                          :require-display-id t))
+                  (should (equal (ejn-panel-entry-text handle) before))))
+              (should-not (ejn-panel-update-published-image
+                           update-handle root unknown "image/png" unknown-sha
+                           (file-attribute-size (file-attributes unknown 'integer)) root-id
+                           "missing-display"))
+              (should (file-exists-p unknown))
+              (set-file-modes unsafe #o4600)
+              (should-error
+               (ejn-panel-set-published-image
+                handle root unsafe "image/png" (ejn-ei4-test--content-sha256 unsafe)
+                (file-attribute-size (file-attributes unsafe 'integer)) root-id "unsafe"))
+              (should-error
+               (ejn-panel-set-published-image
+                handle root unknown "image/png" (upcase unknown-sha)
+                (file-attribute-size (file-attributes unknown 'integer)) root-id "uppercase"))
+              ;; The pathname digest must be rejected; the independently
+              ;; computed content digest is the accepted representation.
+              (set-file-modes unknown #o600)
+              (should-error
+               (ejn-panel-set-published-image
+                handle root unknown "image/png" (secure-hash 'sha256 unknown)
+                (file-attribute-size (file-attributes unknown 'integer)) root-id
+                "pathname-hash"))
+              (should
+               (ejn-panel-set-published-image
+                handle root unknown "image/png" unknown-sha
+                (file-attribute-size (file-attributes unknown 'integer)) root-id
+                "content-hash")))))
+          ;; A replaced path must survive panel retirement.  The panel only
+          ;; unlinks its captured device/inode, never a new symlink.
+          (delete-file second)
+          (make-symbolic-link unknown second t)
+          (ejn-panel-clear-all panel)
+          (should (file-symlink-p second))
+          ;; Matching the child inode alone is insufficient: if the root was
+          ;; replaced, even a hard link to the old file must survive cleanup.
+          (let* ((pinned (expand-file-name "ejn-artifact-root-pinned" root))
+                 (replacement (concat root "-old"))
+                 (handle (ejn-panel-start-entry panel '("ei4.py" . 30) "root()")))
+            (with-temp-file pinned (insert "root-pinned"))
+            (set-file-modes pinned #o600)
+            (should
+             (ejn-panel-set-published-image
+              handle root pinned "image/png" (ejn-ei4-test--content-sha256 pinned)
+              (file-attribute-size (file-attributes pinned 'integer)) root-id
+              "root-pinned"))
+            (rename-file root replacement)
+            (make-directory root)
+            (set-file-modes root #o700)
+            (add-name-to-file (expand-file-name "ejn-artifact-root-pinned" replacement)
+                              pinned)
+            (ejn-panel-clear-all panel)
+            (should (file-exists-p pinned))
+            (delete-directory replacement t)))
+      (dolist (file (list first second unknown unsafe))
+        (ignore-errors (delete-file file)))
+      (when (buffer-live-p panel) (kill-buffer panel))
+      (ignore-errors (delete-directory root))))
+
+(ert-deftest ejn-ei4-published-image-rejects-confinement-and-metadata-attacks ()
+  "Every publication boundary check fails before panel ownership changes."
+  (let* ((root (make-temp-file "ejn-ei4-attacks-" t))
+         (valid (expand-file-name "valid" root))
+         (nested-dir (expand-file-name "nested" root))
+         (nested (expand-file-name "nested-file" nested-dir))
+         (outside (make-temp-file "ejn-ei4-outside-"))
+         (root-link (concat root "-link"))
+         (root-id nil) panel handle)
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (make-directory nested-dir)
+          (set-file-modes nested-dir #o700)
+          (dolist (file (list valid nested outside))
+            (with-temp-file file (insert "image"))
+            (set-file-modes file #o600))
+          (setq root-id (file-attribute-file-identifier
+                         (file-attributes root 'integer)))
+          (with-temp-buffer
+            (setq panel (ejn-panel-ensure (current-buffer)))
+            (setq handle (ejn-panel-start-entry panel '("attacks.py" . 1) "plot()"))
+            (let* ((sha (ejn-ei4-test--content-sha256 valid))
+                   (size (file-attribute-size (file-attributes valid 'integer))))
+              (should-error
+               (ejn-panel-set-published-image
+                handle root outside "image/png" sha size root-id))
+              (should-error
+               (ejn-panel-set-published-image
+                handle root nested "image/png" sha size root-id))
+              (should-error
+               (ejn-panel-set-published-image
+                handle root nested-dir "image/png" sha 0 root-id))
+              (when (fboundp 'make-symbolic-link)
+                (make-symbolic-link outside (expand-file-name "link" root) t)
+                (should-error
+                 (ejn-panel-set-published-image
+                  handle root (expand-file-name "link" root)
+                  "image/png" sha size root-id))
+                (make-symbolic-link root root-link t)
+                (should-error
+                 (ejn-panel-set-published-image
+                  handle root-link valid "image/png" sha size root-id))
+                (delete-file root-link))
+              (set-file-modes valid #o644)
+              (should-error
+               (ejn-panel-set-published-image
+                handle root valid "image/png" sha size root-id))
+              (set-file-modes valid #o600)
+              (should-error
+               (ejn-panel-set-published-image
+                handle root valid "image/png" sha (1+ size) root-id))
+              (should-error
+               (ejn-panel-set-published-image
+                handle root valid "image/png" (make-string 64 ?0) size root-id))
+              (should-error
+               (ejn-panel-set-published-image
+                handle root valid "image/png" sha size (cons 'wrong root-id)))
+              (should-not (ejn-panel-entry-images handle))
+              (should (= (plist-get (ejn-panel-entry-snapshot handle)
+                                    :artifact-bytes)
+                         0))))
+          ;; Replacing the root and recreating the same child cannot reuse the
+          ;; captured publication identity.
+          (let ((replacement (concat root "-replacement")))
+            (rename-file root replacement)
+            (make-directory root)
+            (set-file-modes root #o700)
+            (with-temp-file valid (insert "image"))
+            (set-file-modes valid #o600)
+            (with-temp-buffer
+              (let* ((panel (ejn-panel-ensure (current-buffer)))
+                     (handle (ejn-panel-start-entry panel '("replace.py" . 1) "x"))
+                     (sha (ejn-ei4-test--content-sha256 valid))
+                     (size (file-attribute-size (file-attributes valid 'integer))))
+                (should-error
+                 (ejn-panel-set-published-image
+                  handle root valid "image/png" sha size root-id))
+                (kill-buffer panel)))
+            (delete-directory replacement t)))
+      (ignore-errors (delete-file root-link))
+      (when (and (stringp valid) (file-exists-p valid)) (delete-file valid))
+      (ignore-errors (delete-file (expand-file-name "link" root)))
+      (ignore-errors (delete-directory nested-dir t))
+      (ignore-errors (delete-file nested))
+      (ignore-errors (delete-file outside))
+      (when (buffer-live-p panel) (kill-buffer panel))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest ejn-ei4-published-image-retirement-and-budget-are-exact ()
+  "Published files carry bounded image specs and obey byte eviction."
+  (let ((emacs-jupyter-notebook-panel-max-total-artifact-bytes 16)
+        (root (make-temp-file "ejn-ei4-budget-" t))
+        panel files)
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (let ((root-id (file-attribute-file-identifier
+                          (file-attributes root 'integer))))
+            (with-temp-buffer
+              (setq panel (ejn-panel-ensure (current-buffer)))
+              (dotimes (index 100)
+                (let* ((path (expand-file-name (format "artifact-%03d" index) root))
+                       (data (format "%04d" index)))
+                  (with-temp-file path (insert data))
+                  (set-file-modes path #o600)
+                  (push path files)
+                  (let ((handle (ejn-panel-start-entry
+                                 panel (cons "budget.py" index) data)))
+                    (should
+                     (ejn-panel-set-published-image
+                      handle root path "image/png" (ejn-ei4-test--content-sha256 path)
+                      (file-attribute-size (file-attributes path 'integer))
+                      root-id)))))
+              (let ((total (with-current-buffer panel
+                             (emacs-jupyter-notebook-panel--total-artifact-bytes))))
+                (should (<= total 16))
+                (let ((existing (cl-count-if #'file-exists-p files)))
+                (should (<= existing 4))
+                  (should (= (* existing 4) total))))
+              (with-current-buffer panel
+                (should (equal (emacs-jupyter-notebook-panel--recompute-totals)
+                               (list :text
+                                     (emacs-jupyter-notebook-panel--total-text-bytes)
+                                     :artifacts
+                                     (emacs-jupyter-notebook-panel--total-artifact-bytes)))))
+              (let* ((handle (ejn-panel-start-entry panel '("retire.py" . 1) "x"))
+                     (path (expand-file-name "retire" root)))
+                (with-temp-file path (insert "once"))
+                (set-file-modes path #o600)
+                (ejn-panel-set-published-image
+                 handle root path "image/png" (ejn-ei4-test--content-sha256 path) 4 root-id)
+                (let ((image (car (last (ejn-panel-entry-images handle)))))
+                  (should (plist-get (cdr image) :max-width))
+                  (should (plist-get (cdr image) :max-height))
+                  (should-not (plist-member (cdr image) :data))
+                  (emacs-jupyter-notebook-panel--retire-image panel image)
+                  (should-not (file-exists-p path))
+                  (emacs-jupyter-notebook-panel--retire-image panel image)
+                  (should-not (file-exists-p path)))))))
+      (dolist (path files) (ignore-errors (delete-file path)))
+      (when (buffer-live-p panel) (kill-buffer panel))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest ejn-ei4-published-image-size-ceiling-bounds-content-read ()
+  "The exact thumbnail ceiling passes; one byte over fails before hashing."
+  (let* ((root (make-temp-file "ejn-ei4-size-boundary-" t))
+         (exact (expand-file-name "exact" root))
+         (over (expand-file-name "over" root))
+         (limit emacs-jupyter-notebook-panel--max-published-image-bytes)
+         panel)
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (dolist (pair `((,exact . ,limit) (,over . ,(1+ limit))))
+            (with-temp-file (car pair)
+              (set-buffer-multibyte nil)
+              (insert (make-string (cdr pair) ?x)))
+            (set-file-modes (car pair) #o600))
+          (with-temp-buffer
+            (setq panel (ejn-panel-ensure (current-buffer)))
+            (let* ((handle (ejn-panel-start-entry panel '("limit.py" . 1) "image()"))
+                   (root-id (file-attribute-file-identifier
+                             (file-attributes root 'integer))))
+              (should
+               (ejn-panel-set-published-image
+                handle root exact "image/png" (ejn-ei4-test--content-sha256 exact)
+                limit root-id "exact-limit"))
+              (let (hashed)
+                (cl-letf (((symbol-function
+                            'emacs-jupyter-notebook-panel--published-file-sha256)
+                           (lambda (&rest _)
+                             (setq hashed t)
+                             (error "must not hash oversized publication"))))
+                  (should-error
+                   (ejn-panel-set-published-image
+                    handle root over "image/png" (make-string 64 ?0)
+                    (1+ limit) root-id "over-limit")))
+                (should-not hashed))
+              (ejn-panel-clear-all panel))))
+      (when (buffer-live-p panel) (kill-buffer panel))
+      (ignore-errors (delete-file exact))
+      (ignore-errors (delete-file over))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest ejn-ei4-retirement-flushes-cache-and-unlinks-once ()
+  "Repeated entry retirement flushes once and never repeats the file unlink."
+  (let* ((root (make-temp-file "ejn-ei4-retire-count-" t))
+         (file (expand-file-name "image" root))
+         (real-delete (symbol-function 'delete-file))
+         (flushes 0) (deletes 0) panel)
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (with-temp-file file (insert "image"))
+          (set-file-modes file #o600)
+          (with-temp-buffer
+            (setq panel (ejn-panel-ensure (current-buffer)))
+            (let* ((handle (ejn-panel-start-entry panel '("retire.py" . 1) "image()"))
+                   (root-id (file-attribute-file-identifier
+                             (file-attributes root 'integer))))
+              (should
+               (ejn-panel-set-published-image
+                handle root file "image/png" (ejn-ei4-test--content-sha256 file)
+                5 root-id "retire"))
+              (cl-letf (((symbol-function 'image-flush)
+                         (lambda (&rest _) (cl-incf flushes)))
+                        ((symbol-function 'delete-file)
+                         (lambda (path &rest args)
+                           (when (equal path file) (cl-incf deletes))
+                           (apply real-delete path args))))
+                (ejn-panel-clear-all panel)
+                (ejn-panel-clear-all panel))
+              (should (= flushes 1))
+              (should (= deletes 1)))))
+      (when (buffer-live-p panel) (kill-buffer panel))
+      (ignore-errors (delete-file file))
+      (ignore-errors (delete-directory root t)))))
 
 (provide 'emacs-jupyter-notebook-tests)
 

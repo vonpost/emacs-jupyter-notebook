@@ -601,7 +601,10 @@
                                                    "event" "transport_error"
                                                    "data" (make-hash-table :test 'equal)))
           (should (ejn-et2--await (lambda () (= (length seen) 3))))
-          (should (equal seen '(1 3 2)))
+          ;; Priority frames bypass credit admission, not already-observed
+          ;; wire order.  The ordinary event must reach its sink first.
+          ;; The callback prepends, so this is reverse dispatch order.
+          (should (equal seen '(3 2 1)))
           (emacs-jupyter-notebook-helper-dispose session "test done"))
       (when (buffer-live-p owner) (kill-buffer owner)) (ejn-et2--clean))))
 
@@ -669,6 +672,73 @@
         (should (ejn-et2--await (lambda () (emacs-jupyter-notebook-helper-session-disposed session))))
         (should (= ordinary 7))))
     (ejn-et2--assert-no-local-leaks)))
+
+(ert-deftest ejn-ei4-process-arrival-order-includes-response-and-credit-boundary ()
+  "The real filter preserves arrival order across ordinary and priority lanes."
+  (let* ((owner (generate-new-buffer " *ejn-ei4-order-owner*"))
+         (process (start-process "ejn-ei4-order-cat" nil "cat"))
+         (seen nil) (credits nil) (callback-credit nil)
+         (session
+          (emacs-jupyter-notebook-helper--make-session
+           :id 901 :owner-buffer owner :process process :state 'ready
+           :decoder (ejn-helper-protocol-make-decoder
+                     ejn-helper-protocol-max-to-emacs-frame
+                     ejn-helper-protocol-max-raw-accumulator)
+           :event-credit 100000 :requests (make-hash-table :test 'equal)
+           :request-sequence 0 :control-sequence 0 :control-sent 0
+           :control-acked 0 :last-event-seq -1 :raw-bytes 0
+           :event-queue-bytes 0 :priority-queue-bytes 0 :wire-sequence 0
+           :event-callback
+           (lambda (current object)
+             (let ((kind (gethash "kind" object)))
+               (setq seen
+                     (append seen
+                             (list (if (equal kind "event")
+                                       (intern (gethash "event" object))
+                                     (if (equal kind "response")
+                                         'response
+                                       (intern kind)))))))
+             (when (equal (gethash "event" object) "stream")
+               (setq callback-credit
+                     (emacs-jupyter-notebook-helper-session-event-credit current))))))
+         (ordinary
+          (ejn-et3--object
+           "v" 1 "kind" "event" "seq" 1 "event" "stream" "request_id" "exec"
+           "data" (ejn-et3--object "name" "stdout" "text" "x")))
+         (response
+          (ejn-et3--object
+           "v" 1 "kind" "response" "id" "exec-ack" "ok" t
+           "result" (make-hash-table :test 'equal)))
+         (priority
+          (ejn-et3--object
+           "v" 1 "kind" "event" "seq" 2 "event" "status" "request_id" "exec"
+           "data" (ejn-et3--object "execution_state" "idle")))
+         (ordinary-bytes (length (ejn-helper-protocol-encode
+                                  ordinary ejn-helper-protocol-max-to-emacs-frame))))
+    (unwind-protect
+        (progn
+          (process-put process 'emacs-jupyter-notebook-helper-session session)
+          (with-current-buffer owner
+            (setq emacs-jupyter-notebook--helper-session session))
+          (puthash "exec-ack"
+                   (emacs-jupyter-notebook-helper--make-request
+                    :id "exec-ack"
+                    :callback (lambda (&rest _) (setq seen (append seen '(response)))))
+                   (emacs-jupyter-notebook-helper-session-requests session))
+          (emacs-jupyter-notebook-helper--filter
+           process
+           (concat (ejn-helper-protocol-encode ordinary ejn-helper-protocol-max-to-emacs-frame)
+                   (ejn-helper-protocol-encode response ejn-helper-protocol-max-to-emacs-frame)
+                   (ejn-helper-protocol-encode priority ejn-helper-protocol-max-to-emacs-frame)))
+          (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper--send-credit)
+                     (lambda (_session bytes) (push bytes credits))))
+            (emacs-jupyter-notebook-helper--drain session))
+          (should (equal seen '(stream response status)))
+          (should (= callback-credit (- 100000 ordinary-bytes)))
+          (should (equal credits (list ordinary-bytes))))
+      (emacs-jupyter-notebook-helper-dispose session "test cleanup")
+      (when (process-live-p process) (delete-process process))
+      (when (buffer-live-p owner) (kill-buffer owner)))))
 
 (ert-deftest ejn-et2-supervisor-has-no-durable-state-or-wait-loop ()
   (let ((source (with-temp-buffer
