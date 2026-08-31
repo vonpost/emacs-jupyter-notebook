@@ -10,6 +10,9 @@
 (defconst ejn-et2--fixture
   (expand-file-name "tests/fixtures/ejn_fake_helper.py" ejn-et2--root))
 
+(defvar ejn-et2--hello-timeout 2
+  "Hello deadline used by the ET2 fixture unless a test overrides it.")
+
 (defun ejn-et2--await (predicate &optional timeout)
   "Permit test subprocess notifications until PREDICATE succeeds or times out."
   (let ((deadline (+ (float-time) (or timeout 1))))
@@ -28,7 +31,7 @@
   (declare (indent 1) (debug ((symbolp form &rest form) body)))
   `(let ((ready nil) (failure nil)
          (owner (generate-new-buffer " *ejn-et2-owner*"))
-         (emacs-jupyter-notebook-helper-hello-timeout 0.12)
+         (emacs-jupyter-notebook-helper-hello-timeout ejn-et2--hello-timeout)
          (emacs-jupyter-notebook-helper-partial-frame-timeout 0.12)
          (emacs-jupyter-notebook-helper-command
           (append (list "python3" ejn-et2--fixture ,scenario) (list ,@options))))
@@ -122,7 +125,7 @@
     (should (equal (process-coding-system
                     (emacs-jupyter-notebook-helper-session-process session))
                    '(binary . binary)))
-    (should (ejn-et2--await (lambda () ready)))
+    (should (ejn-et2--await (lambda () ready) 3))
     (should (eq (emacs-jupyter-notebook-helper-session-state session) 'ready))
     (should-not failure)
     (emacs-jupyter-notebook-helper-dispose session "test done")
@@ -146,7 +149,7 @@
   (let ((request-log (make-temp-file "ejn-et2-requests")))
     (unwind-protect
         (ejn-et2--with-session (session "normal" "--requests" request-log)
-          (should (ejn-et2--await (lambda () ready)))
+          (should (ejn-et2--await (lambda () ready) 3))
           (let ((request (json-parse-string
                           (car (split-string (with-temp-buffer
                                                (insert-file-contents request-log)
@@ -170,19 +173,20 @@
                          (when (hash-table-p result) (puthash "version" 2 result)))))
                    objects))))
       (ejn-et2--with-session (session "normal")
-        (should (ejn-et2--await (lambda () failure)))
+        (should (ejn-et2--await (lambda () failure) 3))
         (should-not ready)
         (should (string-match-p "hello" failure))
         (should (emacs-jupyter-notebook-helper-session-disposed session))
         (ejn-et2--assert-no-local-leaks)))))
 
 (ert-deftest ejn-et2-th1-silence-hits-the-hello-deadline ()
-  (ejn-et2--with-session (session "silent")
-    (should (ejn-et2--await (lambda () failure)))
-    (should-not ready)
-    (should (string-match-p "timed out" failure))
-    (should (emacs-jupyter-notebook-helper-session-disposed session))
-    (ejn-et2--assert-no-local-leaks)))
+  (let ((ejn-et2--hello-timeout 0.12))
+    (ejn-et2--with-session (session "silent")
+      (should (ejn-et2--await (lambda () failure)))
+      (should-not ready)
+      (should (string-match-p "timed out" failure))
+      (should (emacs-jupyter-notebook-helper-session-disposed session))
+      (ejn-et2--assert-no-local-leaks))))
 
 (ert-deftest ejn-et2-failure-preserves-close-then-failure-callback-order ()
   (let ((emacs-jupyter-notebook-helper-command
