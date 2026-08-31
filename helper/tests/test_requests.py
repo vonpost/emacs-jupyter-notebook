@@ -334,6 +334,24 @@ class BackendReaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(backend._tasks)
         self.assertFalse(backend._timed_out_tasks)
 
+    async def test_wait_closed_reaps_done_operation_without_done_callback_turn(self):
+        """Joining completed tasks cannot depend on a call_soon callback turn."""
+        backend, _client = await self._backend()
+
+        async def already_done():
+            return None
+
+        task = asyncio.create_task(already_done())
+        await task
+        # Insert a completed operation directly, emulating the narrow window
+        # after gather observes completion but before the normal discard done
+        # callback gets to run.
+        backend._tasks.add(task)
+        backend.close()
+        await asyncio.wait_for(backend.wait_closed(), 1)
+        self.assertFalse(backend._tasks)
+        self.assertFalse(backend._retired_tasks)
+
     async def test_awaitable_heartbeat_timeout_fails_once_and_reaps_cleanly(self):
         backend, client = await self._backend()
         callbacks = []

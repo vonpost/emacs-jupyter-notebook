@@ -982,3 +982,12 @@ class JupyterBackend:
                 return
             else:
                 await asyncio.gather(*tasks, return_exceptions=True)
+                # `Task.add_done_callback(self._tasks.discard)' is scheduled
+                # with call_soon.  If every gathered task is already done,
+                # gather may return without yielding to that callback; looping
+                # then would repeatedly gather the same done task forever.
+                # Reap joined operation tasks directly instead of depending on
+                # callback scheduling for shutdown progress.
+                self._tasks.difference_update(
+                    task for task in tasks if task.done()
+                )
