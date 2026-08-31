@@ -757,7 +757,7 @@ modules.
   active restarter in this launch shape.  No lifecycle production code was
   added.
 
-- [~] owner=terra-ht12r1 claimed=2026-08-31 **HT12R1 Prove a direct kernelspec launch and relaunch contract.**
+- [x] owner=terra-ht12r1 claimed=2026-08-31 landed=dd7bc63 **HT12R1 Prove a direct kernelspec launch and relaunch contract.**
   - Depends: HT12 stop evidence, TH2.
   - Files: `helper/integration_tests/direct_kernel_fixture.py`,
     `helper/integration_tests/test_direct_kernel_lifecycle.py`.
@@ -776,21 +776,60 @@ modules.
   - Stop condition: if the same connection file/ports cannot be reused safely,
     mark `[!]` with observations before changing production launch code.
 
-- [ ] **HT12R2 Launch the actual remote kernel PID asynchronously.**
+  **Proof result:** the validated kernelspec argv is the tracked process itself;
+  message interrupt preserves it and protocol shutdown exits it cleanly.  A
+  kernel-created connection file is removed during shutdown.  Restoring the
+  saved connection JSON privately at the same path before a fresh direct launch
+  reuses all five ports, yields a new PID and reset namespace, and accepts new
+  execution.  The proof is portable POSIX code with no `/proc` dependency.
+
+- [~] owner=terra-ht12r2 claimed=2026-08-31 **HT12R2 Launch the actual remote kernel PID asynchronously.**
   - Depends: HT12R1.
-  - Files: `emacs-jupyter-notebook-ssh.el`,
-    `emacs-jupyter-notebook.el`, `tests/emacs-jupyter-notebook-tests.el`.
-  - Deliverable: add a bounded asynchronous kernelspec-resolution phase for new
-    starts, parse only the proven structured schema, and build a shell-quoted
-    direct kernelspec argv/environment launch.  The detached PID recorded in the
-    registry is the kernel itself.  PID identity checks recognize the exact
-    connection-file argument used by the resolved argv.  Existing
-    `jupyter kernel` launcher entries are rejected rather than adapted.
+  - Files: `emacs-jupyter-notebook-vars.el`,
+    `emacs-jupyter-notebook-ssh.el`, `emacs-jupyter-notebook.el`,
+    `tests/emacs-jupyter-notebook-tests.el`,
+    `tests/emacs-jupyter-notebook-remote-tests.el`, `README.md`.
+  - Deliverable: replace raw shell-string `:jupyter-command` with a non-empty
+    structured `:python-command` argv (default `("python3")`; no compatibility
+    path).  Add a bounded asynchronous resolution phase that appends a constant
+    Python resolver and the selected kernelspec as separate quoted argv.  The
+    resolver may run behind explicit prefixes such as `uv run ... python`, but
+    it emits only one bounded standard kernelspec JSON entry: `$NAME`
+    environment expansion is already applied, bare Python is `sys.executable`,
+    every other executable is resolved to an absolute path, resource paths are
+    absolute, and only `{connection_file}` / `{resource_dir}` are substituted.
+    The remote shell expands a home-relative connection path before passing it
+    as a separate resolver argument.  Emacs strictly reparses the resulting
+    final schema and rejects every relative executable, leftover/unknown
+    placeholder, missing or duplicate connection-path occurrence, malformed
+    field, or bound violation.
+  - Deliverable: build a shell-quoted direct argv/environment launch in which
+    the resolution prefix is absent.  The detached PID recorded in the registry
+    is the kernel itself.  Persist only non-secret restart/identity data
+    (`:launch-kind`, remote ports, and exact connection-file argv tokens), never
+    the resolved kernelspec environment.  The launch wrapper atomically writes
+    its own stable pre-`exec` PID to a private deterministic sidecar, then
+    `exec`s the resolved kernel so that PID becomes the kernel; ambiguous starts
+    recover the PID asynchronously from that sidecar.  PID identity checks
+    recognize the exact token sequence used by the resolved argv.  Existing
+    launcher-shaped registry entries are rejected clearly and left untouched
+    rather than adapted.  Once launch is admitted, create a provisional durable
+    entry before waiting for the PID/retrieval/connect phases; remove it only on
+    proof that no kernel was started.  An ambiguous failure or cancellation
+    retains enough deterministic session/path metadata for reconnect or explicit
+    cleanup.
+    Cancellation/failure never kills or broadly matches a remote process; stale
+    callbacks cannot promote a provisional entry to ready.
   - Tests: kernelspec success/missing/malformed/oversized/hostile values;
-    placeholder and environment substitution; profile command prefixes; exact
-    shell argv quoting; phase deadline/cancel/supersede; PID match/mismatch;
-    launch failure leaves registry and remote files unpromoted.  No synchronous
-    SSH or wait loop is permitted.
+    placeholder and environment substitution; structured Python prefixes and
+    legacy-string rejection; exact shell argv quoting; hard-bounded resolver
+    stdout/stderr; phase deadline/cancel/supersede; Linux token and Darwin
+    best-effort PID match/mismatch/unverified; private PID-sidecar write/read,
+    malformed/stale identity, and ambiguous-start recovery; launch failure
+    leaves registry and remote files unpromoted when launch is proven not to
+    have started; ambiguous post-admission failure retains a provisional
+    recoverable entry; registry contains no kernelspec environment values.  No
+    synchronous SSH or wait loop is permitted.
   - Narrow run: focused SSH/async start/reconnect ERT selectors plus source
     no-blocking assertions.
 
