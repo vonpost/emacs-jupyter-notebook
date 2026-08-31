@@ -14,6 +14,16 @@
 (require 'emacs-jupyter-notebook)
 (require 'emacs-jupyter-notebook-result)
 
+(defun ejn-doom-e2e--run-command (argv)
+  "Run test-only remote ARGV synchronously and return its stdout."
+  (with-temp-buffer
+    (let ((status (apply #'process-file (car argv) nil (current-buffer) nil
+                         (cdr argv))))
+      (unless (and (integerp status) (zerop status))
+        (error "Doom E2E command failed (%s): %s\n%s"
+               status (mapconcat #'identity argv " ") (buffer-string)))
+      (buffer-string))))
+
 (defun ejn-doom-e2e--timeout ()
   "Return the E2E timeout in seconds."
   (string-to-number (or (getenv "EJN_DOOM_E2E_TIMEOUT") "90")))
@@ -90,13 +100,13 @@ Signal if the notebook async setup enters an error phase before TIMEOUT."
     client))
 
 (defun ejn-doom-e2e--cleanup-remote-entry (entry)
-  "Best-effort delete of ENTRY's remote connection file on the remote host."
-  (when-let* ((remote-file (plist-get entry :remote-connection-file)))
+  "Best-effort identity-bound cleanup of direct remote kernel ENTRY."
+  (when (emacs-jupyter-notebook-ssh-direct-entry-valid-p entry)
     (ignore-errors
-      (emacs-jupyter-notebook-ssh-run-command
+      (ejn-doom-e2e--run-command
        (emacs-jupyter-notebook-ssh-build-remote-cleanup
         (emacs-jupyter-notebook--entry-profile entry)
-        remote-file)))))
+        entry)))))
 
 (defun ejn-doom-e2e-python-cell-evaluates-on-mother ()
   "Open a temp Python file, evaluate an image cell and a text cell, then

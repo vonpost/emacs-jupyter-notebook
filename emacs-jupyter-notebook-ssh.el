@@ -17,6 +17,77 @@
 (require 'emacs-jupyter-notebook-vars)
 (require 'emacs-jupyter-notebook-connection)
 
+(defconst emacs-jupyter-notebook-ssh-kernelspec-max-bytes 65536)
+(defconst emacs-jupyter-notebook-ssh-kernelspec-max-argv 64)
+(defconst emacs-jupyter-notebook-ssh-kernelspec-max-env 64)
+(defconst emacs-jupyter-notebook-ssh-kernelspec-max-text-bytes 4096)
+(defconst emacs-jupyter-notebook-ssh-kernelspec-max-argv-bytes 16384)
+(defconst emacs-jupyter-notebook-ssh-kernelspec-max-env-bytes 16384)
+
+(defconst emacs-jupyter-notebook-ssh--kernelspec-resolver
+  (concat
+   "import json,os,re,shutil,sys\n"
+   "from string import Template\n"
+   "from jupyter_client.kernelspec import KernelSpecManager\n"
+   "name,connection,session=sys.argv[1:]\n"
+   "spec=KernelSpecManager().get_kernel_spec(name)\n"
+   "resource=os.path.abspath(spec.resource_dir)\n"
+   "argv=list(spec.argv); env=dict(spec.env)\n"
+   "def text(x): return isinstance(x,str) and '\\0' not in x and len(x.encode('utf-8'))<=4096\n"
+   "def braces(x):\n"
+   " out=[]; i=0; repl={'{connection_file}':connection,'{resource_dir}':resource}\n"
+   " while i<len(x):\n"
+   "  a=x.find('{',i); b=x.find('}',i)\n"
+   "  if b>=0 and (a<0 or b<a): raise ValueError('placeholder')\n"
+   "  if a<0: out.append(x[i:]); break\n"
+   "  z=x.find('}',a+1)\n"
+   "  if z<0: raise ValueError('placeholder')\n"
+   "  out.append(x[i:a]); token=x[a:z+1]\n"
+   "  if token not in repl: raise ValueError('placeholder')\n"
+   "  out.append(repl[token]); i=z+1\n"
+   " return ''.join(out)\n"
+   "if not (text(name) and text(connection) and text(session) and os.path.isabs(connection) and os.path.basename(connection)==f'kernel-{session}.json' and isinstance(argv,list) and 1<=len(argv)<=64 and isinstance(env,dict) and len(env)<=64 and text(resource) and os.path.isabs(resource) and os.path.isdir(resource)): raise ValueError('schema')\n"
+   "count=0; final=[]\n"
+   "for value in argv:\n"
+   " if not text(value): raise ValueError('argv')\n"
+   " count+=value.count('{connection_file}'); value=braces(value)\n"
+   " if not value or not text(value): raise ValueError('argv')\n"
+   " final.append(value)\n"
+   "if count!=1 or sum(len(x.encode('utf-8')) for x in final)>16384: raise ValueError('argv')\n"
+   "if re.fullmatch(r'python(?:3(?:\\.\\d+)?)?',final[0]): final[0]=sys.executable\n"
+   "elif not os.path.isabs(final[0]): final[0]=shutil.which(final[0]) or ''\n"
+   "if not final[0] or not os.path.isabs(final[0]) or sum(len(x.encode('utf-8')) for x in final)>16384: raise ValueError('executable')\n"
+   "expanded={}\n"
+   "for key,value in env.items():\n"
+   " if not (text(key) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*',key) and text(value)): raise ValueError('env')\n"
+   " value=Template(value).safe_substitute(os.environ)\n"
+   " if not text(value): raise ValueError('env')\n"
+   " expanded[key]=value\n"
+   "if sum(len(k.encode('utf-8'))+len(v.encode('utf-8')) for k,v in expanded.items())>16384: raise ValueError('env')\n"
+   "print(json.dumps({'kernelspecs':{name:{'resource_dir':resource,'spec':{'argv':final,'env':expanded,'metadata':{'ejn_connection_file':connection,'ejn_session_id':session}}}}},separators=(',',':')))\n")
+  "Constant remote Python source that resolves one selected kernelspec.")
+
+(defun emacs-jupyter-notebook-ssh--python-command (profile)
+  "Return PROFILE's validated structured resolver Python argv.
+Legacy `:jupyter-command' profile values are rejected rather than parsed."
+  (when (plist-member profile :jupyter-command)
+    (error "Legacy :jupyter-command is unsupported; use :python-command argv"))
+  (let ((argv (plist-get profile :python-command)))
+    (unless (and (listp argv) argv
+                 (<= (length argv)
+                     emacs-jupyter-notebook-ssh-kernelspec-max-argv)
+                 (cl-every (lambda (value)
+                             (and (stringp value)
+                                  (not (string-empty-p value))
+                                  (not (string-match-p (string 0) value))
+                                  (<= (string-bytes value)
+                                      emacs-jupyter-notebook-ssh-kernelspec-max-text-bytes)))
+                           argv)
+                 (<= (apply #'+ (mapcar #'string-bytes argv))
+                     emacs-jupyter-notebook-ssh-kernelspec-max-argv-bytes))
+      (error ":python-command must be a non-empty argv list of strings"))
+    (copy-sequence argv)))
+
 (defun emacs-jupyter-notebook-ssh--profile-name (profile)
   "Return PROFILE's string name."
   (cond
@@ -50,9 +121,12 @@
     (unless (plist-member plist :kernelspec)
       (setq plist (plist-put plist :kernelspec
                              emacs-jupyter-notebook-default-kernelspec)))
-    (unless (plist-member plist :jupyter-command)
-      (setq plist (plist-put plist :jupyter-command
-                             emacs-jupyter-notebook-jupyter-command)))
+    (when (plist-member plist :jupyter-command)
+      (error "Legacy :jupyter-command is unsupported; use :python-command argv"))
+    (unless (plist-member plist :python-command)
+      (setq plist (plist-put plist :python-command
+                             emacs-jupyter-notebook-python-command)))
+    (emacs-jupyter-notebook-ssh--python-command plist)
     plist))
 
 (defun emacs-jupyter-notebook-ssh-destination (profile)
@@ -192,39 +266,148 @@ without a `~' anchor) are returned unchanged."
    (plist-get (emacs-jupyter-notebook-ssh-profile profile) :remote-cache-dir)
    (format "kernel-%s.json" session-id)))
 
-(defun emacs-jupyter-notebook-ssh-build-remote-launch (profile session-id)
-  "Return launch metadata for starting a remote kernel.
-The return value is a plist containing :argv, :remote-command,
-:connection-file, and :log-file."
+(defun emacs-jupyter-notebook-ssh-build-kernelspec-resolution (profile session-id)
+  "Return bounded async kernelspec-resolution metadata for PROFILE.
+The resolver prefix is structured argv; it never passes through shell parsing."
   (let* ((profile (emacs-jupyter-notebook-ssh-profile profile))
          (cache-dir (plist-get profile :remote-cache-dir))
          (remote-cwd (plist-get profile :remote-cwd))
          (kernelspec (plist-get profile :kernelspec))
-         (jupyter-cmd (plist-get profile :jupyter-command))
+         (python-command (emacs-jupyter-notebook-ssh--python-command profile))
          (connection-file (emacs-jupyter-notebook-ssh-remote-connection-file
                            profile session-id))
          (log-file (emacs-jupyter-notebook-ssh--remote-join
                     cache-dir (format "kernel-%s.log" session-id)))
+         (sidecar-file (emacs-jupyter-notebook-ssh--remote-join
+                        cache-dir (format "kernel-%s.pid" session-id)))
+         (_ (unless (and (stringp kernelspec) (not (string-empty-p kernelspec))
+                         (not (string-match-p (string 0) kernelspec))
+                         (<= (string-bytes kernelspec)
+                             emacs-jupyter-notebook-ssh-kernelspec-max-text-bytes)
+                         (stringp cache-dir) (stringp remote-cwd)
+                         (stringp session-id) (not (string-empty-p session-id))
+                         (not (string-match-p (string 0) session-id))
+                         (string-match-p "\\`[[:alnum:]_.-]+\\'" session-id)
+                         (<= (string-bytes session-id)
+                             emacs-jupyter-notebook-ssh-kernelspec-max-text-bytes)
+                         (not (string-empty-p cache-dir))
+                         (not (string-empty-p remote-cwd))
+                         (not (string-match-p (string 0) cache-dir))
+                         (not (string-match-p (string 0) remote-cwd))
+                         (not (string-match-p "[\n\r]" cache-dir))
+                         (not (string-match-p "[\n\r]" remote-cwd))
+                         (<= (string-bytes cache-dir)
+                             emacs-jupyter-notebook-ssh-kernelspec-max-text-bytes)
+                         (<= (string-bytes remote-cwd)
+                             emacs-jupyter-notebook-ssh-kernelspec-max-text-bytes))
+              (error "Remote profile has invalid kernelspec or paths")))
          (remote-command
-          (mapconcat
-           #'identity
-           (list
-            (format "mkdir -p %s"
-                    (emacs-jupyter-notebook-ssh--quote-remote-path cache-dir))
-            (format "cd %s"
-                    (emacs-jupyter-notebook-ssh--quote-remote-path remote-cwd))
-            (format (concat "{ nohup %s kernel --kernel=%s "
-                            "--KernelManager.connection_file=%s "
-                            "> %s 2>&1 < /dev/null & printf 'EJN_PID=%%s\\n' \"$!\"; }")
-                    jupyter-cmd
-                    (shell-quote-argument kernelspec)
-                    (emacs-jupyter-notebook-ssh--quote-remote-path connection-file)
-                    (emacs-jupyter-notebook-ssh--quote-remote-path log-file)))
-           " && ")))
+          (concat
+           (format (concat "mkdir -p %s && cd %s && connection_file=%s && "
+                           "printf 'EJN_CONNECTION_FILE=%%s\\n' \"$connection_file\" && ")
+                   (emacs-jupyter-notebook-ssh--quote-remote-path cache-dir)
+                   (emacs-jupyter-notebook-ssh--quote-remote-path remote-cwd)
+                   (emacs-jupyter-notebook-ssh--quote-remote-path connection-file))
+           (mapconcat #'shell-quote-argument
+                      (append python-command
+                              (list "-c"
+                                    emacs-jupyter-notebook-ssh--kernelspec-resolver
+                                    kernelspec))
+                      " ")
+           " "
+           "\"$connection_file\""
+           " "
+           (shell-quote-argument session-id))))
     (list :argv (emacs-jupyter-notebook-ssh-command profile remote-command)
           :remote-command remote-command
           :connection-file connection-file
-          :log-file log-file)))
+          :log-file log-file
+          :sidecar-file sidecar-file)))
+
+(defun emacs-jupyter-notebook-ssh-build-remote-direct-launch
+    (profile session-id resolved)
+  "Build the detached direct-kernel launch from parsed RESOLVED metadata.
+RESOLVED is trusted only after the strict local parser in the async pipeline.
+The resolver prefix is intentionally absent from the final process argv."
+  (let* ((profile (emacs-jupyter-notebook-ssh-profile profile))
+         (cache-dir (plist-get profile :remote-cache-dir))
+         (remote-cwd (plist-get profile :remote-cwd))
+         (connection-file (plist-get resolved :connection-file))
+         (argv (plist-get resolved :argv))
+         (environment (plist-get resolved :env))
+         (connection-tokens (plist-get resolved :connection-tokens))
+         (_ (unless (and (stringp session-id)
+                         (string-match-p "\\`[[:alnum:]_.-]+\\'" session-id)
+                         (stringp connection-file) (file-name-absolute-p connection-file)
+                         (equal (file-name-nondirectory connection-file)
+                                (format "kernel-%s.json" session-id))
+                         (not (string-match-p "[\n\r]" connection-file))
+                         (listp argv) argv (stringp (car argv))
+                         (file-name-absolute-p (car argv))
+                         (cl-every (lambda (value)
+                                     (and (stringp value) (not (string-empty-p value))
+                                          (not (string-match-p (string 0) value))))
+                                   argv)
+                         (listp environment)
+                         (listp connection-tokens) connection-tokens
+                         (<= (length connection-tokens) 2)
+                         (cl-every (lambda (value)
+                                     (and (stringp value)
+                                          (not (string-empty-p value))
+                                          (not (string-match-p (string 0) value))))
+                                   connection-tokens)
+                         (cl-every (lambda (pair)
+                                     (and (consp pair) (stringp (car pair)) (stringp (cdr pair))
+                                          (not (string-match-p (string 0) (car pair)))
+                                          (not (string-match-p (string 0) (cdr pair)))
+                                          (<= (string-bytes (car pair))
+                                              emacs-jupyter-notebook-ssh-kernelspec-max-text-bytes)
+                                          (<= (string-bytes (cdr pair))
+                                              emacs-jupyter-notebook-ssh-kernelspec-max-text-bytes)
+                                          (string-match-p "\\`[A-Za-z_][A-Za-z0-9_]*\\'" (car pair))))
+                                   environment)
+                         (<= (cl-loop for pair in environment
+                                      sum (+ (string-bytes (car pair))
+                                             (string-bytes (cdr pair))))
+                             emacs-jupyter-notebook-ssh-kernelspec-max-env-bytes))
+              (error "Direct kernel launch requires validated resolved argv and environment")))
+         (log-file (replace-regexp-in-string
+                    "\\.json\\'" ".log" connection-file))
+         (sidecar-file (replace-regexp-in-string
+                        "\\.json\\'" ".pid" connection-file))
+         (program (append (list "env")
+                          (mapcar (lambda (pair)
+                                    (concat (car pair) "=" (cdr pair))) environment)
+                          argv))
+         (wrapper
+          (concat "umask 077; pidfile=$1; session=$2; shift 2; "
+                  "tmp=\"$pidfile.$$\"; "
+                  "{ printf 'EJN_PID=%s\\n' \"$$\"; "
+                  "printf 'EJN_SESSION=%s\\n' \"$session\"; } > \"$tmp\" && "
+                  "chmod 600 \"$tmp\" && mv -f \"$tmp\" \"$pidfile\" && "
+                  "exec \"$@\""))
+         (remote-command
+          (format (concat "mkdir -p %s && cd %s && { nohup sh -c %s ejn-kernel %s %s %s "
+                          "> %s 2>&1 < /dev/null & printf 'EJN_LAUNCH_ADMITTED\\n'; }")
+                  (emacs-jupyter-notebook-ssh--quote-remote-path cache-dir)
+                  (emacs-jupyter-notebook-ssh--quote-remote-path remote-cwd)
+                  (shell-quote-argument wrapper)
+                  (emacs-jupyter-notebook-ssh--quote-remote-path sidecar-file)
+                  (shell-quote-argument session-id)
+                  (mapconcat #'shell-quote-argument program " ")
+                  (emacs-jupyter-notebook-ssh--quote-remote-path log-file))))
+    (list :argv (emacs-jupyter-notebook-ssh-command profile remote-command)
+          :remote-command remote-command
+          :connection-file connection-file
+          :sidecar-file sidecar-file
+          :log-file log-file
+          :connection-tokens (copy-sequence connection-tokens))))
+
+(defun emacs-jupyter-notebook-ssh-build-remote-read-pid-sidecar (profile sidecar-file)
+  "Return SSH argv that reads the private PID SIDECAR-FILE without mutation."
+  (emacs-jupyter-notebook-ssh-command
+   profile
+   (format "cat %s" (emacs-jupyter-notebook-ssh--quote-remote-path sidecar-file))))
 
 (defun emacs-jupyter-notebook-ssh-build-remote-kill (profile pid)
   "Return an SSH argv list that asks the remote shell to terminate PID."
@@ -232,52 +415,118 @@ The return value is a plist containing :argv, :remote-command,
    profile
    (format "kill %s" (shell-quote-argument (format "%s" pid)))))
 
-(defun emacs-jupyter-notebook-ssh-build-pid-alive (profile pid &optional connection-file)
+(defun emacs-jupyter-notebook-ssh--identity-token-path-count (tokens path)
+  "Return the number of literal PATH occurrences across identity TOKENS."
+  (cl-loop for token in tokens sum
+           (let ((start 0) (count 0) (regexp (regexp-quote path)))
+             (while (string-match regexp token start)
+               (setq count (1+ count)
+                     start (match-end 0)))
+             count)))
+
+(defun emacs-jupyter-notebook-ssh-direct-entry-valid-p (entry)
+  "Return non-nil when ENTRY has the strict direct-launch identity schema."
+  (let* ((session (plist-get entry :session-id))
+         (path (plist-get entry :remote-connection-file))
+         (sidecar (plist-get entry :remote-pid-sidecar))
+         (tokens (plist-get entry :connection-file-tokens))
+         (pid (plist-get entry :remote-pid)))
+    (and (eq (plist-get entry :launch-kind) 'direct)
+         (stringp session) (not (string-empty-p session))
+         (not (string-match-p (string 0) session))
+         (string-match-p "\\`[[:alnum:]_.-]+\\'" session)
+         (<= (string-bytes session)
+             emacs-jupyter-notebook-ssh-kernelspec-max-text-bytes)
+         (stringp path) (file-name-absolute-p path)
+         (not (string-match-p (string 0) path))
+         (not (string-match-p "[\n\r]" path))
+         (<= (string-bytes path)
+             emacs-jupyter-notebook-ssh-kernelspec-max-text-bytes)
+         (equal (file-name-nondirectory path) (format "kernel-%s.json" session))
+         (stringp sidecar) (file-name-absolute-p sidecar)
+         (not (string-match-p (string 0) sidecar))
+         (not (string-match-p "[\n\r]" sidecar))
+         (<= (string-bytes sidecar)
+             emacs-jupyter-notebook-ssh-kernelspec-max-text-bytes)
+         (equal sidecar (concat (string-remove-suffix ".json" path) ".pid"))
+         (listp tokens) (<= 1 (length tokens) 2)
+         (cl-every (lambda (token)
+                     (and (stringp token) (not (string-empty-p token))
+                          (not (string-match-p (string 0) token))
+                          (<= (string-bytes token)
+                              emacs-jupyter-notebook-ssh-kernelspec-max-text-bytes)))
+                   tokens)
+         (<= (apply #'+ (mapcar #'string-bytes tokens))
+             emacs-jupyter-notebook-ssh-kernelspec-max-argv-bytes)
+         (= (emacs-jupyter-notebook-ssh--identity-token-path-count tokens path) 1)
+         (if (= (length tokens) 2)
+             (and (string-prefix-p "-" (car tokens))
+                  (equal (cadr tokens) path))
+           (string-match-p (regexp-quote path) (car tokens)))
+         (memq (plist-get entry :provisional) '(nil t))
+         (or (and (integerp pid) (> pid 0) (<= pid 2147483647))
+             (and (eq (plist-get entry :provisional) t) (null pid))))))
+
+(defun emacs-jupyter-notebook-ssh--identity-token-hex (tokens)
+  "Return a NUL-delimited UTF-8 hex needle for contiguous TOKENS."
+  (concat
+   "00"
+   (mapconcat
+    (lambda (token)
+      (mapconcat (lambda (byte) (format "%02x" byte))
+                 (string-to-list (encode-coding-string token 'utf-8 t)) ""))
+    tokens "00")
+   "00"))
+
+(defun emacs-jupyter-notebook-ssh-build-pid-alive (profile pid connection-tokens)
   "Return an SSH argv list probing whether PID is alive on PROFILE's host.
 Uses `kill -0 <pid>' (sends no signal) but does NOT rely on the ssh exit
 status to convey the answer — that conflates \"PID is gone\" with \"ssh
 itself failed\" (auth, timeout, an over-long ControlPath), which would let
 an infra hiccup masquerade as a dead kernel.  Instead the remote shell
-always exits 0 and prints `__EJN_ALIVE__' only when the PID exists,
-followed by `__EJN_DONE__'.  The caller reads stdout: `__EJN_ALIVE__' →
-alive; `__EJN_DONE__' without it → confirmed dead; NEITHER → the host never
-answered, i.e. an ssh/infra failure, not a dead kernel (W13).
-
-When CONNECTION-FILE is non-nil, also verify that PID's command line has
-the exact `--KernelManager.connection_file=CONNECTION-FILE' argument.  The
+always exits 0 and prints an identity-aware result for the PID,
+followed by `__EJN_DONE__'.  CONNECTION-TOKENS is mandatory and identifies
+the exact contiguous connection-file argument sequence.  The
 remote command emits one of `__EJN_ALIVE_MATCH__', `__EJN_DEAD__',
 `__EJN_ALIVE_MISMATCH__', or `__EJN_INSPECT_UNAVAILABLE__', then the same
 `__EJN_DONE__' terminator.  It prefers the NUL-delimited argv exposed by
 Linux /proc and falls back to `ps' only when the expected token contains no
 whitespace, since `ps' cannot otherwise preserve argument boundaries."
+  (unless (and (integerp pid) (> pid 0)
+               (listp connection-tokens) (<= 1 (length connection-tokens) 2)
+               (cl-every (lambda (token)
+                           (and (stringp token) (not (string-empty-p token))
+                                (not (string-match-p (string 0) token))))
+                         connection-tokens))
+    (error "PID probe requires a positive PID and direct identity tokens"))
   (let ((pid (shell-quote-argument (format "%s" pid))))
     (emacs-jupyter-notebook-ssh-command
      profile
-     (if (not connection-file)
-         (format
-          "if kill -0 %s 2>/dev/null; then echo __EJN_ALIVE__; fi; echo __EJN_DONE__"
-          pid)
-       (let ((remote-file
-              (emacs-jupyter-notebook-ssh--quote-remote-path connection-file)))
-         (format
+     (let ((quoted-tokens
+            (mapconcat #'shell-quote-argument connection-tokens " "))
+           (hex-needle
+            (shell-quote-argument
+             (emacs-jupyter-notebook-ssh--identity-token-hex
+              connection-tokens))))
+       (format
           (concat
-           "pid=%s; connection_file=%s; "
-           "expected=\"--KernelManager.connection_file=$connection_file\"; "
+           "pid=%s; set -- %s; needle=%s; "
            "if ! kill -0 \"$pid\" 2>/dev/null; then echo __EJN_DEAD__; "
            "elif [ -r \"/proc/$pid/cmdline\" ] && "
-           "command -v tr >/dev/null 2>&1 && command -v grep >/dev/null 2>&1; then "
-           "if tr '\\000' '\\n' < \"/proc/$pid/cmdline\" | "
-           "grep -F -x -- \"$expected\" >/dev/null 2>&1; "
-           "then echo __EJN_ALIVE_MATCH__; else echo __EJN_ALIVE_MISMATCH__; fi; "
+           "command -v od >/dev/null 2>&1 && command -v tr >/dev/null 2>&1; then "
+           "actual=$(od -An -tx1 -v \"/proc/$pid/cmdline\" 2>/dev/null | tr -d ' \\n'); "
+           "case \"$actual\" in *\"$needle\"*) echo __EJN_ALIVE_MATCH__;; "
+           "*) echo __EJN_ALIVE_MISMATCH__;; esac; "
            "elif command -v ps >/dev/null 2>&1; then "
            "args=$(ps -p \"$pid\" -o args= 2>/dev/null) || args=; "
-           "if [ -z \"$args\" ]; then echo __EJN_INSPECT_UNAVAILABLE__; "
-           "else case \"$expected\" in *[[:space:]]*) "
-           "echo __EJN_INSPECT_UNAVAILABLE__;; "
-           "*) case \" $args \" in *\" $expected \"*) "
-           "echo __EJN_ALIVE_MATCH__;; *) echo __EJN_ALIVE_MISMATCH__;; esac;; esac; fi; "
+           "sequence=; safe=1; for expected; do "
+           "case \"$expected\" in *[[:space:]]*) safe=0;; esac; "
+           "sequence=\"${sequence}${sequence:+ }$expected\"; done; "
+           "if [ -z \"$args\" ] || [ \"$safe\" != 1 ]; then echo __EJN_INSPECT_UNAVAILABLE__; "
+           "else case \" $args \" in *\" $sequence \"*) echo __EJN_ALIVE_MATCH__;; "
+           "*) echo __EJN_ALIVE_MISMATCH__;; esac; fi; "
            "else echo __EJN_INSPECT_UNAVAILABLE__; fi; echo __EJN_DONE__")
-          pid remote-file))))))
+        pid quoted-tokens hex-needle)))))
 
 (defun emacs-jupyter-notebook-ssh-build-batch-pid-alive (profile pids &optional connect-timeout)
   "Return an SSH argv reporting which of PIDS are alive on PROFILE's host.
@@ -308,15 +557,48 @@ and its PIDs stay UNKNOWN (never pruned)."
                   "-o" "BatchMode=yes")
             (cdr argv))))
 
-(defun emacs-jupyter-notebook-ssh-build-remote-cleanup (profile connection-file)
-  "Return an SSH argv list that cleans remote processes for CONNECTION-FILE."
-  (let ((remote-file (emacs-jupyter-notebook-ssh--quote-remote-path connection-file))
-        (remote-log (emacs-jupyter-notebook-ssh--quote-remote-path
-                     (replace-regexp-in-string "\\.json\\'" ".log" connection-file))))
-    (emacs-jupyter-notebook-ssh-command
-     profile
-      (format "{ pkill -f %s 2>/dev/null || true; rm -f %s %s; }"
-              remote-file remote-file remote-log))))
+(defun emacs-jupyter-notebook-ssh-build-remote-cleanup (profile entry)
+  "Return explicit, PID-bound cleanup argv for direct-launch registry ENTRY.
+The command never uses `pkill -f': it kills only ENTRY's recorded PID after
+the persisted connection-bearing argv sequence matches Linux /proc or Darwin
+`ps'.  When identity inspection is unavailable it leaves the process untouched."
+  (let* ((pid (plist-get entry :remote-pid))
+         (tokens (plist-get entry :connection-file-tokens))
+         (connection-file (plist-get entry :remote-connection-file))
+         (sidecar (plist-get entry :remote-pid-sidecar)))
+    (unless (emacs-jupyter-notebook-ssh-direct-entry-valid-p entry)
+      (error "Remote cleanup requires a direct entry with verified PID identity"))
+    (let ((quoted-tokens (mapconcat #'shell-quote-argument tokens " "))
+          (hex-needle
+           (shell-quote-argument
+            (emacs-jupyter-notebook-ssh--identity-token-hex tokens)))
+          (remote-file (emacs-jupyter-notebook-ssh--quote-remote-path connection-file))
+          (remote-log (emacs-jupyter-notebook-ssh--quote-remote-path
+                       (replace-regexp-in-string "\\.json\\'" ".log" connection-file)))
+          (remote-sidecar (and sidecar
+                               (emacs-jupyter-notebook-ssh--quote-remote-path sidecar))))
+      (emacs-jupyter-notebook-ssh-command
+       profile
+       (format
+        (concat "pid=%s; set -- %s; needle=%s; cleanup() { rm -f %s %s%s; }; "
+                "if ! kill -0 \"$pid\" 2>/dev/null; then cleanup; exit 0; fi; "
+                "matched=0; "
+                "if [ -r \"/proc/$pid/cmdline\" ] && command -v od >/dev/null 2>&1 && "
+                "command -v tr >/dev/null 2>&1; then "
+                "actual=$(od -An -tx1 -v \"/proc/$pid/cmdline\" 2>/dev/null | tr -d ' \\n'); "
+                "case \"$actual\" in *\"$needle\"*) matched=1;; esac; "
+                "elif command -v ps >/dev/null 2>&1; then "
+                "args=$(ps -p \"$pid\" -o args= 2>/dev/null) || args=; "
+                "sequence=; safe=1; for expected; do "
+                "case \"$expected\" in *[[:space:]]*) safe=0;; esac; "
+                "sequence=\"${sequence}${sequence:+ }$expected\"; done; "
+                "if [ -n \"$args\" ] && [ \"$safe\" = 1 ]; then "
+                "case \" $args \" in *\" $sequence \"*) matched=1;; esac; fi; fi; "
+                "if [ \"$matched\" = 1 ]; then kill \"$pid\" && cleanup; exit $?; fi; "
+                "echo EJN_CLEANUP_IDENTITY_UNCONFIRMED >&2; exit 1")
+        (shell-quote-argument (format "%s" pid)) quoted-tokens hex-needle
+        remote-file remote-log
+        (if remote-sidecar (concat " " remote-sidecar) ""))))))
 
 (defun emacs-jupyter-notebook-ssh-build-remote-cat-log (profile connection-file)
   "Return an SSH argv list that prints a bounded tail for CONNECTION-FILE."
@@ -448,16 +730,6 @@ Kinds (in priority order; the first matching pattern wins):
                     "`M-x emacs-jupyter-notebook-fetch-remote-log' for "
                     "details."))))))
 
-(defun emacs-jupyter-notebook-ssh-run-command (argv)
-  "Run ARGV synchronously and return stdout.
-Signal an error if the command exits non-zero."
-  (with-temp-buffer
-    (let ((status (apply #'process-file (car argv) nil (current-buffer) nil (cdr argv))))
-      (unless (and (integerp status) (zerop status))
-        (error "Command failed (%s): %s\n%s"
-               status (mapconcat #'identity argv " ") (buffer-string)))
-      (buffer-string))))
-
 (defun emacs-jupyter-notebook-ssh-start-process (name argv &optional sentinel)
   "Start ARGV asynchronously as process NAME and return the process."
   (let ((stdout-buffer (generate-new-buffer (format " *%s*" name)))
@@ -475,6 +747,59 @@ Signal an error if the command exits non-zero."
                               :stderr stderr-buffer))
           (process-put process 'emacs-jupyter-notebook-stderr-buffer
                        stderr-buffer)
+          process)
+      (error
+       (when (buffer-live-p stdout-buffer) (kill-buffer stdout-buffer))
+       (when (buffer-live-p stderr-buffer) (kill-buffer stderr-buffer))
+       (signal (car err) (cdr err))))))
+
+(defun emacs-jupyter-notebook-ssh--bounded-output-filter (process output limit owner)
+  "Append OUTPUT only while OWNER remains below binary-stream LIMIT."
+  (let* ((owner (or owner process))
+         (buffer (process-buffer process)))
+    (when (and (buffer-live-p buffer) (not (process-get owner 'ejn-output-overflow)))
+      (with-current-buffer buffer
+        (if (> (+ (string-bytes output)
+                  (- (or (position-bytes (point-max)) (point-max))
+                     (or (position-bytes (point-min)) (point-min))))
+               limit)
+            (progn
+              (process-put owner 'ejn-output-overflow t)
+              (when (process-live-p owner) (delete-process owner)))
+          (goto-char (point-max))
+          (insert output))))))
+
+(defun emacs-jupyter-notebook-ssh-start-bounded-process (name argv limit sentinel)
+  "Start ARGV with a strict per-stream byte LIMIT and SENTINEL.
+Overflow kills the owning SSH process instead of retaining a tail, allowing a
+protocol parser to distinguish truncated hostile output from a valid reply."
+  (unless (and (integerp limit) (> limit 0))
+    (error "Bounded process requires a positive output limit"))
+  (let ((stdout-buffer (generate-new-buffer (format " *%s*" name)))
+        (stderr-buffer (generate-new-buffer (format " *%s stderr*" name)))
+        process)
+    ;; Make the buffers unibyte before the child starts.  The resolver schema
+    ;; is UTF-8 JSON, so invalid bytes must fail validation rather than being
+    ;; silently decoded/replaced by Emacs's process coding layer.
+    (with-current-buffer stdout-buffer (set-buffer-multibyte nil))
+    (with-current-buffer stderr-buffer (set-buffer-multibyte nil))
+    (condition-case err
+        (progn
+          (setq process
+                (make-process
+                 :name name :buffer stdout-buffer :command argv
+                 :connection-type 'pipe :noquery t :sentinel sentinel
+                 :stderr stderr-buffer :coding 'binary
+                 :filter (lambda (proc output)
+                           (emacs-jupyter-notebook-ssh--bounded-output-filter
+                            proc output limit process))))
+          (process-put process 'emacs-jupyter-notebook-stderr-buffer stderr-buffer)
+          (when-let ((stderr-process (get-buffer-process stderr-buffer)))
+            (set-process-filter
+             stderr-process
+             (lambda (proc output)
+               (emacs-jupyter-notebook-ssh--bounded-output-filter
+                proc output limit process))))
           process)
       (error
        (when (buffer-live-p stdout-buffer) (kill-buffer stdout-buffer))

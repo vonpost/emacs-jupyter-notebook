@@ -50,27 +50,31 @@ If no kernel is connected, the first send announces which profile it will use ("
          :kernelspec "python3")))
 ```
 
-If `jupyter` is not directly on the remote `PATH`, set `:jupyter-command` in the profile. This is the most common first-run failure: `ssh host 'cmd'` runs a **non-login, non-interactive** shell, so it does not source `~/.bashrc`/`~/.bash_profile` — a conda/venv/module `jupyter` will not be found. Set `:jupyter-command` to the absolute path (from `which jupyter` in an interactive login), or to `"bash -lc 'conda activate <env> && jupyter'"` for full env activation. When a start fails, the error surfaced in Emacs now includes the tail of the remote launch log so you can see the real cause without SSHing in.
+Kernel resolution uses structured `:python-command` argv, never a shell command
+string.  The argv must accept appended `-c SCRIPT ARG...` Python arguments and
+run Python with `jupyter_client` available; direct Python, `uv run ... python`,
+and `nix shell ... -c python` have this shape.  Shell activation command
+strings are unsupported.  The command is used only to resolve the selected
+kernelspec.  The resolved absolute kernel argv then launches directly in a
+detached process, so a wrapper such as Nix does not become the persisted
+kernel PID.
+
+```elisp
+:python-command
+'("nix" "shell" "--impure" "--expr"
+  "with import <nixpkgs> {}; python3.withPackages (ps: with ps; [ jupyter ipykernel numpy matplotlib ])"
+  "-c" "python")
+```
+
+The resolver returns a one-entry kernelspec document and records the exact
+absolute connection-file path in `spec.metadata.ejn_connection_file`, bound
+to the opaque start session in `ejn_session_id`.  Emacs validates both before
+launching or retrieving anything.  Legacy `:jupyter-command` values are
+rejected rather than interpreted.
 
 ### ProxyJump / ssh config
 
 `ssh` and `scp` read your `~/.ssh/config`, and this package never bypasses it (no `-F none`, no `ProxyCommand` override). ProxyJump therefore works transparently: set the profile `:host` to the **`Host` alias** from your ssh config (not a raw IP) so its `ProxyJump`/`HostName`/`User`/`IdentityFile`/`Port` all apply, and leave `:port`/`:user`/`:identity-file` **unset** in the profile (those emit `-p`/`user@`/`-i`, which override the config). Connection multiplexing (on by default, `emacs-jupyter-notebook-ssh-control-master`) reuses one connection across the whole jump chain, so a ProxyJump setup is where it pays off most.
-
-### Running the kernel in Docker
-
-To launch the kernel via `docker run`, three flags are mandatory:
-
-```elisp
-:jupyter-command
-"docker run --rm --network host --gpus all -v /abs/cache:/abs/cache image_name jupyter"
-```
-
-- **No `-i`/`-t`.** The launch runs with stdin from `/dev/null`; `-t` fails with "the input device is not a tty".
-- **`-v <cache-dir>:<cache-dir>` (same path both sides).** Jupyter writes the connection file *inside* the container at `--KernelManager.connection_file=<cache-dir>/…`; without a bind-mount to the identical host path the file never appears where `scp` looks, and the retrieve times out.
-- **`--network host`.** The kernel binds dynamic ZMQ ports on the container loopback; the SSH tunnel forwards to `host:127.0.0.1:<port>`. Without host networking those ports are unreachable.
-- **Never `-d`.** The tool backgrounds the process itself and reads `$!` for liveness; a detached `docker run` returns immediately and breaks reconnect.
-
-If the container runs as root, add `--user "$(id -u):$(id -g)"` so the connection file is readable by your ssh user. For the interactive figure viewer, pin your local matplotlib to the image's matplotlib version.
 
 ## Keymap
 

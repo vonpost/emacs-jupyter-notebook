@@ -18,6 +18,16 @@
 (defvar jupyter-current-client)
 (defvar jupyter-default-timeout)
 
+(defun ejn-remote-tests--run-command (argv)
+  "Run test-only remote ARGV synchronously and return its stdout."
+  (with-temp-buffer
+    (let ((status (apply #'process-file (car argv) nil (current-buffer) nil
+                         (cdr argv))))
+      (unless (and (integerp status) (zerop status))
+        (error "Remote smoke command failed (%s): %s\n%s"
+               status (mapconcat #'identity argv " ") (buffer-string)))
+      (buffer-string))))
+
 (defun ejn-remote-tests--host ()
   "Return the configured remote test host, or nil."
   (getenv "EJN_REMOTE_TEST_HOST"))
@@ -31,8 +41,7 @@
          :remote-cache-dir (or (getenv "EJN_REMOTE_TEST_CACHE")
                                "~/.cache/emacs-jupyter-notebook-smoke")
          :kernelspec (or (getenv "EJN_REMOTE_TEST_KERNELSPEC") "python3")
-         :jupyter-command (or (getenv "EJN_REMOTE_TEST_JUPYTER_COMMAND")
-                              emacs-jupyter-notebook-jupyter-command)))
+         :python-command (list (or (getenv "EJN_REMOTE_TEST_PYTHON") "python3"))))
 
 (defun ejn-remote-tests--session-id ()
   "Return a unique session id for a remote smoke test."
@@ -90,23 +99,46 @@ overlays."
   :tags '(:remote)
   (let* ((profile (ejn-remote-tests--profile))
          (session-id (ejn-remote-tests--session-id))
-         (launch (emacs-jupyter-notebook-ssh-build-remote-launch profile session-id))
-         (remote-file (plist-get launch :connection-file))
-         (remote-log (plist-get launch :log-file))
+         (resolution (emacs-jupyter-notebook-ssh-build-kernelspec-resolution profile session-id))
+         resolved launch remote-file
          (local-copy (make-temp-file "ejn-remote-connection-" nil ".json"))
-         pid tunnel connection local-ports remote-ports)
+         pid cleanup-entry tunnel connection local-ports remote-ports)
     (unwind-protect
         (progn
-          (setq pid (emacs-jupyter-notebook--parse-pid
-                     (emacs-jupyter-notebook-ssh-run-command
-                      (plist-get launch :argv))))
+          (setq resolved
+                (emacs-jupyter-notebook--parse-resolved-kernelspec
+                 (ejn-remote-tests--run-command
+                  (plist-get resolution :argv)) session-id
+                 (plist-get profile :kernelspec)
+                 (plist-get resolution :connection-file)))
+          (setq launch (emacs-jupyter-notebook-ssh-build-remote-direct-launch
+                        profile session-id resolved)
+                remote-file (plist-get launch :connection-file))
+          (should (string-match-p "EJN_LAUNCH_ADMITTED"
+                                  (ejn-remote-tests--run-command
+                                   (plist-get launch :argv))))
+          (setq pid (emacs-jupyter-notebook--parse-pid-sidecar
+                     (ejn-remote-tests--run-command
+                      (emacs-jupyter-notebook-ssh-build-remote-read-pid-sidecar
+                       profile (plist-get launch :sidecar-file)))
+                     session-id))
           (should (integerp pid))
+          (setq cleanup-entry
+                (list :launch-kind 'direct :session-id session-id :remote-pid pid
+                      :connection-file-tokens (plist-get launch :connection-tokens)
+                      :remote-connection-file remote-file
+                      :remote-pid-sidecar (plist-get launch :sidecar-file)))
+          (should (eq 'alive
+                      (emacs-jupyter-notebook--classify-pid-probe
+                       (ejn-remote-tests--run-command
+                        (emacs-jupyter-notebook-ssh-build-pid-alive
+                         profile pid (plist-get launch :connection-tokens))))))
           ;; W4.7 removed the sync `--retrieve-connection-file'; retrieve
           ;; inline via scp + read, polling until the kernel has written it.
           (let ((deadline (+ (float-time) 30)))
             (while (and (not connection) (< (float-time) deadline))
               (ignore-errors
-                (emacs-jupyter-notebook-ssh-run-command
+                (ejn-remote-tests--run-command
                  (emacs-jupyter-notebook-ssh-scp-from-command
                   profile remote-file local-copy))
                 (setq connection
@@ -129,17 +161,10 @@ overlays."
                      (plist-get local-ports key) 10))))
       (when (and tunnel (process-live-p tunnel))
         (delete-process tunnel))
-      (when (integerp pid)
-        (ignore-errors
-          (emacs-jupyter-notebook-ssh-run-command
-           (emacs-jupyter-notebook-ssh-build-remote-kill profile pid))))
       (ignore-errors
-        (emacs-jupyter-notebook-ssh-run-command
-         (emacs-jupyter-notebook-ssh-command
-          profile
-          (format "rm -f %s %s"
-                  (emacs-jupyter-notebook-ssh--quote-remote-path remote-file)
-                  (emacs-jupyter-notebook-ssh--quote-remote-path remote-log)))))
+        (when cleanup-entry
+          (ejn-remote-tests--run-command
+           (emacs-jupyter-notebook-ssh-build-remote-cleanup profile cleanup-entry))))
       (when (file-exists-p local-copy)
         (delete-file local-copy)))))
 
@@ -165,7 +190,7 @@ overlays."
             (setq buffer-file-name "/tmp/ejn-remote-async.py")
             (emacs-jupyter-notebook-start-remote-kernel (plist-get profile :profile))
             (should (eq (plist-get emacs-jupyter-notebook--async-context :phase)
-                        'launch))
+                        'resolve))
             (should (ejn-remote-tests--wait-for-phase buffer 'done 60))
             (let ((jupyter-current-client emacs-jupyter-notebook--client)
                   (jupyter-default-timeout 30))

@@ -23,7 +23,7 @@
   "Remote profile definitions.
 Each element is (NAME . PLIST).  Supported PLIST keys include
 :host, :user, :port, :identity-file, :ssh-options, :remote-cwd,
-:remote-cache-dir, :kernelspec, and :jupyter-command.
+:remote-cache-dir, :kernelspec, and :python-command.
 :host may include a user as in user@example.com."
   :type '(alist :key-type string :value-type plist)
   :group 'emacs-jupyter-notebook)
@@ -114,10 +114,14 @@ multiplexing off."
   :type 'string
   :group 'emacs-jupyter-notebook)
 
-(defcustom emacs-jupyter-notebook-jupyter-command "jupyter"
-  "Default Jupyter command on the remote host.
-Can be overridden per-profile with :jupyter-command in the profile plist."
-  :type 'string
+(defcustom emacs-jupyter-notebook-python-command '("python3")
+  "Remote Python command argv used to resolve a kernelspec.
+Each element is one argument; this is never parsed as a shell command.  The
+argv must accept appended `-c SCRIPT ARG...' Python arguments, as direct
+Python, `uv run ... python', and `nix shell ... -c python' do.  Shell
+activation command strings are unsupported.  Profiles override it with a
+non-empty `:python-command' string list."
+  :type '(repeat string)
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-helper-command '("ejn-helper")
