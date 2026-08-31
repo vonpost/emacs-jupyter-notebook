@@ -15,6 +15,7 @@ from direct_kernel_fixture import (
     MAX_KERNELSPEC_JSON_BYTES,
     DirectKernelFixture,
     DirectKernelFixtureError,
+    close_installed_sync_event_loop,
     resolve_kernelspec_document,
 )
 
@@ -230,6 +231,21 @@ class DirectKernelSpecTests(unittest.TestCase):
 
 
 class DirectKernelLifecycleTests(unittest.TestCase):
+    def test_sync_event_loop_cleanup_closes_installed_loop(self) -> None:
+        import asyncio
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            close_installed_sync_event_loop()
+            self.assertTrue(loop.is_closed())
+            with self.assertRaises(RuntimeError):
+                asyncio.get_event_loop()
+        finally:
+            if not loop.is_closed():
+                loop.close()
+            asyncio.set_event_loop(None)
+
     def _client(self, fixture: DirectKernelFixture):
         from jupyter_client import BlockingKernelClient
 
@@ -270,6 +286,7 @@ class DirectKernelLifecycleTests(unittest.TestCase):
                 self.assertEqual(_execute(client, "6 * 7")["content"].get("status"), "ok")
             finally:
                 client.stop_channels()
+                close_installed_sync_event_loop()
 
     @unittest.skipUnless(DirectKernelFixture.available(), "direct local kernel unavailable")
     def test_protocol_shutdown_exits_exact_direct_process(self) -> None:
@@ -287,6 +304,7 @@ class DirectKernelLifecycleTests(unittest.TestCase):
                 self.assertEqual(process.poll(), 0)
             finally:
                 client.stop_channels()
+                close_installed_sync_event_loop()
 
     @unittest.skipUnless(DirectKernelFixture.available(), "direct local kernel unavailable")
     def test_restored_connection_file_relaunches_on_same_ports(self) -> None:
@@ -306,6 +324,7 @@ class DirectKernelLifecycleTests(unittest.TestCase):
                 self.assertEqual(fixture.wait_exited(8), 0)
             finally:
                 client.stop_channels()
+                close_installed_sync_event_loop()
             self.assertFalse(connection_path.exists())
             fixture.relaunch(connection_data=connection_before)
             assert fixture.connection is not None and fixture.kernel_pid is not None
@@ -330,6 +349,7 @@ class DirectKernelLifecycleTests(unittest.TestCase):
                 self.assertEqual(_execute(client, "new_value = 42")["content"].get("status"), "ok")
             finally:
                 client.stop_channels()
+                close_installed_sync_event_loop()
 
     def test_failed_resolution_cleans_private_state(self) -> None:
         fixture = DirectKernelFixture(kernelspec="definitely-missing-ejn-kernel")

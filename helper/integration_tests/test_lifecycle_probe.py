@@ -12,6 +12,7 @@ import time
 import unittest
 from queue import Empty
 
+from direct_kernel_fixture import close_installed_sync_event_loop
 from kernel_fixture import KernelAppFixture
 
 
@@ -91,6 +92,7 @@ class LifecycleProtocolProbe(unittest.TestCase):
                 )
             finally:
                 client.stop_channels()
+                close_installed_sync_event_loop()
 
     @unittest.skipUnless(KernelAppFixture.available(), "jupyter_client unavailable")
     def test_protocol_restart_does_not_restart_under_kernelapp_parent(self) -> None:
@@ -149,6 +151,7 @@ class LifecycleProtocolProbe(unittest.TestCase):
                 client.stop_channels()
                 if fresh_client is not None:
                     fresh_client.stop_channels()
+                close_installed_sync_event_loop()
 
     @unittest.skipUnless(KernelAppFixture.available(), "jupyter_client unavailable")
     def test_protocol_shutdown_stops_child_but_not_kernelapp_parent(self) -> None:
@@ -192,6 +195,7 @@ class LifecycleProtocolProbe(unittest.TestCase):
                 client.stop_channels()
                 if fresh_client is not None:
                     fresh_client.stop_channels()
+                close_installed_sync_event_loop()
 
 
 if __name__ == "__main__":

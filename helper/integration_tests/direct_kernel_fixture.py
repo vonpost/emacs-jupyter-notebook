@@ -7,6 +7,7 @@ or a KernelManager parent.  It resolves one kernelspec from the structured
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -40,6 +41,17 @@ _PLACEHOLDERS = {"{connection_file}", "{resource_dir}"}
 
 class DirectKernelFixtureError(RuntimeError):
     """The test-owned direct kernel could not be resolved or started."""
+
+
+def close_installed_sync_event_loop() -> None:
+    """Close the loop jupyter-core creates for blocking client calls."""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        return
+    if not loop.is_running():
+        loop.close()
+        asyncio.set_event_loop(None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,6 +415,7 @@ class DirectKernelFixture:
             client.wait_for_ready(timeout=timeout)
         finally:
             client.stop_channels()
+            close_installed_sync_event_loop()
 
     def wait_exited(self, timeout: float = 10.0) -> int:
         self._validate_timeout(timeout, "timeout")

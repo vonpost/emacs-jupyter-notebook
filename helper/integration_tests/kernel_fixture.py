@@ -22,7 +22,7 @@ from queue import Empty
 from pathlib import Path
 from typing import Any, Sequence
 
-from direct_kernel_fixture import DirectKernelFixture
+from direct_kernel_fixture import DirectKernelFixture, close_installed_sync_event_loop
 
 
 class KernelFixtureError(RuntimeError):
@@ -250,6 +250,7 @@ class KernelAppFixture:
             raise TimeoutError("timed out waiting for execute reply")
         finally:
             client.stop_channels()
+            close_installed_sync_event_loop()
 
     def cleanup(self) -> None:
         """Terminate only this fixture's process group and remove its files.
@@ -367,6 +368,7 @@ class _DirectLocalKernelFixture(DirectKernelFixture):
             raise TimeoutError("timed out waiting for execute reply")
         finally:
             client.stop_channels()
+            close_installed_sync_event_loop()
 
 
 class LocalKernelFixture(_DirectLocalKernelFixture):
