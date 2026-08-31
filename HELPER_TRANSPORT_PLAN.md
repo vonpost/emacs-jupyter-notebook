@@ -783,7 +783,7 @@ modules.
   reuses all five ports, yields a new PID and reset namespace, and accepts new
   execution.  The proof is portable POSIX code with no `/proc` dependency.
 
-- [~] owner=terra-ht12r2 claimed=2026-08-31 **HT12R2 Launch the actual remote kernel PID asynchronously.**
+- [x] owner=terra-ht12r2 claimed=2026-08-31 landed=1d3f791 **HT12R2 Launch the actual remote kernel PID asynchronously.**
   - Depends: HT12R1.
   - Files: `emacs-jupyter-notebook-vars.el`,
     `emacs-jupyter-notebook-ssh.el`, `emacs-jupyter-notebook.el`,
@@ -794,10 +794,12 @@ modules.
     path).  Add a bounded asynchronous resolution phase that appends a constant
     Python resolver and the selected kernelspec as separate quoted argv.  The
     resolver may run behind explicit prefixes such as `uv run ... python`, but
-    it emits only one bounded standard kernelspec JSON entry: `$NAME`
-    environment expansion is already applied, bare Python is `sys.executable`,
-    every other executable is resolved to an absolute path, resource paths are
-    absolute, and only `{connection_file}` / `{resource_dir}` are substituted.
+    it emits only one bounded standard kernelspec JSON entry: available `$NAME`
+    environment references are expanded with standard `Template.safe_substitute`
+    semantics (unavailable names remain literal), bare Python is
+    `sys.executable`, every other executable is resolved to an absolute path,
+    resource paths are absolute, and only `{connection_file}` / `{resource_dir}`
+    are substituted.
     The remote shell expands a home-relative connection path before passing it
     as a separate resolver argument.  Emacs strictly reparses the resulting
     final schema and rejects every relative executable, leftover/unknown
@@ -833,7 +835,7 @@ modules.
   - Narrow run: focused SSH/async start/reconnect ERT selectors plus source
     no-blocking assertions.
 
-- [ ] **HT12R3 Implement proven helper interrupt and shutdown semantics.**
+- [~] owner=terra-ht12r3 claimed=2026-08-31 **HT12R3 Implement proven helper interrupt and shutdown semantics.**
   - Depends: HT12R2.
   - Files: `helper/integration_tests/kernel_fixture.py`,
     `helper/ejn_helper/backend.py`, `helper/ejn_helper/dispatcher.py`,
