@@ -34,6 +34,7 @@ VALID_PARAMS = {
     "connect": {
         "connection_file": "/tmp/ejn-connection.json",
         "artifact_dir": "/tmp/ejn-artifacts",
+        "image_max_pixels": 4_194_304,
     },
     "kernel_info": {},
     "execute": {"code": "1 + 1"},
@@ -132,6 +133,28 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.responses[-1]["result"], {"credit": 10})
         self.assertEqual(self.backend.starts, [])
 
+    async def test_connect_image_max_pixels_uses_exact_protocol_range(self):
+        self.dispatcher.negotiated = True
+        for value in (0, 4_194_304):
+            with self.subTest(value=value):
+                params = dict(VALID_PARAMS["connect"], image_max_pixels=value)
+                self.dispatcher.dispatch(request(str(value), "connect", params))
+                await asyncio.sleep(0)
+                self.assertTrue(self.responses[-1]["ok"])
+                self.dispatcher._inflight.clear()
+                self.dispatcher.connected = False
+        for value in (-1, 4_194_305, True):
+            with self.subTest(value=value):
+                params = dict(VALID_PARAMS["connect"], image_max_pixels=value)
+                self.dispatcher.dispatch(request(str(value), "connect", params))
+                self.assertEqual(
+                    self.responses[-1]["error"]["code"], "invalid-request"
+                )
+        params = dict(VALID_PARAMS["connect"])
+        params.pop("image_max_pixels")
+        self.dispatcher.dispatch(request("missing", "connect", params))
+        self.assertEqual(self.responses[-1]["error"]["code"], "invalid-request")
+
         close_responses = []
         close_backend = FakeBackend(self.loop)
         close_dispatcher = Dispatcher(
@@ -181,7 +204,14 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
             ("grant_event_credit", {}),
             ("grant_event_credit", {"bytes": True}),
             ("connect", {"connection_file": "/tmp/a"}),
-            ("connect", {"connection_file": "relative", "artifact_dir": "/tmp/a"}),
+            (
+                "connect",
+                {
+                    "connection_file": "relative",
+                    "artifact_dir": "/tmp/a",
+                    "image_max_pixels": 4_194_304,
+                },
+            ),
             ("execute", {}),
             ("execute", {"code": 1}),
             ("complete", {"code": "x"}),
@@ -553,6 +583,7 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "connection_file": f"/tmp/{surrogate}",
                     "artifact_dir": "/tmp/artifacts",
+                    "image_max_pixels": 4_194_304,
                 },
             ),
             request(
@@ -561,6 +592,7 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "connection_file": "/tmp/connection.json",
                     "artifact_dir": f"/tmp/{surrogate}",
+                    "image_max_pixels": 4_194_304,
                 },
             ),
             request(

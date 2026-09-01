@@ -66,7 +66,7 @@ class AuxiliaryRequestTests(unittest.IsolatedAsyncioTestCase):
         artifact_dir.mkdir(mode=0o700)
         self.backend = JupyterBackend(deadline=0.1)
         self.connected = asyncio.get_running_loop().create_future()
-        self.backend.start("connect", {"connection_file": str(path), "artifact_dir": str(artifact_dir)}, lambda _e: None, self.connected.set_result)
+        self.backend.start("connect", {"connection_file": str(path), "artifact_dir": str(artifact_dir), "image_max_pixels": 4_194_304}, lambda _e: None, self.connected.set_result)
         await asyncio.wait_for(self.connected, 1)
 
     async def asyncTearDown(self):

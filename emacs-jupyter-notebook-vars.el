@@ -219,6 +219,17 @@ pickle MIME payloads."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
+(defcustom emacs-jupyter-notebook-helper-inline-image-max-pixels 4194304
+  "Maximum source pixels permitted in a helper-published image preview.
+This option can only lower the helper protocol's immutable 4,194,304-pixel
+ceiling.  A non-positive value disables helper image previews while retaining
+their bounded original files for the asynchronous external viewer.  The value
+is sent with each helper attachment and enforced before its isolated decoder
+starts.  Emacs receives only a bounded uncompressed PPM derivative; compressed
+remote bytes never reach an Emacs native image API."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
 (defcustom emacs-jupyter-notebook-panel-slice-images nil
   "When non-nil, insert panel images sliced into line-height rows.
 A tall image inserted as one display property is a single screen line, so
@@ -250,6 +261,22 @@ started asynchronously without a shell.  Nil selects the platform opener:
 Windows."
   :type '(choice (const :tag "Platform default" nil)
                  (repeat :tag "Command and arguments" string))
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-external-image-snapshot-ttl 300
+  "Seconds to retain a verified image snapshot after launching its viewer.
+Platform launchers such as `open' and `xdg-open' commonly exit before the GUI
+application consumes the path.  The independent snapshot therefore remains
+available for this bounded handoff period."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-external-image-max-snapshots 4
+  "Maximum pending and retained external image snapshots.
+Each snapshot may contain one original image up to the helper's artifact
+limit.  Reaching this bound rejects another open request until a pending job
+settles, a request is cancelled, or a retained snapshot expires."
+  :type 'integer
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-panel-max-pickles 20
@@ -534,11 +561,11 @@ indicator in a buffer."
 ;;; W8 local interactive matplotlib viewer customization
 
 (defcustom emacs-jupyter-notebook-local-python-command "python3"
-  "Local Python executable used to run the interactive matplotlib viewer.
+  "Local Python executable used by bounded local helper processes.
 This is the LOCAL workstation's Python (never a remote one).  It must
-have matplotlib and a GUI backend (Qt or Tk) installed, and — because W8
-transports figures as pickles — matplotlib pinned to the same version as
-the remote kernels.  Set to an absolute path or a command found on
+run the bundled artifact verifier.  Interactive pickle viewing additionally
+requires matplotlib with a GUI backend (Qt or Tk), pinned to the same version
+as the remote kernels.  Set this to an absolute path or a command found on
 `exec-path'."
   :type 'string
   :group 'emacs-jupyter-notebook)

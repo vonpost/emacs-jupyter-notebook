@@ -37,6 +37,10 @@
 (require 'subr-x)
 (require 'emacs-jupyter-notebook-vars)
 
+(defconst emacs-jupyter-notebook-result--load-file
+  (or load-file-name buffer-file-name)
+  "Path of this file at load time, used to locate bundled local helpers.")
+
 ;;; Faces
 
 (defface emacs-jupyter-notebook-result-face
@@ -203,16 +207,34 @@ before a future implementation chooses to reuse entry ids.")
 (defvar-local emacs-jupyter-notebook-panel--retained-artifact-bytes 0
   "Cached total image and MIME artifact bytes retained by this panel.")
 
-(defconst emacs-jupyter-notebook-panel--max-published-image-bytes 4194304
-  "Maximum bytes accepted for one helper-published panel thumbnail.
+(defconst emacs-jupyter-notebook-panel--max-published-original-bytes 67108864
+  "Maximum bytes retained for one compressed external-viewer original.")
 
-Panel admission verifies content in Emacs before display.  Keeping this at
-4 MiB bounds that literal read and SHA-256 work below the UI responsiveness
-budget; larger originals belong in the asynchronous external-viewer path.")
+(defconst emacs-jupyter-notebook-panel--max-published-preview-bytes 4194304
+  "Maximum byte length of a canonical helper-generated PPM preview.")
+
+(defconst emacs-jupyter-notebook-panel--hard-image-pixels 4194304
+  "Immutable helper protocol pixel ceiling for native image previews.")
 
 (defconst emacs-jupyter-notebook-panel--max-published-pickle-bytes 67108864
   "Maximum bytes accepted for one helper-published matplotlib pickle.
 This finite ceiling matches the helper's decoded artifact ceiling.")
+
+(defun emacs-jupyter-notebook-panel--inline-image-pixel-budget ()
+  "Return the configured helper preview budget, clamped to its hard ceiling."
+  (let ((value emacs-jupyter-notebook-helper-inline-image-max-pixels))
+    (if (and (integerp value) (> value 0))
+        (min value emacs-jupyter-notebook-panel--hard-image-pixels)
+      0)))
+
+(defun emacs-jupyter-notebook-panel--inline-image-dimensions-safe-p (width height)
+  "Return non-nil when WIDTH and HEIGHT satisfy immutable and local limits."
+  (and (integerp width) (integerp height)
+       (> width 0) (> height 0)
+       (<= width 1024)
+       (<= height 1024)
+       (<= (* width height)
+           (emacs-jupyter-notebook-panel--inline-image-pixel-budget))))
 
 (defvar emacs-jupyter-notebook-panel--text-materialization-count nil
   "Test instrument for text materializations, or nil when disabled.")
@@ -590,6 +612,71 @@ no source-buffer marker is registered, e.g. in tests)."
                            when (eq (car seg) 'image)
                            collect (cdr seg))))
 
+(defun emacs-jupyter-notebook-panel--native-image-safe-p (image)
+  "Return non-nil when IMAGE may reach an Emacs native image API.
+Legacy image specs have no helper publication root and retain their existing
+rendering path.  A helper-published image is native-safe only through its
+separate canonical PPM preview; its compressed original is never examined.
+The PPM bytes and digest are checked once at admission.  This last-boundary
+check revalidates only pinned identity, ownership, mode, and size so repeated
+redisplay cannot turn into multi-megabyte file reads on Emacs's UI thread."
+  (let ((props (and (consp image) (cdr image))))
+    (if (not (plist-member props :ejn-publication-root))
+        t
+      (let* ((preview (plist-get props :ejn-preview))
+             (path (plist-get props :file))
+             (width (and preview (plist-get preview :width)))
+             (height (and preview (plist-get preview :height))))
+        (and (listp preview)
+             (eq (plist-get props :type) 'pbm)
+             (equal path (plist-get preview :file))
+             (emacs-jupyter-notebook-panel--inline-image-dimensions-safe-p
+              width height)
+             (condition-case nil
+                 (let ((checked
+                        (emacs-jupyter-notebook-panel--published-artifact-metadata
+                         (plist-get preview :root) (plist-get preview :file)
+                         (plist-get preview :sha256) (plist-get preview :size)
+                         (plist-get preview :root-identity)
+                         emacs-jupyter-notebook-panel--max-published-preview-bytes)))
+                   (equal (plist-get checked :identity)
+                          (plist-get preview :identity)))
+               (error nil)))))))
+
+(defun emacs-jupyter-notebook-panel--native-preview-spec (image)
+  "Return IMAGE's minimal native preview spec, with no original metadata.
+Helper image records intentionally retain their compressed original for `o'.
+That record must never become part of an argument to a native image function,
+including cache flushing.  Legacy local image specs retain their established
+path because they do not carry helper publication fields."
+  (let ((props (and (consp image) (cdr image))))
+    (if (not (plist-member props :ejn-publication-root))
+        image
+      (let ((preview (plist-get props :ejn-preview)))
+        (when (listp preview)
+          (append
+           (list 'image :type 'pbm :file (plist-get preview :file))
+           (when (plist-member props :scale)
+             (list :scale (plist-get props :scale)))
+           (when (plist-member props :max-width)
+             (list :max-width (plist-get props :max-width)))
+           (when (plist-member props :max-height)
+             (list :max-height (plist-get props :max-height)))))))))
+
+(defun emacs-jupyter-notebook-panel--inline-image-admitted-p (image)
+  "Return non-nil when IMAGE is a cheap candidate for bounded inline preview.
+This deliberately performs no file access.  The full fixed-header and identity
+check belongs immediately at the native image boundary, after the panel has
+already reduced candidates to its small inline-preview budget.
+"
+  (let ((props (and (consp image) (cdr image))))
+    (or (not (plist-member props :ejn-publication-root))
+        (let ((preview (plist-get props :ejn-preview)))
+          (and (listp preview)
+               (emacs-jupyter-notebook-panel--inline-image-dimensions-safe-p
+                (plist-get preview :width)
+                (plist-get preview :height)))))))
+
 (defun emacs-jupyter-notebook-panel--bounded-inline-specs (entries)
   "Return the newest bounded subset of image specs visible in ENTRIES.
 Newness follows entry creation ids, rather than source-position display order."
@@ -599,14 +686,21 @@ Newness follows entry creation ids, rather than source-position display order."
          (specs (emacs-jupyter-notebook-panel--image-specs creation-order))
          (max emacs-jupyter-notebook-panel-max-inline-images))
     (if (and (integerp max) (> max 0))
-        (last specs (min max (length specs)))
+        (let ((safe (cl-remove-if-not
+                     #'emacs-jupyter-notebook-panel--inline-image-admitted-p specs)))
+          (last safe (min max (length safe))))
       nil)))
 
 (defun emacs-jupyter-notebook-panel--set-inline-specs (specs)
   "Install SPECS as the inline set, flushing previews that were demoted."
   (dolist (old emacs-jupyter-notebook-panel--inline-image-specs)
     (unless (member old specs)
-      (ignore-errors (image-flush old t))))
+      ;; A demoted placeholder was never decoded.  Do not re-read/hash every
+      ;; retained image merely to decide whether to flush its cache entry.
+      (when (plist-get (cdr old) :ejn-materialized)
+        (when-let ((preview (emacs-jupyter-notebook-panel--native-preview-spec old)))
+          (ignore-errors (image-flush preview t)))
+        (plist-put (cdr old) :ejn-materialized nil))))
   (setq emacs-jupyter-notebook-panel--inline-image-specs specs))
 
 (defun emacs-jupyter-notebook-panel--insert-image-placeholder (image index)
@@ -643,16 +737,24 @@ disabled, on non-graphic displays (batch/tty — the pixel size is unknown
 there), or if the slice insert fails.  W18 bounds this work to the newest
 configured inline previews; placeholder images never call `image-size'."
   (let ((start (point)))
-    (if (not inline-p)
+    (if (not (and inline-p
+                  (emacs-jupyter-notebook-panel--native-image-safe-p image)))
         (emacs-jupyter-notebook-panel--insert-image-placeholder image index)
-      (if (and emacs-jupyter-notebook-panel-slice-images
-               (display-graphic-p))
-          (condition-case nil
-              (let* ((height (cdr (image-size image t)))
-                     (rows (max 1 (ceiling height (frame-char-height)))))
-                (insert-sliced-image image " " nil rows 1))
-            (error (insert (propertize " " 'display image))))
-        (insert (propertize " " 'display image))))
+      (let ((native (emacs-jupyter-notebook-panel--native-preview-spec image)))
+        (if (not native)
+            (emacs-jupyter-notebook-panel--insert-image-placeholder image index)
+          ;; Set only after strict PPM revalidation and immediately before the
+          ;; first native call.  Retirement can then flush exactly materialized
+          ;; preview specs without touching original files or retained history.
+          (plist-put (cdr image) :ejn-materialized t)
+          (if (and emacs-jupyter-notebook-panel-slice-images
+                   (display-graphic-p))
+              (condition-case nil
+                  (let* ((height (cdr (image-size native t)))
+                         (rows (max 1 (ceiling height (frame-char-height)))))
+                    (insert-sliced-image native " " nil rows 1))
+                (error (insert (propertize " " 'display native))))
+            (insert (propertize " " 'display native))))))
     (add-text-properties
      start (point) (list 'emacs-jupyter-notebook-segment-index index))))
 
@@ -965,43 +1067,41 @@ returned unchanged.  The file is mode 0600 and written without coding."
            (ignore-errors (delete-file file))
            (signal (car err) (cdr err))))))))
 
-(defun emacs-jupyter-notebook-panel--published-image-type (mime)
-  "Return the image type accepted for published MIME, or nil."
-  (pcase mime
-    ("image/png" 'png)
-    ("image/jpeg" 'jpeg)
-    ("image/gif" 'gif)
-    ("image/webp" 'webp)
-    (_ nil)))
+(defconst emacs-jupyter-notebook-panel--ppm-header-read-limit 64
+  "Maximum P6 header bytes read synchronously during preview admission.")
 
-(defun emacs-jupyter-notebook-panel--published-file-sha256 (path size limit)
-  "Return PATH's SHA-256 after one bounded literal read of declared SIZE.
-No file-name handler is allowed on the helper's local publication path."
-  (let ((file-name-handler-alist nil)
-        (coding-system-for-read 'no-conversion))
-    (with-temp-buffer
-      (set-buffer-multibyte nil)
-      ;; Read at most one byte beyond the admission ceiling.  A racing growth
-      ;; can therefore fail validation without allocating an unbounded buffer.
-      (insert-file-contents-literally
-       path nil 0 (1+ limit))
-      (unless (= (buffer-size) size)
-        (error "published image size changed while reading"))
-      (secure-hash 'sha256 (current-buffer)))))
+(defun emacs-jupyter-notebook-panel--canonical-ppm-header-metadata (prefix size)
+  "Return canonical P6 metadata for unibyte PREFIX and total file SIZE.
+Only the fixed worker grammar is accepted: one space between decimal
+dimensions, max value 255, no comments, and exactly three payload bytes per
+pixel.  PREFIX need only contain the complete header; image payload is never
+read or hashed on the Emacs UI thread."
+  (when (and (stringp prefix) (integerp size) (>= size 0)
+             (string-match
+              "\\`P6\n\\([1-9][0-9]*\\) \\([1-9][0-9]*\\)\n255\n"
+              prefix))
+    (let ((width (string-to-number (match-string 1 prefix)))
+          (height (string-to-number (match-string 2 prefix)))
+          (header-size (match-end 0)))
+      (when (and (<= 1 width 1024) (<= 1 height 1024)
+                 (= size (+ header-size (* width height 3))))
+        (list :mime "image/x-portable-pixmap"
+              :width width :height height)))))
 
-(defun emacs-jupyter-notebook-panel--published-image-spec (root path mime sha256 size root-identity &optional display-id)
-  "Validate one helper publication and return a panel-owned image spec.
-ROOT is pinned by the helper adapter.  PATH must remain an immediate regular
-child of that exact non-symlink root through validation and transfer.
-"
+(defun emacs-jupyter-notebook-panel--published-artifact-metadata
+    (root path sha256 size root-identity limit &optional ppm width height)
+  "Validate one pinned publication and return metadata for later retirement.
+When PPM is non-nil, only its bounded canonical header and declared total
+length are checked before a native image spec is created.  The trusted local
+helper parent already validated the complete worker output and SHA-256 before
+publication.  Original compressed files deliberately skip content reads here;
+they are copied and revalidated outside the UI thread before external opening."
   (unless (and (stringp root) (file-name-absolute-p root)
                (stringp path) (file-name-absolute-p path)
-               (stringp sha256) (string-match-p "\\`[0-9a-f]\\{64\\}\\'" sha256)
-               (integerp size) (>= size 0)
-               (<= size emacs-jupyter-notebook-panel--max-published-image-bytes)
-               root-identity
-               (emacs-jupyter-notebook-panel--published-image-type mime))
-    (error "invalid published image metadata"))
+               (stringp sha256) (string-equal sha256 (downcase sha256))
+               (string-match-p "\\`[0-9a-f]\\{64\\}\\'" sha256)
+               (integerp size) (<= 0 size limit) root-identity)
+    (error "invalid published artifact metadata"))
   (let* ((root-name (directory-file-name (expand-file-name root)))
          (path-name (expand-file-name path))
          (root-attrs (and (not (file-symlink-p root-name))
@@ -1009,75 +1109,112 @@ child of that exact non-symlink root through validation and transfer.
          (attrs (and (not (file-symlink-p path-name))
                      (file-attributes path-name 'integer)))
          (identity (and attrs (file-attribute-file-identifier attrs))))
-    (unless (and root-attrs (file-directory-p root-name)
+    (unless (and root-attrs attrs identity
+                 (file-directory-p root-name)
                  (eq (file-attribute-type root-attrs) t)
                  (equal (file-attribute-user-id root-attrs) (user-uid))
                  (= (logand (file-modes root-name) #o7777) #o700)
                  (equal root-identity (file-attribute-file-identifier root-attrs))
                  (equal (file-name-directory (directory-file-name path-name))
                         (file-name-as-directory root-name))
-                 attrs identity
-                 (file-regular-p path-name)
-                 (null (file-attribute-type attrs))
+                 (file-regular-p path-name) (null (file-attribute-type attrs))
+                 (= (file-attribute-link-number attrs) 1)
                  (equal (file-attribute-user-id attrs) (user-uid))
                  (= (logand (file-modes path-name) #o7777) #o600)
-                 (= (file-attribute-size attrs) size)
-                 (string-equal
-                  (emacs-jupyter-notebook-panel--published-file-sha256
-                   path-name size emacs-jupyter-notebook-panel--max-published-image-bytes)
-                  sha256)
-                 ;; Hashing is not an ownership transfer until both paths are
-                 ;; still valid, same objects observed before it.
-                 (let ((post-root (and (not (file-symlink-p root-name))
-                                       (file-attributes root-name 'integer)))
-                       (post (and (not (file-symlink-p path-name))
-                                  (file-attributes path-name 'integer))))
-                   (and post-root post
-                        (file-directory-p root-name)
-                        (eq (file-attribute-type post-root) t)
-                        (equal (file-attribute-user-id post-root) (user-uid))
-                        (= (logand (file-modes root-name) #o7777) #o700)
-                        (equal root-identity
-                               (file-attribute-file-identifier post-root))
-                        (file-regular-p path-name)
-                        (null (file-attribute-type post))
-                        (equal (file-attribute-user-id post) (user-uid))
-                        (= (logand (file-modes path-name) #o7777) #o600)
-                        (= (file-attribute-size post) size)
-                        (equal identity (file-attribute-file-identifier post)))))
-      (error "unsafe published image"))
-    (cons 'image (list :type (emacs-jupyter-notebook-panel--published-image-type mime)
-                       :file path-name :ejn-artifact-bytes size
-                       :max-width emacs-jupyter-notebook-image-max-width
-                       :max-height emacs-jupyter-notebook-image-max-height
-                       :ejn-publication-root root-name
-                       :ejn-publication-root-identity root-identity
-                       :ejn-publication-identity identity
-                       :ejn-display-id display-id))))
+                 (= (file-attribute-size attrs) size))
+      (error "unsafe published artifact"))
+    (when ppm
+      (let* ((prefix
+              (let ((file-name-handler-alist nil)
+                    (coding-system-for-read 'no-conversion))
+                (with-temp-buffer
+                  (set-buffer-multibyte nil)
+                  (insert-file-contents-literally
+                   path-name nil 0
+                   (min size emacs-jupyter-notebook-panel--ppm-header-read-limit))
+                  (buffer-string))))
+             (metadata
+              (emacs-jupyter-notebook-panel--canonical-ppm-header-metadata
+               prefix size)))
+        (unless (and metadata
+                     (= (plist-get metadata :width) width)
+                     (= (plist-get metadata :height) height))
+          (error "unsafe PPM preview"))))
+    ;; Re-observe names after the optional bounded hash/read before ownership
+    ;; transfer.  This captures each publication's own device/inode.
+    (let ((post-root (and (not (file-symlink-p root-name))
+                          (file-attributes root-name 'integer)))
+          (post (and (not (file-symlink-p path-name))
+                     (file-attributes path-name 'integer))))
+      (unless (and post-root post
+                   (equal root-identity (file-attribute-file-identifier post-root))
+                   (equal identity (file-attribute-file-identifier post))
+                   (= (file-attribute-size post) size)
+                   (= (file-attribute-link-number post) 1)
+                   (= (logand (file-modes path-name) #o7777) #o600))
+        (error "published artifact changed during validation")))
+    (list :root root-name :root-identity root-identity :file path-name
+          :identity identity :sha256 sha256 :size size)))
 
-(defun ejn-panel-set-published-image (handle root path mime sha256 size root-identity &optional display-id)
-  "Append a validated helper-published image to HANDLE.
-On success the panel owns PATH's lifetime; helper disposal must leave it in
-place until this entry is cleared, replaced, evicted, or the panel exits.
-"
-  (when (ejn-panel-entry-live-p handle)
-    (ejn-panel-set-image
-     handle (emacs-jupyter-notebook-panel--published-image-spec
-             root path mime sha256 size root-identity display-id))
-    t))
-
-(defun ejn-panel-update-published-image (handle root path mime sha256 size root-identity &optional display-id)
-  "Replace DISPLAY-ID's panel image with a validated helper publication."
-  (when (ejn-panel-entry-live-p handle)
-    ;; An update with a display id cannot manufacture a new display.  Reject
-    ;; it before accepting a publication so its staging lease is discarded.
-    (when (or (null display-id)
-              (emacs-jupyter-notebook-panel--display-target
-               (plist-get handle :panel) display-id 'image))
-      (ejn-panel-update-image
-       handle (emacs-jupyter-notebook-panel--published-image-spec
-               root path mime sha256 size root-identity display-id) display-id)
-      t)))
+(defun emacs-jupyter-notebook-panel--published-image-bundle-spec (image)
+  "Validate nested IMAGE descriptor and construct its panel image spec.
+The original is an external-only compressed file.  The optional preview is a
+separate canonical PPM artifact; it is the only path that can reach Emacs's
+native image machinery."
+  (let* ((root (plist-get image :root))
+         (root-identity (plist-get image :root-identity))
+         (original-value (plist-get image :original))
+         (preview-value (plist-get image :preview))
+         (mime (plist-get image :mime)))
+    (unless (and (member mime '("image/png" "image/jpeg" "image/gif" "image/webp"))
+                 (listp original-value)
+                 (plist-member original-value :path)
+                 (plist-member original-value :size)
+                 (plist-member original-value :sha256)
+                 (plist-member image :preview)
+                 (or (null preview-value) (listp preview-value)))
+      (error "invalid published image bundle"))
+    (let* ((original (emacs-jupyter-notebook-panel--published-artifact-metadata
+                      root (plist-get original-value :path)
+                      (plist-get original-value :sha256)
+                      (plist-get original-value :size) root-identity
+                      emacs-jupyter-notebook-panel--max-published-original-bytes))
+           (preview
+            (and preview-value
+                 (let ((preview-mime (plist-get preview-value :mime))
+                       (width (plist-get preview-value :width))
+                       (height (plist-get preview-value :height)))
+                   (unless (and (equal preview-mime "image/x-portable-pixmap")
+                                (integerp width) (integerp height))
+                     (error "invalid published PPM metadata"))
+                   (append
+                    (emacs-jupyter-notebook-panel--published-artifact-metadata
+                     root (plist-get preview-value :path)
+                     (plist-get preview-value :sha256)
+                     (plist-get preview-value :size) root-identity
+                     emacs-jupyter-notebook-panel--max-published-preview-bytes
+                     t width height)
+                    (list :mime preview-mime :width width :height height)))))
+           ;; Keeping :file at the original for no-preview entries preserves
+           ;; placeholder and external-open ergonomics, but native admission
+           ;; below requires :ejn-preview and will never decode it.
+           (display-file (if preview (plist-get preview :file) (plist-get original :file)))
+           (display-identity (if preview (plist-get preview :identity)
+                             (plist-get original :identity))))
+      (cons 'image
+            (list :type (and preview 'pbm) :file display-file
+                  :max-width emacs-jupyter-notebook-image-max-width
+                  :max-height emacs-jupyter-notebook-image-max-height
+                  :ejn-original original :ejn-preview preview
+                  :ejn-artifact-bytes (+ (plist-get original :size)
+                                         (or (plist-get preview :size) 0))
+                  :ejn-publication-root (plist-get original :root)
+                  :ejn-publication-root-identity (plist-get original :root-identity)
+                  :ejn-publication-identity display-identity
+                  :ejn-original-mime mime
+                  :ejn-display-id (plist-get image :display-id)
+                  :ejn-materialized nil :ejn-retired nil
+                  :ejn-original-open-leases 0)))))
 
 (defun emacs-jupyter-notebook-panel--published-pickle (root path sha256 size root-identity)
   "Validate a published pickle and return its confined panel metadata.
@@ -1085,7 +1222,8 @@ The artifact is never read into Emacs.  The viewer verifies SHA-256 from the
 same identity-pinned bytes it executes in its bounded worker."
   (unless (and (stringp root) (file-name-absolute-p root)
                (stringp path) (file-name-absolute-p path)
-               (stringp sha256) (string-match-p "\\`[0-9a-f]\\{64\\}\\'" sha256)
+               (stringp sha256) (string-equal sha256 (downcase sha256))
+               (string-match-p "\\`[0-9a-f]\\{64\\}\\'" sha256)
                (integerp size) (>= size 0)
                (<= size emacs-jupyter-notebook-panel--max-published-pickle-bytes)
                root-identity)
@@ -1213,11 +1351,12 @@ pickle follows the image's existing cross-entry target."
                         (emacs-jupyter-notebook-panel--display-target
                          (plist-get handle :panel) display-id 'image)))
            (effective (or (car-safe target) handle)))
-      (when (and (or (null image-id) (null pickle-id)
+      (when (and (or image pickle)
+                 (or (null image-id) (null pickle-id)
                      (equal image-id pickle-id))
                  (or (not update-p) target))
-        ;; Resolve cheap display identity and target admission before touching
-        ;; file descriptors or constructing an image spec.
+        ;; Validate both publications before changing the entry.  Descriptor
+        ;; rejection therefore leaves the existing image/pickle bundle intact.
         (let ((pickle-meta
                (and pickle
                     (emacs-jupyter-notebook-panel--published-pickle
@@ -1226,37 +1365,100 @@ pickle follows the image's existing cross-entry target."
                      (plist-get pickle :root-identity))))
               (image-spec
                (and image
-                    (emacs-jupyter-notebook-panel--published-image-spec
-                     (plist-get image :root) (plist-get image :path)
-                     (plist-get image :mime) (plist-get image :sha256)
-                     (plist-get image :size) (plist-get image :root-identity)
-                     (plist-get image :display-id)))))
-        ;; Both paths normally enforce retention after each mutation.  Suppress
-        ;; that intermediate eviction: the bundle owns both files only after
-        ;; the target has accepted image and pickle together.
-        (let ((emacs-jupyter-notebook-panel-max-history-entries most-positive-fixnum)
-              (emacs-jupyter-notebook-panel-max-total-artifact-bytes most-positive-fixnum)
-              (emacs-jupyter-notebook-panel-max-pickles most-positive-fixnum))
-          (when image-spec
-            (if update-p
-                (ejn-panel-update-image effective image-spec display-id)
-              (ejn-panel-set-image effective image-spec)))
-          (when (and pickle-meta (ejn-panel-entry-live-p effective))
-            (emacs-jupyter-notebook-panel--set-pickle-metadata effective pickle-meta))
-          ;; A fresh image replaces the interactive figure associated with the
-          ;; target.  Do not leave a prior pickle available for `v'.
-          (when (and image-spec (null pickle-meta)
-                     (ejn-panel-entry-live-p effective))
-            (ejn-panel-clear-pickle effective)))
-        (when (and (ejn-panel-entry-live-p effective)
-                   (or (null pickle-meta)
-                       (equal (plist-get (ejn-panel-entry-snapshot effective) :mpl-pickle)
-                              pickle-meta)))
-          (emacs-jupyter-notebook-panel--prune-pickles
-           (plist-get effective :panel))
-          (emacs-jupyter-notebook-panel--enforce-retention-budgets
-           (plist-get effective :panel))
-          (and (ejn-panel-entry-live-p effective) effective)))))))
+                    (emacs-jupyter-notebook-panel--published-image-bundle-spec
+                     image)))
+              (panel (plist-get effective :panel))
+              (old-entry (ejn-panel-entry-snapshot effective))
+              old-images old-pickle old-timer replace-pickle-p new-entry committed)
+          (when old-entry
+            (setq old-pickle (plist-get old-entry :mpl-pickle)
+                  old-timer (plist-get old-entry :pickle-open-timer))
+            ;; Copy only mutable list structure.  Unchanged image specs keep
+            ;; object identity so an outstanding external-viewer lease is
+            ;; still released against the retained panel object.
+            (let* ((pending-clear (plist-get old-entry :pending-clear))
+                   (new (copy-sequence old-entry))
+                   (outputs
+                    (unless pending-clear
+                      (mapcar (lambda (segment)
+                                (cons (car segment) (cdr segment)))
+                              (plist-get old-entry :outputs)))))
+              (when pending-clear
+                (setq old-images (ejn-panel-entry-images old-entry))
+                (setq new
+                      (emacs-jupyter-notebook-panel--entry-reset-output-accounting
+                       new)))
+              (when image-spec
+                (if update-p
+                    (let ((matching
+                           (and (not pending-clear)
+                                (cl-find-if
+                                 (lambda (segment)
+                                   (and (eq (car segment) 'image)
+                                        (equal
+                                         (emacs-jupyter-notebook-panel--segment-display-id
+                                          segment)
+                                         display-id)))
+                                 (reverse outputs)))))
+                      (if matching
+                          (progn
+                            (setq old-images (list (cdr matching)))
+                            (setcdr matching image-spec))
+                        ;; clear_output(wait=True) deliberately turns the next
+                        ;; update into the first new output segment.
+                        (setq outputs
+                              (append outputs (list (cons 'image image-spec))))))
+                  (setq outputs
+                        (append outputs (list (cons 'image image-spec))))))
+              (setq new (plist-put new :outputs outputs))
+              ;; A new image without a pickle clears the stale interactive
+              ;; figure.  A pickle-only bundle leaves image output intact.
+              (setq replace-pickle-p (or pending-clear pickle-meta image-spec))
+              (when replace-pickle-p
+                (setq new (plist-put new :mpl-pickle pickle-meta))
+                (setq new (plist-put new :pickle-open-timer nil))
+                (setq new (plist-put new :pickle-open-token nil)))
+              (setq new (plist-put new :pending-clear nil))
+              (setq new
+                    (plist-put
+                     new :artifact-bytes
+                     (emacs-jupyter-notebook-panel--recompute-entry-artifact-bytes
+                      new)))
+              (setq new-entry new))
+            ;; No callback, process wait, or file operation occurs between the
+            ;; snapshot check and this single logical entry ownership swap.
+            (when (and new-entry (ejn-panel-entry-live-p effective)
+                       (eq old-entry (ejn-panel-entry-snapshot effective)))
+              (with-current-buffer panel
+                (cl-incf emacs-jupyter-notebook-panel--retained-text-bytes
+                         (- (emacs-jupyter-notebook-panel--entry-text-bytes new-entry)
+                            (emacs-jupyter-notebook-panel--entry-text-bytes old-entry)))
+                (cl-incf emacs-jupyter-notebook-panel--retained-artifact-bytes
+                         (- (emacs-jupyter-notebook-panel--entry-artifact-bytes new-entry)
+                            (emacs-jupyter-notebook-panel--entry-artifact-bytes old-entry))))
+              (emacs-jupyter-notebook-panel--set-entry
+               panel (plist-get effective :id) new-entry)
+              (setq committed t)
+              (condition-case err
+                  (emacs-jupyter-notebook-panel--schedule-render
+                   panel (plist-get effective :id) t)
+                (error
+                 (message "emacs-jupyter-notebook: panel render scheduling failed: %s"
+                          (error-message-string err)))))
+            (when committed
+              ;; Retirement is intentionally after the entry swap.  Any
+              ;; validation or construction error above leaves these live.
+              (dolist (old-image old-images)
+                (emacs-jupyter-notebook-panel--retire-image panel old-image))
+              (when (and replace-pickle-p old-pickle)
+                (when (timerp old-timer)
+                  (cancel-timer old-timer))
+                (emacs-jupyter-notebook-panel--retire-pickle old-pickle))
+              (when (and replace-pickle-p (timerp old-timer) (null old-pickle))
+                (cancel-timer old-timer))
+              (emacs-jupyter-notebook-panel--prune-pickles panel)
+              (emacs-jupyter-notebook-panel--enforce-retention-budgets panel)
+              effective)))))))
 
 (defun ejn-panel-acquire-pickle (handle)
   "Return HANDLE's pickle metadata with one viewer lifetime lease, or nil."
@@ -1291,35 +1493,72 @@ pickle follows the image's existing cross-entry target."
               (file-in-directory-p
                file emacs-jupyter-notebook-panel--image-directory)))))
 
+(defun emacs-jupyter-notebook-panel--delete-published-artifact (artifact)
+  "Delete ARTIFACT only while its root and file identities still match.
+This intentionally performs only stat-based identity validation.  Retirement
+must not hash or parse every retained image, especially during a large clear."
+  (when (listp artifact)
+    (let ((file (plist-get artifact :file))
+          (identity (plist-get artifact :identity))
+          (root (plist-get artifact :root))
+          (root-identity (plist-get artifact :root-identity)))
+      (cond
+       ((and (stringp file) (not (file-exists-p file))) t)
+       ((and (stringp file) identity root root-identity
+             (not (file-symlink-p root))
+             (not (file-symlink-p file))
+             (let ((root-attrs (file-attributes root 'integer))
+                   (attrs (file-attributes file 'integer)))
+               (and root-attrs attrs
+                    (file-directory-p root) (eq (file-attribute-type root-attrs) t)
+                    (= (logand (file-modes root) #o7777) #o700)
+                    (equal (file-attribute-user-id root-attrs) (user-uid))
+                    (equal root-identity
+                           (file-attribute-file-identifier root-attrs))
+                    (file-regular-p file) (null (file-attribute-type attrs))
+                    (= (file-attribute-link-number attrs) 1)
+                    (= (logand (file-modes file) #o7777) #o600)
+                    (equal (file-attribute-user-id attrs) (user-uid))
+                    (equal identity (file-attribute-file-identifier attrs)))))
+        (condition-case nil
+            (progn (delete-file file) (not (file-exists-p file)))
+          (error nil)))))))
+
+(defun emacs-jupyter-notebook-panel--retire-original-if-released (image)
+  "Delete IMAGE's original after both entry retirement and opener release."
+  (let ((props (cdr image)))
+    (when (and (plist-get props :ejn-retired)
+               (<= (or (plist-get props :ejn-original-open-leases) 0) 0))
+      (emacs-jupyter-notebook-panel--delete-published-artifact
+       (plist-get props :ejn-original)))))
+
 (defun emacs-jupyter-notebook-panel--retire-image (panel image)
-  "Flush IMAGE and delete its private PANEL-owned backing file."
+  "Flush materialized preview IMAGE and retire its owned artifact bundle."
   (when (and (consp image) (eq (car image) 'image))
-    (ignore-errors (image-flush image t))
+    (when (plist-get (cdr image) :ejn-materialized)
+      (when-let ((preview (emacs-jupyter-notebook-panel--native-preview-spec image)))
+        (ignore-errors (image-flush preview t)))
+      (plist-put (cdr image) :ejn-materialized nil))
     (let* ((props (cdr image))
            (file (plist-get props :file))
-           (identity (plist-get props :ejn-publication-identity))
-           (published (plist-get props :ejn-publication-root))
-           (root-identity (plist-get props :ejn-publication-root-identity)))
+           (preview (plist-get props :ejn-preview))
+           (original (plist-get props :ejn-original)))
+      (plist-put props :ejn-retired t)
       (cond
        ((emacs-jupyter-notebook-panel--owned-image-file-p panel file)
         (ignore-errors (delete-file file)))
-       ;; Never unlink a replacement or symlink at a former publication path.
-       ((and published root-identity identity (stringp file)
-             (not (file-symlink-p published))
-             (let ((root-attrs (file-attributes published 'integer)))
-               (and root-attrs
-                    (file-directory-p published)
-                    (eq (file-attribute-type root-attrs) t)
-                    (equal (file-attribute-user-id root-attrs) (user-uid))
-                    (= (logand (file-modes published) #o7777) #o700)
-                    (equal root-identity
-                           (file-attribute-file-identifier root-attrs))))
-             (not (file-symlink-p file))
-             (equal identity
-                    (and (file-exists-p file)
-                         (file-attribute-file-identifier
-                          (file-attributes file 'integer)))))
-        (ignore-errors (delete-file file)))))))
+       (preview
+        (emacs-jupyter-notebook-panel--delete-published-artifact preview))
+       ;; Legacy file-backed specs still use their captured publication fields.
+       ((and (not original)
+             (plist-get props :ejn-publication-root)
+             (plist-get props :ejn-publication-identity))
+        (emacs-jupyter-notebook-panel--delete-published-artifact
+         (list :root (plist-get props :ejn-publication-root)
+               :root-identity (plist-get props :ejn-publication-root-identity)
+               :file file :identity (plist-get props :ejn-publication-identity)))))
+      (when original
+        (emacs-jupyter-notebook-panel--retire-original-if-released image)))))
 
 (defun emacs-jupyter-notebook-panel--retire-outputs (panel outputs)
   "Retire every image spec in OUTPUTS owned by PANEL."
@@ -1461,8 +1700,6 @@ normal Emacs exit; it never consults source, registry, SSH, or kernel state."
                       (cdr cell))))
           (emacs-jupyter-notebook-panel--retire-pickle (plist-get entry :mpl-pickle))
           (setcdr cell (plist-put entry :mpl-pickle nil))))
-      (dolist (spec emacs-jupyter-notebook-panel--inline-image-specs)
-        (ignore-errors (image-flush spec t)))
       (setq emacs-jupyter-notebook-panel--inline-image-specs nil)
       ;; Removing the whole private directory also catches an orphan created
       ;; by a partially failed materialization.
@@ -2110,6 +2347,8 @@ Also coerces a non-numeric `:scale' (Emacs 29+ reports the symbol
          (seg (and seg-index (nth seg-index outputs)))
          (image (and seg (eq (car seg) 'image) (cdr seg))))
     (when (and image (consp image) (eq (car image) 'image))
+      (unless (emacs-jupyter-notebook-panel--native-image-safe-p image)
+        (user-error "Image is retained for external viewing only"))
       (let* ((raw (plist-get (cdr image) :scale))
              (scale (if (numberp raw) raw 1.0))
              (new-scale (max 0.05 (* scale factor)))
@@ -2117,7 +2356,8 @@ Also coerces a non-numeric `:scale' (Emacs 29+ reports the symbol
                              unless (memq k '(:scale :max-width :max-height))
                              collect k and collect v))
              (new-image (cons 'image (append props (list :scale new-scale)))))
-        (ignore-errors (image-flush image))
+        (when-let ((preview (emacs-jupyter-notebook-panel--native-preview-spec image)))
+          (ignore-errors (image-flush preview)))
         ;; Mutate the segment in place; the entry list structure is shared
         ;; with the stored entry, so the new spec persists across renders.
         (setcdr seg new-image)
@@ -2363,18 +2603,340 @@ placeholders.  On an entry header, fall back to its first image segment."
   #'emacs-jupyter-notebook-panel--external-open-default
   "Function called with an image file path to open it externally.")
 
+(defvar emacs-jupyter-notebook-panel--external-image-snapshots nil
+  "Verified external-viewer snapshots retained until their handoff deadline.")
+
+(defvar emacs-jupyter-notebook-panel--external-image-pending-count 0
+  "Number of image snapshot verifier jobs currently in flight.")
+
+(defvar emacs-jupyter-notebook-panel--external-image-pending-cancels nil
+  "Cancellation functions for image snapshot verifier jobs in flight.")
+
+(defun emacs-jupyter-notebook-panel--original-for-external-open (image)
+  "Return IMAGE's identity-pinned original for asynchronous verification."
+  (let* ((props (cdr image))
+         (original (plist-get props :ejn-original)))
+    (unless (listp original)
+      (error "Image original is unavailable"))
+    (emacs-jupyter-notebook-panel--published-artifact-metadata
+     (plist-get original :root) (plist-get original :file)
+     (plist-get original :sha256) (plist-get original :size)
+     (plist-get original :root-identity)
+     emacs-jupyter-notebook-panel--max-published-original-bytes)
+    original))
+
+(defun emacs-jupyter-notebook-panel--artifact-verifier-script ()
+  "Return the bundled asynchronous artifact verifier path, or nil."
+  (let* ((base (or emacs-jupyter-notebook-result--load-file
+                   (locate-library "emacs-jupyter-notebook-result")))
+         (dirs
+          (when base
+            (let ((source (concat (file-name-sans-extension base) ".el")))
+              (delq nil
+                    (list (file-name-directory base)
+                          (file-name-directory (file-truename base))
+                          (and (file-exists-p source)
+                               (file-name-directory (file-truename source)))))))))
+    (cl-loop for directory in (delete-dups dirs)
+             for script = (expand-file-name
+                           "helper/ejn_helper/artifact_verify.py" directory)
+             when (file-regular-p script) return script)))
+
+(defun emacs-jupyter-notebook-panel--identity-parts (identity)
+  "Return numeric device/inode parts from Emacs file IDENTITY."
+  (let ((inode (car-safe identity))
+        (device (cond
+                 ((and (consp identity) (consp (cdr identity))
+                       (null (cddr identity)))
+                  (cadr identity))
+                 ((and (consp identity) (integerp (cdr identity)))
+                  (cdr identity)))))
+    (unless (and (integerp device) (integerp inode)
+                 (>= device 0) (>= inode 0))
+      (error "Invalid artifact identity"))
+    (list device inode)))
+
+(defconst emacs-jupyter-notebook-panel--original-verify-timeout 10
+  "Maximum seconds allowed for one local original-file verification.")
+
+(defun emacs-jupyter-notebook-panel--verify-original-async
+    (original snapshot callback)
+  "Verify ORIGINAL into SNAPSHOT asynchronously, then call CALLBACK.
+CALLBACK receives non-nil only after the exact verified bytes have been
+durably copied into SNAPSHOT.  Return a no-argument cancellation function."
+  (let* ((python (and (stringp emacs-jupyter-notebook-local-python-command)
+                      (if (file-name-absolute-p
+                           emacs-jupyter-notebook-local-python-command)
+                          (and (file-executable-p
+                                emacs-jupyter-notebook-local-python-command)
+                               emacs-jupyter-notebook-local-python-command)
+                        (executable-find
+                         emacs-jupyter-notebook-local-python-command))))
+         (script (emacs-jupyter-notebook-panel--artifact-verifier-script))
+         (root-id (emacs-jupyter-notebook-panel--identity-parts
+                   (plist-get original :root-identity)))
+         (file-id (emacs-jupyter-notebook-panel--identity-parts
+                   (plist-get original :identity))))
+    (unless python
+      (error "Local Python command %S not found on `exec-path'"
+             emacs-jupyter-notebook-local-python-command))
+    (unless script
+      (error "Bundled image artifact verifier is unavailable"))
+    (let (process timer settled)
+      (cl-labels
+          ((finish (valid)
+             (unless settled
+               (setq settled t)
+               (when (timerp timer) (cancel-timer timer))
+               (when (and (processp process) (process-live-p process))
+                 (delete-process process))
+               (funcall callback valid))))
+        (setq process
+              (make-process
+               :name (generate-new-buffer-name "ejn-image-verify")
+               :buffer nil
+               :command
+               (list python "-I" script
+                     (plist-get original :root) (plist-get original :file)
+                     (number-to-string (nth 0 root-id))
+                     (number-to-string (nth 1 root-id))
+                     (number-to-string (nth 0 file-id))
+                     (number-to-string (nth 1 file-id))
+                     (number-to-string (plist-get original :size))
+                     (plist-get original :sha256)
+                     (plist-get snapshot :root)
+                     (plist-get snapshot :file))
+               :connection-type 'pipe
+               :noquery t
+               :sentinel
+               (lambda (current _event)
+                 (unless (process-live-p current)
+                   (finish (and (eq (process-status current) 'exit)
+                                (= (process-exit-status current) 0)))))))
+        (setq timer
+              (run-at-time
+               emacs-jupyter-notebook-panel--original-verify-timeout nil
+               (lambda () (finish nil))))
+        (lambda ()
+          (unless settled
+            (when (and (processp process) (process-live-p process))
+              (delete-process process))
+            (finish nil)))))))
+
+(defvar emacs-jupyter-notebook-panel-original-verify-function
+  #'emacs-jupyter-notebook-panel--verify-original-async
+  "Function called with original, snapshot, and async boolean callback.
+It returns a no-argument function which cancels the pending verification.")
+
+(defun emacs-jupyter-notebook-panel--release-original-open (image)
+  "Release one external-opener lease and finish deferred bundle retirement."
+  (let ((props (cdr image)))
+    (when (> (or (plist-get props :ejn-original-open-leases) 0) 0)
+      (plist-put props :ejn-original-open-leases
+                 (1- (plist-get props :ejn-original-open-leases))))
+    (emacs-jupyter-notebook-panel--retire-original-if-released image)))
+
+(defun emacs-jupyter-notebook-panel--external-image-suffix (mime)
+  "Return the conventional file suffix for image MIME."
+  (pcase mime
+    ("image/png" ".png")
+    ("image/jpeg" ".jpg")
+    ("image/gif" ".gif")
+    ("image/webp" ".webp")
+    (_ ".img")))
+
+(defun emacs-jupyter-notebook-panel--snapshot-root-safe-p (snapshot)
+  "Return non-nil when SNAPSHOT's private root still has its captured identity."
+  (let* ((root (plist-get snapshot :root))
+         (attrs (and (stringp root) (not (file-symlink-p root))
+                     (file-attributes root 'integer))))
+    (and attrs (file-directory-p root) (eq (file-attribute-type attrs) t)
+         (equal (file-attribute-user-id attrs) (user-uid))
+         (= (logand (file-modes root) #o7777) #o700)
+         (equal (plist-get snapshot :root-identity)
+                (file-attribute-file-identifier attrs)))))
+
+(defun emacs-jupyter-notebook-panel--cleanup-external-image-snapshot (snapshot)
+  "Retire the exact private SNAPSHOT without following replaced names."
+  (when (timerp (plist-get snapshot :timer))
+    (cancel-timer (plist-get snapshot :timer)))
+  (setq emacs-jupyter-notebook-panel--external-image-snapshots
+        (delq snapshot emacs-jupyter-notebook-panel--external-image-snapshots))
+  (let ((artifact (plist-get snapshot :artifact))
+        (file (plist-get snapshot :file))
+        (root (plist-get snapshot :root)))
+    (if artifact
+        (emacs-jupyter-notebook-panel--delete-published-artifact artifact)
+      ;; A killed verifier may leave only its known partial destination.
+      (when (and (emacs-jupyter-notebook-panel--snapshot-root-safe-p snapshot)
+                 (stringp file)
+                 (equal (file-name-directory file)
+                        (file-name-as-directory root))
+                 (not (file-symlink-p file))
+                 (file-regular-p file))
+        (ignore-errors (delete-file file))))
+    (when (and (emacs-jupyter-notebook-panel--snapshot-root-safe-p snapshot)
+               (null (directory-files root nil directory-files-no-dot-files-regexp)))
+      (ignore-errors (delete-directory root)))))
+
+(defun emacs-jupyter-notebook-panel--make-external-image-snapshot (mime)
+  "Create and return an empty private snapshot descriptor for MIME."
+  (let ((root (make-temp-file "ejn-image-open-" t)))
+    (set-file-modes root #o700)
+    (list :root (directory-file-name (expand-file-name root))
+          :root-identity
+          (file-attribute-file-identifier (file-attributes root 'integer))
+          :file (expand-file-name
+                 (concat "original"
+                         (emacs-jupyter-notebook-panel--external-image-suffix mime))
+                 root)
+          :artifact nil :timer nil)))
+
+(defun emacs-jupyter-notebook-panel--register-external-image-snapshot
+    (snapshot original)
+  "Admit verified SNAPSHOT for ORIGINAL and schedule its bounded retirement."
+  (let ((artifact
+         (emacs-jupyter-notebook-panel--published-artifact-metadata
+          (plist-get snapshot :root) (plist-get snapshot :file)
+          (plist-get original :sha256) (plist-get original :size)
+          (plist-get snapshot :root-identity)
+          emacs-jupyter-notebook-panel--max-published-original-bytes)))
+    (plist-put snapshot :artifact artifact)
+    (push snapshot emacs-jupyter-notebook-panel--external-image-snapshots)
+    (plist-put
+     snapshot :timer
+     (run-at-time
+      (max 1 emacs-jupyter-notebook-external-image-snapshot-ttl) nil
+      #'emacs-jupyter-notebook-panel--cleanup-external-image-snapshot snapshot))
+    snapshot))
+
+(defun emacs-jupyter-notebook-panel--cleanup-external-image-opens-on-exit ()
+  "Cancel verifier jobs and remove retained external-viewer snapshots."
+  (dolist (cancel (copy-sequence
+                   emacs-jupyter-notebook-panel--external-image-pending-cancels))
+    (ignore-errors (funcall cancel)))
+  (dolist (snapshot (copy-sequence
+                     emacs-jupyter-notebook-panel--external-image-snapshots))
+    (emacs-jupyter-notebook-panel--cleanup-external-image-snapshot snapshot)))
+
+(add-hook 'kill-emacs-hook
+          #'emacs-jupyter-notebook-panel--cleanup-external-image-opens-on-exit)
+
+(defun emacs-jupyter-notebook-panel--start-external-image-open
+    (image original snapshot)
+  "Verify IMAGE's ORIGINAL into SNAPSHOT and launch its external viewer."
+  (let* ((props (cdr image))
+         (token (cons 'ejn-image-open nil))
+         (settled nil)
+         (lease-released nil)
+         verifier-cancel cancel-function)
+    (cl-labels
+        ((release-original ()
+           (unless lease-released
+             (setq lease-released t)
+             (emacs-jupyter-notebook-panel--release-original-open image)))
+         (finish (valid &optional quiet)
+           (unless settled
+             (setq settled t)
+             (setq emacs-jupyter-notebook-panel--external-image-pending-cancels
+                   (delq cancel-function
+                         emacs-jupyter-notebook-panel--external-image-pending-cancels))
+             (setq emacs-jupyter-notebook-panel--external-image-pending-count
+                   (max 0 (1- emacs-jupyter-notebook-panel--external-image-pending-count)))
+             (when (eq (plist-get props :ejn-original-open-pending) token)
+               (plist-put props :ejn-original-open-pending nil)
+               (plist-put props :ejn-original-open-cancel nil))
+             (if (not valid)
+                 (progn
+                   (emacs-jupyter-notebook-panel--cleanup-external-image-snapshot
+                    snapshot)
+                   (release-original)
+                   (unless quiet
+                     (message
+                      "emacs-jupyter-notebook: image original failed verification")))
+               (condition-case err
+                   (let ((registered
+                          (emacs-jupyter-notebook-panel--register-external-image-snapshot
+                           snapshot original)))
+                     ;; The verifier's durable snapshot, rather than launcher
+                     ;; process lifetime, now owns the external handoff.
+                     (release-original)
+                     (funcall emacs-jupyter-notebook-panel-external-open-function
+                              (plist-get registered :file)))
+                 (error
+                  (emacs-jupyter-notebook-panel--cleanup-external-image-snapshot
+                   snapshot)
+                  (release-original)
+                  (message
+                   "emacs-jupyter-notebook: external image opener failed: %s"
+                   (error-message-string err)))))))
+         (cancel ()
+           (unless settled
+             ;; Settle ownership before killing the process.  Its sentinel may
+             ;; run synchronously from `delete-process', but the callback will
+             ;; then observe SETTLED and cannot release anything twice.
+             (finish nil t)
+             (when (functionp verifier-cancel)
+               (ignore-errors (funcall verifier-cancel))))))
+      (setq cancel-function (lambda () (cancel)))
+      (plist-put props :ejn-original-open-pending token)
+      (plist-put props :ejn-original-open-cancel cancel-function)
+      (plist-put props :ejn-original-open-leases
+                 (1+ (or (plist-get props :ejn-original-open-leases) 0)))
+      (cl-incf emacs-jupyter-notebook-panel--external-image-pending-count)
+      (push cancel-function
+            emacs-jupyter-notebook-panel--external-image-pending-cancels)
+      (condition-case err
+          (setq verifier-cancel
+                (funcall emacs-jupyter-notebook-panel-original-verify-function
+                         original snapshot (lambda (valid) (finish valid))))
+        (error
+         (cancel)
+         (signal (car err) (cdr err))))
+      cancel-function)))
+
 (defun emacs-jupyter-notebook-panel-open-image-externally ()
-  "Open the original static image at point in an external application."
+  "Open the original static image at point in an external application.
+A second invocation while its verifier is pending cancels that request."
   (interactive)
   (unless (derived-mode-p 'emacs-jupyter-notebook-panel-mode)
     (user-error "Not in an EJN output panel"))
   (let* ((image (emacs-jupyter-notebook-panel--image-at-point))
-         (file (and image (plist-get (cdr image) :file))))
+         (props (and image (cdr image))))
     (unless image
       (user-error "No image on this entry"))
-    (unless (and (stringp file) (file-readable-p file))
-      (user-error "Image original is unavailable"))
-    (funcall emacs-jupyter-notebook-panel-external-open-function file)))
+    (if (not (plist-member props :ejn-publication-root))
+        ;; Legacy/local images are already ordinary local files and never carry
+        ;; helper publication metadata.  Keep that non-blocking opener path.
+        (let ((file (plist-get props :file)))
+          (unless (and (stringp file) (file-readable-p file))
+            (user-error "Image original is unavailable"))
+          (funcall emacs-jupyter-notebook-panel-external-open-function file))
+      (condition-case err
+          (if-let ((cancel (plist-get props :ejn-original-open-cancel)))
+              (progn
+                (funcall cancel)
+                (message "emacs-jupyter-notebook: cancelled pending image open"))
+            (let ((limit emacs-jupyter-notebook-external-image-max-snapshots))
+              (unless (and (integerp limit) (> limit 0))
+                (user-error "External image snapshots are disabled"))
+              (when (>= (+ emacs-jupyter-notebook-panel--external-image-pending-count
+                           (length emacs-jupyter-notebook-panel--external-image-snapshots))
+                        limit)
+                (user-error "External image snapshot limit reached"))
+              (let ((original
+                     (emacs-jupyter-notebook-panel--original-for-external-open image))
+                    (snapshot
+                     (emacs-jupyter-notebook-panel--make-external-image-snapshot
+                      (plist-get props :ejn-original-mime))))
+                (condition-case start-error
+                    (emacs-jupyter-notebook-panel--start-external-image-open
+                     image original snapshot)
+                  (error
+                   (emacs-jupyter-notebook-panel--cleanup-external-image-snapshot
+                    snapshot)
+                   (signal (car start-error) (cdr start-error)))))))
+        (error (user-error "%s" (error-message-string err)))))))
 
 (defun emacs-jupyter-notebook-panel--entry-pickle-at-point ()
   "Acquire the matplotlib pickle for the panel entry at point, or nil."

@@ -553,7 +553,9 @@ class JupyterBackend:
         if not isinstance(artifact_dir, str):
             raise BackendError("invalid-request")
         try:
-            self._output_attachment = self._outputs.attach(artifact_dir)
+            self._output_attachment = self._outputs.attach(
+                artifact_dir, image_max_pixels=params.get("image_max_pixels")
+            )
         except Exception as exc:
             raise BackendError("invalid-request") from exc
         client = AsyncKernelClient()

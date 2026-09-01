@@ -437,6 +437,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                 "params": {
                     "connection_file": "/tmp/connection.json",
                     "artifact_dir": "/tmp/artifacts",
+                    "image_max_pixels": 4_194_304,
                 },
             },
             1_048_576,
@@ -490,7 +491,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("private backend failure")
 
         hello = encode({"v": 1, "kind": "request", "id": "h", "op": "hello", "params": {"versions": [1]}}, 1_048_576)
-        connect = encode({"v": 1, "kind": "request", "id": "c", "op": "connect", "params": {"connection_file": "/tmp/x", "artifact_dir": "/tmp/y"}}, 1_048_576)
+        connect = encode({"v": 1, "kind": "request", "id": "c", "op": "connect", "params": {"connection_file": "/tmp/x", "artifact_dir": "/tmp/y", "image_max_pixels": 4_194_304}}, 1_048_576)
         reader, writer, stderr, backend = asyncio.StreamReader(), _Writer(), io.BytesIO(), BoomBackend()
         reader.feed_data(hello + connect)
         reader.feed_eof()
@@ -522,7 +523,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                 return _Cancellation()
 
         hello = encode({"v": 1, "kind": "request", "id": "h", "op": "hello", "params": {"versions": [1]}}, 1_048_576)
-        connect = encode({"v": 1, "kind": "request", "id": "c", "op": "connect", "params": {"connection_file": "/tmp/x", "artifact_dir": "/tmp/y"}}, 1_048_576)
+        connect = encode({"v": 1, "kind": "request", "id": "c", "op": "connect", "params": {"connection_file": "/tmp/x", "artifact_dir": "/tmp/y", "image_max_pixels": 4_194_304}}, 1_048_576)
         credit = encode({"v": 1, "kind": "request", "id": "g", "op": "grant_event_credit", "params": {"bytes": 10_000}}, 1_048_576)
         execute = encode({"v": 1, "kind": "request", "id": "e", "op": "execute", "params": {"code": "x"}}, 1_048_576)
         reader, writer, stderr, backend = asyncio.StreamReader(), _Writer(), io.BytesIO(), ReentrantBackend()
@@ -546,7 +547,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stop_disposes_active_connect_and_active_request_once(self):
         hello = encode({"v": 1, "kind": "request", "id": "h", "op": "hello", "params": {"versions": [1]}}, 1_048_576)
-        connect = encode({"v": 1, "kind": "request", "id": "c", "op": "connect", "params": {"connection_file": "/tmp/x", "artifact_dir": "/tmp/y"}}, 1_048_576)
+        connect = encode({"v": 1, "kind": "request", "id": "c", "op": "connect", "params": {"connection_file": "/tmp/x", "artifact_dir": "/tmp/y", "image_max_pixels": 4_194_304}}, 1_048_576)
         execute = encode({"v": 1, "kind": "request", "id": "e", "op": "execute", "params": {"code": "x"}}, 1_048_576)
 
         active_connect = _HoldingBackend(attach=False)
@@ -676,7 +677,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_protocol_close_finishes_busy_request_before_close_ack(self):
         hello = encode({"v": 1, "kind": "request", "id": "h", "op": "hello", "params": {"versions": [1]}}, 1_048_576)
-        connect = encode({"v": 1, "kind": "request", "id": "c", "op": "connect", "params": {"connection_file": "/tmp/x", "artifact_dir": "/tmp/y"}}, 1_048_576)
+        connect = encode({"v": 1, "kind": "request", "id": "c", "op": "connect", "params": {"connection_file": "/tmp/x", "artifact_dir": "/tmp/y", "image_max_pixels": 4_194_304}}, 1_048_576)
         execute = encode({"v": 1, "kind": "request", "id": "e", "op": "execute", "params": {"code": "x"}}, 1_048_576)
         close = encode({"v": 1, "kind": "request", "id": "z", "op": "close", "params": {}}, 1_048_576)
         backend = _HoldingBackend(attach=True)

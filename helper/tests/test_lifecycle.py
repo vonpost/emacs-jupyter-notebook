@@ -122,7 +122,7 @@ class LifecycleBackendTests(unittest.IsolatedAsyncioTestCase):
         complete = asyncio.get_running_loop().create_future()
         backend.start(
             "connect",
-            {"connection_file": str(connection), "artifact_dir": str(artifacts)},
+            {"connection_file": str(connection), "artifact_dir": str(artifacts), "image_max_pixels": 4_194_304},
             lambda _event: None,
             complete.set_result,
         )

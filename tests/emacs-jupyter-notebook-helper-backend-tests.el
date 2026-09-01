@@ -16,6 +16,14 @@
 (defun ejn-ei2-test--object (&rest pairs)
   (apply #'emacs-jupyter-notebook-helper-backend--make-object pairs))
 
+(defun ejn-ei4d-test--image-descriptor (path bytes sha256 &optional preview)
+  "Return the required nested helper image descriptor for test fixtures."
+  (let ((original (ejn-ei2-test--object
+                   "path" path "bytes" bytes "sha256" sha256)))
+    (if preview
+        (ejn-ei2-test--object "original" original "preview" preview)
+      (ejn-ei2-test--object "original" original))))
+
 (defun ejn-ei2-test--response (&optional result)
   (ejn-ei2-test--object "ok" t "result" (or result (make-hash-table :test #'equal))))
 
@@ -1204,9 +1212,8 @@ DISPOSALS receives local-only disposal reasons."
              "data" (ejn-ei2-test--object
                       "data" (ejn-ei2-test--object
                               "image/png"
-                              (ejn-ei2-test--object
-                               "path" path "bytes" 4
-                               "sha256" (make-string 64 ?a)))
+                              (ejn-ei4d-test--image-descriptor
+                               path 4 (make-string 64 ?a)))
                       "metadata" (if malformed "bad" (ejn-ei2-test--object)))))))
     (unwind-protect
         (progn
@@ -1273,9 +1280,8 @@ DISPOSALS receives local-only disposal reasons."
               "data" (ejn-ei2-test--object
                        "data" (ejn-ei2-test--object
                                "image/png"
-                               (ejn-ei2-test--object
-                                "path" image-path "bytes" 10
-                                "sha256" (make-string 64 ?a))
+                               (ejn-ei4d-test--image-descriptor
+                                image-path 10 (make-string 64 ?a))
                                "application/x-ejn-mpl-pickle"
                                (ejn-ei2-test--object
                                 "path" pickle-path "bytes" 11
@@ -1332,9 +1338,9 @@ DISPOSALS receives local-only disposal reasons."
     (should (eq (plist-get normalized :require-display-id) t))
     (should (equal (gethash "display_id" (plist-get normalized :transient))
                    "plot-1"))
-    (let* ((artifact (ejn-ei2-test--object
-                      "path" "/tmp/ejn-ei4-root/ejn-artifact-1"
-                      "bytes" 12 "sha256" (make-string 64 ?a)))
+    (let* ((artifact (ejn-ei4d-test--image-descriptor
+                      "/tmp/ejn-ei4-root/ejn-artifact-1"
+                      12 (make-string 64 ?a)))
            (artifact-event
             (ejn-ei2-test--object
              "event" "display_data"
@@ -1350,9 +1356,9 @@ DISPOSALS receives local-only disposal reasons."
              :ejn-published-image)))
       (should (equal (plist-get publication :root) "/tmp/ejn-ei4-root"))
       (should (equal (plist-get publication :root-identity) '(7 . 11)))
-      (should (equal (plist-get publication :path)
+      (should (equal (plist-get (plist-get publication :original) :path)
                      "/tmp/ejn-ei4-root/ejn-artifact-1"))
-      (should (= (plist-get publication :size) 12)))
+      (should (= (plist-get (plist-get publication :original) :size) 12)))
     (puthash "update" "not-a-boolean" (gethash "data" raw))
     (should-error
      (emacs-jupyter-notebook-helper-backend--normalize-event state raw))))
@@ -1362,21 +1368,80 @@ DISPOSALS receives local-only disposal reasons."
   (let* ((state (emacs-jupyter-notebook-helper-backend--make-state
                  :artifact-dir "/tmp/ejn-ei4v-root" :artifact-identity '(7 11)))
          (sha (make-string 64 ?a))
-         (descriptor (lambda (name bytes)
-                       (ejn-ei2-test--object "path" (concat "/tmp/ejn-ei4v-root/" name)
-                                              "bytes" bytes "sha256" sha)))
+         (leaf (lambda (name bytes)
+                 (ejn-ei2-test--object
+                  "path" (concat "/tmp/ejn-ei4v-root/" name)
+                  "bytes" bytes "sha256" sha)))
          (raw (ejn-ei2-test--object
                "event" "display_data"
                "data" (ejn-ei2-test--object
                        "data" (ejn-ei2-test--object
-                               "image/png" (funcall descriptor "ejn-artifact-11111111111111111111111111111111" 4)
-                               "application/x-ejn-mpl-pickle" (funcall descriptor "ejn-artifact-22222222222222222222222222222222" 6))
+                               "image/png"
+                               (ejn-ei2-test--object
+                                "original"
+                                (funcall leaf
+                                         "ejn-artifact-11111111111111111111111111111111"
+                                         4))
+                               "application/x-ejn-mpl-pickle"
+                               (funcall leaf
+                                        "ejn-artifact-22222222222222222222222222222222"
+                                        6))
                        "metadata" (ejn-ei2-test--object))))
          (data (plist-get (emacs-jupyter-notebook-helper-backend--normalize-event state raw)
                           :data)))
-    (should (equal (plist-get (plist-get data :ejn-published-image) :size) 4))
+    (should (equal (plist-get (plist-get (plist-get data :ejn-published-image)
+                                          :original)
+                              :size)
+                   4))
     (should (equal (plist-get (plist-get data :ejn-published-pickle) :size) 6))
     (should-not (string-match-p "base64" (prin1-to-string data)))))
+
+(ert-deftest ejn-ei4d-image-descriptors-require-exact-bounded-metadata ()
+  "Helper image descriptors require an original and validate PPM previews."
+  (let ((state (emacs-jupyter-notebook-helper-backend--make-state
+                :artifact-dir "/tmp/ejn-ei4d-root" :artifact-identity '(7 . 11))))
+    (cl-labels
+        ((raw (descriptor &optional mime)
+           (ejn-ei2-test--object
+            "event" "display_data"
+            "data" (ejn-ei2-test--object
+                    "data" (ejn-ei2-test--object
+                            (or mime "image/png")
+                            descriptor)
+                    "metadata" (ejn-ei2-test--object)))))
+      (let* ((original (ejn-ei2-test--object
+                        "path" "/tmp/ejn-ei4d-root/ejn-artifact-11111111111111111111111111111111"
+                        "bytes" 4 "sha256" (make-string 64 ?a)))
+             (preview (ejn-ei2-test--object
+                       "path" "/tmp/ejn-ei4d-root/ejn-artifact-22222222222222222222222222222222"
+                       "bytes" 17 "sha256" (make-string 64 ?b)
+                       "mime" "image/x-portable-pixmap" "width" 2 "height" 1))
+             (descriptor (ejn-ei2-test--object "original" original "preview" preview))
+             (publication
+              (plist-get
+               (plist-get (emacs-jupyter-notebook-helper-backend--normalize-event
+                           state (raw descriptor))
+                          :data)
+               :ejn-published-image)))
+        (should (equal (plist-get (plist-get publication :original) :size) 4))
+        (should (equal (plist-get (plist-get publication :preview) :mime)
+                       "image/x-portable-pixmap"))
+        (dolist (bad (list
+                      (ejn-ei2-test--object)
+                      (ejn-ei2-test--object
+                       "original"
+                       (ejn-ei2-test--object
+                        "path" "/tmp/ejn-ei4d-root/ejn-artifact-uppercase"
+                        "bytes" 4 "sha256" (make-string 64 ?A)))
+                      (ejn-ei2-test--object "original" original "preview"
+                                            (ejn-ei2-test--object "path" "x"))
+                      (ejn-ei2-test--object "original" original "preview"
+                                            (ejn-ei2-test--object
+                                             "path" "/tmp/x" "bytes" 1
+                                             "sha256" (make-string 64 ?a)
+                                             "mime" "image/png" "width" 1 "height" 1)))))
+          (should-error
+           (emacs-jupyter-notebook-helper-backend--normalize-event state (raw bad)))))))
 
 (provide 'emacs-jupyter-notebook-helper-backend-tests)
 

@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+import zlib
 from pathlib import Path
 from unittest import mock
 
@@ -41,6 +42,31 @@ def contains(value, needle):
     return False
 
 
+def png(width=2, height=3):
+    """Return a minimal CRC-valid PNG IHDR prefix for descriptor tests."""
+    ihdr = (
+        b"IHDR"
+        + width.to_bytes(4, "big")
+        + height.to_bytes(4, "big")
+        + b"\x08\x02\x00\x00\x00"
+    )
+    return (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0d"
+        + ihdr
+        + zlib.crc32(ihdr).to_bytes(4, "big")
+    )
+
+
+def jpeg(width=2, height=3):
+    """Return a minimal baseline JPEG frame header for descriptor tests."""
+    return (
+        b"\xff\xd8\xff\xc0\x00\x0b\x08"
+        + height.to_bytes(2, "big")
+        + width.to_bytes(2, "big")
+        + b"\x01\x01\x11\x00\xff\xd9"
+    )
+
+
 class _BlockingStore:
     def __init__(self, directory):
         self.store = ArtifactStore(directory)
@@ -50,11 +76,20 @@ class _BlockingStore:
         self.discard_release = threading.Event()
         self.block_discard = False
         self.closed = False
+        self.source_pixel_limits = []
 
     def store_base64(self, payload):
         self.entered.set()
         self.release.wait(2)
         return self.store.store_base64(payload)
+
+    def make_image(self, payload, mime, *, max_source_pixels):
+        self.source_pixel_limits.append(max_source_pixels)
+        self.entered.set()
+        self.release.wait(2)
+        return self.store.make_image(
+            payload, mime, max_source_pixels=max_source_pixels
+        )
 
     def discard(self, published):
         if self.block_discard:
@@ -83,6 +118,61 @@ class OutputNormalizerTests(unittest.IsolatedAsyncioTestCase):
     async def submit(self, request_id, item, deliver=None):
         self.normalizer.submit(request_id, item, self.events.append if deliver is None else deliver)
         await asyncio.wait_for(self.normalizer.finish(request_id), 2)
+
+    async def test_zero_image_max_pixels_retains_original_without_sanitizer(self):
+        store = ArtifactStore(self.directory)
+        normalizer = OutputNormalizer(artifact_store=store, image_max_pixels=0)
+        payload = base64.b64encode(png()).decode("ascii")
+        try:
+            with mock.patch.object(store, "make_image", side_effect=AssertionError):
+                normalizer.submit(
+                    "zero",
+                    message(
+                        "display_data",
+                        {"data": {"image/png": payload}, "metadata": {}},
+                    ),
+                    self.events.append,
+                )
+                await asyncio.wait_for(normalizer.finish("zero"), 1)
+            descriptor = self.events[-1].data["data"]["image/png"]
+            self.assertIn("original", descriptor)
+            self.assertNotIn("preview", descriptor)
+        finally:
+            normalizer.close()
+            await normalizer.wait_closed()
+
+    async def test_attachment_image_max_pixels_is_isolated_per_generation(self):
+        old_dir = Path(self.temporary.name) / "old-limit"
+        new_dir = Path(self.temporary.name) / "new-limit"
+        old_dir.mkdir(mode=0o700)
+        new_dir.mkdir(mode=0o700)
+        store = _BlockingStore(old_dir)
+        normalizer = OutputNormalizer()
+        old = normalizer.attach(artifact_store=store, image_max_pixels=1)
+        payload = base64.b64encode(png()).decode("ascii")
+        try:
+            normalizer.submit(
+                old,
+                "old",
+                message(
+                    "display_data",
+                    {"data": {"image/png": payload}, "metadata": {}},
+                ),
+                self.events.append,
+            )
+            for _ in range(20):
+                if store.entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(store.entered.is_set())
+            normalizer.retire(old)
+            normalizer.attach(str(new_dir), image_max_pixels=4_194_304)
+            store.release.set()
+            await asyncio.wait_for(normalizer.finish(old, "old"), 1)
+            self.assertEqual(store.source_pixel_limits, [1])
+        finally:
+            normalizer.close()
+            await normalizer.wait_closed()
 
     async def test_protocol_v1_mime_shape_preserves_metadata_and_execution_count(self):
         await self.submit(
@@ -168,35 +258,46 @@ class OutputNormalizerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(ansi, self.events[1].data["text"])
 
     async def test_every_artifact_mime_is_spooled_and_base64_is_absent(self):
-        for index, mime in enumerate(
-            ("image/png", "image/jpeg", "application/x-ejn-mpl-pickle")
+        for index, (mime, raw) in enumerate(
+            (
+                ("image/png", png(4, 5)),
+                ("image/jpeg", jpeg(6, 7)),
+                ("image/gif", b"GIF89a\x01\x00\x01\x00"),
+                ("image/webp", b"RIFF\x04\x00\x00\x00WEBP"),
+                ("application/x-ejn-mpl-pickle", b"pickle"),
+            )
         ):
-            payload = base64.b64encode(f"artifact-{index}".encode()).decode("ascii")
+            payload = base64.b64encode(raw).decode("ascii")
             await self.submit(
                 f"artifact-{index}",
                 message("display_data", {"data": {mime: payload}, "metadata": {}}),
             )
             reference = self.events[-1].data["data"][mime]
+            if mime.startswith("image/"):
+                self.assertEqual(set(reference), {"original"})
+                reference = reference["original"]
             self.assertEqual(set(reference), {"path", "bytes", "sha256"})
+            self.assertTrue(Path(reference["path"]).is_file())
             self.assertFalse(contains(self.events[-1].data, payload))
 
     async def test_figure_pickle_and_thumbnail_transfer_in_one_event(self):
-        png = base64.b64encode(b"thumbnail").decode("ascii")
+        image_payload = base64.b64encode(png()).decode("ascii")
         pickle_payload = base64.b64encode(b"pickle").decode("ascii")
         await self.submit(
             "figure",
             message(
                 "display_data",
-                {"data": {"image/png": png,
+                {"data": {"image/png": image_payload,
                           "application/x-ejn-mpl-pickle": pickle_payload},
                  "metadata": {}},
             ),
         )
         data = self.events[-1].data["data"]
         self.assertEqual(set(data), {"image/png", "application/x-ejn-mpl-pickle"})
-        self.assertTrue(Path(data["image/png"]["path"]).is_file())
+        self.assertTrue(Path(data["image/png"]["original"]["path"]).is_file())
         self.assertTrue(Path(data["application/x-ejn-mpl-pickle"]["path"]).is_file())
-        self.assertFalse(contains(self.events[-1].data, png))
+        self.assertNotIn("preview", data["image/png"])
+        self.assertFalse(contains(self.events[-1].data, image_payload))
         self.assertFalse(contains(self.events[-1].data, pickle_payload))
 
     async def test_dual_artifact_second_publication_failure_rolls_back_both(self):
@@ -291,23 +392,40 @@ class OutputNormalizerTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self.normalizer.finish(request_id), 2)
 
     async def test_artifact_reference_replaces_nested_mime_value_and_never_leaks_base64(self):
-        payload = base64.b64encode(b"png-data").decode("ascii")
+        payload = base64.b64encode(png()).decode("ascii")
         await self.submit(
             "png",
             message(
                 "display_data",
                 {
                     "data": {"text/plain": "fallback", "image/png": payload},
-                    "metadata": {"image/png": {"width": 2}},
+                    "metadata": {"image/png": {"width": 999999}},
                 },
             ),
         )
         event = self.events[0]
         image = event.data["data"]["image/png"]
-        self.assertEqual(event.data["metadata"], {"image/png": {"width": 2}})
-        self.assertEqual(set(image), {"path", "bytes", "sha256"})
-        self.assertTrue(Path(image["path"]).is_file())
+        self.assertEqual(event.data["metadata"], {"image/png": {"width": 999999}})
+        self.assertEqual(set(image), {"original"})
+        self.assertEqual(set(image["original"]), {"path", "bytes", "sha256"})
+        self.assertTrue(Path(image["original"]["path"]).is_file())
         self.assertFalse(contains(event.data, payload))
+
+    async def test_invalid_or_mime_mismatched_images_are_original_only(self):
+        cases = (
+            ("invalid", "image/png", b"not an image"),
+            ("mismatch", "image/png", jpeg(9, 4)),
+            ("bomb", "image/png", png(4097, 1024)),
+        )
+        for request_id, mime, raw in cases:
+            payload = base64.b64encode(raw).decode("ascii")
+            await self.submit(
+                request_id,
+                message("display_data", {"data": {mime: payload}, "metadata": {}}),
+            )
+            descriptor = self.events[-1].data["data"][mime]
+            self.assertEqual(set(descriptor), {"original"})
+            self.assertTrue(Path(descriptor["original"]["path"]).is_file())
 
     async def test_long_display_ids_are_omitted_not_truncated_into_an_alias(self):
         first = "a" * 256 + "first"

@@ -1204,32 +1204,67 @@ be manager-reviewed for durable-kernel rules.
 - [~] owner=terra-ei4d claimed=2026-09-01 **EI4D Reject compressed-image decoder bombs before Emacs image APIs.**
   - Depends: EI4V.
   - Files: `helper/ejn_helper/image_metadata.py`,
-    `helper/ejn_helper/outputs.py`, `helper/tests/test_image_metadata.py`,
-    `helper/tests/test_outputs.py`, `emacs-jupyter-notebook-helper-backend.el`,
+    `helper/ejn_helper/thumbnail.py`,
+    `helper/ejn_helper/thumbnail_worker.py`,
+    `helper/ejn_helper/artifact_verify.py`,
+    `helper/ejn_helper/artifacts.py`, `helper/ejn_helper/outputs.py`,
+    `helper/tests/test_image_metadata.py`,
+    `helper/tests/test_image_sanitizer.py`,
+    `helper/tests/test_thumbnail_worker.py`,
+    `helper/tests/test_artifact_verify.py`, `helper/tests/test_artifacts.py`,
+    `helper/tests/test_outputs.py`, `helper/pyproject.toml`, `flake.nix`,
+    `emacs-jupyter-notebook-helper-backend.el`,
     `emacs-jupyter-notebook-result.el`, `emacs-jupyter-notebook-vars.el`,
     `tests/emacs-jupyter-notebook-helper-backend-tests.el`, and the panel image
     tests in `tests/emacs-jupyter-notebook-tests.el`.
-  - Deliverable: parse PNG IHDR and JPEG SOF dimensions without an image
-    library, decoded bitmap allocation, or an unbounded scan.  The helper
-    records exact width/height and an inline-safe decision on every published
-    image descriptor.  Emacs independently re-reads only a fixed-size header,
-    requires the same MIME magic and dimensions, and enforces hard width,
-    height, and pixel-area ceilings before any call to `create-image`,
-    `image-size`, or another native decoder.  The default configurable inline
-    pixel budget is 4,194,304 pixels and may only lower the hard protocol
-    ceiling.  A malformed, unsupported, mismatched, over-dimension, or
-    over-area original remains a bounded panel-owned external-viewer artifact
-    with a lightweight placeholder; it is never decoded inside Emacs.  Limit
-    helper-mode inline images to PNG and JPEG until an equivalent bounded
-    parser exists for another format.
-  - Tests: minimal valid PNG/JPEG at exact dimension and pixel boundaries;
-    one pixel over; forged tiny compressed files advertising huge dimensions;
-    malformed/truncated headers and JPEG marker storms/SOF beyond the scan
-    limit; helper/Emacs dimension mismatch; MIME-magic mismatch; and a canary
-    around every native image API proving unsafe files never reach it.  Assert
-    unsafe originals still open through the asynchronous external viewer and
-    retire under the existing count/byte budgets.  The parser suite runs on
-    x86_64-linux and aarch64-darwin without `/proc`, GUI, or remote services.
+  - Deliverable: compressed remote image bytes are external-viewer-only and
+    never reach an Emacs native image API.  A cheap bounded PNG/JPEG header
+    parser rejects obvious MIME, dimension, and pixel-area violations before
+    decode, but it never makes an original inline-safe.  The helper's sole
+    artifact executor invokes one fixed local thumbnail worker with no shell,
+    inherited pinned input/output file descriptors, a monotonic wall deadline,
+    bounded or discarded stdout/stderr, a new process session, process-group
+    termination on timeout, and CPU/file-size/open-file/core/address-space
+    resource limits where the target supports them.  The child applies its
+    limits before importing Pillow, fully decodes at most 4,194,304 source
+    pixels, converts to RGB, downsizes to at most 1024 by 1024, and writes a
+    canonical uncompressed P6 PPM preview no larger than 4 MiB.  Failure to
+    establish required limits, import or decode safely, meet the deadline, or
+    validate the exact PPM header/length produces an original-only artifact.
+    The parent fsyncs, atomically publishes, and revalidates each preview.
+    Original and preview are independent pinned leases transferred, rolled
+    back, replaced, budgeted, and retired as one logical bundle.  Emacs accepts
+    only complete nested descriptors, synchronously reads at most the PPM's
+    64-byte canonical header, trusts the local parent's already-verified
+    payload digest, and feeds only that PPM preview to native APIs.  The
+    compressed original remains external-only.  `o` single-flights one bounded
+    local verifier that pins and hashes the original outside the UI thread
+    while copying exact bytes into a private snapshot; a second invocation
+    cancels it.  The snapshot has an independent count/TTL bound so `open' and
+    `xdg-open' may exit before their GUI consumer reads the path without racing
+    panel eviction.  Retirement flushes only previews that were actually
+    materialized, without rereading every retained image.  Pillow is a declared
+    helper/Nix dependency.  The default configurable source-pixel budget may
+    only lower the hard protocol ceiling.
+  - Tests: complete PNG/JPEG success produces an exact bounded PPM whose
+    dimensions, length, digest, mode, ownership, and direct-child identity are
+    verified; every truncated prefix, corrupt stream/CRC/entropy, MIME-magic
+    mismatch, decompression-bomb warning/error, exact ceiling, one-over
+    ceiling, worker crash/timeout/import failure/resource failure, malformed or
+    oversized output, stdout/stderr flood, and publication race becomes
+    external-only with no partial file or leaked lease.  Prove ping/event-loop
+    responsiveness during slow decode, hard pre-launch quotas, and atomic
+    original+preview rollback/update/retirement.  ERT recursively canaries
+    `create-image`, `image-size`, `insert-sliced-image`, and `image-flush` so no
+    argument ever contains the original path; original-only entries invoke no
+    native API; admission reads no more than the fixed header and never hashes
+    pixels in Emacs; the external opener receives only a freshly verified
+    independent snapshot that survives immediate launcher exit; repeated opens
+    remain single-flight and cancellable.  Scroll, rerender, zoom, eviction,
+    clear, panel kill, and exact byte/count boundaries preserve source text and
+    stay bounded.  The suite runs on x86_64-linux and aarch64-darwin without
+    `/proc`, GUI, SSH, or remote services, with a required real Pillow worker
+    check in the Nix closure (no dependency skip is accepted).
   - Narrow run: helper image-metadata/output tests plus ERT selector
     `^ejn-ei4d-` and all panel image tests, each under an external deadline.
 
@@ -1314,8 +1349,12 @@ be manager-reviewed for durable-kernel rules.
   - Files: `tests/emacs-jupyter-notebook-helper-backend-tests.el`,
     `helper/tests/test_architecture.py`.
   - Deliverable: stripped-source assertions enforce no production
-    `AsyncKernelManager`/`KernelManager`/kernel launch/subprocess launch in
-    helper backend, no base64 artifact in event encoder, no `jupyter-*` call
+    `AsyncKernelManager`/`KernelManager`/kernel launch or general subprocess
+    launch in the helper backend.  The sole subprocess exception is EI4D's
+    statically fixed thumbnail-worker invocation: no shell or caller-supplied
+    executable/arguments, pinned inherited file descriptors, bounded/discarded
+    output, resource caps, monotonic deadline, and process-group kill are all
+    asserted.  Also enforce no base64 artifact in event encoder, no `jupyter-*` call
     outside legacy file, no `sleep-for`/sync SSH in interactive Elisp, bounded
     frame/queue constants non-nil, and no production wait loop for helper I/O.
   - Tests: mutation fixtures prove each assertion detects its forbidden form

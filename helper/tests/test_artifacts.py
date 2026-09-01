@@ -1,4 +1,5 @@
 import base64
+import errno
 import hashlib
 import os
 import stat
@@ -184,6 +185,50 @@ class ArtifactStoreTests(unittest.TestCase):
                 with self.assertRaises(ArtifactIOError):
                     store.store_base64(self.encode(b"payload"))
         self.assertEqual(list(self.directory.iterdir()), [])
+
+    def test_darwin_unsupported_directory_fsync_is_tolerated_after_file_fsync(self):
+        calls = 0
+
+        def fsync_file_then_reject_directory(_fd):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError(errno.EINVAL, "directory fsync unsupported")
+
+        with mock.patch.object(artifacts.sys, "platform", "darwin"), mock.patch.object(
+            artifacts.os, "fsync", side_effect=fsync_file_then_reject_directory
+        ):
+            with ArtifactStore(self.directory) as store:
+                published = store.store_base64(self.encode(b"portable publication"))
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(published.path.read_bytes(), b"portable publication")
+
+    def test_darwin_unsupported_error_does_not_weaken_file_fsync(self):
+        with mock.patch.object(artifacts.sys, "platform", "darwin"), mock.patch.object(
+            artifacts.os,
+            "fsync",
+            side_effect=OSError(errno.EINVAL, "file fsync failed"),
+        ):
+            with ArtifactStore(self.directory) as store:
+                with self.assertRaises(ArtifactIOError):
+                    store.store_base64(self.encode(b"must be durable"))
+        self.assertEqual(list(self.directory.iterdir()), [])
+
+    def test_directory_fsync_rejects_darwin_unrelated_and_non_darwin_errors(self):
+        unsupported = OSError(errno.EPERM, "permission denied")
+        with mock.patch.object(
+            artifacts.os, "fsync", side_effect=unsupported
+        ), mock.patch.object(artifacts.sys, "platform", "darwin"):
+            with self.assertRaises(OSError):
+                artifacts._fsync_directory(123)
+
+        not_supported = OSError(errno.ENOTSUP, "operation unsupported")
+        with mock.patch.object(
+            artifacts.os, "fsync", side_effect=not_supported
+        ), mock.patch.object(artifacts.sys, "platform", "linux"):
+            with self.assertRaises(OSError):
+                artifacts._fsync_directory(123)
 
     def test_replace_failure_cleans_partial(self):
         with ArtifactStore(self.directory) as store:

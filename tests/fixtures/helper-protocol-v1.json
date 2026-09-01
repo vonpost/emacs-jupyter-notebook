@@ -10,7 +10,7 @@
     {"name":"op-hello","kind":"frame","object":{"v":1,"kind":"request","id":"op-hello","op":"hello","params":{"versions":[1]}}},
     {"name":"op-ping","kind":"frame","object":{"v":1,"kind":"request","id":"op-ping","op":"ping","params":{}}},
     {"name":"op-grant-event-credit","kind":"frame","object":{"v":1,"kind":"request","id":"op-credit","op":"grant_event_credit","params":{"bytes":262144}}},
-    {"name":"op-connect","kind":"frame","object":{"v":1,"kind":"request","id":"op-connect","op":"connect","params":{"connection_file":"/tmp/ejn.json","artifact_dir":"/tmp/ejn-artifacts"}}},
+    {"name":"op-connect","kind":"frame","object":{"v":1,"kind":"request","id":"op-connect","op":"connect","params":{"connection_file":"/tmp/ejn.json","artifact_dir":"/tmp/ejn-artifacts","image_max_pixels":4194304}}},
     {"name":"op-kernel-info","kind":"frame","object":{"v":1,"kind":"request","id":"op-info","op":"kernel_info","params":{}}},
     {"name":"op-execute","kind":"frame","object":{"v":1,"kind":"request","id":"op-exec","op":"execute","params":{"code":"1+1"}}},
     {"name":"op-complete","kind":"frame","object":{"v":1,"kind":"request","id":"op-complete","op":"complete","params":{"code":"pri","cursor_pos":3}}},

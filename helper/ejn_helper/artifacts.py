@@ -4,16 +4,41 @@ from __future__ import annotations
 
 import base64
 import binascii
+import errno
 import hashlib
 import os
 import secrets
 import stat
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO
 
+from .image_metadata import (
+    EJN_IMAGE_HEADER_SCAN_BYTES,
+    EJN_MAX_IMAGE_PIXELS,
+    parse_image_metadata,
+)
+from .thumbnail import ThumbnailError, run_worker, validate_ppm_fd
+
 EJN_MAX_ARTIFACT_BYTES = 67_108_864
 _BASE64_CHUNK_BYTES = 65_536
+
+
+def _fsync_directory(directory_fd: int) -> None:
+    """Durably publish a renamed artifact where the platform supports it.
+
+    File contents are always fsynced before rename.  Darwin filesystems may
+    reject a directory descriptor with ``EINVAL`` or ``ENOTSUP`` even though
+    the rename itself succeeded; those two errors are the sole portability
+    exception.  Every other platform and error remains fail-closed.
+    """
+    try:
+        os.fsync(directory_fd)
+    except OSError as exc:
+        if sys.platform == "darwin" and exc.errno in {errno.EINVAL, errno.ENOTSUP}:
+            return
+        raise
 
 
 class ArtifactError(Exception):
@@ -44,6 +69,22 @@ class PublishedArtifact:
     byte_count: int
     sha256: str
     _lease: _PublicationLease = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedImage:
+    """One logical image handoff with independently pinned files.
+
+    The compressed original is always present.  ``preview`` is an optional
+    canonical PPM generated only by the constrained child worker.  Both carry
+    distinct private leases, so caller rollback is all-or-nothing while panel
+    ownership can retire them as a single logical bundle.
+    """
+
+    original: PublishedArtifact
+    preview: PublishedArtifact | None
+    width: int | None = None
+    height: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,6 +302,194 @@ class ArtifactStore:
             raise ArtifactIOError("artifact discard failed") from exc
         return True
 
+    def _validate_published_fd(self, published: PublishedArtifact) -> int:
+        """Open one store-owned published file and pin its original bytes."""
+        if not isinstance(published, PublishedArtifact):
+            raise ArtifactIOError("thumbnail input needs a store publication")
+        lease = published._lease
+        if lease.store_token is not self._lease_token:
+            raise ArtifactIOError("thumbnail input belongs to another store")
+        directory_fd = self._require_open()
+        self._validate_pinned_directory(directory_fd)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(lease.relative_name, flags, dir_fd=directory_fd)
+            metadata = os.fstat(fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_nlink != 1
+                or (metadata.st_dev, metadata.st_ino) != (lease.device, lease.inode)
+                or metadata.st_size != published.byte_count
+            ):
+                raise ArtifactIOError("thumbnail input identity changed")
+            digest = hashlib.sha256()
+            while True:
+                block = os.read(fd, _BASE64_CHUNK_BYTES)
+                if not block:
+                    break
+                digest.update(block)
+            if digest.hexdigest() != published.sha256:
+                raise ArtifactIOError("thumbnail input content changed")
+            os.lseek(fd, 0, os.SEEK_SET)
+            return fd
+        except Exception:
+            try:
+                os.close(fd)
+            except (OSError, UnboundLocalError):
+                pass
+            raise
+
+    @staticmethod
+    def _hash_fd(fd: int) -> str:
+        digest = hashlib.sha256()
+        os.lseek(fd, 0, os.SEEK_SET)
+        while True:
+            block = os.read(fd, _BASE64_CHUNK_BYTES)
+            if not block:
+                break
+            digest.update(block)
+        os.lseek(fd, 0, os.SEEK_SET)
+        return digest.hexdigest()
+
+    def _publish_preview_fd(self, partial_name: str, file_fd: int) -> PublishedArtifact:
+        """Fsync and atomically publish a PPM preview already written to FD."""
+        directory_fd = self._require_open()
+        self._validate_pinned_directory(directory_fd)
+        width, height, byte_count = validate_ppm_fd(file_fd)
+        del width, height  # Dimension metadata is returned by the caller.
+        partial_metadata = os.fstat(file_fd)
+        partial_identity = (partial_metadata.st_dev, partial_metadata.st_ino)
+        published_identity: tuple[int, int] | None = None
+        published_name: str | None = None
+        try:
+            os.fchmod(file_fd, 0o600)
+            os.fsync(file_fd)
+            digest = self._hash_fd(file_fd)
+            published_name = self._random_name("ejn-artifact-")
+            os.stat(published_name, dir_fd=directory_fd, follow_symlinks=False)
+            raise ArtifactIOError("artifact publication name already exists")
+        except FileNotFoundError:
+            pass
+        except ArtifactError:
+            raise
+        except OSError as exc:
+            raise ArtifactIOError("preview publication failed") from exc
+        try:
+            self._validate_pinned_directory(directory_fd)
+            os.replace(
+                partial_name,
+                published_name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            # Rename preserves the inode.  Record it before any subsequent
+            # stat/fsync can fail so rollback still owns the published name.
+            published_identity = partial_identity
+            metadata = os.stat(published_name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_nlink != 1
+                or metadata.st_size != byte_count
+                or (metadata.st_dev, metadata.st_ino) != partial_identity
+            ):
+                raise ArtifactIOError("preview publication is unsafe")
+            # A file fsync is not sufficient to durably publish the name.
+            _fsync_directory(directory_fd)
+            return PublishedArtifact(
+                path=self._directory / published_name,
+                byte_count=byte_count,
+                sha256=digest,
+                _lease=_PublicationLease(
+                    self._lease_token,
+                    published_name,
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ),
+            )
+        except Exception:
+            if published_name is not None and published_identity is not None:
+                try:
+                    current = os.stat(
+                        published_name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if (current.st_dev, current.st_ino) == published_identity:
+                        os.unlink(published_name, dir_fd=directory_fd)
+                        _fsync_directory(directory_fd)
+                except OSError:
+                    pass
+            raise
+
+    def make_image(self, payload: str, mime: str, *, max_source_pixels: int = EJN_MAX_IMAGE_PIXELS) -> PublishedImage:
+        """Publish PAYLOAD and, when safe, attach one constrained PPM preview.
+
+        All worker/preflight failures are deliberately non-fatal to the
+        original artifact.  That leaves an external-viewer-only descriptor;
+        publication failures before the original exists still raise normally.
+        """
+        original = self.store_base64(payload)
+        if (
+            mime not in {"image/png", "image/jpeg"}
+            or type(max_source_pixels) is not int
+            or max_source_pixels <= 0
+            or max_source_pixels > EJN_MAX_IMAGE_PIXELS
+        ):
+            return PublishedImage(original, None)
+        input_fd: int | None = None
+        output_fd: int | None = None
+        partial_name: str | None = None
+        partial_identity: tuple[int, int] | None = None
+        try:
+            input_fd = self._validate_published_fd(original)
+            prefix = os.read(input_fd, EJN_IMAGE_HEADER_SCAN_BYTES)
+            metadata = parse_image_metadata(prefix)
+            if (
+                metadata is None
+                or metadata.mime != mime
+                or metadata.width * metadata.height > max_source_pixels
+            ):
+                return PublishedImage(original, None)
+            os.lseek(input_fd, 0, os.SEEK_SET)
+            directory_fd = self._require_open()
+            self._validate_pinned_directory(directory_fd)
+            partial_name = self._random_name(".ejn-partial-")
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            output_fd = os.open(partial_name, flags, 0o600, dir_fd=directory_fd)
+            output_metadata = os.fstat(output_fd)
+            partial_identity = (output_metadata.st_dev, output_metadata.st_ino)
+            run_worker(input_fd, output_fd)
+            width, height, _size = validate_ppm_fd(output_fd)
+            preview = self._publish_preview_fd(partial_name, output_fd)
+            partial_name = None
+            return PublishedImage(original, preview, width, height)
+        # The child boundary is intentionally fail-closed: an unexpected
+        # launcher failure is equivalent to a corrupt/invalid preview.
+        except Exception:
+            return PublishedImage(original, None)
+        finally:
+            if input_fd is not None:
+                try:
+                    os.close(input_fd)
+                except OSError:
+                    pass
+            if output_fd is not None:
+                try:
+                    os.close(output_fd)
+                except OSError:
+                    pass
+            if partial_name is not None:
+                try:
+                    directory_fd = self._require_open()
+                    current = os.stat(
+                        partial_name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if partial_identity == (current.st_dev, current.st_ino):
+                        os.unlink(partial_name, dir_fd=directory_fd)
+                except (ArtifactError, OSError):
+                    pass
+
     @staticmethod
     def _random_name(prefix: str) -> str:
         return f"{prefix}{secrets.token_hex(16)}"
@@ -284,6 +513,8 @@ class ArtifactStore:
         partial_created = False
         published_created = False
         completed = False
+        partial_identity: tuple[int, int] | None = None
+        published_identity: tuple[int, int] | None = None
         result: PublishedArtifact | None = None
         byte_count = 0
         digest = hashlib.sha256()
@@ -294,6 +525,8 @@ class ArtifactStore:
         try:
             file_fd = os.open(partial_name, flags, 0o600, dir_fd=directory_fd)
             partial_created = True
+            partial_metadata = os.fstat(file_fd)
+            partial_identity = (partial_metadata.st_dev, partial_metadata.st_ino)
             stream = os.fdopen(file_fd, "wb", buffering=0)
             file_fd = None  # STREAM now owns it.
 
@@ -332,11 +565,18 @@ class ArtifactStore:
                 dst_dir_fd=directory_fd,
             )
             published_created = True
+            published_identity = partial_identity
             metadata = os.stat(
                 published_name, dir_fd=directory_fd, follow_symlinks=False
             )
-            if not stat.S_ISREG(metadata.st_mode):
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_nlink != 1
+                or (metadata.st_dev, metadata.st_ino) != partial_identity
+            ):
                 raise ArtifactIOError("artifact publication is not a regular file")
+            _fsync_directory(directory_fd)
             result = PublishedArtifact(
                 path=self._directory / published_name,
                 byte_count=byte_count,
@@ -366,14 +606,22 @@ class ArtifactStore:
                     pass
             if partial_created and not published_created:
                 try:
-                    os.unlink(partial_name, dir_fd=directory_fd)
+                    current = os.stat(
+                        partial_name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if partial_identity == (current.st_dev, current.st_ino):
+                        os.unlink(partial_name, dir_fd=directory_fd)
                 except FileNotFoundError:
                     pass
                 except OSError:
                     pass
             if published_created and not completed:
                 try:
-                    os.unlink(published_name, dir_fd=directory_fd)
+                    current = os.stat(
+                        published_name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if published_identity == (current.st_dev, current.st_ino):
+                        os.unlink(published_name, dir_fd=directory_fd)
                 except FileNotFoundError:
                     pass
                 except OSError:

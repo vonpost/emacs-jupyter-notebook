@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable, Mapping
 
 from .artifacts import ArtifactError, ArtifactStore, PublishedArtifact
+from .image_metadata import EJN_MAX_IMAGE_PIXELS
 from .backend import BackendEvent
 
 EJN_MAX_OUTPUT_TEXT_BYTES = 524_288
@@ -37,6 +38,8 @@ _ARTIFACT_MIMES = (
     "application/x-ejn-mpl-pickle",
     "image/png",
     "image/jpeg",
+    "image/gif",
+    "image/webp",
 )
 _WORKER_LIVENESS_INTERVAL = 0.05
 _STOP = object()
@@ -60,6 +63,7 @@ class OutputAttachment:
 @dataclass(slots=True)
 class _AttachmentState:
     store: ArtifactStore
+    image_max_pixels: int
     retired: bool = False
 
 
@@ -201,16 +205,25 @@ class OutputNormalizer:
         artifact_dir: str | None = None,
         *,
         artifact_store: ArtifactStore | None = None,
+        image_max_pixels: int = EJN_MAX_IMAGE_PIXELS,
     ) -> None:
         if artifact_dir is not None and artifact_store is not None:
             raise ValueError("artifact directory and store are mutually exclusive")
+        if (
+            type(image_max_pixels) is not int
+            or image_max_pixels < 0
+            or image_max_pixels > EJN_MAX_IMAGE_PIXELS
+        ):
+            raise ValueError("image_max_pixels must be within the protocol ceiling")
         self._closed = False
         self._attachments: dict[int, _AttachmentState] = {}
         self._next_generation = 1
         self._default_attachment: OutputAttachment | None = None
         if artifact_dir is not None or artifact_store is not None:
             self._default_attachment = self.attach(
-                artifact_dir, artifact_store=artifact_store
+                artifact_dir,
+                artifact_store=artifact_store,
+                image_max_pixels=image_max_pixels,
             )
         self._executor: ThreadPoolExecutor | None = None
         self._queue: asyncio.Queue[_OutputJob | object] = asyncio.Queue(
@@ -228,7 +241,7 @@ class OutputNormalizer:
         self._pending_artifact_bytes = 0
         self._worker_artifacts = 0
         self._worker_artifact_bytes = 0
-        self._store_futures: set[Future[PublishedArtifact]] = set()
+        self._store_futures: set[Future[object]] = set()
         self._worker_failure: BaseException | None = None
 
     def attach(
@@ -236,19 +249,28 @@ class OutputNormalizer:
         artifact_dir: str | None = None,
         *,
         artifact_store: ArtifactStore | None = None,
+        image_max_pixels: int = EJN_MAX_IMAGE_PIXELS,
     ) -> OutputAttachment:
         """Create a connection generation without creating another worker."""
         if self._closed:
             raise RuntimeError("output normalizer is closed")
         if artifact_dir is not None and artifact_store is not None:
             raise ValueError("artifact directory and store are mutually exclusive")
+        if (
+            type(image_max_pixels) is not int
+            or image_max_pixels < 0
+            or image_max_pixels > EJN_MAX_IMAGE_PIXELS
+        ):
+            raise ValueError("image_max_pixels must be within the protocol ceiling")
         if artifact_store is None:
             if artifact_dir is None:
                 raise ValueError("artifact directory is required")
             artifact_store = ArtifactStore(Path(artifact_dir))
         attachment = OutputAttachment(self._next_generation)
         self._next_generation += 1
-        self._attachments[attachment.generation] = _AttachmentState(artifact_store)
+        self._attachments[attachment.generation] = _AttachmentState(
+            artifact_store, image_max_pixels
+        )
         return attachment
 
     def retire(self, attachment: OutputAttachment | None) -> None:
@@ -673,7 +695,7 @@ class OutputNormalizer:
                                 self._worker_artifacts += 1
                                 self._worker_artifact_bytes += job.artifact_bytes
                             try:
-                                events = await self._normalize(job, attachment_state.store)
+                                events = await self._normalize(job, attachment_state)
                             finally:
                                 if job.artifact_bytes:
                                     self._worker_artifacts -= 1
@@ -787,7 +809,7 @@ class OutputNormalizer:
         return self._marker(state, reason)
 
     async def _normalize(
-        self, job: _OutputJob, store: ArtifactStore
+        self, job: _OutputJob, attachment_state: _AttachmentState
     ) -> list[_NormalizedEvent]:
         state = self._states.setdefault(job.key, _OutputState())
         assert job.message is not None
@@ -802,7 +824,9 @@ class OutputNormalizer:
         elif message_type == "clear_output":
             events = [BackendEvent("clear_output", {"wait": content.get("wait") is True})]
         elif message_type in {"execute_result", "display_data", "update_display_data"}:
-            events = await self._rich(state, message_type, content, store)
+            events = await self._rich(
+                state, message_type, content, attachment_state
+            )
         else:
             events = [self._marker(state, "unsupported output")]
         if job.message.get("_ejn_snapshot_truncated") and not state.truncated:
@@ -867,7 +891,7 @@ class OutputNormalizer:
         state: _OutputState,
         message_type: object,
         content: Mapping[str, object],
-        store: ArtifactStore,
+        attachment_state: _AttachmentState,
     ) -> list[BackendEvent | _NormalizedEvent]:
         if state.truncated:
             return []
@@ -890,7 +914,11 @@ class OutputNormalizer:
             (mime, data[mime]) for mime in _ARTIFACT_MIMES if mime in data
         ]
         if artifacts:
-            return [await self._artifact_event(state, event_name, base, artifacts, store)]
+            return [
+                await self._artifact_event(
+                    state, event_name, base, artifacts, attachment_state
+                )
+            ]
         text = data.get("text/plain")
         if isinstance(text, str):
             remaining = EJN_MAX_OUTPUT_TEXT_BYTES - state.text_bytes
@@ -919,10 +947,11 @@ class OutputNormalizer:
         event_name: str,
         base: dict[str, object],
         artifacts: list[tuple[str, object]],
-        store: ArtifactStore,
+        attachment_state: _AttachmentState,
     ) -> BackendEvent | _NormalizedEvent:
         published: list[PublishedArtifact] = []
         descriptors: dict[str, object] = {}
+        store = attachment_state.store
         try:
             if self._executor is None:
                 self._executor = ThreadPoolExecutor(
@@ -931,16 +960,57 @@ class OutputNormalizer:
             for mime, payload in artifacts:
                 if not isinstance(payload, str):
                     raise ArtifactError("artifact unavailable")
-                future = self._executor.submit(store.store_base64, payload)
+                image_mime = mime.startswith("image/")
+                if image_mime and attachment_state.image_max_pixels:
+                    future = self._executor.submit(
+                        store.make_image,
+                        payload,
+                        mime,
+                        max_source_pixels=attachment_state.image_max_pixels,
+                    )
+                else:
+                    future = self._executor.submit(store.store_base64, payload)
                 self._store_futures.add(future)
                 future.add_done_callback(self._store_futures.discard)
-                artifact = await self._await_store_future(future)
-                published.append(artifact)
-                descriptors[mime] = {
-                    "path": str(artifact.path),
-                    "bytes": artifact.byte_count,
-                    "sha256": artifact.sha256,
-                }
+                result = await self._await_store_future(future)
+                if image_mime:
+                    if attachment_state.image_max_pixels:
+                        original = result.original
+                        preview = result.preview
+                        width = result.width
+                        height = result.height
+                    else:
+                        original = result
+                        preview = None
+                        width = None
+                        height = None
+                    published.append(original)
+                    descriptor = {
+                        "original": {
+                            "path": str(original.path),
+                            "bytes": original.byte_count,
+                            "sha256": original.sha256,
+                        }
+                    }
+                    if preview is not None:
+                        published.append(preview)
+                        descriptor["preview"] = {
+                            "path": str(preview.path),
+                            "bytes": preview.byte_count,
+                            "sha256": preview.sha256,
+                            "mime": "image/x-portable-pixmap",
+                            "width": width,
+                            "height": height,
+                        }
+                else:
+                    artifact = result
+                    published.append(artifact)
+                    descriptor = {
+                        "path": str(artifact.path),
+                        "bytes": artifact.byte_count,
+                        "sha256": artifact.sha256,
+                    }
+                descriptors[mime] = descriptor
         except ArtifactError:
             for artifact in published:
                 await self._discard(store, artifact)

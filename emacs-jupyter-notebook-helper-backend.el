@@ -14,8 +14,10 @@
 (require 'subr-x)
 (require 'emacs-jupyter-notebook-backend)
 (require 'emacs-jupyter-notebook-helper)
+(require 'emacs-jupyter-notebook-vars)
 
 (defconst emacs-jupyter-notebook-helper-backend--connect-timeout 30)
+(defconst emacs-jupyter-notebook-helper-backend--hard-image-pixels 4194304)
 (defconst emacs-jupyter-notebook-helper-backend--verify-timeout 180
   "Hard local deadline for helper `kernel_info' readiness verification.
 
@@ -26,6 +28,13 @@ whether an attached reconnect is usable before this terminal request expiry.")
 (defun emacs-jupyter-notebook-helper-backend-ensure ()
   "Resolve the helper executable before any remote launch is admitted."
   (emacs-jupyter-notebook-helper-resolve-argv))
+
+(defun emacs-jupyter-notebook-helper-backend--image-pixel-budget ()
+  "Return the configured preview budget clamped to the protocol ceiling."
+  (let ((value emacs-jupyter-notebook-helper-inline-image-max-pixels))
+    (if (and (integerp value) (> value 0))
+        (min value emacs-jupyter-notebook-helper-backend--hard-image-pixels)
+      0)))
 
 (cl-defstruct (emacs-jupyter-notebook-helper-backend-state
                (:constructor emacs-jupyter-notebook-helper-backend--make-state))
@@ -185,6 +194,61 @@ cleanup.  A failure after creation removes that just-created directory.
   (let ((data (and (hash-table-p event) (gethash "data" event))))
     (and (hash-table-p data) data)))
 
+(defun emacs-jupyter-notebook-helper-backend--required-field (object field)
+  "Return required FIELD from OBJECT, rejecting absent JSON keys explicitly."
+  (let ((missing (make-symbol "missing")))
+    (let ((value (gethash field object missing)))
+      (when (eq value missing)
+        (error "helper artifact lacks required %s" field))
+      value)))
+
+(defun emacs-jupyter-notebook-helper-backend--artifact-leaf (object)
+  "Validate one required path/bytes/SHA256 artifact leaf from OBJECT."
+  (unless (hash-table-p object)
+    (error "malformed helper artifact leaf"))
+  (let ((path (emacs-jupyter-notebook-helper-backend--required-field object "path"))
+        (bytes (emacs-jupyter-notebook-helper-backend--required-field object "bytes"))
+        (sha256 (emacs-jupyter-notebook-helper-backend--required-field object "sha256")))
+    (unless (and (stringp path) (file-name-absolute-p path)
+                 (integerp bytes) (>= bytes 0)
+                 (stringp sha256)
+                 (string-equal sha256 (downcase sha256))
+                 (string-match-p "\\`[0-9a-f]\\{64\\}\\'" sha256))
+      (error "malformed helper artifact leaf"))
+    (list :path path :size bytes :sha256 sha256)))
+
+(defun emacs-jupyter-notebook-helper-backend--image-publication
+    (state mime descriptor display-id)
+  "Validate nested image DESCRIPTOR and attach STATE's pinned root metadata."
+  (unless (hash-table-p descriptor)
+    (error "malformed helper image descriptor"))
+  (let* ((original
+          (emacs-jupyter-notebook-helper-backend--artifact-leaf
+           (emacs-jupyter-notebook-helper-backend--required-field
+            descriptor "original")))
+         (missing (make-symbol "missing"))
+         (preview-value (gethash "preview" descriptor missing))
+         (preview
+          (unless (eq preview-value missing)
+            (let* ((leaf (emacs-jupyter-notebook-helper-backend--artifact-leaf
+                          preview-value))
+                   (preview-mime
+                    (emacs-jupyter-notebook-helper-backend--required-field
+                     preview-value "mime"))
+                   (width (emacs-jupyter-notebook-helper-backend--required-field
+                           preview-value "width"))
+                   (height (emacs-jupyter-notebook-helper-backend--required-field
+                            preview-value "height")))
+              (unless (and (equal preview-mime "image/x-portable-pixmap")
+                           (integerp width) (integerp height)
+                           (<= 1 width 1024) (<= 1 height 1024))
+                (error "malformed helper PPM preview"))
+              (append leaf (list :mime preview-mime :width width :height height))))))
+    (list :root (emacs-jupyter-notebook-helper-backend-state-artifact-dir state)
+          :root-identity
+          (emacs-jupyter-notebook-helper-backend-state-artifact-identity state)
+          :mime mime :original original :preview preview :display-id display-id)))
+
 (defun emacs-jupyter-notebook-helper-backend--normalize-event (state event)
   "Translate one bounded helper EVENT into an EI1R event plist, or signal.
 No generic reducer is called here: the core validates the ledger/backend/
@@ -251,19 +315,22 @@ generation tuple before any presentation mutation.
          (cond
           ((or pickle-artifact image-artifact)
            (let ((publication-data nil))
-             (dolist (spec (delq nil (list (and image-artifact (list :ejn-published-image image-mime image-artifact))
-                                           (and pickle-artifact (list :ejn-published-pickle "application/x-ejn-mpl-pickle" pickle-artifact)))))
-               (let* ((key (car spec)) (mime (cadr spec)) (artifact (caddr spec))
-                      (path (gethash "path" artifact)) (bytes (gethash "bytes" artifact))
-                      (sha (gethash "sha256" artifact)))
-                 (unless (and (stringp path) (integerp bytes) (>= bytes 0) (stringp sha))
-                   (error "malformed helper artifact"))
+             (when image-artifact
+               (setq publication-data
+                     (append publication-data
+                             (list :ejn-published-image
+                                   (emacs-jupyter-notebook-helper-backend--image-publication
+                                    state image-mime image-artifact display-id)))))
+             (when pickle-artifact
+               (let ((pickle (emacs-jupyter-notebook-helper-backend--artifact-leaf
+                              pickle-artifact)))
                  (setq publication-data
                        (append publication-data
-                               (list key (list :root (emacs-jupyter-notebook-helper-backend-state-artifact-dir state)
-                                               :root-identity (emacs-jupyter-notebook-helper-backend-state-artifact-identity state)
-                                               :path path :mime mime :sha256 sha :size bytes
-                                               :display-id display-id))))))
+                               (list :ejn-published-pickle
+                                     (append pickle
+                                             (list :root (emacs-jupyter-notebook-helper-backend-state-artifact-dir state)
+                                                   :root-identity (emacs-jupyter-notebook-helper-backend-state-artifact-identity state)
+                                                   :display-id display-id)))))))
              (list :type type :data publication-data
                    :metadata metadata
                    :transient transient :display-id display-id
@@ -289,12 +356,20 @@ generation tuple before any presentation mutation.
   (let* ((data (emacs-jupyter-notebook-helper-backend--event-data event))
          (payload (and data (gethash "data" data))))
     (when (hash-table-p payload)
-      (delq nil
-            (mapcar (lambda (mime)
-                      (let ((artifact (gethash mime payload)))
-                        (and (hash-table-p artifact) (gethash "path" artifact))))
-                    '("application/x-ejn-mpl-pickle"
-                      "image/png" "image/jpeg" "image/gif" "image/webp"))))))
+      (let (paths)
+        (dolist (mime '("application/x-ejn-mpl-pickle"
+                        "image/png" "image/jpeg" "image/gif" "image/webp"))
+          (let ((artifact (gethash mime payload)))
+            (when (hash-table-p artifact)
+              (if (string-prefix-p "image/" mime)
+                  (dolist (part '("original" "preview"))
+                    (let ((leaf (gethash part artifact)))
+                      (when (hash-table-p leaf)
+                        (let ((path (gethash "path" leaf)))
+                          (when (stringp path) (push path paths))))))
+                (let ((path (gethash "path" artifact)))
+                  (when (stringp path) (push path paths)))))))
+        (nreverse paths)))))
 
 (defun emacs-jupyter-notebook-helper-backend--discard-publication (state path)
   "Unlink unaccepted helper publication PATH if its pinned identity is intact."
@@ -613,7 +688,9 @@ core can retain an attached helper for the existing PID busy arbitration.
                    session state "connect"
                    (emacs-jupyter-notebook-helper-backend--make-object
                     "connection_file" connection-file
-                    "artifact_dir" (emacs-jupyter-notebook-helper-backend-state-artifact-dir state))
+                    "artifact_dir" (emacs-jupyter-notebook-helper-backend-state-artifact-dir state)
+                    "image_max_pixels"
+                    (emacs-jupyter-notebook-helper-backend--image-pixel-budget))
                    emacs-jupyter-notebook-helper-backend--connect-timeout
                    (lambda (result)
                      (cond

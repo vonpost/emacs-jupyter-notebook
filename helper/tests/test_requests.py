@@ -146,7 +146,7 @@ class BackendReaderTests(unittest.IsolatedAsyncioTestCase):
         future = asyncio.get_running_loop().create_future()
         backend.start(
             "connect",
-            {"connection_file": str(path), "artifact_dir": str(artifact_dir)},
+            {"connection_file": str(path), "artifact_dir": str(artifact_dir), "image_max_pixels": 4_194_304},
             lambda _event: None,
             future.set_result,
         )
@@ -390,6 +390,7 @@ class BackendReaderTests(unittest.IsolatedAsyncioTestCase):
                     "artifact_dir": str(
                         Path(self._directory.name) / "artifacts"
                     ),
+                    "image_max_pixels": 4_194_304,
                 },
                 lambda _event: None,
                 future.set_result,

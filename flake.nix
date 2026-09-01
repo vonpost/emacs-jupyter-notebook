@@ -31,12 +31,19 @@
             dependencies = with python.pkgs; [
               jupyter-client
               pyzmq
+              pillow
             ];
 
-            nativeCheckInputs = [ python.pkgs.ipykernel ];
+            # The Python builder runs this suite as an install check, where
+            # runtime dependencies are not guaranteed on the check-time
+            # module path.  Keep the real decoder boundary exercised there.
+            nativeCheckInputs = with python.pkgs; [ ipykernel pillow ];
+            doCheck = true;
             checkPhase = ''
               runHook preCheck
-              PYTHONPATH=$PWD/.. python -m unittest discover -s tests -p 'test_*.py'
+              EJN_REQUIRE_PILLOW=1 \
+                PYTHONPATH=${python.pkgs.pillow}/${python.sitePackages}:$PWD/.. \
+                python -m unittest discover -s tests -p 'test_*.py'
               runHook postCheck
             '';
             pythonImportsCheck = [ "ejn_helper" ];
@@ -63,6 +70,7 @@
               ipykernel
               jupyter-client
               pyzmq
+              pillow
             ]))
           ];
         };

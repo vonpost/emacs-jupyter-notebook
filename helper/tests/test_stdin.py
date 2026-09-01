@@ -279,6 +279,7 @@ class BackendInputTests(unittest.IsolatedAsyncioTestCase):
             {
                 "connection_file": str(connection),
                 "artifact_dir": str(artifact),
+                "image_max_pixels": 4_194_304,
             },
             lambda _event: None,
             future.set_result,

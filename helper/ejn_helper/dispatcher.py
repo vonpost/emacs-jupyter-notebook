@@ -25,6 +25,7 @@ from .flow import (
     FlowControlError,
 )
 from .framing import FrameCodecError, encode
+from .image_metadata import EJN_MAX_IMAGE_PIXELS
 
 EJN_PROTOCOL_VERSION = 1
 EJN_MAX_CODE_BYTES = 524_288
@@ -306,7 +307,10 @@ class Dispatcher:
             return {"bytes": amount}
         if operation == "connect":
             _exact_fields(
-                params, frozenset({"connection_file", "artifact_dir"})
+                params,
+                frozenset(
+                    {"connection_file", "artifact_dir", "image_max_pixels"}
+                ),
             )
             result = {}
             for field in ("connection_file", "artifact_dir"):
@@ -321,6 +325,17 @@ class Dispatcher:
                         "invalid-request", "connect paths must be bounded and absolute"
                     )
                 result[field] = value
+            image_max_pixels = params["image_max_pixels"]
+            if (
+                type(image_max_pixels) is not int
+                or image_max_pixels < 0
+                or image_max_pixels > EJN_MAX_IMAGE_PIXELS
+            ):
+                raise _RequestError(
+                    "invalid-request",
+                    "image_max_pixels must be within the protocol ceiling",
+                )
+            result["image_max_pixels"] = image_max_pixels
             return result
         if operation in {
             "ping",
