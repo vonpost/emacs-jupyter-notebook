@@ -94,6 +94,7 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
                 dispatcher.dispatch(request(operation, operation, params))
                 self.assertFalse(responses[-1]["ok"])
                 self.assertEqual(responses[-1]["error"]["code"], "busy")
+                self.assertIs(responses[-1]["error"]["admitted"], False)
                 self.assertEqual(backend.starts, [])
                 self.assertFalse(backend.closed)
 
@@ -293,7 +294,7 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.dispatcher.dispatch(request("close", "close"))
         self.assertEqual(self.dispatcher.inflight_count, 0)
 
-    async def test_deadline_cancels_and_ignores_late_completion(self):
+    async def test_execute_has_no_dispatcher_deadline_or_late_cancellation(self):
         await self.connect()
         self.backend.queue_plan(
             "execute",
@@ -304,21 +305,20 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
                 ignore_cancellation=True,
             ),
         )
-        self.dispatcher.operation_timeouts["execute"] = 0.01
         self.dispatcher.dispatch(request("slow", "execute", {"code": "secret()"}))
         await asyncio.sleep(0.02)
         matching = [item for item in self.responses if item["id"] == "slow"]
-        self.assertEqual(len(matching), 1)
-        self.assertEqual(matching[0]["error"]["code"], "timeout")
-        self.assertEqual(self.backend.cancel_calls, 1)
+        self.assertEqual(matching, [])
+        self.assertEqual(self.backend.cancel_calls, 0)
         await asyncio.sleep(0.04)
         self.assertEqual(
             len([item for item in self.responses if item["id"] == "slow"]), 1
         )
-        self.assertEqual(self.dispatcher.late_completions, 1)
-        self.assertEqual(self.dispatcher.late_events, 1)
+        self.assertTrue(self.responses[-1]["ok"])
+        self.assertEqual(self.dispatcher.late_completions, 0)
+        self.assertEqual(self.dispatcher.late_events, 0)
 
-    async def test_kernel_info_override_does_not_extend_ordinary_operation_deadline(self):
+    async def test_kernel_info_override_leaves_execute_without_a_deadline(self):
         await self.connect()
         dispatcher = Dispatcher(
             self.backend,
@@ -337,9 +337,89 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
         info_timer = dispatcher._inflight["slow-info"].timer
         execute_timer = dispatcher._inflight["slow-execute"].timer
         now = self.loop.time()
+        self.assertIsNotNone(info_timer)
         self.assertGreater(info_timer.when() - now, 0.04)
-        self.assertLess(execute_timer.when() - now, 0.04)
+        self.assertIsNone(execute_timer)
         dispatcher.dispose()
+
+    async def test_idle_backend_transport_failure_emits_one_priority_event(self):
+        class FatalBackend(FakeBackend):
+            def __init__(self, loop):
+                super().__init__(loop)
+                self.transport_failure_callback = None
+
+            def set_transport_failure_callback(self, callback):
+                self.transport_failure_callback = callback
+
+            def fail_transport(self):
+                assert self.transport_failure_callback is not None
+                self.transport_failure_callback()
+
+        backend = FatalBackend(self.loop)
+        responses = []
+        queue = EventQueue()
+        dispatcher = Dispatcher(
+            backend, responses.append, event_queue=queue, loop=self.loop
+        )
+        self.assertIsNotNone(backend.transport_failure_callback)
+        backend.fail_transport()
+        backend.fail_transport()
+
+        events = decode_events(queue.drain())
+        self.assertEqual(
+            events,
+            [
+                {
+                    "v": 1,
+                    "kind": "event",
+                    "seq": 10**15,
+                    "event": "transport_error",
+                    "request_id": None,
+                    "data": {
+                        "code": "transport-error",
+                        "message": "Jupyter transport lost",
+                    },
+                }
+            ],
+        )
+        self.assertEqual(responses, [])
+
+    async def test_backend_transport_failure_does_not_duplicate_execute_error(self):
+        class FatalBackend(FakeBackend):
+            def __init__(self, loop):
+                super().__init__(loop)
+                self.transport_failure_callback = None
+
+            def set_transport_failure_callback(self, callback):
+                self.transport_failure_callback = callback
+
+            def fail_transport(self):
+                assert self.transport_failure_callback is not None
+                self.transport_failure_callback()
+
+        backend = FatalBackend(self.loop)
+        responses = []
+        queue = EventQueue()
+        dispatcher = Dispatcher(
+            backend, responses.append, event_queue=queue, loop=self.loop
+        )
+        dispatcher.negotiated = True
+        dispatcher.connected = True
+        backend.queue_plan(
+            "execute", FakePlan(delay=0.01, error=BackendError("transport-error"))
+        )
+        dispatcher.dispatch(request("active", "execute", {"code": "x"}))
+        backend.fail_transport()
+        backend.fail_transport()
+        self.assertFalse(dispatcher.connected)
+        await asyncio.sleep(0.03)
+
+        events = decode_events(queue.drain())
+        self.assertEqual([item["event"] for item in events], ["transport_error"])
+        matching = [item for item in responses if item["id"] == "active"]
+        self.assertEqual(len(matching), 1)
+        self.assertFalse(matching[0]["ok"])
+        self.assertIs(matching[0]["error"]["admitted"], True)
 
     async def test_duplicate_backend_completion_emits_one_response(self):
         await self.connect()
@@ -382,6 +462,7 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         unsafe = self.responses[-1]
         self.assertEqual(unsafe["error"]["code"], "transport-error")
+        self.assertIs(unsafe["error"]["admitted"], True)
         self.assertNotIn(secret, json.dumps(unsafe))
 
         self.backend.queue_plan("execute", FakePlan(error=BackendError("timeout")))
@@ -389,6 +470,7 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         safe = self.responses[-1]
         self.assertEqual(safe["error"]["code"], "timeout")
+        self.assertIs(safe["error"]["admitted"], True)
         self.assertNotIn(secret, json.dumps(safe))
 
         self.backend.queue_plan(
@@ -397,6 +479,7 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.dispatcher.dispatch(request("raised", "execute", {"code": secret}))
         raised = self.responses[-1]
         self.assertEqual(raised["error"]["code"], "transport-error")
+        self.assertIs(raised["error"]["admitted"], True)
         self.assertNotIn(secret, json.dumps(raised))
 
     async def test_code_limit_is_exact_and_oversize_is_not_dispatched(self):
@@ -791,7 +874,7 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(dispatcher.closed)
         self.assertFalse(dispatcher.connected)
         self.assertEqual(dispatcher.inflight_count, 0)
-        self.assertTrue(record.timer.cancelled())
+        self.assertIsNone(record.timer)
         self.assertEqual(backend.cancellation.calls, 1)
         self.assertEqual(backend.close_calls, 1)
         self.assertEqual(responses, [])

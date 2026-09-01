@@ -142,18 +142,8 @@ any pre-existing `_repr_mimebundle_', and a graceful no-op when
     (emacs-jupyter-notebook-helper-backend-ensure)))
 
 (defun emacs-jupyter-notebook--backend-transport-failed (session reason)
-  "Mark the installed SESSION unusable after a local transport failure.
-
-The durable registry and remote kernel remain untouched.  The existing bounded
-reconnect loop owns replacement of local helper/tunnel state."
-  (when (eq emacs-jupyter-notebook--client session)
-    (ignore-errors (emacs-jupyter-notebook--heartbeat-cancel))
-    (setq emacs-jupyter-notebook--tunnel-dead t
-          emacs-jupyter-notebook--kernel-status nil)
-    (emacs-jupyter-notebook--log-append
-     'transport "backend transport failed: %s" reason)
-    (force-mode-line-update t)
-    (emacs-jupyter-notebook--schedule-auto-reconnect)))
+  "Atomically retire local SESSION after helper/protocol transport failure."
+  (emacs-jupyter-notebook--transport-lost reason session nil))
 
 (defun emacs-jupyter-notebook--helper-input-reply
     (client request helper-request-id input-id)
@@ -763,9 +753,6 @@ crossing the misses-allowed threshold writes a `heartbeat-dead' line."
      (buffer-name))
     (when (>= emacs-jupyter-notebook--heartbeat-misses
               (max 1 (or emacs-jupyter-notebook-heartbeat-misses-allowed 2)))
-      (setq emacs-jupyter-notebook--tunnel-dead t)
-      (setq emacs-jupyter-notebook--kernel-status nil)
-      (force-mode-line-update t)
       (emacs-jupyter-notebook--log-append
        'heartbeat-dead
        "tunnel flagged dead after %d consecutive misses in `%s'"
@@ -775,8 +762,9 @@ crossing the misses-allowed threshold writes a `heartbeat-dead' line."
        (format
         "Heartbeat: %d consecutive kernel-info misses in `%s'; tunnel flagged dead."
         emacs-jupyter-notebook--heartbeat-misses (buffer-name)))
-      (emacs-jupyter-notebook--heartbeat-cancel)
-      (emacs-jupyter-notebook--schedule-auto-reconnect))))
+      (emacs-jupyter-notebook--transport-lost
+       "heartbeat lost local kernel transport"
+       emacs-jupyter-notebook--client nil))))
 
 (defvar-local emacs-jupyter-notebook--async-last-error nil
   "Buffer-local flag: set when the last async operation finished with `error'.
@@ -1013,8 +1001,7 @@ disposer does not prevent the remaining disposers from running."
   "Cancel execution-record timers and the completion-idle timer."
   (when (hash-table-p emacs-jupyter-notebook--execution-ledger)
     (maphash (lambda (_id record)
-               (when (timerp (plist-get record :timer))
-                 (cancel-timer (plist-get record :timer))))
+               (emacs-jupyter-notebook--execution-cancel-timer record))
              emacs-jupyter-notebook--execution-ledger))
   (when (timerp emacs-jupyter-notebook--execution-setup-timer)
     (cancel-timer emacs-jupyter-notebook--execution-setup-timer))
@@ -1050,10 +1037,13 @@ disposer does not prevent the remaining disposers from running."
   record)
 
 (defun emacs-jupyter-notebook--execution-cancel-timer (record)
-  "Cancel RECORD's dispatched-only timeout timer."
+  "Cancel RECORD's local evaluation and post-interrupt grace timers."
   (when (timerp (plist-get record :timer))
     (cancel-timer (plist-get record :timer))
     (setq record (plist-put record :timer nil)))
+  (when (timerp (plist-get record :interrupt-grace-timer))
+    (cancel-timer (plist-get record :interrupt-grace-timer))
+    (setq record (plist-put record :interrupt-grace-timer nil)))
   record)
 
 (defun emacs-jupyter-notebook--execution-remove (record)
@@ -1118,6 +1108,125 @@ at the FIFO head until correlated terminal evidence arrives.
           (emacs-jupyter-notebook-fringe-set cell-key status execution-count))))
     (emacs-jupyter-notebook--execution-remove record)
     (emacs-jupyter-notebook--execution-pump)))
+
+(defun emacs-jupyter-notebook--execution-admitted-p (record client)
+  "Return non-nil only when RECORD has evidence of reaching CLIENT.
+`dispatched' is deliberately insufficient: the core enters that state before
+calling the backend so reentrant terminal events can be staged.  The helper
+adapter's wire map is the authoritative post-write admission record; legacy
+backends retain their returned generic request id as the available evidence."
+  (and (not (plist-get record :terminal))
+       (if (and client
+                (eq (emacs-jupyter-notebook-backend-session-backend client)
+                    'helper)
+                (fboundp
+                 'emacs-jupyter-notebook-helper-backend-ledger-id-admitted-p))
+           (emacs-jupyter-notebook-helper-backend-ledger-id-admitted-p
+            client (plist-get record :id) (plist-get record :backend-request-id))
+         (plist-get record :backend-request-id))))
+
+(defun emacs-jupyter-notebook--execution-settle-transport-loss
+    (record status suffix)
+  "Finish RECORD locally as STATUS without pumping the FIFO.
+This is the atomic portion of a transport-loss transition.  It deliberately
+uses the normal presentation and helper-wire retirement primitives, but does
+not invoke `--execution-finish': pumping between records could replay queued
+source while the old transport is still being released."
+  (unless (plist-get record :terminal)
+    (setq record (emacs-jupyter-notebook--execution-cancel-timer record))
+    (setq record (plist-put record :state status))
+    (setq record (plist-put record :terminal t))
+    (let ((handle (plist-get record :panel-entry))
+          (cell-key (plist-get record :cell-key)))
+      (when (and suffix (ejn-panel-entry-live-p handle))
+        (ignore-errors
+          (ejn-panel-append-text handle suffix
+                                 'emacs-jupyter-notebook-result-error-face)))
+      (when (ejn-panel-entry-live-p handle)
+        (ignore-errors (ejn-panel-finish-entry handle status nil)))
+      (when (and cell-key (ejn-panel-entry-live-p handle)
+                 (emacs-jupyter-notebook--execution-cell-fringe-current-p record))
+        (ignore-errors (emacs-jupyter-notebook-fringe-set cell-key status))))
+    ;; `--execution-remove' tombstones helper wire ids before the adapter is
+    ;; closed, so late output/replies are observationally inert.
+    (emacs-jupyter-notebook--execution-remove record)))
+
+(defun emacs-jupyter-notebook--execution-mark-transport-lost (client)
+  "Classify and terminally present every live ledger record for CLIENT.
+Accepted executions have an ambiguous remote outcome; records lacking actual
+dispatch evidence never reached the kernel and are visibly cancelled.  No
+terminal record is touched and no code is retained for replay."
+  (when (hash-table-p emacs-jupyter-notebook--execution-ledger)
+    (let (records)
+      (maphash (lambda (_id record) (push record records))
+               emacs-jupyter-notebook--execution-ledger)
+      ;; Preserve FIFO presentation order even though hash iteration is not
+      ;; ordered.  The list is small (the user queue is serialized).
+      (setq records (sort records
+                          (lambda (left right)
+                            (< (plist-get left :id) (plist-get right :id)))))
+      (dolist (record records)
+        (unless (plist-get record :terminal)
+          (if (emacs-jupyter-notebook--execution-admitted-p record client)
+              (emacs-jupyter-notebook--execution-settle-transport-loss
+               record 'outcome-unknown "\nlocal transport lost; outcome unknown")
+            (emacs-jupyter-notebook--execution-settle-transport-loss
+             record 'cancelled "\nlocal transport lost before dispatch; cancelled")))))
+  (setq emacs-jupyter-notebook--execution-active-id nil)))
+
+(defun emacs-jupyter-notebook--transport-lost
+    (reason &optional expected-client expected-tunnel)
+  "Atomically retire one current local transport after ambiguous failure.
+REASON is diagnostic only.  EXPECTED-CLIENT and EXPECTED-TUNNEL guard helper
+callbacks and process sentinels so stale local resources cannot affect a
+replacement session.  This never changes the durable registry, remote
+connection file, or remote kernel; it only starts the existing deduplicated
+automatic reconnect loop after local resources are gone."
+  (let ((client emacs-jupyter-notebook--client)
+        (tunnel emacs-jupyter-notebook--tunnel-process))
+    (when (and (or (null expected-client) (eq expected-client client))
+               (or (null expected-tunnel) (eq expected-tunnel tunnel))
+               ;; A heartbeat can discover loss after an earlier local
+               ;; cleanup left no client/process.  `--tunnel-dead' is the
+               ;; latch for that resource-less transition; all identified
+               ;; helper/tunnel failures still require exact ownership above.
+               (or client tunnel (not emacs-jupyter-notebook--tunnel-dead)))
+      ;; Invalidate local-only setup before settling user records.  A setup
+      ;; callback can otherwise arrive during this transition and pump work
+      ;; against the dying client between two ledger classifications.
+      (when (timerp emacs-jupyter-notebook--execution-setup-timer)
+        (cancel-timer emacs-jupyter-notebook--execution-setup-timer))
+      (setq emacs-jupyter-notebook--execution-setup-timer nil
+            emacs-jupyter-notebook--execution-setup-pending nil
+            emacs-jupyter-notebook--execution-setup-epoch
+            (1+ emacs-jupyter-notebook--execution-setup-epoch))
+      ;; Settle presentation before releasing the helper map.  In particular,
+      ;; `--begin-reconnect' later calls `--release-local-resources', which
+      ;; clears the ledger and would otherwise erase dispatch evidence.
+      (emacs-jupyter-notebook--execution-mark-transport-lost client)
+      (emacs-jupyter-notebook--heartbeat-cancel)
+      (emacs-jupyter-notebook--completion-cancel-idle-timer)
+      (cl-incf emacs-jupyter-notebook--inspect-request-id)
+      ;; Clear ownership before closing/deleting.  Either action may invoke a
+      ;; synchronous sentinel/callback; those stale callbacks then fail their
+      ;; exact identity gates rather than scheduling a second recovery.
+      (setq emacs-jupyter-notebook--client nil
+            emacs-jupyter-notebook--tunnel-process nil
+            emacs-jupyter-notebook--kernel-status nil)
+      (when client
+        (ignore-errors
+          (emacs-jupyter-notebook-backend-close-local client #'ignore #'ignore)))
+      (when (processp tunnel)
+        ;; Detach before deletion even when the process already exited: a
+        ;; queued sentinel must be unable to classify this retired tunnel.
+        (ignore-errors (set-process-sentinel tunnel #'ignore))
+        (ignore-errors (emacs-jupyter-notebook--async-delete-process tunnel)))
+      (setq emacs-jupyter-notebook--tunnel-dead t)
+      (emacs-jupyter-notebook--log-append 'transport "local transport lost: %s" reason)
+      (force-mode-line-update t)
+      ;; The existing scheduler owns de-duplication through its timer/token
+      ;; guards and never relaunches or terminates the durable kernel.
+      (emacs-jupyter-notebook--schedule-auto-reconnect))))
 
 (defun emacs-jupyter-notebook--execution-code-bytes (code &optional ceiling)
   "Return CODE's UTF-8 byte count, stopping just above CEILING when supplied.
@@ -1251,7 +1360,8 @@ Queued and completeness-checking records deliberately have no timer."
     (when (and record (emacs-jupyter-notebook--execution-current-p request-id)
                (memq (plist-get record :state) '(dispatched cancelling)))
       (let ((timeout emacs-jupyter-notebook-evaluation-timeout)
-            (client emacs-jupyter-notebook--client))
+            (client emacs-jupyter-notebook--client)
+            (buffer (current-buffer)))
         ;; An interrupt is not a terminal outcome.  Keep this record at the
         ;; FIFO head until its correlated reply *and* idle arrive, so B cannot
         ;; execute while A's kernel-side outcome remains unknown.
@@ -1268,10 +1378,49 @@ Queued and completeness-checking records deliberately have no timer."
           (when client
             (ignore-errors
               (emacs-jupyter-notebook--interrupt-active-execution client))))
-        (emacs-jupyter-notebook--log-append
-         'eval-timeout "evaluation timed out after %ss; interrupted kernel" timeout)
-        (setq emacs-jupyter-notebook--kernel-status 'busy)
-        (force-mode-line-update t)))))
+        ;; Interrupt admission updates this record independently.  Re-read it
+        ;; before adding the grace timer so this callback cannot overwrite the
+        ;; fresh :interrupt-sent marker with its stale pre-interrupt plist.
+        (setq record (emacs-jupyter-notebook--execution-record request-id))
+        ;; The interrupt path can synchronously report a transport failure and
+        ;; retire the record.  Only this exact still-current cancelling record
+        ;; may receive the grace timer; otherwise a nil plist would create a
+        ;; phantom ledger entry after the terminal transition.
+        (when (and record
+                   (eq client emacs-jupyter-notebook--client)
+                   (emacs-jupyter-notebook--execution-current-p request-id)
+                   (eq (plist-get record :state) 'cancelling))
+          ;; The configured evaluation timeout is the sole execution-lifetime
+          ;; policy.  One equal terminal grace gives a correlated interrupt time
+          ;; to settle; a stuck local helper is then an ambiguous transport loss,
+          ;; never an indefinitely wedged FIFO or a second hidden deadline.
+          (unless (timerp (plist-get record :interrupt-grace-timer))
+            (setq record
+                  (plist-put
+                   record :interrupt-grace-timer
+                   (run-at-time
+                    timeout nil
+                    (lambda ()
+                      ;; Timers do not retain `current-buffer'.  Re-enter the
+                      ;; owner before consulting any buffer-local lifecycle
+                      ;; state so another source buffer cannot be retired.
+                      (when (buffer-live-p buffer)
+                        (with-current-buffer buffer
+                          (when-let ((current
+                                      (emacs-jupyter-notebook--execution-record
+                                       request-id)))
+                            (when (and (eq client emacs-jupyter-notebook--client)
+                                       (emacs-jupyter-notebook--execution-current-p
+                                        request-id)
+                                       (eq (plist-get current :state) 'cancelling))
+                              (emacs-jupyter-notebook--transport-lost
+                               "evaluation did not settle after interrupt"
+                               client nil))))))))))
+            (emacs-jupyter-notebook--execution-put record))
+          (emacs-jupyter-notebook--log-append
+           'eval-timeout "evaluation timed out after %ss; interrupted kernel" timeout)
+          (setq emacs-jupyter-notebook--kernel-status 'busy)
+          (force-mode-line-update t)))))
 
 (defun emacs-jupyter-notebook--release-local-resources ()
   "Drop the current buffer's local kernel handles without touching durable state.
@@ -2008,22 +2157,26 @@ when at least one entry is actually pruned.  Return a plist
 (defun emacs-jupyter-notebook--install-tunnel-sentinel (process buffer)
   "Install a sentinel on PROCESS that marks the tunnel dead in BUFFER."
   (if (not (process-live-p process))
-      (when (buffer-live-p buffer)
-        (with-current-buffer buffer
-          (setq emacs-jupyter-notebook--tunnel-dead t)
-          (setq emacs-jupyter-notebook--kernel-status nil)
-          (force-mode-line-update t)
-          (emacs-jupyter-notebook--schedule-auto-reconnect)))
+      (progn
+        ;; A dead process can still retain a queued sentinel.  Silence it
+        ;; before the state transition so it cannot run against a replacement.
+        (set-process-sentinel process #'ignore)
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (when (eq process emacs-jupyter-notebook--tunnel-process)
+              (emacs-jupyter-notebook--transport-lost
+               "SSH tunnel exited" nil process)))))
     (set-process-sentinel
      process
      (lambda (proc _event)
        (when (memq (process-status proc) '(exit signal))
          (when (buffer-live-p buffer)
            (with-current-buffer buffer
-             (setq emacs-jupyter-notebook--tunnel-dead t)
-             (setq emacs-jupyter-notebook--kernel-status nil)
-             (force-mode-line-update t)
-             (emacs-jupyter-notebook--schedule-auto-reconnect))))))))
+             ;; A replacement tunnel or local teardown owns the buffer now;
+             ;; this old process must not classify or schedule anything.
+             (when (eq proc emacs-jupyter-notebook--tunnel-process)
+               (emacs-jupyter-notebook--transport-lost
+                "SSH tunnel exited" nil proc)))))))))
 
 (defun emacs-jupyter-notebook--cancel-auto-reconnect ()
   "Cancel this buffer's pending automatic reconnect timer."

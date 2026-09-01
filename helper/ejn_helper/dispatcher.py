@@ -93,7 +93,7 @@ class _RequestError(ValueError):
 class _Inflight:
     request_id: str
     operation: BackendOperation
-    timer: asyncio.TimerHandle
+    timer: asyncio.TimerHandle | None
     cancellation: Cancellation | None = None
     cancel_requested: bool = False
     terminal: bool = False
@@ -179,6 +179,8 @@ class Dispatcher:
         for operation, timeout in (operation_timeouts or {}).items():
             if operation not in _BACKEND_OPERATIONS:
                 raise ValueError("operation timeout names an unsupported operation")
+            if operation == "execute":
+                raise ValueError("execute timeout belongs to the Emacs owner")
             if (
                 isinstance(timeout, bool)
                 or not isinstance(timeout, (int, float))
@@ -203,10 +205,48 @@ class Dispatcher:
         self.callback_failures = 0
         self.late_completions = 0
         self.late_events = 0
+        self._transport_failure_reported = False
+        register_transport_failure = getattr(
+            backend, "set_transport_failure_callback", None
+        )
+        if callable(register_transport_failure):
+            register_transport_failure(self._backend_transport_failed)
 
     @property
     def inflight_count(self) -> int:
         return len(self._inflight)
+
+    def _backend_transport_failed(self) -> None:
+        """Publish one uncorrelated fatal Jupyter-channel event.
+
+        An attached backend can discover a dead channel while no EJN request is
+        in flight.  A local helper ping proves only that this dispatcher is
+        alive, so that condition must cross the protocol boundary explicitly.
+        The reserved priority event reaches Emacs independently of request
+        traffic; closing the connected gate also prevents a later operation
+        from being sent on the failed backend while that event drains.
+        """
+        if self.closed or self._transport_failure_reported:
+            return
+        self._transport_failure_reported = True
+        self.connected = False
+        try:
+            self.event_queue.enqueue(
+                {
+                    "v": EJN_PROTOCOL_VERSION,
+                    "kind": "event",
+                    "event": "transport_error",
+                    "request_id": None,
+                    "data": {
+                        "code": "transport-error",
+                        "message": "Jupyter transport lost",
+                    },
+                }
+            )
+        except FlowControlError:
+            # A saturated priority queue is already fatal.  Runtime will
+            # terminate the helper when its writer next drains this queue.
+            pass
 
     def dispatch(self, envelope: object) -> None:
         """Validate and start one request, emitting exactly one response."""
@@ -460,14 +500,16 @@ class Dispatcher:
                     request_id, "transport-error", "dispatcher loop is unavailable"
                 )
                 return False
-        timeout = self.operation_timeouts.get(operation, self.request_timeout)
-        try:
-            timer = loop.call_later(timeout, self._deadline, request_id)
-        except BaseException:
-            self._send_error(
-                request_id, "transport-error", "dispatcher loop is unavailable"
-            )
-            return False
+        timer = None
+        if operation != "execute":
+            timeout = self.operation_timeouts.get(operation, self.request_timeout)
+            try:
+                timer = loop.call_later(timeout, self._deadline, request_id)
+            except BaseException:
+                self._send_error(
+                    request_id, "transport-error", "dispatcher loop is unavailable"
+                )
+                return False
         typed_operation = cast(BackendOperation, operation)
         record = _Inflight(request_id, typed_operation, timer)
         self._inflight[request_id] = record
@@ -641,7 +683,8 @@ class Dispatcher:
         if self._inflight.get(request_id) is not record or record.terminal:
             return
         record.terminal = True
-        record.timer.cancel()
+        if record.timer is not None:
+            record.timer.cancel()
         if record.operation == "execute":
             self._retire_prompt_lease(request_id)
         if cancel:
@@ -667,6 +710,7 @@ class Dispatcher:
                     "code": exc.code,
                     "message": _safe_message(exc.code),
                 }
+                payload["admitted"] = True
         if success and record.operation == "connect":
             self.connected = True
         # A shutdown request is terminal or outcome-unknown after admission.
@@ -679,13 +723,19 @@ class Dispatcher:
             if success:
                 self._send_success(request_id, payload)
             else:
+                error = dict(payload)
+                # Every operation that reached a dispatcher record is
+                # deliberately conservative: a backend-start or completion
+                # failure may follow a successful Jupyter wire write.  For
+                # execute this tells Emacs to preserve outcome ambiguity.
+                error["admitted"] = True
                 self._send_response(
                     {
                         "v": EJN_PROTOCOL_VERSION,
                         "kind": "response",
                         "id": request_id,
                         "ok": False,
-                        "error": payload,
+                        "error": error,
                     }
                 )
         finally:
@@ -745,7 +795,8 @@ class Dispatcher:
         failed = False
         for request_id, record in records:
             record.terminal = True
-            record.timer.cancel()
+            if record.timer is not None:
+                record.timer.cancel()
             try:
                 self.event_queue.reset_request(request_id)
             except BaseException:
@@ -787,7 +838,10 @@ class Dispatcher:
                 "kind": "response",
                 "id": request_id,
                 "ok": False,
-                "error": {"code": code, "message": message},
+                # This path precedes dispatcher admission.  EJN may classify
+                # an execute rejected here as cancelled rather than claiming
+                # an unknown kernel-side outcome.
+                "error": {"code": code, "message": message, "admitted": False},
             }
         )
 
@@ -802,15 +856,24 @@ class Dispatcher:
                 > EJN_MAX_REQUEST_ID_BYTES
             ):
                 request_id = ""
+            error = {
+                "code": "frame-too-large",
+                "message": _safe_message("frame-too-large"),
+                # A fallback for a local-only success (hello/ping/credit) has
+                # no backend admission evidence.  Backend completions are
+                # converted by `_finish' first and carry true explicitly.
+                "admitted": False,
+            }
+            if isinstance(response.get("error"), dict) and type(
+                response["error"].get("admitted")
+            ) is bool:
+                error["admitted"] = response["error"]["admitted"]
             response = {
                 "v": EJN_PROTOCOL_VERSION,
                 "kind": "response",
                 "id": request_id,
                 "ok": False,
-                "error": {
-                    "code": "frame-too-large",
-                    "message": _safe_message("frame-too-large"),
-                },
+                "error": error,
             }
             encode(response, EJN_MAX_RESPONSE_FRAME)
         try:

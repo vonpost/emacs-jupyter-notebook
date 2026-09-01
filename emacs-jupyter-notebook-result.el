@@ -156,7 +156,7 @@ Each entry plist supports:
   :id N
   :cell-key KEY-or-nil
   :code STRING
-  :status running|ok|error
+  :status queued|running|ok|error|cancelled|outcome-unknown
   :exec-count INTEGER-or-\"*\"
   :timestamp ISO-string
   :outputs ordered text/image segments
@@ -773,6 +773,8 @@ configured inline previews; placeholder images never call `image-size'."
                      ('running "running")
                      ('ok "ok")
                      ('error "error")
+                     ('cancelled "cancelled")
+                     ('outcome-unknown "outcome unknown")
                      (_ (format "%s" status)))))
     (propertize
      (format "[%s] %s [%s] %s\n" count ts status-s title)
@@ -2427,6 +2429,8 @@ Also coerces a non-numeric `:scale' (Emacs 29+ reports the symbol
       ('running "►")
       ('ok (concat "✓" digit))
       ('error "✗")
+      ('cancelled "!")
+      ('outcome-unknown "?")
       ('queued "…")
       (_ ""))))
 
@@ -2436,6 +2440,7 @@ Also coerces a non-numeric `:scale' (Emacs 29+ reports the symbol
     ('running 'emacs-jupyter-notebook-fringe-running-face)
     ('ok 'emacs-jupyter-notebook-fringe-ok-face)
     ('error 'emacs-jupyter-notebook-fringe-error-face)
+    ((or 'cancelled 'outcome-unknown) 'emacs-jupyter-notebook-fringe-error-face)
     ('queued 'emacs-jupyter-notebook-fringe-queued-face)
     (_ 'default)))
 

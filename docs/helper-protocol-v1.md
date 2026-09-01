@@ -153,7 +153,13 @@ execution's string `request_id`, its exact 32-character lowercase-hex
 operations use `{}`.
 
 Responses require string `id` and boolean `ok`; success has an object
-`result`, failure has a short safe `error` with string `code` and `message`.
+`result`, failure has a short safe `error` with string `code` and `message`
+plus boolean `admitted`.  `admitted:false` proves that the dispatcher rejected
+the request before it entered its backend operation table.  `admitted:true`
+means the operation reached that table; for `execute`, Emacs must treat any
+such failure as outcome-unknown because a Jupyter wire write may already have
+occurred.  Missing or malformed admission evidence is a protocol failure, not
+evidence that code was unsent.
 Events require integer monotonic `seq`, string `event`, and object `data`;
 execution events also require `request_id`. An `input_request` has exactly
 `input_id`, `prompt`, and `password`: `input_id` is a fresh 32-character
@@ -180,6 +186,16 @@ silent setup creates no panel entry. At most 8 requests await responses. On
 transport ambiguity, dispatched/busy becomes `outcome-unknown`; code is
 never replayed automatically. Late replies and duplicate events are logged
 and ignored.
+
+`execute` has no dispatcher or Jupyter-backend execution deadline.  Its
+lifetime is owned by Emacs: the configured evaluation timeout sends one
+interrupt, then one equal terminal grace retires the local transport as
+outcome-unknown if correlated terminal evidence still has not arrived.  The
+Emacs helper supervisor retains a final fallback deadline one second beyond
+that transition, only to catch a stalled owner timer.  This permits
+intentionally long-running cells without a competing helper timeout; connect,
+readiness, auxiliary, input, control, and internal silent-setup operations
+remain bounded.
 
 ### Scheduling and artifacts
 

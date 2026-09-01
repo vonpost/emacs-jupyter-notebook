@@ -194,20 +194,27 @@ class LifecycleBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await asyncio.wait_for(execute, 1)).result, {"status": "ok"})
         self.assertFalse(backend._transport_failed)
 
-    async def test_kernel_info_deadline_override_leaves_other_operations_at_default(self):
+    async def test_kernel_info_deadline_override_leaves_execute_to_its_owner(self):
         backend, _client = await self._connected(
             deadline=0.01, operation_deadlines={"kernel_info": 0.08}
         )
-        self.assertEqual(backend._operation_deadline("execute"), 0.01)
+        self.assertIsNone(backend._operation_deadline("execute"))
         self.assertEqual(backend._operation_deadline("kernel_info"), 0.08)
 
         _token, kernel_info = await self._request(backend, "kernel_info")
         _token, execute = await self._request(backend, "execute")
-        execute_result = await asyncio.wait_for(execute, 1)
-        self.assertEqual(execute_result.error.code, "timeout")
+        await asyncio.sleep(0.03)
+        self.assertFalse(execute.done())
         self.assertFalse(kernel_info.done())
         kernel_info_result = await asyncio.wait_for(kernel_info, 1)
         self.assertEqual(kernel_info_result.error.code, "timeout")
+        backend.close()
+        await backend.wait_closed()
+        # Local close deliberately does not manufacture a terminal reply for
+        # an admitted execute.  Emacs owns that ambiguity and has already
+        # classified it before retiring its helper transport.
+        self.assertFalse(execute.done())
+        execute.cancel()
 
     async def test_operation_deadline_overrides_are_finite_and_kernel_info_only(self):
         for invalid in (False, 0, float("nan"), float("inf")):
@@ -216,6 +223,24 @@ class LifecycleBackendTests(unittest.IsolatedAsyncioTestCase):
                     JupyterBackend(operation_deadlines={"kernel_info": invalid})
         with self.assertRaises(ValueError):
             JupyterBackend(operation_deadlines={"execute": 0.1})
+
+    async def test_idle_liveness_failure_notifies_once_without_a_request(self):
+        backend, client = await self._connected(deadline=0.05)
+        observed = []
+        backend.set_transport_failure_callback(lambda: observed.append("lost"))
+        client.alive = False
+
+        for _ in range(30):
+            if observed:
+                break
+            await asyncio.sleep(0.01)
+
+        self.assertEqual(observed, ["lost"])
+        self.assertTrue(backend._transport_failed)
+        self.assertIsNone(backend.client)
+        self.assertGreaterEqual(client.stopped, 1)
+        await asyncio.sleep(0.08)
+        self.assertEqual(observed, ["lost"])
 
     async def test_shutdown_requires_reply_and_terminal_liveness_then_retires_local_state(self):
         backend, client = await self._connected()

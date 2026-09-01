@@ -13,7 +13,7 @@ import stat
 from dataclasses import dataclass
 from queue import Empty
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 from .backend import BackendCompletion, BackendError, BackendEvent
 from .outputs import OutputAttachment, OutputNormalizer
@@ -356,6 +356,8 @@ class JupyterBackend:
         self._retired_tasks: list[asyncio.Task] = []
         self._timed_out_tasks: set[asyncio.Task[None]] = set()
         self._transport_failed = False
+        self._transport_failure_callback: Callable[[], None] | None = None
+        self._transport_failure_notified = False
         self._shutting_down = False
         self._shutdown_reply_received = False
         # One coordinator covers every connect/reattach generation.  Its
@@ -365,9 +367,50 @@ class JupyterBackend:
         self._heartbeat_interval = min(1.0, max(0.05, self.deadline / 4))
         self._heartbeat_timeout = min(1.0, max(0.05, self.deadline / 2))
 
-    def _operation_deadline(self, operation: str) -> float:
-        """Return the finite local deadline for one backend operation."""
+    def _operation_deadline(self, operation: str) -> float | None:
+        """Return the local deadline for one backend operation.
+
+        Execute lifetime belongs to the Emacs execution ledger.  The helper
+        must keep its channels available for an explicitly long-running cell
+        and for the later interrupt that its owner may issue, so it never
+        applies a second hidden execution deadline.
+        """
+        if operation == "execute":
+            return None
         return self.operation_deadlines.get(operation, self.deadline)
+
+    def set_transport_failure_callback(
+        self, callback: Callable[[], None] | None
+    ) -> None:
+        """Install the one-shot local transport-failure observer.
+
+        The dispatcher owns the protocol-visible consequence of a dead Jupyter
+        channel.  The backend merely reports that local fact; it never sends a
+        kernel control message or makes a kernel-lifetime decision here.
+        """
+        if callback is not None and not callable(callback):
+            raise ValueError("transport failure callback must be callable")
+        self._transport_failure_callback = callback
+        self._notify_transport_failure()
+
+    def _notify_transport_failure(self) -> None:
+        """Report a previously detected local channel failure once."""
+        if (
+            not self._transport_failed
+            or self._transport_failure_notified
+            or self.closed
+        ):
+            return
+        callback = self._transport_failure_callback
+        if callback is None:
+            return
+        self._transport_failure_notified = True
+        try:
+            callback()
+        except Exception:
+            # The observer is local protocol plumbing.  Its failure must not
+            # disrupt release of readers and pending operation futures.
+            pass
 
     @staticmethod
     def _connection(path_value: object) -> dict:
@@ -477,8 +520,13 @@ class JupyterBackend:
         retire_provisional = operation in {"connect", "shutdown"}
         task = asyncio.current_task()
         assert task is not None
-        deadline = asyncio.get_running_loop().call_later(
-            self._operation_deadline(operation), self._expire_operation, task
+        operation_deadline = self._operation_deadline(operation)
+        deadline = (
+            asyncio.get_running_loop().call_later(
+                operation_deadline, self._expire_operation, task
+            )
+            if operation_deadline is not None
+            else None
         )
         try:
             # One operation deadline cancels this operation task directly.  It
@@ -526,7 +574,8 @@ class JupyterBackend:
                 self._stop_channels()
             completion = BackendCompletion.failure(BackendError("transport-error"))
         finally:
-            deadline.cancel()
+            if deadline is not None:
+                deadline.cancel()
             self._timed_out_tasks.discard(task)
             if operation == "connect":
                 self._connecting = False
@@ -1069,6 +1118,7 @@ class JupyterBackend:
             # terminal-liveness check and its final local teardown.
             return
         self._transport_failed = True
+        self._notify_transport_failure()
         for pending in tuple(self._pending.values()):
             if not pending.future.done():
                 pending.future.set_exception(BackendError("transport-error"))

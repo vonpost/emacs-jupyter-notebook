@@ -243,6 +243,48 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await asyncio.wait_for(task, 1), 0)
         self.assertEqual(backend.closed, 1)
 
+    async def test_idle_backend_failure_reaches_runtime_once_as_transport_event(self):
+        class FatalBackend(_Backend):
+            def __init__(self) -> None:
+                super().__init__()
+                self.transport_failure_callback = None
+
+            def set_transport_failure_callback(self, callback) -> None:
+                self.transport_failure_callback = callback
+
+            def fail_transport(self) -> None:
+                assert self.transport_failure_callback is not None
+                self.transport_failure_callback()
+
+        reader, writer, backend = asyncio.StreamReader(), _Writer(), FatalBackend()
+        runtime = ProtocolRuntime(reader, writer, backend=backend)
+        task = asyncio.create_task(runtime.run())
+        hello = encode(
+            {"v": 1, "kind": "request", "id": "h", "op": "hello", "params": {"versions": [1]}},
+            1_048_576,
+        )
+        reader.feed_data(hello)
+        for _ in range(30):
+            if writer.frames:
+                break
+            await asyncio.sleep(0.01)
+        self.assertTrue(writer.frames)
+
+        backend.fail_transport()
+        backend.fail_transport()
+        for _ in range(30):
+            frames = _decode(writer.frames)
+            if any(item.get("event") == "transport_error" for item in frames):
+                break
+            await asyncio.sleep(0.01)
+
+        events = [item for item in _decode(writer.frames) if item.get("event") == "transport_error"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["request_id"], None)
+        self.assertEqual(events[0]["data"]["code"], "transport-error")
+        runtime.request_stop()
+        self.assertEqual(await asyncio.wait_for(task, 1), 0)
+
     async def test_partial_deadline_is_absolute_across_trickle_reads(self):
         reader, writer, backend = asyncio.StreamReader(), _Writer(), _Backend()
         stderr = io.BytesIO()

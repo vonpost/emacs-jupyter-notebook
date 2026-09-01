@@ -286,7 +286,8 @@ DISPOSALS receives local-only disposal reasons."
               ((symbol-function 'emacs-jupyter-notebook-helper-dispose)
                (lambda (_helper reason) (push reason disposals))))
       (ejn-ei2-test-with-session
-        (let (state artifact verify (scheduled 0))
+        (let* ((entry (ejn-ei2-test--direct-entry))
+               state artifact verify (scheduled 0))
           (emacs-jupyter-notebook-backend-connect
            session "/tmp/c.json" #'ignore (lambda (_id reason) (setq failure reason)))
           (setq state (emacs-jupyter-notebook-backend-session-data session)
@@ -299,7 +300,7 @@ DISPOSALS receives local-only disposal reasons."
           ;; Model the exact wedge: busy arbitration installed this session,
           ;; then the bounded readiness request retired before helper death.
           (setq emacs-jupyter-notebook--client session
-                emacs-jupyter-notebook--session-entry (ejn-ei2-test--direct-entry)
+                emacs-jupyter-notebook--session-entry entry
                 emacs-jupyter-notebook--kernel-status 'busy
                 emacs-jupyter-notebook--tunnel-dead nil
                 emacs-jupyter-notebook-mode t)
@@ -317,7 +318,8 @@ DISPOSALS receives local-only disposal reasons."
                 (should (= scheduled 1))
                 (should emacs-jupyter-notebook--tunnel-dead)
                 (should-not emacs-jupyter-notebook--kernel-status)
-                (should (eq emacs-jupyter-notebook--client session))
+                (should-not emacs-jupyter-notebook--client)
+                (should (equal emacs-jupyter-notebook--session-entry entry))
                 (should (string-match-p "kernel_info timed out" failure))
                 (should (emacs-jupyter-notebook-helper-backend-state-retired state))
                 (should-not (file-exists-p artifact))
@@ -1190,9 +1192,9 @@ DISPOSALS receives local-only disposal reasons."
                     (emacs-jupyter-notebook-helper-backend-state-pending-events state))
                    0))))))
 
-(ert-deftest ejn-ei4-rejected-or-malformed-early-output-cannot-drop-terminals ()
-  "One bad early output cannot suppress its later real reply and idle events."
-  (let (seen messages)
+(ert-deftest ejn-ei4-malformed-early-output-invalidates-later-terminals ()
+  "A malformed early event invalidates later terminal claims in its stream."
+  (let (seen failures)
     (with-temp-buffer
       (let* ((session (emacs-jupyter-notebook-backend-session-create
                        nil
@@ -1205,36 +1207,36 @@ DISPOSALS receives local-only disposal reasons."
                                (push type seen)
                                (not (eq type 'update-display)))))))
         (setf (emacs-jupyter-notebook-backend-session-data session) state)
+        (setf (emacs-jupyter-notebook-helper-backend-state-transport-failure state)
+              (lambda (reason) (push reason failures)))
         (setf (emacs-jupyter-notebook-backend-session-dispatch-depth session) 1)
-        (cl-letf (((symbol-function 'message)
-                   (lambda (format-string &rest args)
-                     (push (apply #'format format-string args) messages))))
-          (dolist (event
-                   (list
-                    (ejn-ei2-test--object
-                     "event" "display_data" "request_id" "wire"
-                     "data" (ejn-ei2-test--object
-                              "data" (ejn-ei2-test--object "text/plain" "bad update")
-                              "metadata" (ejn-ei2-test--object)
-                              "update" t))
-                    ;; This malformed item must be isolated rather than aborting
-                    ;; the remainder of the bounded FIFO.
-                    (ejn-ei2-test--object "event" "display_data"
-                                          "request_id" "wire"
-                                          "data" (ejn-ei2-test--object))
-                    (ejn-ei2-test--object
-                     "event" "execute_reply" "request_id" "wire"
-                     "data" (ejn-ei2-test--object "status" "ok"))
-                    (ejn-ei2-test--object
-                     "event" "status" "request_id" "wire"
-                     "data" (ejn-ei2-test--object "execution_state" "idle"))))
-            (emacs-jupyter-notebook-helper-backend--event session state event))
-          (setf (emacs-jupyter-notebook-backend-session-dispatch-depth session) 0)
-          (puthash "wire" '(:ledger-id 1 :backend-request-id 11) mapping)
-          (emacs-jupyter-notebook-helper-backend--flush-pending-events session state))
-        (should (equal (nreverse seen) '(update-display execute-reply status)))
-        (should (= (length messages) 1))
-        (should (string-match-p "rejected early helper event" (car messages)))
+        (dolist (event
+                 (list
+                  (ejn-ei2-test--object
+                   "event" "display_data" "request_id" "wire"
+                   "data" (ejn-ei2-test--object
+                            "data" (ejn-ei2-test--object "text/plain" "bad update")
+                            "metadata" (ejn-ei2-test--object)
+                            "update" t))
+                  ;; A malformed framed item makes every later item in the
+                  ;; same stream untrustworthy, including apparent terminal
+                  ;; evidence.
+                  (ejn-ei2-test--object "event" "display_data"
+                                        "request_id" "wire"
+                                        "data" (ejn-ei2-test--object))
+                  (ejn-ei2-test--object
+                   "event" "execute_reply" "request_id" "wire"
+                   "data" (ejn-ei2-test--object "status" "ok"))
+                  (ejn-ei2-test--object
+                   "event" "status" "request_id" "wire"
+                   "data" (ejn-ei2-test--object "execution_state" "idle"))))
+          (emacs-jupyter-notebook-helper-backend--event session state event))
+        (setf (emacs-jupyter-notebook-backend-session-dispatch-depth session) 0)
+        (puthash "wire" '(:ledger-id 1 :backend-request-id 11) mapping)
+        (emacs-jupyter-notebook-helper-backend--flush-pending-events session state)
+        (should (equal (nreverse seen) '(update-display)))
+        (should (= (length failures) 1))
+        (should (string-match-p "malformed" (car failures)))
         (should (= (hash-table-count
                     (emacs-jupyter-notebook-helper-backend-state-pending-events state))
                    0))))))
@@ -2183,6 +2185,982 @@ DISPOSALS receives local-only disposal reasons."
         (should (= 2 (length results)))
         (should (equal (mapcar #'car (nreverse requests))
                        '("interrupt" "shutdown")))))))
+
+;; EI7 transport ambiguity tests deliberately exercise the public backend
+;; failure boundary.  The fake helper never starts SSH or Jupyter; its request
+;; log is the dispatch evidence used to distinguish accepted from queued work.
+
+(defun ejn-ei7-test--session (owner)
+  "Return an installed helper SESSION with no remote resources."
+  (let ((emacs-jupyter-notebook-backend 'helper))
+    (let* ((session (emacs-jupyter-notebook-backend-session-create
+                     nil owner #'emacs-jupyter-notebook--backend-transport-failed))
+           (state (emacs-jupyter-notebook-helper-backend--make-state
+                   :helper 'ei7-fake
+                   :request-map (make-hash-table :test #'equal)
+                   :retired-request-ids (make-hash-table :test #'equal))))
+      (setf (emacs-jupyter-notebook-backend-session-data session) state)
+      (setf (emacs-jupyter-notebook-helper-backend-state-transport-failure state)
+            (lambda (reason)
+              (emacs-jupyter-notebook-backend-session-notify-transport-failure
+               session reason)))
+      (emacs-jupyter-notebook-backend-session-mark-attached session)
+      (emacs-jupyter-notebook-backend-session-mark-installed session)
+      session)))
+
+(defun ejn-ei7-test--record (id state &optional backend-id timer)
+  "Return an EI7 ledger record with stable correlation metadata."
+  (list :id id :state state :backend-request-id backend-id :generation 1
+        :timer timer :reply-seen nil :idle-seen nil
+        :terminal (memq state '(terminal-ok terminal-error))
+        :panel-entry (list :ei7-entry id)
+        :cell-key (cons "ei7-test.py" id)))
+
+(cl-defmacro ejn-ei7-test-with-presentations ((finished fringe text) &body body)
+  "Run BODY with deterministic panel/fringe presentation spies."
+  (declare (indent 1) (debug t))
+  `(let (,finished ,fringe ,text)
+     (cl-letf (((symbol-function 'ejn-panel-entry-live-p)
+                (lambda (_handle) t))
+               ((symbol-function 'ejn-panel-append-text)
+                (lambda (_handle value &rest _face) (push value ,text)))
+               ((symbol-function 'ejn-panel-finish-entry)
+                (lambda (_handle status &rest _count) (push status ,finished)))
+               ((symbol-function 'emacs-jupyter-notebook-fringe-set)
+                (lambda (_key status &rest _count) (push status ,fringe)))
+               ((symbol-function 'emacs-jupyter-notebook--execution-pump)
+                #'ignore))
+       ,@body)))
+
+(cl-defmacro ejn-ei7-test-with-fake-requests ((requests callbacks) &body body)
+  "Run BODY with a request log and callback table for EI7."
+  (declare (indent 1) (debug t))
+  `(let (,requests ,callbacks)
+     (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper-request)
+                (lambda (_helper operation params callback &rest _keys)
+                  (let ((wire-id (format "ei7-wire-%d" (1+ (length ,callbacks)))))
+                    (push (list operation params wire-id) ,requests)
+                    (push callback ,callbacks)
+                    wire-id))))
+       ,@body)))
+
+(ert-deftest ejn-ei7-failure-before-send-cancels-unaccepted-work ()
+  "A queued record has no outcome ambiguity when transport dies pre-dispatch."
+  (with-temp-buffer
+    (let* ((session (ejn-ei7-test--session (current-buffer)))
+           (record (ejn-ei7-test--record 1 'queued))
+           (scheduled 0))
+      (setq emacs-jupyter-notebook--client session
+            emacs-jupyter-notebook--execution-active-id nil
+            emacs-jupyter-notebook--execution-queue '(1))
+      (emacs-jupyter-notebook--execution-put record)
+      (ejn-ei7-test-with-fake-requests (requests callbacks)
+        (ejn-ei7-test-with-presentations (finished fringe text)
+          (cl-letf (((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
+                     #'ignore)
+                    ((symbol-function 'emacs-jupyter-notebook-backend-close-local)
+                     #'ignore)
+                    ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                     (lambda () (cl-incf scheduled)))
+                    ((symbol-function 'emacs-jupyter-notebook--log-append)
+                     #'ignore))
+            (emacs-jupyter-notebook-backend-session-notify-transport-failure
+             session "before send")
+            (should (= scheduled 1))
+            (should-not requests)
+            (should (equal finished '(cancelled)))
+            (should (equal fringe '(cancelled)))
+            (should-not (emacs-jupyter-notebook--execution-record 1))
+            (should-not emacs-jupyter-notebook--execution-active-id)
+            (should-not callbacks)))))))
+
+(ert-deftest ejn-ei7-helper-death-after-send-marks-unknown-and-cancels-timer ()
+  "Helper death after accepted send marks only that execution unknown."
+  (with-temp-buffer
+    (let* ((session (ejn-ei7-test--session (current-buffer)))
+           (timer (run-at-time 300 nil #'ignore))
+           (scheduled 0) (success-called nil) (failure-called nil)
+           backend-id)
+      (unwind-protect
+          (progn
+            (setq emacs-jupyter-notebook--client session
+                  emacs-jupyter-notebook--execution-active-id 1
+                  emacs-jupyter-notebook--execution-queue '(1))
+            (ejn-ei7-test-with-fake-requests (requests callbacks)
+              (ejn-ei7-test-with-presentations (finished fringe text)
+                (setq backend-id
+                      (emacs-jupyter-notebook-backend-execute
+                       session "accepted()" '(:ledger-id 1 :entry-handle (:generation 1))
+                       (lambda (&rest _) (setq success-called t))
+                       (lambda (&rest _) (setq failure-called t))))
+                (emacs-jupyter-notebook--execution-put
+                 (ejn-ei7-test--record 1 'dispatched backend-id timer))
+                (cl-letf (((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
+                           #'ignore)
+                          ((symbol-function 'emacs-jupyter-notebook-backend-close-local)
+                           #'ignore)
+                          ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                           (lambda () (cl-incf scheduled)))
+                          ((symbol-function 'emacs-jupyter-notebook--log-append)
+                           #'ignore))
+                  (emacs-jupyter-notebook-backend-session-notify-transport-failure
+                   session "helper died")
+                  ;; A duplicate lifecycle signal must not admit a second retry.
+                  (emacs-jupyter-notebook-backend-session-notify-transport-failure
+                   session "helper died again")
+                  (should (= scheduled 1))
+                  (should (equal finished '(outcome-unknown)))
+                  (should (equal fringe '(outcome-unknown)))
+                  (should-not (emacs-jupyter-notebook--execution-record 1))
+                  (should-not (memq timer timer-list))
+                  (should-not success-called)
+                  (should-not failure-called)
+                  (should (= 1 (length requests)))
+                  (should (= 1 (length callbacks)))))))
+        (when (timerp timer) (cancel-timer timer))))))
+
+(ert-deftest ejn-ei7-busy-failure-cancels-queued-without-replay ()
+  "A busy accepted head becomes unknown; unaccepted FIFO work is cancelled."
+  (with-temp-buffer
+    (let* ((session (ejn-ei7-test--session (current-buffer)))
+           (timer (run-at-time 300 nil #'ignore))
+           (scheduled 0))
+      (unwind-protect
+          (progn
+            (setq emacs-jupyter-notebook--client session
+                  emacs-jupyter-notebook--execution-active-id 1
+                  emacs-jupyter-notebook--execution-queue '(1 2))
+            (emacs-jupyter-notebook--execution-put
+             (ejn-ei7-test--record 1 'busy "wire-a" timer))
+            (emacs-jupyter-notebook--execution-put
+             (ejn-ei7-test--record 2 'queued))
+            (puthash "wire-a" (list :ledger-id 1 :backend-request-id "wire-a"
+                                     :panel-generation 1)
+                     (emacs-jupyter-notebook-helper-backend-state-request-map
+                      (emacs-jupyter-notebook-backend-session-data session)))
+            (ejn-ei7-test-with-presentations (finished fringe text)
+              (cl-letf (((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
+                         #'ignore)
+                        ((symbol-function 'emacs-jupyter-notebook-backend-close-local)
+                         #'ignore)
+                        ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                         (lambda () (cl-incf scheduled)))
+                        ((symbol-function 'emacs-jupyter-notebook--log-append)
+                         #'ignore))
+                (emacs-jupyter-notebook--backend-transport-failed
+                 session "tunnel died")
+                (should (= scheduled 1))
+                (should (equal finished '(cancelled outcome-unknown)))
+                (should (equal fringe '(cancelled outcome-unknown)))
+                (should-not emacs-jupyter-notebook--execution-active-id))))
+        (when (timerp timer) (cancel-timer timer))))))
+
+(ert-deftest ejn-ei7-reply-before-idle-is-unknown-and-late-idle-is-inert ()
+  "Transport death after reply but before idle cannot be completed by late idle."
+  (with-temp-buffer
+    (let* ((session-a (ejn-ei7-test--session (current-buffer)))
+           (timer (run-at-time 300 nil #'ignore))
+           (scheduled 0))
+      (unwind-protect
+          (progn
+            (setq emacs-jupyter-notebook--client session-a
+                  emacs-jupyter-notebook--execution-active-id 1
+                  emacs-jupyter-notebook--execution-queue '(1))
+            (emacs-jupyter-notebook--execution-put
+             (ejn-ei7-test--record 1 'dispatched "wire-a" timer))
+            (puthash "wire-a" (list :ledger-id 1 :backend-request-id "wire-a"
+                                     :panel-generation 1)
+                     (emacs-jupyter-notebook-helper-backend-state-request-map
+                      (emacs-jupyter-notebook-backend-session-data session-a)))
+            (emacs-jupyter-notebook--execution-note-event
+             '(:request-id 1 :backend-request-id "wire-a" :panel-generation 1)
+             '(:type execute-reply :status "ok"))
+            (ejn-ei7-test-with-presentations (finished fringe text)
+              (cl-letf (((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
+                         #'ignore)
+                        ((symbol-function 'emacs-jupyter-notebook-backend-close-local)
+                         #'ignore)
+                        ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                         (lambda () (cl-incf scheduled)))
+                        ((symbol-function 'emacs-jupyter-notebook--log-append)
+                         #'ignore))
+                (emacs-jupyter-notebook--backend-transport-failed
+                 session-a "heartbeat died")
+                (should (= scheduled 1))
+                (should (equal finished '(outcome-unknown)))
+                (should (equal fringe '(outcome-unknown)))
+                ;; The record was retired, so a late idle cannot settle it.
+                (emacs-jupyter-notebook--execution-note-event
+                 '(:request-id 1 :backend-request-id "wire-a" :panel-generation 1)
+                 '(:type status :execution-state "idle"))
+                (should-not (emacs-jupyter-notebook--execution-record 1))))))
+        (when (timerp timer) (cancel-timer timer)))))
+
+(ert-deftest ejn-ei7-terminal-work-is-not-replayed-after-protocol-failure ()
+  "A terminal record stays terminal while a protocol failure reconnects once."
+  (with-temp-buffer
+    (let* ((session (ejn-ei7-test--session (current-buffer)))
+           (scheduled 0)
+           (record (ejn-ei7-test--record 1 'terminal-ok "wire-terminal")))
+      (setq emacs-jupyter-notebook--client session
+            emacs-jupyter-notebook--execution-active-id nil
+            emacs-jupyter-notebook--execution-queue nil)
+      (emacs-jupyter-notebook--execution-put record)
+      (puthash "wire-terminal"
+               (list :ledger-id 1 :backend-request-id "wire-terminal"
+                     :panel-generation 1)
+               (emacs-jupyter-notebook-helper-backend-state-request-map
+                (emacs-jupyter-notebook-backend-session-data session)))
+      (ejn-ei7-test-with-presentations (finished fringe text)
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
+                   #'ignore)
+                  ((symbol-function 'emacs-jupyter-notebook-backend-close-local)
+                   #'ignore)
+                  ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                   (lambda () (cl-incf scheduled)))
+                  ((symbol-function 'emacs-jupyter-notebook--log-append)
+                   #'ignore))
+          ;; A malformed event is a protocol failure, not a user execution.
+          (emacs-jupyter-notebook-helper-backend--event
+           session (emacs-jupyter-notebook-backend-session-data session)
+           (ejn-ei2-test--object "event" "not-a-real-event"
+                                 "request_id" "wire-terminal"
+                                 "data" (ejn-ei2-test--object)))
+          (should (= scheduled 1))
+          (should-not finished)
+          (should-not fringe)
+          (should-not text)
+          ;; Terminal state is intentionally absent from the transport-loss
+          ;; presentation, so a protocol failure cannot rewrite its result.
+          (should (eq (plist-get (emacs-jupyter-notebook--execution-record 1)
+                                 :state)
+                      'terminal-ok)))))))
+
+(ert-deftest ejn-ei7-reconnect-does-not-replay-and-new-execution-succeeds ()
+  "A retired helper cannot replay old code; a new helper accepts new code."
+  (with-temp-buffer
+    (let* ((session-a (ejn-ei7-test--session (current-buffer)))
+           (session-b (ejn-ei7-test--session (current-buffer)))
+           (state-a (emacs-jupyter-notebook-backend-session-data session-a))
+           (state-b (emacs-jupyter-notebook-backend-session-data session-b))
+           successes)
+      (ejn-ei7-test-with-fake-requests (requests callbacks)
+        (let ((old-id nil) (new-id nil))
+          (setq old-id
+                (emacs-jupyter-notebook-backend-execute
+                 session-a "old()" '(:ledger-id 1 :entry-handle (:generation 1))
+                 (lambda (&rest _) (push 'old successes))
+                 (lambda (&rest _) (push 'old-error successes))))
+          ;; Reconnect replaces the local helper; it must not resend OLD.
+          (emacs-jupyter-notebook-helper-backend--dispose state-a "transport lost")
+          (setq new-id
+                (emacs-jupyter-notebook-backend-execute
+                 session-b "new()" '(:ledger-id 2 :entry-handle (:generation 1))
+                 (lambda (&rest _) (push 'new successes))
+                 (lambda (&rest _) (push 'new-error successes))))
+          (should (integerp old-id))
+          (should (integerp new-id))
+          (should (< old-id new-id))
+          ;; The newest callback is B's; its successful response is accepted.
+          (funcall (car callbacks) 'fake
+                   (ejn-ei2-test--response
+                    (ejn-ei2-test--object "status" "ok" "execution_count" 1))
+                   nil)
+          ;; A late response from retired A must be inert.
+          (funcall (car (last callbacks)) 'fake
+                   (ejn-ei2-test--response
+                    (ejn-ei2-test--object "status" "ok" "execution_count" 1))
+                   nil)
+          (ejn-ei2-test--run-timers)
+          (should (equal successes '(new)))
+          (should (equal (mapcar #'car (nreverse requests))
+                         '("execute" "execute")))))
+      (emacs-jupyter-notebook-helper-backend--dispose state-b "EI7 test cleanup"))))
+
+(ert-deftest ejn-ei7-setup-callback-after-transport-loss-cannot-pump ()
+  "A setup callback from a retired transport cannot release the FIFO."
+  (with-temp-buffer
+    (let* ((session (ejn-ei7-test--session (current-buffer)))
+           (timer (run-at-time 300 nil #'ignore))
+           (pumps 0) (scheduled 0))
+      (unwind-protect
+          (progn
+            (setq emacs-jupyter-notebook--client session
+                  emacs-jupyter-notebook--execution-setup-pending t
+                  emacs-jupyter-notebook--execution-setup-timer timer
+                  emacs-jupyter-notebook--execution-setup-epoch 7)
+            (cl-letf (((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
+                       #'ignore)
+                      ((symbol-function 'emacs-jupyter-notebook-backend-close-local)
+                       #'ignore)
+                      ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                       (lambda () (cl-incf scheduled)))
+                      ((symbol-function 'emacs-jupyter-notebook--execution-pump)
+                       (lambda () (cl-incf pumps)))
+                      ((symbol-function 'emacs-jupyter-notebook--log-append)
+                       #'ignore))
+              (emacs-jupyter-notebook--transport-lost
+               "setup transport lost" session nil)
+              ;; This is the callback already queued by the old setup request.
+              (emacs-jupyter-notebook--execution-setup-finish session 7 nil)
+              (should (= scheduled 1))
+              (should (= pumps 0))
+              (should-not emacs-jupyter-notebook--execution-setup-pending)
+              (should-not emacs-jupyter-notebook--execution-setup-timer)
+              (should (= emacs-jupyter-notebook--execution-setup-epoch 8))))
+        (when (timerp timer) (cancel-timer timer))
+        (ignore-errors
+          (emacs-jupyter-notebook-helper-backend--dispose
+           (emacs-jupyter-notebook-backend-session-data session)
+           "EI7 test cleanup"))))))
+
+(ert-deftest ejn-ei7-helper-tunnel-heartbeat-signals-schedule-once ()
+  "Concurrent lifecycle signals settle once and admit one reconnect loop."
+  (with-temp-buffer
+    (let* ((session (ejn-ei7-test--session (current-buffer)))
+           (record (ejn-ei7-test--record 1 'queued))
+           (scheduled 0))
+      (setq emacs-jupyter-notebook--client session
+            emacs-jupyter-notebook--execution-queue '(1))
+      (emacs-jupyter-notebook--execution-put record)
+      (ejn-ei7-test-with-presentations (finished fringe text)
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
+                   #'ignore)
+                  ((symbol-function 'emacs-jupyter-notebook-backend-close-local)
+                   #'ignore)
+                  ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                   (lambda () (cl-incf scheduled)))
+                  ((symbol-function 'emacs-jupyter-notebook--log-append)
+                   #'ignore))
+          (emacs-jupyter-notebook-backend-session-notify-transport-failure
+           session "helper")
+          (emacs-jupyter-notebook--transport-lost "tunnel" session nil)
+          (emacs-jupyter-notebook--transport-lost "heartbeat" session nil)
+          (should (= scheduled 1))
+          (should (equal finished '(cancelled)))
+          (should (equal fringe '(cancelled)))
+          (should (string-match-p "transport lost" (car text))))))))
+
+(ert-deftest ejn-ei7-stale-tunnel-sentinel-cannot-retire-replacement ()
+  "An old tunnel process must not affect the replacement process."
+  (let* ((buffer (generate-new-buffer " *ejn-ei7-sentinel*"))
+         (old (start-process "ejn-ei7-old-tunnel" nil "true"))
+         (current (start-process "ejn-ei7-current-tunnel" nil "sleep" "30"))
+         (scheduled 0))
+    (unwind-protect
+        (progn
+          (while (process-live-p old) (accept-process-output old 0.01))
+          (with-current-buffer buffer
+            (setq emacs-jupyter-notebook--tunnel-process current)
+            (cl-letf (((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                       (lambda () (cl-incf scheduled)))
+                      ((symbol-function 'emacs-jupyter-notebook--transport-lost)
+                       (lambda (&rest _) (cl-incf scheduled))))
+              (emacs-jupyter-notebook--install-tunnel-sentinel old buffer)
+              (should (eq emacs-jupyter-notebook--tunnel-process current))
+              (should (= scheduled 0)))))
+      (when (process-live-p old) (delete-process old))
+      (when (process-live-p current) (delete-process current))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest ejn-ei7-transport-loss-never-touches-durable-or-remote-state ()
+  "Local transport loss does not control the kernel or mutate its registry."
+  (with-temp-buffer
+    (let* ((session (ejn-ei7-test--session (current-buffer)))
+           (record (ejn-ei7-test--record 1 'queued))
+           (controls 0) (remote-cleanups 0) (registry-removals 0)
+           (scheduled 0))
+      (setq emacs-jupyter-notebook--client session
+            emacs-jupyter-notebook--session-entry '(:session-id "durable")
+            emacs-jupyter-notebook--execution-queue '(1))
+      (emacs-jupyter-notebook--execution-put record)
+      (ejn-ei7-test-with-presentations (finished fringe text)
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-control)
+                   (lambda (&rest _) (cl-incf controls)))
+                  ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
+                   (lambda (&rest _) (cl-incf remote-cleanups)))
+                  ((symbol-function 'emacs-jupyter-notebook--remove-registry-entry)
+                   (lambda (&rest _) (cl-incf registry-removals)))
+                  ((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
+                   #'ignore)
+                  ((symbol-function 'emacs-jupyter-notebook-backend-close-local)
+                   #'ignore)
+                  ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                   (lambda () (cl-incf scheduled)))
+                  ((symbol-function 'emacs-jupyter-notebook--log-append)
+                   #'ignore))
+          (emacs-jupyter-notebook--transport-lost "local only" session nil)
+          (should (= scheduled 1))
+          (should (= controls 0))
+          (should (= remote-cleanups 0))
+          (should (= registry-removals 0))
+          (should (equal emacs-jupyter-notebook--session-entry
+                         '(:session-id "durable"))))))))
+
+(ert-deftest ejn-ei7-sync-write-failure-is-not-admission-evidence ()
+  "A generic id returned after a failed write must classify as cancelled."
+  (with-temp-buffer
+    (let* ((session (ejn-ei7-test--session (current-buffer)))
+           (scheduled 0) request-id)
+      (setq emacs-jupyter-notebook--client session
+            emacs-jupyter-notebook--execution-active-id 1
+            emacs-jupyter-notebook--execution-queue '(1))
+      (ejn-ei7-test-with-presentations (finished fringe text)
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper-request)
+                   (lambda (_helper _operation _params callback &rest _keys)
+                     (funcall callback 'fake nil "local write failed")
+                     "wire-after-failure"))
+                  ((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
+                   #'ignore)
+                  ((symbol-function 'emacs-jupyter-notebook-backend-close-local)
+                   #'ignore)
+                  ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                   (lambda () (cl-incf scheduled)))
+                  ((symbol-function 'emacs-jupyter-notebook--log-append)
+                   #'ignore))
+          (setq request-id
+                (emacs-jupyter-notebook-backend-execute
+                 session "write-fails()" '(:ledger-id 1)
+                 #'ignore #'ignore))
+          (should (integerp request-id))
+          (should-not
+           (emacs-jupyter-notebook-helper-backend-ledger-id-admitted-p
+            session 1 request-id))
+          (emacs-jupyter-notebook--execution-put
+           (ejn-ei7-test--record 1 'dispatched request-id))
+          (emacs-jupyter-notebook--transport-lost "write failed" session nil)
+          (should (= scheduled 1))
+          (should (equal finished '(cancelled)))
+          (should (equal fringe '(cancelled))))))))
+
+(ert-deftest ejn-ei7-valid-helper-transport-error-retires-admitted-and-queued-work ()
+  "A valid helper transport frame settles admitted A and queued B once."
+  (with-temp-buffer
+    (let* ((session (ejn-ei7-test--session (current-buffer)))
+           (state (emacs-jupyter-notebook-backend-session-data session))
+           (scheduled 0) (closed 0) backend-id)
+      (setq emacs-jupyter-notebook--client session
+            emacs-jupyter-notebook--execution-active-id 1
+            emacs-jupyter-notebook--execution-queue '(1 2)
+            emacs-jupyter-notebook--kernel-status 'busy)
+      (ejn-ei7-test-with-fake-requests (requests callbacks)
+        (setq backend-id
+              (emacs-jupyter-notebook-backend-execute
+               session "A()" '(:ledger-id 1 :entry-handle (:generation 1))
+               #'ignore #'ignore))
+        (emacs-jupyter-notebook--execution-put
+         (ejn-ei7-test--record 1 'busy backend-id))
+        (emacs-jupyter-notebook--execution-put
+         (ejn-ei7-test--record 2 'queued))
+        (ejn-ei7-test-with-presentations (finished fringe text)
+          (cl-letf (((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
+                     #'ignore)
+                    ((symbol-function 'emacs-jupyter-notebook-backend-close-local)
+                     (lambda (&rest _) (cl-incf closed)))
+                    ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                     (lambda () (cl-incf scheduled)))
+                    ((symbol-function 'emacs-jupyter-notebook--log-append)
+                     #'ignore))
+            ;; This is a valid post-write helper response.  `admitted' is the
+            ;; helper's evidence that the execute reached Jupyter; the shared
+            ;; transport-loss path must classify A as ambiguous.
+            (funcall (car callbacks) 'fake
+                     (ejn-ei2-test--object
+                      "ok" :false
+                      "error" (ejn-ei2-test--object
+                                "code" "transport-error"
+                                "message" "helper lost the channel"
+                                "admitted" t))
+                     nil)
+            (should (= scheduled 1))
+            (should (= closed 1))
+            (should (= 1 (length requests)))
+            (should (equal finished '(cancelled outcome-unknown)))
+            (should (equal fringe '(cancelled outcome-unknown)))
+            (should (= 1 (hash-table-count
+                          (emacs-jupyter-notebook-backend-session-requests session))))
+            (should-not emacs-jupyter-notebook--execution-active-id)
+            (should-not emacs-jupyter-notebook--client)
+            (should (cl-some (lambda (line)
+                               (string-match-p "outcome unknown" line))
+                             text))))))))
+
+(ert-deftest ejn-ei7-post-send-helper-timeout-with-busy-kernel-is-unknown ()
+  "A helper timeout after dispatch does not replay busy work or pump B."
+  (with-temp-buffer
+    (let* ((session (ejn-ei7-test--session (current-buffer)))
+           (timer (run-at-time 300 nil #'ignore))
+           (scheduled 0) backend-id)
+      (unwind-protect
+          (progn
+            (setq emacs-jupyter-notebook--client session
+                  emacs-jupyter-notebook--execution-active-id 1
+                  emacs-jupyter-notebook--execution-queue '(1 2)
+                  emacs-jupyter-notebook--kernel-status 'busy)
+            (ejn-ei7-test-with-fake-requests (requests callbacks)
+              (setq backend-id
+                    (emacs-jupyter-notebook-backend-execute
+                     session "busy-A()" '(:ledger-id 1 :entry-handle (:generation 1))
+                     #'ignore #'ignore))
+              (emacs-jupyter-notebook--execution-put
+               (ejn-ei7-test--record 1 'busy backend-id timer))
+              (emacs-jupyter-notebook--execution-put
+               (ejn-ei7-test--record 2 'queued))
+              (ejn-ei7-test-with-presentations (finished fringe text)
+                (cl-letf (((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
+                           #'ignore)
+                          ((symbol-function 'emacs-jupyter-notebook-backend-close-local)
+                           #'ignore)
+                          ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                           (lambda () (cl-incf scheduled)))
+                          ((symbol-function 'emacs-jupyter-notebook--log-append)
+                           #'ignore))
+                  ;; A timeout is delivered through the helper request
+                  ;; callback after the execute frame has been written.
+                  (funcall (car callbacks) 'fake nil
+                           "helper execute request timed out")
+                  (should (= scheduled 1))
+                  (should (= 1 (length requests)))
+                  (should (equal finished '(cancelled outcome-unknown)))
+                  (should (equal fringe '(cancelled outcome-unknown)))
+                  (should-not (memq timer timer-list))
+                  (should-not emacs-jupyter-notebook--execution-active-id))))))
+        (when (timerp timer) (cancel-timer timer)))))
+
+(ert-deftest ejn-ei7-pre-admission-rejection-remains-ordinary-error ()
+  "A valid admitted:false helper error does not retire the transport."
+  (with-temp-buffer
+    (let* ((session (ejn-ei7-test--session (current-buffer)))
+           (state (emacs-jupyter-notebook-backend-session-data session))
+           (failure nil) (transport-failed nil))
+      (setf (emacs-jupyter-notebook-helper-backend-state-transport-failure state)
+            (lambda (_reason) (setq transport-failed t)))
+      (ejn-ei7-test-with-fake-requests (requests callbacks)
+        (emacs-jupyter-notebook-backend-execute
+         session "rejected()" '(:ledger-id 1)
+         #'ignore (lambda (_id reason) (setq failure reason)))
+        (funcall (car callbacks) 'fake
+                 (ejn-ei2-test--object
+                  "ok" :false
+                  "error" (ejn-ei2-test--object
+                            "code" "invalid-request"
+                            "message" "rejected before backend admission"
+                            "admitted" :false))
+                 nil)
+        (ejn-ei2-test--run-timers)
+        (should (= 1 (length requests)))
+        (should (string-match-p "invalid-request" failure))
+        (should-not transport-failed)
+        (should-not (emacs-jupyter-notebook-helper-backend-state-retired state))
+        ;; An explicit pre-admission rejection is ordinary operation failure,
+        ;; but its wire id is retired synchronously so a racing loss cannot
+        ;; reinterpret it as an admitted execution.
+        (should-not (emacs-jupyter-notebook-helper-backend-ledger-id-admitted-p
+                     session 1 nil))
+        (should (gethash
+                 "ei7-wire-1"
+                 (emacs-jupyter-notebook-helper-backend-state-retired-request-ids
+                  state)))))))
+
+(ert-deftest ejn-ei7-malformed-early-event-flush-is-fatal-transport-loss ()
+  "An early event that fails normalization must trigger transport recovery."
+  (with-temp-buffer
+    (let* ((session (ejn-ei7-test--session (current-buffer)))
+           (state (emacs-jupyter-notebook-backend-session-data session))
+           (scheduled 0) backend-id)
+      (setq emacs-jupyter-notebook--client session
+            emacs-jupyter-notebook--execution-active-id 1
+            emacs-jupyter-notebook--execution-queue '(1))
+      (ejn-ei7-test-with-presentations (finished fringe text)
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper-request)
+                   (lambda (_helper _operation _params _callback &rest _keys)
+                     ;; The public dispatch depth makes this an early event;
+                     ;; the mapping is installed only after this returns.
+                     (emacs-jupyter-notebook-helper-backend--event
+                      session state
+                      (ejn-ei2-test--object
+                       "event" "execute_reply"
+                       "request_id" "early-malformed"
+                       "data" (ejn-ei2-test--object "unexpected" t)))
+                     "early-malformed"))
+                  ((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
+                   #'ignore)
+                  ((symbol-function 'emacs-jupyter-notebook-backend-close-local)
+                   #'ignore)
+                  ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                   (lambda () (cl-incf scheduled)))
+                  ((symbol-function 'emacs-jupyter-notebook--log-append)
+                   #'ignore))
+          (setq backend-id
+                (emacs-jupyter-notebook-backend-execute
+                 session "early()" '(:ledger-id 1 :entry-handle (:generation 1))
+                 #'ignore #'ignore))
+          (emacs-jupyter-notebook--execution-put
+           (ejn-ei7-test--record 1 'dispatched backend-id))
+          (ejn-ei2-test--run-timers)
+          (should (= scheduled 1))
+          (should (equal finished '(outcome-unknown)))
+          (should (equal fringe '(outcome-unknown)))
+          (should-not emacs-jupyter-notebook--client))))))
+
+(ert-deftest ejn-ei7-retry-cycle-admits-only-new-work-after-transport-loss ()
+  "Retry callback restores a new helper without resending A or queued B."
+  (with-temp-buffer
+    (let* ((session-a (ejn-ei7-test--session (current-buffer)))
+           (session-c (ejn-ei7-test--session (current-buffer)))
+           (entry (ejn-ei2-test--direct-entry))
+           (attempts 0) (backend-id))
+      (setq emacs-jupyter-notebook--client session-a
+            emacs-jupyter-notebook--session-entry entry
+            emacs-jupyter-notebook--execution-active-id 1
+            emacs-jupyter-notebook--execution-queue '(1 2)
+            emacs-jupyter-notebook--kernel-status 'busy
+            emacs-jupyter-notebook-mode t)
+      (ejn-ei7-test-with-fake-requests (requests callbacks)
+        (setq backend-id
+              (emacs-jupyter-notebook-backend-execute
+               session-a "A()" '(:ledger-id 1 :entry-handle (:generation 1))
+               #'ignore #'ignore))
+        (emacs-jupyter-notebook--execution-put
+         (ejn-ei7-test--record 1 'busy backend-id))
+        (emacs-jupyter-notebook--execution-put
+         (ejn-ei7-test--record 2 'queued))
+        (ejn-ei7-test-with-presentations (finished fringe text)
+          (cl-letf (((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
+                     #'ignore)
+                    ((symbol-function 'emacs-jupyter-notebook-backend-close-local)
+                     #'ignore)
+                    ((symbol-function 'emacs-jupyter-notebook--log-append)
+                     #'ignore)
+                    ((symbol-function 'emacs-jupyter-notebook--begin-reconnect)
+                     (lambda (_entry callback _error-callback &optional _owner)
+                       (cl-incf attempts)
+                       (setq emacs-jupyter-notebook--client session-c
+                             emacs-jupyter-notebook--tunnel-dead nil)
+                       (funcall callback (list :phase 'done))))
+                    ((symbol-function 'emacs-jupyter-notebook--execution-pump)
+                     #'ignore))
+            (emacs-jupyter-notebook--transport-lost "retry cycle" session-a nil)
+            (should (= 1 (length requests)))
+            (let ((token emacs-jupyter-notebook--reconnect-schedule-token))
+              (should token)
+              (emacs-jupyter-notebook--auto-reconnect-fire (current-buffer) token)
+              (should (= attempts 1))
+              (should-not emacs-jupyter-notebook--reconnect-schedule-token)
+              ;; The consumed token cannot admit a second reconnect attempt.
+              (emacs-jupyter-notebook--auto-reconnect-fire (current-buffer) token)
+              (should (= attempts 1)))
+            (should (eq emacs-jupyter-notebook--client session-c))
+            (emacs-jupyter-notebook-backend-execute
+             session-c "C()" '(:ledger-id 3 :entry-handle (:generation 1))
+             #'ignore #'ignore)
+            (should
+             (equal
+              (mapcar (lambda (request) (gethash "code" (cadr request)))
+                      (nreverse requests))
+              '("A()" "C()")))
+            (should (equal finished '(cancelled outcome-unknown)))
+            (should (equal fringe '(cancelled outcome-unknown)))))))))
+
+(ert-deftest ejn-ei7-execute-response-without-terminal-events-expires-grace-in-owner ()
+  "An execute response alone cannot cancel the core terminal grace timer."
+  (let ((owner (generate-new-buffer " *ejn-ei7-grace-owner*"))
+        (other (generate-new-buffer " *ejn-ei7-grace-other*"))
+        grace)
+    (unwind-protect
+        (with-current-buffer owner
+          (let* ((session (ejn-ei7-test--session owner))
+                 (state (emacs-jupyter-notebook-backend-session-data session))
+                 (interrupts 0) (scheduled 0) backend-id)
+            (setq emacs-jupyter-notebook--client session
+                  emacs-jupyter-notebook--execution-active-id 1
+                  emacs-jupyter-notebook--execution-queue '(1))
+            (ejn-ei7-test-with-fake-requests (requests callbacks)
+              (setq backend-id
+                    (emacs-jupyter-notebook-backend-execute
+                     session "long_cell()" '(:ledger-id 1 :entry-handle (:generation 1))
+                     #'ignore #'ignore))
+              (emacs-jupyter-notebook--execution-put
+               (ejn-ei7-test--record 1 'dispatched backend-id))
+              ;; The helper's successful request response may arrive before
+              ;; the queued execute_reply/status frames.  It is not terminal
+              ;; ledger evidence and must leave the core timeout in force.
+              (funcall (car callbacks) 'fake
+                       (ejn-ei2-test--response
+                        (ejn-ei2-test--object "status" "ok" "execution_count" 1))
+                       nil)
+              (should (eq (plist-get (emacs-jupyter-notebook--execution-record 1)
+                                     :state)
+                          'dispatched))
+              (ejn-ei7-test-with-presentations (finished fringe text)
+                (cl-letf (((symbol-function 'emacs-jupyter-notebook--interrupt-active-execution)
+                           (lambda (_client) (cl-incf interrupts)))
+                          ((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
+                           #'ignore)
+                          ((symbol-function 'emacs-jupyter-notebook-backend-close-local)
+                           #'ignore)
+                          ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                           (lambda () (cl-incf scheduled)))
+                          ((symbol-function 'emacs-jupyter-notebook--log-append)
+                           #'ignore))
+                  (let ((emacs-jupyter-notebook-evaluation-timeout 30))
+                    (emacs-jupyter-notebook--evaluation-on-timeout 1))
+                  (setq grace (plist-get (emacs-jupyter-notebook--execution-record 1)
+                                         :interrupt-grace-timer))
+                  (should (= interrupts 1))
+                  (should (timerp grace))
+                  ;; The timer must use OWNER's buffer-local session even
+                  ;; though another source buffer is current when it fires.
+                  (with-current-buffer other
+                    (apply (timer--function grace) (timer--args grace)))
+                  (should (= scheduled 1))
+                  (should (equal finished '(outcome-unknown)))
+                  (should (equal fringe '(outcome-unknown)))
+                  (should-not emacs-jupyter-notebook--client)
+                  (should-not (emacs-jupyter-notebook--execution-record 1))))
+            (ignore-errors
+              (emacs-jupyter-notebook-helper-backend--dispose state "EI7 grace cleanup"))))
+      (when (timerp grace) (cancel-timer grace))
+      (when (buffer-live-p owner) (kill-buffer owner))
+      (when (buffer-live-p other) (kill-buffer other))))))
+
+(ert-deftest ejn-ei7-timeout-interrupt-synchronous-loss-creates-no-phantom-record ()
+  "A synchronous interrupt failure may retire the record before grace setup."
+  (with-temp-buffer
+    (let* ((session (ejn-ei7-test--session (current-buffer)))
+           (state (emacs-jupyter-notebook-backend-session-data session))
+           (scheduled 0))
+      (setq emacs-jupyter-notebook--client session
+            emacs-jupyter-notebook--execution-active-id 1
+            emacs-jupyter-notebook--execution-queue '(1))
+      (emacs-jupyter-notebook--execution-put
+       (ejn-ei7-test--record 1 'dispatched "wire-a"))
+      (puthash "wire-a" (list :ledger-id 1 :backend-request-id "wire-a"
+                               :panel-generation 1)
+               (emacs-jupyter-notebook-helper-backend-state-request-map state))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--interrupt-active-execution)
+                 (lambda (client)
+                   (emacs-jupyter-notebook--transport-lost
+                    "synchronous interrupt transport loss" client nil)))
+                ((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
+                 #'ignore)
+                ((symbol-function 'emacs-jupyter-notebook-backend-close-local)
+                 #'ignore)
+                ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                 (lambda () (cl-incf scheduled)))
+                ((symbol-function 'emacs-jupyter-notebook--log-append)
+                 #'ignore))
+        (let ((emacs-jupyter-notebook-evaluation-timeout 30))
+          (emacs-jupyter-notebook--evaluation-on-timeout 1))
+        (should (= scheduled 1))
+        (should-not emacs-jupyter-notebook--client)
+        (should-not emacs-jupyter-notebook--execution-active-id)
+        (should (= (hash-table-count emacs-jupyter-notebook--execution-ledger) 0))
+        (should-not (gethash nil emacs-jupyter-notebook--execution-ledger))))))
+
+(ert-deftest ejn-ei7-reentrant-admitted-error-defers-until-wire-map-exists ()
+  "A reentrant admitted error waits for mapping before settling transport."
+  (with-temp-buffer
+    (let* ((session (ejn-ei7-test--session (current-buffer)))
+           (state (emacs-jupyter-notebook-backend-session-data session))
+           (record (ejn-ei7-test--record 1 'dispatched))
+           (scheduled 0) (closed 0) (backend-id nil))
+      (setq emacs-jupyter-notebook--client session
+            emacs-jupyter-notebook--execution-active-id 1
+            emacs-jupyter-notebook--execution-queue '(1 2)
+            emacs-jupyter-notebook--kernel-status 'busy)
+      (emacs-jupyter-notebook--execution-put record)
+      (emacs-jupyter-notebook--execution-put
+       (ejn-ei7-test--record 2 'queued))
+      (ejn-ei7-test-with-presentations (finished fringe text)
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper-request)
+                   (lambda (_helper operation _params callback &rest _keys)
+                     (should (equal operation "execute"))
+                     ;; This callback runs while generic dispatch depth is
+                     ;; nonzero, before the adapter can install its map.
+                     (funcall callback 'fake
+                              (ejn-ei2-test--object
+                               "ok" :false
+                               "error" (ejn-ei2-test--object
+                                         "code" "transport-error"
+                                         "message" "write was accepted then lost"
+                                         "admitted" t))
+                              nil)
+                     "reentrant-wire"))
+                  ((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
+                   #'ignore)
+                  ((symbol-function 'emacs-jupyter-notebook-backend-close-local)
+                   (lambda (&rest _) (cl-incf closed)))
+                  ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                   (lambda () (cl-incf scheduled)))
+                  ((symbol-function 'emacs-jupyter-notebook--log-append)
+                   #'ignore)
+                  ((symbol-function 'emacs-jupyter-notebook--execution-pump)
+                   #'ignore))
+          (setq backend-id
+                (emacs-jupyter-notebook-backend-execute
+                 session "A()" '(:ledger-id 1 :entry-handle (:generation 1))
+                 #'ignore #'ignore))
+          ;; The deferred transport callback must observe this post-return
+          ;; backend id and the helper's newly-installed wire mapping.
+          (emacs-jupyter-notebook--execution-put
+           (plist-put record :backend-request-id backend-id))
+          (should (emacs-jupyter-notebook-helper-backend-ledger-id-admitted-p
+                   session 1 backend-id))
+          (should (= scheduled 0))
+          (should-not finished)
+          (ejn-ei2-test--run-timers)
+          (should (= scheduled 1))
+          (should (= closed 1))
+          (should (equal finished '(cancelled outcome-unknown)))
+          (should (equal fringe '(cancelled outcome-unknown)))
+          (should-not (emacs-jupyter-notebook--execution-record 1))
+          (should-not (emacs-jupyter-notebook--execution-record 2))
+          (should-not emacs-jupyter-notebook--execution-active-id)
+          (should (cl-some (lambda (line)
+                             (string-match-p "outcome unknown" line))
+                           text)))))))
+
+(ert-deftest ejn-ei7-setup-and-user-execute-use-distinct-helper-deadlines ()
+  "Setup executes use the bounded auxiliary deadline, unlike user work."
+  (with-temp-buffer
+    (let* ((session (ejn-ei7-test--session (current-buffer)))
+           (state (emacs-jupyter-notebook-backend-session-data session))
+           (requests nil) (callbacks nil)
+           (emacs-jupyter-notebook-evaluation-timeout 17))
+      (unwind-protect
+          (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper-request)
+                     (lambda (_helper operation _params callback &rest keys)
+                       (push (list operation
+                                   (plist-get keys :timeout)
+                                   (plist-get keys :allow-long-timeout))
+                             requests)
+                       (push callback callbacks)
+                       (format "ei7-deadline-%d" (length requests)))))
+            (emacs-jupyter-notebook-backend-execute
+             session "setup()" '(:setup t) #'ignore #'ignore)
+            (emacs-jupyter-notebook-backend-execute
+             session "user()" '(:ledger-id 1) #'ignore #'ignore)
+            (should (= (length callbacks) 2))
+            (should
+             (equal (nreverse requests)
+                    '(("execute" 30 nil)
+                      ("execute" 35 t)))))
+        (emacs-jupyter-notebook-helper-backend--dispose state
+                                                        "EI7 deadline cleanup")))))
+
+(ert-deftest ejn-ei7-post-send-setup-timeout-signals-transport-loss ()
+  "A setup timeout after send is fatal and cannot release or pump work."
+  (with-temp-buffer
+    (let* ((session (ejn-ei7-test--session (current-buffer)))
+           (state (emacs-jupyter-notebook-backend-session-data session))
+           (callbacks nil) (requests nil) (transport-failures 0)
+           (success-called nil) (failure-called nil) (pumps 0))
+      (setf (emacs-jupyter-notebook-helper-backend-state-transport-failure state)
+            (lambda (_reason) (cl-incf transport-failures)))
+      (unwind-protect
+          (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper-request)
+                     (lambda (_helper operation _params callback &rest _keys)
+                       (push operation requests)
+                       (push callback callbacks)
+                       "ei7-setup-timeout-wire"))
+                    ((symbol-function 'emacs-jupyter-notebook--execution-pump)
+                     (lambda () (cl-incf pumps))))
+            (emacs-jupyter-notebook-backend-execute
+             session "setup()" '(:setup t)
+             (lambda (&rest _) (setq success-called t))
+             (lambda (&rest _) (setq failure-called t)))
+            ;; This callback is post-send: the helper request has already
+            ;; returned its wire id, so a local timeout is transport evidence,
+            ;; not an ordinary setup failure that may release the FIFO.
+            (funcall (car callbacks) 'ei7-fake nil "setup timed out")
+            (should (= (length requests) 1))
+            (should (= transport-failures 1))
+            (should (= pumps 0))
+            (should-not success-called)
+            (should-not failure-called))
+        (emacs-jupyter-notebook-helper-backend--dispose state
+                                                        "EI7 setup timeout cleanup")))))
+
+(ert-deftest ejn-ei7-pre-admission-rejection-wins-transport-race ()
+  "A pre-admission rejection cannot become outcome-unknown via a late loss."
+  (with-temp-buffer
+    (let* ((session (ejn-ei7-test--session (current-buffer)))
+           (state (emacs-jupyter-notebook-backend-session-data session))
+           (callbacks nil) (requests nil) (scheduled 0) (backend-id nil))
+      (setq emacs-jupyter-notebook--client session
+            emacs-jupyter-notebook--execution-active-id 1
+            emacs-jupyter-notebook--execution-queue '(1)
+            emacs-jupyter-notebook--kernel-status 'busy)
+      (unwind-protect
+          (ejn-ei7-test-with-presentations (finished fringe text)
+            (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper-request)
+                       (lambda (_helper operation _params callback &rest _keys)
+                         (push operation requests)
+                         (push callback callbacks)
+                         "ei7-race-wire"))
+                      ((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
+                       #'ignore)
+                      ((symbol-function 'emacs-jupyter-notebook-backend-close-local)
+                       #'ignore)
+                      ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                       (lambda () (cl-incf scheduled)))
+                      ((symbol-function 'emacs-jupyter-notebook--log-append)
+                       #'ignore)
+                      ((symbol-function 'emacs-jupyter-notebook--execution-pump)
+                       #'ignore))
+              (setq backend-id
+                    (emacs-jupyter-notebook-backend-execute
+                     session "race()" '(:ledger-id 1 :entry-handle (:generation 1))
+                     #'ignore
+                     (lambda (_id reason)
+                       (when-let ((record
+                                   (emacs-jupyter-notebook--execution-record 1)))
+                         (emacs-jupyter-notebook--execution-fail record reason)))))
+              (emacs-jupyter-notebook--execution-put
+               (ejn-ei7-test--record 1 'dispatched backend-id))
+              ;; The exact admitted:false envelope queues the ordinary
+              ;; consumer failure on the generic backend's zero-delay timer.
+              (funcall (car callbacks) 'ei7-fake
+                       (ejn-ei2-test--object
+                        "ok" :false
+                        "error" (ejn-ei2-test--object
+                                  "code" "invalid-request"
+                                  "message" "rejected before admission"
+                                  "admitted" :false))
+                       nil)
+              ;; Race the queued ordinary failure with an uncorrelated loss.
+              ;; It must not reinterpret this already-rejected execution as
+              ;; an admitted remote execution.
+              (emacs-jupyter-notebook-helper-backend--event
+               session state
+               (ejn-ei2-test--object
+                "event" "transport_error"
+                "data" (ejn-ei2-test--object "message" "late channel loss")))
+              (should (= scheduled 1))
+              (should (equal finished '(cancelled)))
+              (should (equal fringe '(cancelled)))
+              (should-not (cl-some (lambda (status) (eq status 'outcome-unknown))
+                                   finished))
+              (should-not (gethash "ei7-race-wire"
+                                   (emacs-jupyter-notebook-helper-backend-state-request-map
+                                    state)))
+              (should (gethash "ei7-race-wire"
+                               (emacs-jupyter-notebook-helper-backend-state-retired-request-ids
+                                state)))
+              ;; A correlated event after retirement must be inert.
+              (emacs-jupyter-notebook-helper-backend--event
+               session state
+               (ejn-ei2-test--object
+                "event" "status" "request_id" "ei7-race-wire"
+                "data" (ejn-ei2-test--object "execution_state" "idle")))
+              (should (equal finished '(cancelled)))
+              (should-not (emacs-jupyter-notebook--execution-record 1)))
+            ;; Run the ordinary rejected-request callback after the race; it
+            ;; must observe the already-retired ledger and remain inert.
+            (ejn-ei2-test--run-timers))
+        (when (emacs-jupyter-notebook-helper-backend-state-p state)
+          (emacs-jupyter-notebook-helper-backend--dispose state "EI7 race cleanup"))))))
 
 (provide 'emacs-jupyter-notebook-helper-backend-tests)
 

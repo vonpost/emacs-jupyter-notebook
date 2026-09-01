@@ -52,9 +52,26 @@
 
 (defvar emacs-jupyter-notebook-helper--next-id 0)
 
-(defun emacs-jupyter-notebook-helper--bounded-positive-number (value fallback)
+(defconst emacs-jupyter-notebook-helper--error-codes
+  '("invalid-request" "invalid-event" "unsupported" "timeout"
+    "protocol-error" "frame-too-large" "credit-exhausted"
+    "transport-error" "busy")
+  "Closed set of helper v1 structured error codes.")
+
+(defun emacs-jupyter-notebook-helper--bounded-positive-number
+    (value fallback &optional allow-long-timeout)
   "Return VALUE when it is a sensible finite timeout, otherwise FALLBACK."
-  (if (and (numberp value) (> value 0) (<= value emacs-jupyter-notebook-helper--hard-timeout))
+  (if (and (numberp value) (> value 0)
+           ;; `isnan' alone is insufficient here: a positive infinity would
+           ;; otherwise evade the normal hard limit when long execution
+           ;; requests are explicitly permitted.
+           (or (not (floatp value))
+               (and (not (isnan value))
+                    ;; Emacs represents infinity as the readable float literal
+                    ;; below; a strict comparison rejects both signs.
+                    (< (abs value) 1.0e+INF)))
+           (or allow-long-timeout
+               (<= value emacs-jupyter-notebook-helper--hard-timeout)))
       value
     fallback))
 
@@ -356,12 +373,15 @@ This is used by the process filter so it never runs user callbacks."
     (emacs-jupyter-notebook-helper--finish-request
      session request nil (format "helper %s request timed out" (emacs-jupyter-notebook-helper-request-op request)))))
 
-(cl-defun emacs-jupyter-notebook-helper-request (session op params callback &key timeout internal)
+(cl-defun emacs-jupyter-notebook-helper-request
+    (session op params callback &key timeout internal allow-long-timeout)
   "Send OP with PARAMS and invoke CALLBACK once with (SESSION RESPONSE ERROR).
 TIMEOUT is bounded independently for this request.  RESPONSE is nil on a
 local deadline or transport failure; ERROR is then a short local reason."
   (unless (and (stringp op) (hash-table-p params))
     (error "Helper request requires a string op and object params"))
+  (when (and allow-long-timeout (not (equal op "execute")))
+    (error "Only execute may use a long helper request timeout"))
   (unless (and (not (emacs-jupyter-notebook-helper-session-disposed session))
                (eq (emacs-jupyter-notebook-helper-session-state session) 'ready))
     (error "Helper session is not ready"))
@@ -377,7 +397,8 @@ local deadline or transport failure; ERROR is then a short local reason."
       (puthash id request requests)
       (setf (emacs-jupyter-notebook-helper-request-timer request)
             (run-at-time
-             (emacs-jupyter-notebook-helper--bounded-positive-number timeout 5)
+             (emacs-jupyter-notebook-helper--bounded-positive-number
+              timeout 5 allow-long-timeout)
              nil #'emacs-jupyter-notebook-helper--request-deadline session id request))
       (condition-case err
           (emacs-jupyter-notebook-helper--send-envelope session id op params)
@@ -479,7 +500,14 @@ local deadline or transport failure; ERROR is then a short local reason."
             (and (emacs-jupyter-notebook-helper--bounded-id-p id)
                  (or (eq ok t) (eq ok :false))
                  (if (eq ok t) (hash-table-p (gethash "result" object))
-                   (hash-table-p (gethash "error" object))))))
+                   (let ((error (gethash "error" object)))
+                     (and (hash-table-p error)
+                          (= (hash-table-count error) 3)
+                          (member (gethash "code" error)
+                                  emacs-jupyter-notebook-helper--error-codes)
+                          (stringp (gethash "message" error))
+                          (or (eq (gethash "admitted" error) t)
+                              (eq (gethash "admitted" error) :false))))))))
          ("event"
           (let ((seq (gethash "seq" object)) (event (gethash "event" object))
                 (request-id (gethash "request_id" object)))

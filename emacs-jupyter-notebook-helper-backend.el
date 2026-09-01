@@ -28,6 +28,23 @@ whether an attached reconnect is usable before this terminal request expiry.")
 (defconst emacs-jupyter-notebook-helper-backend--aux-timeout 30
   "Local deadline for one bounded helper auxiliary or stdin request.")
 
+(defconst emacs-jupyter-notebook-helper-backend--error-codes
+  '("invalid-request" "invalid-event" "unsupported" "timeout"
+    "protocol-error" "frame-too-large" "credit-exhausted"
+    "transport-error" "busy")
+  "Closed set of structured helper v1 error codes.")
+
+(defun emacs-jupyter-notebook-helper-backend--execute-request-timeout ()
+  "Return the helper fallback deadline owned by the Emacs evaluation policy.
+The core sends an interrupt at `emacs-jupyter-notebook-evaluation-timeout' and
+retires the local transport after one equal terminal grace.  This deadline is
+one second later, so it can only catch a stalled Emacs timer; it must never be
+the mechanism that interrupts a long-running kernel execution."
+  (let ((timeout emacs-jupyter-notebook-evaluation-timeout))
+    (unless (and (numberp timeout) (> timeout 0))
+      (error "Evaluation timeout must be a positive number"))
+    (1+ (* 2 timeout))))
+
 (defun emacs-jupyter-notebook-helper-backend-ensure ()
   "Resolve the helper executable before any remote launch is admitted."
   (emacs-jupyter-notebook-helper-resolve-argv))
@@ -60,6 +77,31 @@ whether an attached reconnect is usable before this terminal request expiry.")
                      (gethash "message" value))
                     (t "helper request failed"))))
     (substring text 0 (min (length text) 512))))
+
+(defun emacs-jupyter-notebook-helper-backend--error-code (value)
+  "Return VALUE's validated helper error code, or nil for a local failure."
+  (and (hash-table-p value)
+       (let ((code (gethash "code" value)))
+         (and (member code emacs-jupyter-notebook-helper-backend--error-codes)
+              code))))
+
+(defun emacs-jupyter-notebook-helper-backend--error-rejected-p (value)
+  "Return non-nil only for an exact, pre-admission helper error VALUE.
+The helper transport normally validates this before adapter callbacks run.
+Keeping the same check here makes direct or test callback injection fail closed
+instead of accidentally treating malformed data as proof that no execute was
+written to Jupyter."
+  (and (hash-table-p value)
+       (= (hash-table-count value) 3)
+       (emacs-jupyter-notebook-helper-backend--error-code value)
+       (stringp (gethash "message" value))
+       (eq (gethash "admitted" value) :false)))
+
+(defun emacs-jupyter-notebook-helper-backend--error-description (value)
+  "Return a bounded diagnostic that retains VALUE's structured error code."
+  (let ((code (emacs-jupyter-notebook-helper-backend--error-code value))
+        (message (emacs-jupyter-notebook-helper-backend--safe-message value)))
+    (if code (format "helper %s: %s" code message) message)))
 
 (defun emacs-jupyter-notebook-helper-backend--state-live-p (session state)
   "Return non-nil when STATE is still the local state of SESSION."
@@ -467,15 +509,18 @@ backend deferral cannot be mistaken for panel acceptance.
         ;; order before delivering entries from multiple now-mapped ids.
         (setq ready (sort ready (lambda (left right)
                                   (< (aref left 0) (aref right 0)))))
-        (dolist (item ready)
-          ;; Admission belongs only to this event's artifact lease.  A rejected
-          ;; or malformed output must never suppress later terminal evidence.
-          (condition-case err
-              (emacs-jupyter-notebook-helper-backend--deliver-mapped-event
-               state (aref item 1) (aref item 2) (aref item 3))
-            (error
-             (message "emacs-jupyter-notebook rejected early helper event: %s"
-                      (error-message-string err)))))))))
+        (catch 'flush-failed
+          (dolist (item ready)
+            ;; A malformed early event makes the helper stream untrustworthy.
+            ;; Stop before delivering any later queued terminal event: it must
+            ;; not manufacture certainty after the shared transport transition.
+            (condition-case err
+                (emacs-jupyter-notebook-helper-backend--deliver-mapped-event
+                 state (aref item 1) (aref item 2) (aref item 3))
+              (error
+               (emacs-jupyter-notebook-helper-backend--signal-transport-failure
+                state (error-message-string err))
+               (throw 'flush-failed nil)))))))))
 
 (defun emacs-jupyter-notebook-helper-backend--schedule-pending-flush (session state)
   "Flush early events now, or in one post-dispatch callback when required."
@@ -526,45 +571,82 @@ backend deferral cannot be mistaken for panel acceptance.
 (defun emacs-jupyter-notebook-helper-backend--event (session state event)
   "Normalize helper EVENT and deliver it only through the EI1R admission path."
   (when (emacs-jupyter-notebook-helper-backend--state-live-p session state)
-    (let ((kind (and (hash-table-p event) (gethash "event" event))))
-      (if (equal kind "transport_error")
-          (when-let* ((failure
-                       (emacs-jupyter-notebook-helper-backend-state-transport-failure
-                        state)))
-            (funcall failure
-                     (emacs-jupyter-notebook-helper-backend--safe-message
-                      (gethash "data" event))))
-        (let ((helper-id (gethash "request_id" event)))
-          ;; A production helper cannot emit before `helper-request' returns,
-          ;; but a synchronous fake can.  Keep its bounded FIFO intact until
-          ;; the mapping is installed; one post-dispatch flush handles all ids.
-          (when (stringp helper-id)
-            (let* ((mapping (emacs-jupyter-notebook-helper-backend-state-request-map state))
-                   (retired (emacs-jupyter-notebook-helper-backend-state-retired-request-ids state))
-                   (mapping-value (and (hash-table-p mapping)
-                                       (gethash helper-id mapping))))
-              (cond
-               ;; A terminal ledger retirement tombstones its helper wire id.
-               ;; Late output must not masquerade as a reentrant early event
-               ;; and consume the pending-id budget.
-               ((and (hash-table-p retired) (gethash helper-id retired))
-                (dolist (publication (emacs-jupyter-notebook-helper-backend--raw-publication-paths event))
-                  (emacs-jupyter-notebook-helper-backend--discard-publication
-                   state publication))
-                nil)
-               (mapping-value
-                (emacs-jupyter-notebook-helper-backend--deliver-mapped-event
-                 state helper-id mapping-value event))
-               (t
-                (emacs-jupyter-notebook-helper-backend--retain-early-event
-                 session state helper-id event))))))))))
+    (condition-case err
+        (let ((kind (and (hash-table-p event) (gethash "event" event))))
+          (if (equal kind "transport_error")
+              (when-let* ((failure
+                           (emacs-jupyter-notebook-helper-backend-state-transport-failure
+                            state)))
+                (funcall failure
+                         (emacs-jupyter-notebook-helper-backend--safe-message
+                          (gethash "data" event))))
+            (let ((helper-id (gethash "request_id" event)))
+              ;; A production helper cannot emit before `helper-request' returns,
+              ;; but a synchronous fake can.  Keep its bounded FIFO intact until
+              ;; the mapping is installed; one post-dispatch flush handles all ids.
+              (unless (and (stringp helper-id) (not (string-empty-p helper-id)))
+                (error "helper event lacks a valid request id"))
+              (let* ((mapping (emacs-jupyter-notebook-helper-backend-state-request-map state))
+                     (retired (emacs-jupyter-notebook-helper-backend-state-retired-request-ids state))
+                     (mapping-value (and (hash-table-p mapping)
+                                         (gethash helper-id mapping))))
+                (cond
+                 ;; A terminal ledger retirement tombstones its helper wire id.
+                 ;; Late output must not masquerade as a reentrant early event
+                 ;; and consume the pending-id budget.
+                 ((and (hash-table-p retired) (gethash helper-id retired))
+                  (dolist (publication (emacs-jupyter-notebook-helper-backend--raw-publication-paths event))
+                    (emacs-jupyter-notebook-helper-backend--discard-publication
+                     state publication))
+                  nil)
+                 (mapping-value
+                  (emacs-jupyter-notebook-helper-backend--deliver-mapped-event
+                   state helper-id mapping-value event))
+                 (t
+                  (emacs-jupyter-notebook-helper-backend--retain-early-event
+                   session state helper-id event)))))))
+      (error
+       ;; Malformed framed events are a local protocol failure, never a
+       ;; recoverable execution error: a later reply cannot be trusted.
+       (when-let ((failure
+                   (emacs-jupyter-notebook-helper-backend-state-transport-failure
+                    state)))
+         (funcall failure (error-message-string err)))))))
+
+(defun emacs-jupyter-notebook-helper-backend--retire-wire-id (state wire-id)
+  "Forget WIRE-ID's mapping in STATE and retain a bounded late-event tombstone."
+  (when (and (emacs-jupyter-notebook-helper-backend-state-p state)
+             (stringp wire-id) (not (string-empty-p wire-id)))
+    (when (hash-table-p
+           (emacs-jupyter-notebook-helper-backend-state-request-map state))
+      (remhash wire-id
+               (emacs-jupyter-notebook-helper-backend-state-request-map state)))
+    (let ((retired
+           (or (emacs-jupyter-notebook-helper-backend-state-retired-request-ids
+                state)
+               (setf (emacs-jupyter-notebook-helper-backend-state-retired-request-ids
+                      state)
+                     (make-hash-table :test #'equal))))
+          (order
+           (emacs-jupyter-notebook-helper-backend-state-retired-request-order
+            state)))
+      (unless (gethash wire-id retired)
+        (puthash wire-id t retired)
+        (setq order (append order (list wire-id)))
+        (when (> (length order) 128)
+          (remhash (car order) retired)
+          (setq order (cdr order)))
+        (setf (emacs-jupyter-notebook-helper-backend-state-retired-request-order
+               state)
+              order)))))
 
 (defun emacs-jupyter-notebook-helper-backend--request
     (session state op params timeout success failure
-             &optional ledger-id backend-request-id panel-generation)
+             &optional ledger-id backend-request-id panel-generation
+             allow-long-timeout)
   "Send helper OP, while gating every terminal callback on SESSION and STATE."
   (let ((helper (emacs-jupyter-notebook-helper-backend-state-helper state))
-        helper-id)
+        helper-id request-returned synchronous-failure pre-admission-rejected)
     (unless helper (error "helper is not available"))
     (when ledger-id
       (unless (and (integerp ledger-id) (> ledger-id 0))
@@ -587,28 +669,120 @@ backend deferral cannot be mistaken for panel acceptance.
                ;; becomes terminal.  Removing it at helper response time races
                ;; already queued output/status events.
                (if error-data
-                   (funcall failure
-                            (emacs-jupyter-notebook-helper-backend--safe-message error-data))
-                 (condition-case err
-                     (funcall success
-                              (emacs-jupyter-notebook-helper-backend--response-result response))
-                   (error
-                    (funcall failure (error-message-string err)))))))
-           :timeout timeout))
-    (when ledger-id
+                   (progn
+                     ;; `helper-request' installs a request slot before its
+                     ;; process write, then reports a synchronous write error
+                     ;; through this callback while still returning a wire id.
+                     ;; That id is not evidence that Jupyter accepted code.
+                     (unless request-returned
+                       (setq synchronous-failure t))
+                     (if (and (equal op "execute") request-returned)
+                         ;; The helper timed out or lost its local transport
+                         ;; after our execute frame was written.  Only an
+                         ;; explicit `admitted: false' protocol response can
+                         ;; prove no backend admission; a local failure carries
+                         ;; no such proof and is therefore outcome-ambiguous.
+                         (emacs-jupyter-notebook-helper-backend--protocol-failure
+                          state failure
+                          (emacs-jupyter-notebook-helper-backend--error-description
+                           error-data))
+                       (funcall failure
+                                (emacs-jupyter-notebook-helper-backend--error-description
+                                 error-data))))
+                 ;; A non-execute failure, or an exact pre-admission execute
+                 ;; rejection, remains an ordinary operation failure.  An
+                 ;; admitted/ambiguous execute failure and any malformed
+                 ;; direct injection retire the local transport fail-closed.
+                 (if (and (hash-table-p response) (eq (gethash "ok" response) t))
+                     (funcall success (gethash "result" response))
+                   (let ((error-object (and (hash-table-p response)
+                                            (gethash "error" response))))
+                     (cond
+                      ((not (equal op "execute"))
+                       (funcall failure
+                                (emacs-jupyter-notebook-helper-backend--error-description
+                                 error-object)))
+                      ((emacs-jupyter-notebook-helper-backend--error-rejected-p
+                        error-object)
+                       ;; Preserve explicit non-admission before a later frame
+                       ;; in this same helper drain can report transport loss.
+                       ;; Generic request failure is deferred, but this wire id
+                       ;; must already be absent from admission evidence.
+                       (setq pre-admission-rejected t)
+                       (when helper-id
+                         (emacs-jupyter-notebook-helper-backend--retire-wire-id
+                          state helper-id))
+                       (funcall failure
+                                (emacs-jupyter-notebook-helper-backend--error-description
+                                 error-object)))
+                      (t
+                       (emacs-jupyter-notebook-helper-backend--protocol-failure
+                        state failure
+                        (emacs-jupyter-notebook-helper-backend--error-description
+                         error-object)))))))))
+           :timeout timeout
+           :allow-long-timeout allow-long-timeout))
+    (setq request-returned t)
+    (when (and ledger-id (not synchronous-failure))
       (unless (and (stringp helper-id)
                    (> (length helper-id) 0))
         (error "Helper returned an invalid request id"))
-      (unless (hash-table-p
-               (emacs-jupyter-notebook-helper-backend-state-request-map state))
-        (setf (emacs-jupyter-notebook-helper-backend-state-request-map state)
-              (make-hash-table :test #'equal)))
-      (puthash helper-id (list :ledger-id ledger-id
-                               :backend-request-id backend-request-id
-                               :panel-generation panel-generation)
-               (emacs-jupyter-notebook-helper-backend-state-request-map state))
-      (emacs-jupyter-notebook-helper-backend--schedule-pending-flush session state))
+      (if pre-admission-rejected
+          (emacs-jupyter-notebook-helper-backend--retire-wire-id state helper-id)
+        (unless (hash-table-p
+                 (emacs-jupyter-notebook-helper-backend-state-request-map state))
+          (setf (emacs-jupyter-notebook-helper-backend-state-request-map state)
+                (make-hash-table :test #'equal)))
+        (puthash helper-id (list :ledger-id ledger-id
+                                 :backend-request-id backend-request-id
+                                 :panel-generation panel-generation)
+                 (emacs-jupyter-notebook-helper-backend-state-request-map state))
+        (emacs-jupyter-notebook-helper-backend--schedule-pending-flush session state)))
     helper-id))
+
+(defun emacs-jupyter-notebook-helper-backend-ledger-id-admitted-p
+    (session ledger-id &optional backend-request-id)
+  "Return non-nil only when helper SESSION admitted LEDGER-ID for execution.
+The mapping is installed after `helper-request' has returned from its process
+write.  In particular, a synchronous pre-write failure deliberately creates
+no mapping even though the generic adapter has allocated a request id.
+BACKEND-REQUEST-ID, when non-nil, must match the mapped generic request."
+  (let ((state (and (emacs-jupyter-notebook-backend-session-p session)
+                    (emacs-jupyter-notebook-backend-session-data session))))
+    (when-let ((mapping (and (emacs-jupyter-notebook-helper-backend-state-p state)
+                             (emacs-jupyter-notebook-helper-backend-state-request-map state))))
+      (let (admitted)
+        (maphash
+         (lambda (_wire-id mapped)
+           (when (and (equal (plist-get mapped :ledger-id) ledger-id)
+                      (or (null backend-request-id)
+                          (equal (plist-get mapped :backend-request-id)
+                                 backend-request-id)))
+             (setq admitted t)))
+         mapping)
+        admitted))))
+
+(defun emacs-jupyter-notebook-helper-backend--protocol-failure
+    (state failure reason)
+  "Escalate ambiguous or malformed helper data as fatal transport failure.
+The helper owns a framed protocol, and an admitted execute error cannot prove
+that code was unsent.  The transport-failure closure notifies the core before
+completing the generic request, preserving the admitted ledger mapping for
+EI7's outcome classification."
+  (if (emacs-jupyter-notebook-helper-backend--signal-transport-failure
+       state reason)
+      nil
+    (funcall failure reason)))
+
+(defun emacs-jupyter-notebook-helper-backend--signal-transport-failure
+    (state reason)
+  "Signal STATE's one local transport-failure transition with REASON.
+Return non-nil when the state still has a live transition owner."
+  (when-let ((transport
+              (and (emacs-jupyter-notebook-helper-backend-state-p state)
+                   (emacs-jupyter-notebook-helper-backend-state-transport-failure state))))
+    (funcall transport reason)
+    t))
 
 (defun emacs-jupyter-notebook-helper-backend--execute-result (result)
   "Validate and normalize the bounded helper execute RESULT.
@@ -634,20 +808,8 @@ an arbitrary helper object."
                    (when (equal (plist-get mapped :ledger-id) ledger-id)
                      (push wire-id ids))) mapping)
         (dolist (wire-id ids)
-          (remhash wire-id mapping)
-          (let ((retired
-                 (or (emacs-jupyter-notebook-helper-backend-state-retired-request-ids state)
-                     (setf (emacs-jupyter-notebook-helper-backend-state-retired-request-ids state)
-                           (make-hash-table :test #'equal))))
-                (order (emacs-jupyter-notebook-helper-backend-state-retired-request-order state)))
-            (unless (gethash wire-id retired)
-              (puthash wire-id t retired)
-              (setq order (append order (list wire-id)))
-              (when (> (length order) 128)
-                (remhash (car order) retired)
-                (setq order (cdr order)))
-              (setf (emacs-jupyter-notebook-helper-backend-state-retired-request-order state)
-                    order))))))))
+          (emacs-jupyter-notebook-helper-backend--retire-wire-id
+           state wire-id))))))
 
 (defun emacs-jupyter-notebook-helper-backend--verification-failure
     (session request reason failure)
@@ -971,65 +1133,85 @@ validates both values before it can send the Jupyter stdin reply."
           (if (eq operation 'input)
               (emacs-jupyter-notebook-helper-backend--input-payload-object payload)
             (emacs-jupyter-notebook-helper-backend--payload-object operation payload))
-          emacs-jupyter-notebook-helper-backend--aux-timeout
+          (if (and (eq operation 'execute)
+                   (not (plist-get options :setup)))
+              (emacs-jupyter-notebook-helper-backend--execute-request-timeout)
+            emacs-jupyter-notebook-helper-backend--aux-timeout)
           (cond
            ((eq operation 'execute)
             (lambda (result)
               (condition-case err
                   (funcall success
                            (emacs-jupyter-notebook-helper-backend--execute-result result))
-                (error (funcall failure (error-message-string err))))))
+                (error
+                 (emacs-jupyter-notebook-helper-backend--protocol-failure
+                  state failure (error-message-string err))))))
            ((emacs-jupyter-notebook-helper-backend--is-complete-operation-p operation)
             (lambda (result)
               (let ((status (and (hash-table-p result) (gethash "status" result))))
                 (if (member status '("complete" "incomplete" "invalid" "unknown"))
                     (funcall success (list :status status))
-                  (funcall failure "helper is_complete returned an invalid result")))))
+                  (emacs-jupyter-notebook-helper-backend--protocol-failure
+                   state failure "helper is_complete returned an invalid result")))))
            ((emacs-jupyter-notebook-helper-backend--complete-operation-p operation)
             (lambda (result)
               (condition-case err
                   (funcall success
                            (emacs-jupyter-notebook-helper-backend--complete-result result))
-                (error (funcall failure (error-message-string err))))))
+                (error
+                 (emacs-jupyter-notebook-helper-backend--protocol-failure
+                  state failure (error-message-string err))))))
            ((emacs-jupyter-notebook-helper-backend--inspect-operation-p operation)
             (lambda (result)
               (condition-case err
                   (funcall success
                            (emacs-jupyter-notebook-helper-backend--inspect-result result))
-                (error (funcall failure (error-message-string err))))))
+                (error
+                 (emacs-jupyter-notebook-helper-backend--protocol-failure
+                  state failure (error-message-string err))))))
            ((eq operation 'input)
             (lambda (result)
               (condition-case err
                   (progn
                     (emacs-jupyter-notebook-helper-backend--input-result result)
                     (funcall success nil))
-                (error (funcall failure (error-message-string err))))))
+                (error
+                 (emacs-jupyter-notebook-helper-backend--protocol-failure
+                  state failure (error-message-string err))))))
            ((emacs-jupyter-notebook-helper-backend--kernel-info-operation-p operation)
             (lambda (result)
               (condition-case err
                   (funcall success
                            (emacs-jupyter-notebook-helper-backend--kernel-info-result
                             result))
-                (error (funcall failure (error-message-string err))))))
+                (error
+                 (emacs-jupyter-notebook-helper-backend--protocol-failure
+                  state failure (error-message-string err))))))
            ((emacs-jupyter-notebook-helper-backend--interrupt-operation-p operation)
             (lambda (result)
               (condition-case err
                   (progn
                     (emacs-jupyter-notebook-helper-backend--control-result result "interrupted")
                     (funcall success nil))
-                (error (funcall failure (error-message-string err))))))
+                (error
+                 (emacs-jupyter-notebook-helper-backend--protocol-failure
+                  state failure (error-message-string err))))))
            ((emacs-jupyter-notebook-helper-backend--shutdown-operation-p operation)
             (lambda (result)
               (condition-case err
                   (progn
                     (emacs-jupyter-notebook-helper-backend--control-result result "shutdown")
                     (funcall success nil))
-                (error (funcall failure (error-message-string err))))))
+                (error
+                 (emacs-jupyter-notebook-helper-backend--protocol-failure
+                  state failure (error-message-string err))))))
            (t success))
           failure ledger-id
           (and (eq operation 'execute)
                (emacs-jupyter-notebook-backend-request-id request))
-          panel-generation))))))
+          panel-generation
+          (and (eq operation 'execute)
+               (not (plist-get options :setup)))))))))
 
 (add-to-list 'emacs-jupyter-notebook-backend-implementations
              (cons 'helper #'emacs-jupyter-notebook-helper-backend-dispatch))

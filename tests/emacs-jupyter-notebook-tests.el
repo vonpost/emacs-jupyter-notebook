@@ -4355,7 +4355,10 @@ the evaluate flow."
     (let* ((buffer (current-buffer))
            (proc (start-process "ejn-test-dead-tunnel" nil "true")))
       (emacs-jupyter-notebook-mode 1)
-      (setq emacs-jupyter-notebook--tunnel-dead nil)
+      ;; EI7 identity-gates tunnel death.  Model the installed tunnel rather
+      ;; than an arbitrary stale process, which must be ignored.
+      (setq emacs-jupyter-notebook--tunnel-process proc
+            emacs-jupyter-notebook--tunnel-dead nil)
       (let ((deadline (+ (float-time) 5)))
         (while (and (process-live-p proc)
                     (< (float-time) deadline))
@@ -13816,6 +13819,38 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                 (should-not (file-exists-p original))))))
       (when (buffer-live-p panel) (kill-buffer panel))
       (ignore-errors (delete-directory root t)))))
+
+(ert-deftest ejn-ei7-mode-disable-cancels-evaluation-and-interrupt-grace-timers ()
+  "Mode disable cancels every execution-owned timer before clearing the ledger."
+  (with-temp-buffer
+    (let ((evaluation-timer nil)
+          (grace-timer nil)
+          (fired 0))
+      (unwind-protect
+          (progn
+            (emacs-jupyter-notebook-mode 1)
+            (setq evaluation-timer
+                  (run-at-time 0.05 nil (lambda () (cl-incf fired))))
+            (setq grace-timer
+                  (run-at-time 0.05 nil (lambda () (cl-incf fired))))
+            (emacs-jupyter-notebook--execution-put
+             (list :id 1 :state 'cancelling
+                   :timer evaluation-timer
+                   :interrupt-grace-timer grace-timer))
+            (emacs-jupyter-notebook-mode -1)
+            (should-not (memq evaluation-timer timer-list))
+            (should-not (memq grace-timer timer-list))
+            (should-not (memq evaluation-timer timer-idle-list))
+            (should-not (memq grace-timer timer-idle-list))
+            (should-not emacs-jupyter-notebook--execution-ledger)
+            ;; Let the original deadlines pass; a cancelled timer must not
+            ;; invoke a callback after the ledger has been discarded.
+            (accept-process-output nil 0.1)
+            (should (= fired 0)))
+        (when (timerp evaluation-timer) (cancel-timer evaluation-timer))
+        (when (timerp grace-timer) (cancel-timer grace-timer))
+        (when emacs-jupyter-notebook-mode
+          (emacs-jupyter-notebook-mode -1))))))
 
 (provide 'emacs-jupyter-notebook-tests)
 

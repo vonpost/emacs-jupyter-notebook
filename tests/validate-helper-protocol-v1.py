@@ -60,7 +60,7 @@ def check_object(v, obj):
     elif kind == "response":
         if not isinstance(obj.get("id"), str) or not isinstance(obj.get("ok"), bool): fail(v["name"] + ": invalid response fields")
         if obj["ok"] and ("error" in obj or not isinstance(obj.get("result"), dict)): fail(v["name"] + ": invalid success branch")
-        if not obj["ok"] and ("result" in obj or not isinstance(obj.get("error"), dict) or obj["error"].get("code") not in ERRORS or not isinstance(obj["error"].get("message"), str)): fail(v["name"] + ": invalid error branch")
+        if not obj["ok"] and ("result" in obj or not isinstance(obj.get("error"), dict) or set(obj["error"]) != {"code", "message", "admitted"} or obj["error"].get("code") not in ERRORS or not isinstance(obj["error"].get("message"), str) or type(obj["error"].get("admitted")) is not bool): fail(v["name"] + ": invalid error branch")
     elif kind == "event":
         if not integer(obj.get("seq")) or not isinstance(obj.get("event"), str) or not isinstance(obj.get("data"), dict): fail(v["name"] + ": invalid event fields")
         if obj["event"] not in EVENTS: fail(v["name"] + ": unsupported event")
