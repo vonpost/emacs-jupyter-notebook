@@ -1154,7 +1154,7 @@ be manager-reviewed for durable-kernel rules.
     capped at 4 MiB for inline images, canonicalizes Darwin's `/var` alias,
     securely discards rejected files, and tombstones retired wire IDs.
 
-- [~] owner=terra-ei4v claimed=2026-09-01 **EI4V Move matplotlib viewer payloads to confined pickle files.**
+- [x] sha=adf3816 **EI4V Move matplotlib viewer payloads to confined pickle files.**
   - Depends: EI4.
   - Files: `helper/ejn_helper/outputs.py`, `helper/tests/test_outputs.py`,
     `emacs-jupyter-notebook-helper-backend.el`,
@@ -1193,6 +1193,13 @@ be manager-reviewed for durable-kernel rules.
     pump remains responsive; and valid figure round trip using a test-owned
     local file.  No GUI is required for security/protocol tests.
   - Narrow run: ERT selector `^ejn-ei4v-` and viewer Python tests.
+  - Landed verification: 667 source-based ERTs, 164 helper Python tests,
+    and 8 real-socket viewer protocol tests pass.  Byte compilation passes
+    with only the two pre-existing optional Evil symbol warnings.  The final
+    audit also exercised real Emacs-to-Python device/inode ordering, bounded
+    viewer death/timeout lease settlement, malformed non-object JSON, exact
+    pickle byte/count eviction, and payload canaries across panel/wire/log
+    surfaces.  GUI coverage skips cleanly when matplotlib is unavailable.
 
 - [ ] **EI4D Reject compressed-image decoder bombs before Emacs image APIs.**
   - Depends: EI4V.
