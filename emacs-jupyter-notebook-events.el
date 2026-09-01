@@ -193,8 +193,7 @@ truncation has optional `:text'."
 (defun emacs-jupyter-notebook-events--render-display
     (context data mode &optional display-id require-display-id)
   "Apply normalized MIME DATA for CONTEXT using result/display MODE semantics."
-  (let ((handle (plist-get context :entry-handle))
-        (buffer (plist-get context :buffer)))
+  (let ((handle (plist-get context :entry-handle)))
     ;; HT9 deliberately omits an oversized display id instead of truncating it.
     ;; Such an update has no safe identity and must not fall back to replacing
     ;; the last unrelated image or all text in the entry.
@@ -202,20 +201,21 @@ truncation has optional `:text'."
                (not (and (eq mode 'update-display)
                          require-display-id
                          (null display-id))))
-      (let ((publication (plist-get data :ejn-published-image)))
-        (if publication
-            (if (eq mode 'update-display)
-                (ejn-panel-update-published-image
-                 handle (plist-get publication :root) (plist-get publication :path)
-                 (plist-get publication :mime) (plist-get publication :sha256)
-                 (plist-get publication :size) (plist-get publication :root-identity)
-                 (plist-get publication :display-id))
-              (ejn-panel-set-published-image
-               handle (plist-get publication :root) (plist-get publication :path)
-               (plist-get publication :mime) (plist-get publication :sha256)
-               (plist-get publication :size) (plist-get publication :root-identity)
-               (plist-get publication :display-id)))
-          (emacs-jupyter-notebook--maybe-stash-pickle buffer handle data)
+      (let ((publication (plist-get data :ejn-published-image))
+            (pickle (plist-get data :ejn-published-pickle)))
+        (if (or publication pickle)
+            (when-let ((effective-handle
+                        (condition-case nil
+                            (ejn-panel-set-published-bundle
+                             handle publication pickle (eq mode 'update-display))
+                          (error nil))))
+              (when pickle
+                (when (and (bound-and-true-p emacs-jupyter-notebook-enable-pickle-viewer)
+                           (bound-and-true-p emacs-jupyter-notebook-viewer-auto-open)
+                           (fboundp 'emacs-jupyter-notebook-open-figure-pickle-lease))
+                  (ejn-panel-schedule-pickle-open
+                   effective-handle #'emacs-jupyter-notebook-open-figure-pickle-lease)))
+              t))
           (let ((rendered (emacs-jupyter-notebook--render-mime-result data)))
             (cond
              ((null rendered)
@@ -244,7 +244,7 @@ truncation has optional `:text'."
                     (ejn-panel-set-display-text handle text display-id)
                   (ejn-panel-append-text handle text))))))
           ;; Non-publication rendering has no transfer lease to acknowledge.
-          t)))))
+          t))))
 
 (defun emacs-jupyter-notebook-events--schedule-input (context prompt password)
   "Schedule, rather than perform, the minibuffer input requested by EVENT.
@@ -318,7 +318,8 @@ transport callback itself remains safe."
               ;; A publication is not panel-owned until this exact call
               ;; accepts it.  Do not turn an unknown display-id or stale handle
               ;; into successful local admission.
-              (when (plist-get (plist-get action :data) :ejn-published-image)
+              (when (or (plist-get (plist-get action :data) :ejn-published-image)
+                        (plist-get (plist-get action :data) :ejn-published-pickle))
                 (setq publication-admitted (and publication-admitted applied))))
             (when (plist-get action :result-seen)
               (when-let ((setter (plist-get context :set-had-result)))

@@ -1239,8 +1239,10 @@ DISPOSALS receives local-only disposal reasons."
   "Late events for a tombstoned helper ID consume no pending-event capacity."
   (let* ((pair (emacs-jupyter-notebook-helper-backend--make-artifact-directory))
          (root (car pair))
-         (path (expand-file-name
-                "ejn-artifact-00000000000000000000000000000009" root))
+         (image-path (expand-file-name
+                      "ejn-artifact-00000000000000000000000000000009" root))
+         (pickle-path (expand-file-name
+                       "ejn-artifact-0000000000000000000000000000000a" root))
          seen state)
     (unwind-protect
         (with-temp-buffer
@@ -1260,19 +1262,27 @@ DISPOSALS receives local-only disposal reasons."
                session state
                (ejn-ei2-test--object "event" name "request_id" "retired-wire"
                                      "data" (ejn-ei2-test--object))))
-            (with-temp-file path (insert "late"))
-            (set-file-modes path #o600)
+            (dolist (pair `((,image-path . "late-image")
+                            (,pickle-path . "late-pickle")))
+              (with-temp-file (car pair) (insert (cdr pair)))
+              (set-file-modes (car pair) #o600))
             (emacs-jupyter-notebook-helper-backend--event
              session state
              (ejn-ei2-test--object
               "event" "display_data" "request_id" "retired-wire"
               "data" (ejn-ei2-test--object
                        "data" (ejn-ei2-test--object
-                               "image/png" (ejn-ei2-test--object
-                                            "path" path "bytes" 4
-                                            "sha256" (make-string 64 ?a)))
+                               "image/png"
+                               (ejn-ei2-test--object
+                                "path" image-path "bytes" 10
+                                "sha256" (make-string 64 ?a))
+                               "application/x-ejn-mpl-pickle"
+                               (ejn-ei2-test--object
+                                "path" pickle-path "bytes" 11
+                                "sha256" (make-string 64 ?b)))
                        "metadata" (ejn-ei2-test--object))))
-            (should-not (file-exists-p path))
+            (should-not (file-exists-p image-path))
+            (should-not (file-exists-p pickle-path))
             (should-not seen)
             (should (= (hash-table-count
                         (emacs-jupyter-notebook-helper-backend-state-pending-events state))
@@ -1346,6 +1356,27 @@ DISPOSALS receives local-only disposal reasons."
     (puthash "update" "not-a-boolean" (gethash "data" raw))
     (should-error
      (emacs-jupyter-notebook-helper-backend--normalize-event state raw))))
+
+(ert-deftest ejn-ei4v-normalizes-dual-artifacts-without-payload-bytes ()
+  "One helper rich event carries independent image and pickle descriptors."
+  (let* ((state (emacs-jupyter-notebook-helper-backend--make-state
+                 :artifact-dir "/tmp/ejn-ei4v-root" :artifact-identity '(7 11)))
+         (sha (make-string 64 ?a))
+         (descriptor (lambda (name bytes)
+                       (ejn-ei2-test--object "path" (concat "/tmp/ejn-ei4v-root/" name)
+                                              "bytes" bytes "sha256" sha)))
+         (raw (ejn-ei2-test--object
+               "event" "display_data"
+               "data" (ejn-ei2-test--object
+                       "data" (ejn-ei2-test--object
+                               "image/png" (funcall descriptor "ejn-artifact-11111111111111111111111111111111" 4)
+                               "application/x-ejn-mpl-pickle" (funcall descriptor "ejn-artifact-22222222222222222222222222222222" 6))
+                       "metadata" (ejn-ei2-test--object))))
+         (data (plist-get (emacs-jupyter-notebook-helper-backend--normalize-event state raw)
+                          :data)))
+    (should (equal (plist-get (plist-get data :ejn-published-image) :size) 4))
+    (should (equal (plist-get (plist-get data :ejn-published-pickle) :size) 6))
+    (should-not (string-match-p "base64" (prin1-to-string data)))))
 
 (provide 'emacs-jupyter-notebook-helper-backend-tests)
 

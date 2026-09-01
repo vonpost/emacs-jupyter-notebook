@@ -223,10 +223,12 @@ generation tuple before any presentation mutation.
               (update-value (gethash "update" data))
               (update-p (or (equal name "update_display_data")
                             (eq update-value t)))
-              (mime (and (hash-table-p payload)
-                         (cl-find-if (lambda (key) (gethash key payload))
-                                     '("image/png" "image/jpeg" "image/gif" "image/webp"))))
-              (artifact (and mime (gethash mime payload)))
+              (pickle-artifact (and (hash-table-p payload)
+                                    (gethash "application/x-ejn-mpl-pickle" payload)))
+              (image-mime (and (hash-table-p payload)
+                               (cl-find-if (lambda (key) (gethash key payload))
+                                           '("image/png" "image/jpeg" "image/gif" "image/webp"))))
+              (image-artifact (and image-mime (gethash image-mime payload)))
               (text (and (hash-table-p payload) (gethash "text/plain" payload)))
               (type (if (equal name "execute_result") 'result
                       (if update-p 'update-display 'display))))
@@ -243,19 +245,26 @@ generation tuple before any presentation mutation.
          (unless (or (null display-id)
                      (and (stringp display-id) (<= (string-bytes display-id) 256)))
            (error "malformed helper display id"))
-         (when (and mime (not (hash-table-p artifact)))
+         (when (or (and pickle-artifact (not (hash-table-p pickle-artifact)))
+                   (and image-mime (not (hash-table-p image-artifact))))
            (error "malformed helper artifact descriptor"))
          (cond
-          ((hash-table-p artifact)
-           (let ((path (gethash "path" artifact)) (bytes (gethash "bytes" artifact))
-                 (sha (gethash "sha256" artifact)))
-             (unless (and (stringp path) (integerp bytes) (>= bytes 0) (stringp sha))
-               (error "malformed helper artifact"))
-             (list :type type :data (list :ejn-published-image
-                                          (list :root (emacs-jupyter-notebook-helper-backend-state-artifact-dir state)
-                                                :root-identity (emacs-jupyter-notebook-helper-backend-state-artifact-identity state)
-                                                :path path :mime mime :sha256 sha :size bytes
-                                                :display-id display-id))
+          ((or pickle-artifact image-artifact)
+           (let ((publication-data nil))
+             (dolist (spec (delq nil (list (and image-artifact (list :ejn-published-image image-mime image-artifact))
+                                           (and pickle-artifact (list :ejn-published-pickle "application/x-ejn-mpl-pickle" pickle-artifact)))))
+               (let* ((key (car spec)) (mime (cadr spec)) (artifact (caddr spec))
+                      (path (gethash "path" artifact)) (bytes (gethash "bytes" artifact))
+                      (sha (gethash "sha256" artifact)))
+                 (unless (and (stringp path) (integerp bytes) (>= bytes 0) (stringp sha))
+                   (error "malformed helper artifact"))
+                 (setq publication-data
+                       (append publication-data
+                               (list key (list :root (emacs-jupyter-notebook-helper-backend-state-artifact-dir state)
+                                               :root-identity (emacs-jupyter-notebook-helper-backend-state-artifact-identity state)
+                                               :path path :mime mime :sha256 sha :size bytes
+                                               :display-id display-id))))))
+             (list :type type :data publication-data
                    :metadata metadata
                    :transient transient :display-id display-id
                    :require-display-id update-p)))
@@ -275,15 +284,17 @@ generation tuple before any presentation mutation.
                         :backend-request-id (plist-get mapping-value :backend-request-id)
                         :panel-generation (plist-get mapping-value :panel-generation)))))
 
-(defun emacs-jupyter-notebook-helper-backend--raw-publication-path (event)
-  "Return a helper artifact path advertised by raw EVENT, or nil."
+(defun emacs-jupyter-notebook-helper-backend--raw-publication-paths (event)
+  "Return every helper artifact path advertised by raw EVENT."
   (let* ((data (emacs-jupyter-notebook-helper-backend--event-data event))
-         (payload (and data (gethash "data" data)))
-         (mime (and (hash-table-p payload)
-                    (cl-find-if (lambda (key) (gethash key payload))
-                                '("image/png" "image/jpeg" "image/gif" "image/webp"))))
-         (artifact (and mime (gethash mime payload))))
-    (and (hash-table-p artifact) (gethash "path" artifact))))
+         (payload (and data (gethash "data" data))))
+    (when (hash-table-p payload)
+      (delq nil
+            (mapcar (lambda (mime)
+                      (let ((artifact (gethash mime payload)))
+                        (and (hash-table-p artifact) (gethash "path" artifact))))
+                    '("application/x-ejn-mpl-pickle"
+                      "image/png" "image/jpeg" "image/gif" "image/webp"))))))
 
 (defun emacs-jupyter-notebook-helper-backend--discard-publication (state path)
   "Unlink unaccepted helper publication PATH if its pinned identity is intact."
@@ -335,14 +346,15 @@ Return the core's explicit admission result.  An accepted publication becomes
 panel-owned; an individually rejected publication is securely discarded.
 Crash-orphaned publications remain for EI9's confined stale-artifact pruning.
 "
-  (let ((path (emacs-jupyter-notebook-helper-backend--raw-publication-path raw-event))
+  (let ((paths (emacs-jupyter-notebook-helper-backend--raw-publication-paths raw-event))
         accepted)
     (unwind-protect
         (let ((event (emacs-jupyter-notebook-helper-backend--normalize-event state raw-event)))
           (setq accepted (emacs-jupyter-notebook-helper-backend--emit-event
                           state helper-id mapping-value event)))
       (unless accepted
-        (emacs-jupyter-notebook-helper-backend--discard-publication state path)))
+        (dolist (path paths)
+          (emacs-jupyter-notebook-helper-backend--discard-publication state path))))
     accepted))
 
 (defun emacs-jupyter-notebook-helper-backend--flush-pending-events (session state)
@@ -392,14 +404,15 @@ backend deferral cannot be mistaken for panel acceptance.
 (defun emacs-jupyter-notebook-helper-backend--retain-early-event
     (session state helper-id event)
   "Boundedly retain reentrant EVENT until HELPER-ID receives its mapping."
-  (let ((publication
-         (emacs-jupyter-notebook-helper-backend--raw-publication-path event)))
+  (let ((publications
+         (emacs-jupyter-notebook-helper-backend--raw-publication-paths event)))
     (cond
-     (publication
+     (publications
       ;; Never hold an uncorrelated disk artifact merely to support a
       ;; synchronous test fake.
-      (emacs-jupyter-notebook-helper-backend--discard-publication
-       state publication))
+      (dolist (publication publications)
+        (emacs-jupyter-notebook-helper-backend--discard-publication
+         state publication)))
      ((<= (or (emacs-jupyter-notebook-backend-session-dispatch-depth session) 0) 0)
       ;; A real process callback cannot run before `helper-request' installs
       ;; the mapping.  An asynchronous unknown id is late or invalid, not early.
@@ -447,9 +460,9 @@ backend deferral cannot be mistaken for panel acceptance.
                ;; Late output must not masquerade as a reentrant early event
                ;; and consume the pending-id budget.
                ((and (hash-table-p retired) (gethash helper-id retired))
-                (emacs-jupyter-notebook-helper-backend--discard-publication
-                 state
-                 (emacs-jupyter-notebook-helper-backend--raw-publication-path event))
+                (dolist (publication (emacs-jupyter-notebook-helper-backend--raw-publication-paths event))
+                  (emacs-jupyter-notebook-helper-backend--discard-publication
+                   state publication))
                 nil)
                (mapping-value
                 (emacs-jupyter-notebook-helper-backend--deliver-mapped-event

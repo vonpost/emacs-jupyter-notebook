@@ -22,6 +22,7 @@ Run it under the viewer's nix closure:
 
 import os
 import pickle
+import hashlib
 import sys
 import tempfile
 
@@ -31,7 +32,48 @@ def _skip(reason):
     return 0
 
 
+def _security_checks():
+    """Run confined pickle protocol checks without a GUI or matplotlib."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import ejn_viewer
+
+    with tempfile.TemporaryDirectory(prefix="ejn-viewer-test-") as root:
+        os.chmod(root, 0o700)
+        path = os.path.join(root, "ejn-artifact-0123456789abcdef0123456789abcdef")
+        payload = b"not-a-real-pickle"
+        with open(path, "wb") as handle:
+            handle.write(payload)
+        os.chmod(path, 0o600)
+        root_stat = os.stat(root)
+        file_stat = os.stat(path)
+        digest = hashlib.sha256(payload).hexdigest()
+        fd = ejn_viewer.open_confined_pickle(
+            root, path, [root_stat.st_dev, root_stat.st_ino],
+            [file_stat.st_dev, file_stat.st_ino], len(payload), digest)
+        os.close(fd)
+
+        def rejected(candidate):
+            try:
+                ejn_viewer.open_confined_pickle(
+                    root, candidate, [root_stat.st_dev, root_stat.st_ino],
+                    [file_stat.st_dev, file_stat.st_ino], len(payload), digest)
+            except ValueError:
+                return True
+            return False
+
+        traversal = rejected(os.path.join(root, "..", "outside.pkl"))
+        link = os.path.join(root, "link.pkl")
+        os.symlink(path, link)
+        symlink = rejected(link)
+        os.chmod(path, 0o644)
+        mode = rejected(path)
+        return traversal and symlink and mode
+
+
 def main():
+    if not _security_checks():
+        sys.stdout.write("FAIL: confined pickle security checks\n")
+        return 1
     if not os.environ.get("DISPLAY"):
         return _skip("no $DISPLAY (GUI test requires a real X display)")
     try:
@@ -73,6 +115,10 @@ def main():
 
     # Select and validate the Tk backend exactly as the viewer does.
     backend = ejn_viewer._select_backend("tk")
+    if sys.platform == "darwin" and backend == "MacOSX":
+        os.unlink(path1)
+        os.unlink(path2)
+        return _skip("Tk-specific GUI guard; production selected native MacOSX")
     import matplotlib.pyplot as plt
     from matplotlib._pylab_helpers import Gcf
 

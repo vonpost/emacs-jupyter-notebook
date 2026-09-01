@@ -3,10 +3,11 @@
 
 Part of emacs-jupyter-notebook.  Runs on the LOCAL workstation (never on any
 remote).  Emacs spawns one persistent instance and hands it newline-delimited
-pickle file paths over a unix-domain socket.  For each path the viewer:
+confined artifact metadata over a unix-domain socket.  For each request the
+viewer:
 
-  * unpickles a matplotlib.figure.Figure (produced headless on the remote,
-    transported as base64 pickle alongside the inline PNG),
+  * validates the helper-spooled pickle file before reading it,
+  * unpickles a matplotlib.figure.Figure produced headless on the remote,
   * reattaches a live GUI canvas (the unpickled figure arrives canvas-less),
   * installs a per-imshow ``format_coord`` override showing integer row/col
     and the pixel value under the cursor,
@@ -25,12 +26,127 @@ live hover, linked zoom) are verified manually.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+import json
+import hashlib
 import math
 import os
 import pickle
+import queue
+import re
 import socket
+import stat
 import sys
 import time
+
+
+MAX_PICKLE_BYTES = 67_108_864
+MAX_REQUEST_BYTES = 4096
+MAX_CLIENTS = 8
+_ARTIFACT_NAME = re.compile(r"ejn-artifact-[0-9a-f]{32}\Z")
+
+
+def _same_identity(left, right):
+    """Return whether two stat results still name the same filesystem object."""
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def open_confined_pickle(root, path, root_identity, file_identity, size, sha256,
+                         max_bytes=MAX_PICKLE_BYTES):
+    """Validate ROOT/PATH and return an open binary fd, or raise ValueError.
+
+    The protocol only permits an immediate, owner-only regular child of an
+    owner-only EJN artifact root.  The root and file are pinned before and
+    after opening so a replacement race fails closed.  The caller owns the fd.
+    """
+    if (not isinstance(root, str) or not isinstance(path, str)
+            or not os.path.isabs(root) or not os.path.isabs(path)
+            or not isinstance(root_identity, list) or len(root_identity) != 2
+            or not isinstance(file_identity, list) or len(file_identity) != 2
+            or any(isinstance(value, bool) or not isinstance(value, int)
+                   for value in root_identity + file_identity)
+            or isinstance(size, bool) or not isinstance(size, int)
+            or size < 0 or size > max_bytes
+            or not isinstance(sha256, str) or len(sha256) != 64
+            or any(char not in "0123456789abcdef" for char in sha256)):
+        raise ValueError("invalid request")
+    root_name = os.path.abspath(root)
+    path_name = os.path.abspath(path)
+    name = os.path.basename(path_name)
+    if os.path.dirname(path_name) != root_name or not _ARTIFACT_NAME.fullmatch(name):
+        raise ValueError("path outside root")
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise ValueError("safe open unavailable")
+    try:
+        root_before = os.lstat(root_name)
+        file_before = os.lstat(path_name)
+    except OSError as exc:
+        raise ValueError("artifact unavailable") from exc
+    uid = os.geteuid()
+    if (stat.S_ISLNK(root_before.st_mode)
+            or not stat.S_ISDIR(root_before.st_mode)
+            or root_before.st_uid != uid
+            or stat.S_IMODE(root_before.st_mode) != 0o700):
+        raise ValueError("unsafe artifact root")
+    if [root_before.st_dev, root_before.st_ino] != root_identity:
+        raise ValueError("root identity changed")
+    if (stat.S_ISLNK(file_before.st_mode)
+            or not stat.S_ISREG(file_before.st_mode)
+            or file_before.st_uid != uid
+            or stat.S_IMODE(file_before.st_mode) != 0o600
+            or file_before.st_nlink != 1
+            or file_before.st_size != size):
+        raise ValueError("unsafe artifact")
+    if [file_before.st_dev, file_before.st_ino] != file_identity:
+        raise ValueError("file identity changed")
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    root_fd = None
+    fd = None
+    try:
+        root_fd = os.open(root_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        fd = os.open(name, flags, dir_fd=root_fd)
+    except OSError as exc:
+        raise ValueError("artifact unavailable") from exc
+    finally:
+        # Validation continues below only after this descriptor is closed;
+        # errors opening the child must not leak the pinned root descriptor.
+        if fd is None and root_fd is not None:
+            os.close(root_fd)
+            root_fd = None
+    try:
+        opened = os.fstat(fd)
+        root_after = os.lstat(root_name)
+        file_after = os.lstat(path_name)
+        if (not _same_identity(root_before, root_after)
+                or not _same_identity(file_before, file_after)
+                or not _same_identity(file_before, opened)
+                or not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != uid
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or opened.st_nlink != 1
+                or opened.st_size != size):
+            raise ValueError("artifact changed")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+
+
+def load_confined_pickle(fd, expected_sha256, expected_size):
+    """Hash and unpickle FD in the bounded worker, returning a figure or None."""
+    with os.fdopen(fd, "rb") as handle:
+        if os.fstat(handle.fileno()).st_size != expected_size:
+            return None
+        data = handle.read(expected_size + 1)
+    if len(data) != expected_size or hashlib.sha256(data).hexdigest() != expected_sha256:
+        return None
+    try:
+        return pickle.loads(data)
+    except Exception:
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -401,34 +517,35 @@ def _local_mpl_version():
         return "unknown"
 
 
-def open_figure(path):
-    """Unpickle the figure at PATH, enhance it, and show it non-blocking.
+def _open_figure_stream(handle):
+    """Unpickle HANDLE, enhance it, and show it non-blocking.
 
-    Deletes PATH afterwards.  Prints a clear message and returns ``None`` on
-    unpickle/show failure so the caller keeps servicing the socket.
+    The caller owns HANDLE and the pathname lifetime.  Failures deliberately
+    avoid echoing request data into stderr.
     """
-    import matplotlib.pyplot as plt
-
-    from matplotlib._pylab_helpers import Gcf
-
-    _install_compat_shims()
-
-    fig = None
     try:
-        with open(path, "rb") as handle:
-            fig = pickle.load(handle)
+        fig = pickle.load(handle)
     except Exception as exc:
         sys.stderr.write(
-            "ejn_viewer: failed to unpickle %s: %s\n"
+            "ejn_viewer: failed to unpickle figure: %s\n"
             "  This is almost always a matplotlib version mismatch between the\n"
             "  remote kernel (which pickled the figure) and this local viewer\n"
             "  (matplotlib %s). Pin both to the same matplotlib version. The\n"
             "  panel PNG thumbnail is unaffected.\n"
-            % (path, exc, _local_mpl_version())
+            % (exc, _local_mpl_version())
         )
         sys.stderr.flush()
-        _unlink(path)
         return None
+
+    return _display_figure(fig)
+
+
+def _display_figure(fig):
+    """Attach/show an already-unpickled FIG on the GUI event thread."""
+    import matplotlib.pyplot as plt
+    from matplotlib._pylab_helpers import Gcf
+
+    _install_compat_shims()
 
     try:
         manager = _reattach_canvas(fig)
@@ -475,9 +592,20 @@ def open_figure(path):
         )
         sys.stderr.flush()
         fig = None
+    return fig
+
+
+def open_figure(path):
+    """Open test-owned PATH directly for the standalone GUI regression guard.
+
+    Production requests use :func:`open_confined_pickle` and never transfer
+    deletion ownership to the viewer.
+    """
+    try:
+        with open(path, "rb") as handle:
+            return _open_figure_stream(handle)
     finally:
         _unlink(path)
-    return fig
 
 
 def _unlink(path):
@@ -538,16 +666,68 @@ def run(socket_path, backend_pref, idle_timeout):
     server.listen(8)
     server.setblocking(False)
 
-    state = {"clients": {}, "last_activity": time.time()}
+    # Exactly one worker and one queued figure bound pickle work off the GUI
+    # tick without allowing an unbounded request backlog.
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ejn-viewer")
+    state = {"clients": {}, "last_activity": time.time(), "busy": False,
+             "ready": queue.SimpleQueue()}
+
+    def queue_pickle(request):
+        if state["busy"]:
+            return False
+        if (not isinstance(request, dict)
+                or set(request) != {"id", "root", "path", "root_identity",
+                                    "file_identity", "size", "sha256"}
+                or not isinstance(request["id"], str)
+                or not request["id"].isascii()
+                or len(request["id"]) > 64):
+            return False
+        try:
+            fd = open_confined_pickle(
+                request["root"], request["path"], request["root_identity"],
+                request["file_identity"], request["size"], request["sha256"]
+            )
+        except ValueError:
+            return False
+        state["busy"] = True
+
+        def worker():
+            return load_confined_pickle(fd, request["sha256"], request["size"])
+
+        future = executor.submit(worker)
+
+        def settled(done):
+            try:
+                figure = done.result()
+            except Exception:
+                figure = None
+            state["ready"].put(figure)
+
+        future.add_done_callback(settled)
+        return True
 
     def pump():
         """Service the socket once.  Return False to request GUI-loop exit."""
+        while True:
+            try:
+                figure = state["ready"].get_nowait()
+            except queue.Empty:
+                break
+            if figure is not None:
+                _display_figure(figure)
+            # Keep admission closed until this GUI tick has consumed the
+            # completed worker result; otherwise several finished figures can
+            # queue between ticks.
+            state["busy"] = False
         # Accept any pending connections.
         while True:
             try:
                 conn, _ = server.accept()
             except (BlockingIOError, OSError):
                 break
+            if len(state["clients"]) >= MAX_CLIENTS:
+                conn.close()
+                continue
             conn.setblocking(False)
             state["clients"][conn] = b""
 
@@ -563,6 +743,13 @@ def run(socket_path, backend_pref, idle_timeout):
                 continue
             if chunk:
                 buf += chunk
+                if len(buf) > MAX_REQUEST_BYTES:
+                    try:
+                        conn.sendall(b'{"id":"","accepted":false}\n')
+                        conn.close()
+                    finally:
+                        state["clients"].pop(conn, None)
+                    continue
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     # W8.7(f): the framing delimiter is the newline only.
@@ -571,13 +758,38 @@ def run(socket_path, backend_pref, idle_timeout):
                     line = line.rstrip(b"\r")
                     if line:
                         state["last_activity"] = time.time()
-                        open_figure(line.decode("utf-8", "replace"))
+                        request = {}
+                        try:
+                            request = json.loads(line.decode("utf-8"))
+                            accepted = queue_pickle(request)
+                        except (UnicodeDecodeError, ValueError, json.JSONDecodeError,
+                                AttributeError):
+                            accepted = False
+                        request_id = (request.get("id", "")
+                                      if isinstance(request, dict) else "")
+                        try:
+                            conn.sendall((json.dumps({"id": request_id,
+                                                     "accepted": accepted}) + "\n").encode("ascii"))
+                        except OSError:
+                            pass
                 state["clients"][conn] = buf
             else:
                 leftover = buf.rstrip(b"\r\n")
                 if leftover:
-                    state["last_activity"] = time.time()
-                    open_figure(leftover.decode("utf-8", "replace"))
+                    request = {}
+                    try:
+                        request = json.loads(leftover.decode("utf-8"))
+                        accepted = queue_pickle(request)
+                    except (UnicodeDecodeError, ValueError, json.JSONDecodeError,
+                            AttributeError):
+                        accepted = False
+                    request_id = (request.get("id", "")
+                                  if isinstance(request, dict) else "")
+                    try:
+                        conn.sendall((json.dumps({"id": request_id,
+                                                 "accepted": accepted}) + "\n").encode("ascii"))
+                    except OSError:
+                        pass
                 try:
                     conn.close()
                 finally:
@@ -590,9 +802,12 @@ def run(socket_path, backend_pref, idle_timeout):
                 return False
         return True
 
-    if backend == "TkAgg":
-        return _run_tk_host(pump, server, socket_path)
-    return _run_mpl_host(pump, server, socket_path)
+    try:
+        if backend == "TkAgg":
+            return _run_tk_host(pump, server, socket_path)
+        return _run_mpl_host(pump, server, socket_path)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _run_tk_host(pump, server, socket_path):

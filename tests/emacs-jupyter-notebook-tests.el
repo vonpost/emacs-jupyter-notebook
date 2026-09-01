@@ -90,6 +90,26 @@ busy-kernel reconnect arbitration may retain it after verification times out."
     (insert-file-contents-literally file)
     (secure-hash 'sha256 (current-buffer))))
 
+(defun ejn-ei4v-test--artifact-file (root hex payload)
+  "Create a confined EI4V artifact under ROOT from HEX and PAYLOAD."
+  (let ((file (expand-file-name (format "ejn-artifact-%s" hex) root)))
+    (with-temp-file file (insert payload))
+    (set-file-modes file #o600)
+    file))
+
+(defun ejn-ei4v-test--descriptor (root file &optional mime display-id)
+  "Return current confined artifact metadata for FILE under ROOT."
+  (let ((attrs (file-attributes file 'integer)))
+    (append
+     (list :root root :path file
+           :sha256 (ejn-ei4-test--content-sha256 file)
+           :size (file-attribute-size attrs)
+           :root-identity
+           (file-attribute-file-identifier
+            (file-attributes root 'integer)))
+     (when mime (list :mime mime))
+     (when display-id (list :display-id display-id)))))
+
 (defun ejn-test-drain-zero-delay-timers ()
   "Run callbacks deferred onto Emacs's zero-delay timer queue.
 
@@ -7416,45 +7436,196 @@ key never disturbs the existing PNG path."
   (should (null (emacs-jupyter-notebook--select-mime-type
                  '(:application/x-ejn-mpl-pickle "cGts")))))
 
-(ert-deftest ejn-w8.2-select-mpl-pickle-extracts-payload ()
-  "W8.2: the pickle selector returns the base64 payload or nil."
-  (should (equal (emacs-jupyter-notebook--select-mpl-pickle
-                  '(:image/png "aW1n" :application/x-ejn-mpl-pickle "cGts"))
-                 "cGts"))
-  (should (null (emacs-jupyter-notebook--select-mpl-pickle
-                 '(:image/png "aW1n"))))
-  (should (null (emacs-jupyter-notebook--select-mpl-pickle
-                 '(:application/x-ejn-mpl-pickle "")))))
+(ert-deftest ejn-w8.2-helper-bundle-stores-descriptor-and-renders-png ()
+  "W8.2/EI4V: helper-published PNG and pickle metadata are retained together."
+  (ejn-test-with-fresh-log-buffer
+    (let* ((root (make-temp-file "ejn-w8-bundle-" t))
+           (image-file nil)
+           (pickle-file nil)
+           (image-canary "RUpOX0lNQUdFX0JBU0U2NF9QYXlsb2FkX0NBTkFSWQ==")
+           (pickle-canary "RUpOX1BJQ0tMRV9CQVNFNjRfUGF5bG9hZF9DQU5BUlk="))
+      (unwind-protect
+          (progn
+            (set-file-modes root #o700)
+            (setq image-file
+                  (ejn-ei4v-test--artifact-file
+                   root "88888888888888888888888888888888" image-canary))
+            (setq pickle-file
+                  (ejn-ei4v-test--artifact-file
+                   root "99999999999999999999999999999999" pickle-canary))
+            (with-temp-buffer
+              (let* ((source (current-buffer))
+                     (panel (ejn-panel-ensure source))
+                     (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
+                     (context (list :buffer source :entry-handle handle))
+                     (event
+                      `(:type display
+                        :data (:ejn-published-image
+                               ,(ejn-ei4v-test--descriptor
+                                 root image-file "image/png" "fig")
+                               :ejn-published-pickle
+                               ,(ejn-ei4v-test--descriptor
+                                 root pickle-file nil "fig"))
+                        :display-id "fig"))
+                     panel-text log-text)
+                (dolist (canary (list image-canary pickle-canary))
+                  (should-not (string-match-p canary (prin1-to-string event))))
+                (should (emacs-jupyter-notebook-events-dispatch context event))
+                (with-current-buffer panel
+                  (emacs-jupyter-notebook-panel-flush-now panel)
+                  (setq panel-text (buffer-string)))
+                (when-let ((log (get-buffer emacs-jupyter-notebook--log-buffer-name)))
+                  (with-current-buffer log
+                    (setq log-text (buffer-string))))
+                (let* ((entry (ejn-panel-entry-snapshot handle))
+                       (image (car (ejn-panel-entry-images handle)))
+                       (printed (prin1-to-string entry)))
+                  (should (equal (plist-get (cdr image) :file) image-file))
+                  (should (equal (plist-get (plist-get entry :mpl-pickle) :file)
+                                 pickle-file))
+                  (dolist (surface (list printed panel-text (or log-text "")))
+                    (dolist (canary (list image-canary pickle-canary))
+                      (should-not (string-match-p canary surface))))))))
+        (ignore-errors (delete-directory root t))))))
 
-(ert-deftest ejn-w8.2-set-and-get-pickle-on-entry ()
-  "W8.2: `ejn-panel-set-pickle' stores under :mpl-pickle; getter reads it."
-  (with-temp-buffer
-    (let* ((panel (ejn-panel-ensure (current-buffer)))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) "")))
-      (should (null (ejn-panel-entry-pickle handle)))
-      (ejn-panel-set-pickle handle "cGlja2xl")
-      (should (equal (ejn-panel-entry-pickle handle) "cGlja2xl"))
-      (should (equal (plist-get (ejn-panel-entry-snapshot handle) :mpl-pickle)
-                     "cGlja2xl")))))
+(ert-deftest ejn-a5-panel-caps-retained-pickle-artifacts ()
+  "A5/EI4V: only the newest `panel-max-pickles' entries keep pickle files."
+  (let ((root (make-temp-file "ejn-a5-pickle-cap-" t))
+        files handles)
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (with-temp-buffer
+            (let ((emacs-jupyter-notebook-panel-max-pickles 2)
+                  (panel (ejn-panel-ensure (current-buffer))))
+              (dotimes (i 5)
+                (let* ((hex (format "%032x" i))
+                       (file (ejn-ei4v-test--artifact-file
+                              root hex (format "pickle-%d" i)))
+                       (handle (ejn-panel-start-entry
+                                panel (cons "x.py" (1+ i)) "")))
+                  (push file files)
+                  (should
+                   (ejn-panel-set-published-pickle
+                    handle root file
+                    (ejn-ei4-test--content-sha256 file)
+                    (file-attribute-size (file-attributes file 'integer))
+                    (file-attribute-file-identifier
+                     (file-attributes root 'integer))))
+                  (push (cons i handle) handles)))
+              (setq handles (nreverse handles))
+              (should (ejn-panel-entry-pickle (cdr (assq 4 handles))))
+              (should (ejn-panel-entry-pickle (cdr (assq 3 handles))))
+              (dolist (i '(0 1 2))
+                (should-not (ejn-panel-entry-pickle (cdr (assq i handles))))
+                (should-not (file-exists-p
+                             (nth i (nreverse (copy-sequence files))))))
+              (dolist (i '(3 4))
+                (should (file-exists-p
+                         (nth i (nreverse (copy-sequence files)))))))))
+      (ignore-errors (delete-directory root t)))))
 
-(ert-deftest ejn-a5-panel-caps-retained-pickles ()
-  "A5: only the newest `panel-max-pickles' entries keep their pickle payload;
-older ones are pruned so an image-heavy session's memory stays bounded."
-  (with-temp-buffer
-    (let ((emacs-jupyter-notebook-panel-max-pickles 2)
-          (panel (ejn-panel-ensure (current-buffer)))
-          handles)
-      (dotimes (i 5)
-        (let ((h (ejn-panel-start-entry panel (cons "x.py" (1+ i)) "")))
-          (ejn-panel-set-pickle h (format "pickle-%d" i))
-          (push (cons i h) handles)))
-      (setq handles (nreverse handles))
-      ;; Newest two (i=3,4) retain their pickle; older ones were pruned.
-      (should (equal (ejn-panel-entry-pickle (cdr (assq 4 handles))) "pickle-4"))
-      (should (equal (ejn-panel-entry-pickle (cdr (assq 3 handles))) "pickle-3"))
-      (should (null (ejn-panel-entry-pickle (cdr (assq 2 handles)))))
-      (should (null (ejn-panel-entry-pickle (cdr (assq 1 handles)))))
-      (should (null (ejn-panel-entry-pickle (cdr (assq 0 handles))))))))
+(ert-deftest ejn-w14-panel-open-figure-finds-pickle-off-header ()
+  "W14/EI4V: panel `v' lookup finds descriptor metadata within an entry body."
+  (let* ((root (make-temp-file "ejn-w14-panel-v-" t))
+         (image-file nil)
+         (pickle-file nil))
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (setq image-file
+                (ejn-ei4v-test--artifact-file
+                 root "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1" "image"))
+          (setq pickle-file
+                (ejn-ei4v-test--artifact-file
+                 root "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2" "pickle"))
+          (with-temp-buffer
+            (let* ((panel (ejn-panel-ensure (current-buffer)))
+                   (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()")))
+              (should
+               (ejn-panel-set-published-bundle
+                handle
+                (ejn-ei4v-test--descriptor root image-file "image/png" "fig")
+                (ejn-ei4v-test--descriptor root pickle-file nil "fig")
+                nil))
+              (with-current-buffer panel
+                (emacs-jupyter-notebook-panel--render panel)
+                (let ((img-pos (next-single-property-change (point-min) 'display))
+                      lease)
+                  (should img-pos)
+                  (goto-char img-pos)
+                  (should-not (get-text-property (point)
+                                                 'emacs-jupyter-notebook-entry-id))
+                  (setq lease (emacs-jupyter-notebook-panel--entry-pickle-at-point))
+                  (unwind-protect
+                      (should (equal (plist-get lease :file) pickle-file))
+                    (ejn-panel-release-pickle lease)))))))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest ejn-w8.7-replace-text-and-clear-entry-drop-pickle ()
+  "W8.7(d)/EI4V: text replacement and clear retire interactive descriptors."
+  (let* ((root (make-temp-file "ejn-w8-drop-pickle-" t))
+         (file-a nil)
+         (file-b nil))
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (setq file-a
+                (ejn-ei4v-test--artifact-file
+                 root "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1" "pk1"))
+          (setq file-b
+                (ejn-ei4v-test--artifact-file
+                 root "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2" "pk2"))
+          (with-temp-buffer
+            (let* ((panel (ejn-panel-ensure (current-buffer)))
+                   (h1 (ejn-panel-start-entry panel '("x.py" . 1) ""))
+                   (h2 (ejn-panel-start-entry panel '("x.py" . 2) ""))
+                   (root-id (file-attribute-file-identifier
+                             (file-attributes root 'integer))))
+              (should (ejn-panel-set-published-pickle
+                       h1 root file-a (ejn-ei4-test--content-sha256 file-a)
+                       3 root-id))
+              (ejn-panel-replace-text h1 "now text")
+              (should-not (ejn-panel-entry-pickle h1))
+              (should-not (file-exists-p file-a))
+              (should (ejn-panel-set-published-pickle
+                       h2 root file-b (ejn-ei4-test--content-sha256 file-b)
+                       3 root-id))
+              (ejn-panel-clear-entry h2)
+              (should-not (ejn-panel-entry-pickle h2))
+              (should-not (file-exists-p file-b)))))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest ejn-w8.7-auto-open-disabled-default-does-not-schedule ()
+  "W8.7/EI4V: auto-open alone cannot load pickles without explicit opt-in."
+  (let* ((root (make-temp-file "ejn-w8-auto-disabled-" t))
+         (file nil))
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (setq file
+                (ejn-ei4v-test--artifact-file
+                 root "cccccccccccccccccccccccccccccccc" "pickle"))
+          (with-temp-buffer
+            (let* ((source (current-buffer))
+                   (panel (ejn-panel-ensure source))
+                   (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
+                   (context (list :buffer source :entry-handle handle))
+                   (emacs-jupyter-notebook-viewer-auto-open t)
+                   (emacs-jupyter-notebook-enable-pickle-viewer nil))
+              (cl-letf (((symbol-function 'run-with-idle-timer)
+                         (lambda (&rest _)
+                           (ert-fail "disabled pickle viewer scheduled auto-open"))))
+                (should
+                 (emacs-jupyter-notebook-events-dispatch
+                  context `(:type display
+                            :data (:ejn-published-pickle
+                                   ,(ejn-ei4v-test--descriptor root file nil "fig"))
+                            :display-id "fig"))))
+              (should (ejn-panel-entry-pickle handle))
+              (should-not (plist-get (ejn-panel-entry-snapshot handle)
+                                     :pickle-open-timer)))))
+      (ignore-errors (delete-directory root t)))))
 
 (ert-deftest ejn-w14-apply-carriage-returns-collapses-progress ()
   "W14: tqdm-style `\\r' progress collapses to the final frame; `\\r\\n'
@@ -7529,143 +7700,6 @@ inserted instead."
       (should (string-match-p "png image"
                               (buffer-substring placeholder-start (point)))))))
 
-(ert-deftest ejn-w14-panel-open-figure-finds-pickle-off-header ()
-  "W14: `v' / open-figure finds the entry's pickle when point is on the
-image line, not just the header — the entry-id lives on the header, so the
-section lookup must resolve the enclosing entry."
-  (with-temp-buffer
-    (let* ((panel (ejn-panel-ensure (current-buffer)))
-           (h (ejn-panel-start-entry panel '("x.py" . 1) "plot()")))
-      (ejn-panel-set-image h (list 'image :type 'png))
-      (ejn-panel-set-pickle h "cGlja2xl")
-      (with-current-buffer panel
-        (emacs-jupyter-notebook-panel--render panel)
-        ;; Jump to the image (first char carrying a `display' property).
-        (let ((img-pos (next-single-property-change (point-min) 'display)))
-          (should img-pos)
-          (goto-char img-pos)
-          ;; Point is NOT on the header line here.
-          (should-not (get-text-property (point) 'emacs-jupyter-notebook-entry-id))
-          (should (equal (emacs-jupyter-notebook-panel--entry-pickle-at-point)
-                         "cGlja2xl")))))))
-
-(ert-deftest ejn-w8.2-display-data-stores-pickle-and-renders-png ()
-  "W8.2: a bundle with both PNG and pickle renders the PNG AND stashes the
-pickle on the entry."
-  (with-temp-buffer
-    (let* ((buffer (current-buffer))
-           (panel (ejn-panel-ensure buffer))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
-           (display-fn (cadr (assoc "display_data" callbacks)))
-           (png (base64-encode-string "imgdata" t))
-           (pickle (base64-encode-string "pickle-bytes" t)))
-      (cl-letf (((symbol-function 'jupyter-message-content)
-                 (lambda (_msg)
-                   `(:data (:image/png ,png
-                            :application/x-ejn-mpl-pickle ,pickle))))
-                ((symbol-function 'create-image)
-                 (lambda (data &optional _type _data-p &rest _props)
-                   (list 'image :type 'png :data data))))
-        (funcall display-fn 'mock-msg))
-      (let ((e (ejn-panel-entry-snapshot handle)))
-        (let ((image (car (ejn-panel-entry-images e))))
-          (should (ejn-test-image-file-backed-p image))
-          (should (equal (ejn-test-image-spec-data image) "imgdata")))
-        (should (equal (plist-get e :mpl-pickle) pickle))))))
-
-(ert-deftest ejn-w8.2-display-data-png-only-stores-no-pickle ()
-  "W8.2: a PNG-only bundle behaves exactly as before — no pickle stashed."
-  (with-temp-buffer
-    (let* ((buffer (current-buffer))
-           (panel (ejn-panel-ensure buffer))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
-           (display-fn (cadr (assoc "display_data" callbacks)))
-           (png (base64-encode-string "imgdata" t)))
-      (cl-letf (((symbol-function 'jupyter-message-content)
-                 (lambda (_msg) `(:data (:image/png ,png))))
-                ((symbol-function 'create-image)
-                 (lambda (data &optional _type _data-p &rest _props)
-                   (list 'image :type 'png :data data))))
-        (funcall display-fn 'mock-msg))
-      (let ((e (ejn-panel-entry-snapshot handle)))
-        (let ((image (car (ejn-panel-entry-images e))))
-          (should (ejn-test-image-file-backed-p image))
-          (should (equal (ejn-test-image-spec-data image) "imgdata")))
-        (should (null (plist-get e :mpl-pickle)))))))
-
-(ert-deftest ejn-w8.7-display-without-pickle-clears-stale-pickle ()
-  "W8.7(d): a later display on the same entry that carries NO pickle drops
-any previously-stashed pickle, so the interactive open cannot reopen a
-figure that is no longer the entry's visible content."
-  (with-temp-buffer
-    (let* ((buffer (current-buffer))
-           (panel (ejn-panel-ensure buffer))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
-           (display-fn (cadr (assoc "display_data" callbacks)))
-           (png (base64-encode-string "imgdata" t))
-           (pickle (base64-encode-string "pickle-bytes" t)))
-      (cl-letf (((symbol-function 'create-image)
-                 (lambda (data &optional _t _d &rest _p)
-                   (list 'image :data data))))
-        ;; First: a figure (png + pickle).
-        (cl-letf (((symbol-function 'jupyter-message-content)
-                   (lambda (_m) `(:data (:image/png ,png
-                                         :application/x-ejn-mpl-pickle ,pickle)))))
-          (funcall display-fn 'm))
-        (should (equal (plist-get (ejn-panel-entry-snapshot handle) :mpl-pickle)
-                       pickle))
-        ;; Then: a non-figure display on the same entry (png only).
-        (cl-letf (((symbol-function 'jupyter-message-content)
-                   (lambda (_m) `(:data (:image/png ,png)))))
-          (funcall display-fn 'm))
-        (should (null (plist-get (ejn-panel-entry-snapshot handle) :mpl-pickle)))))))
-
-(ert-deftest ejn-w8.7-replace-text-and-clear-entry-drop-pickle ()
-  "W8.7(d): `ejn-panel-replace-text' and `ejn-panel-clear-entry' both drop a
-stashed pickle."
-  (with-temp-buffer
-    (let* ((panel (ejn-panel-ensure (current-buffer)))
-           (h1 (ejn-panel-start-entry panel '("x.py" . 1) ""))
-           (h2 (ejn-panel-start-entry panel '("x.py" . 2) "")))
-      (ejn-panel-set-pickle h1 "pk1")
-      (ejn-panel-replace-text h1 "now text")
-      (should (null (ejn-panel-entry-pickle h1)))
-      (ejn-panel-set-pickle h2 "pk2")
-      (ejn-panel-clear-entry h2)
-      (should (null (ejn-panel-entry-pickle h2))))))
-
-(ert-deftest ejn-w8.7-auto-open-defers-off-the-callback ()
-  "W8.7(a): when auto-open is enabled, the display callback does NOT call
-`viewer-open-pickle' synchronously — it schedules it on an idle timer so a
-large pickle decode/write never blocks the IOPub callback."
-  (with-temp-buffer
-    (let* ((buffer (current-buffer))
-           (panel (ejn-panel-ensure buffer))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
-           (display-fn (cadr (assoc "display_data" callbacks)))
-           (png (base64-encode-string "imgdata" t))
-           (pickle (base64-encode-string "pickle-bytes" t))
-           (emacs-jupyter-notebook-viewer-auto-open t)
-           (sync-called nil)
-           (scheduled nil))
-      (cl-letf (((symbol-function 'create-image)
-                 (lambda (data &optional _t _d &rest _p) (list 'image data)))
-                ((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
-                 (lambda (_b64) (setq sync-called t)))
-                ((symbol-function 'run-with-idle-timer)
-                 (lambda (&rest _args) (setq scheduled t) nil))
-                ((symbol-function 'jupyter-message-content)
-                 (lambda (_m) `(:data (:image/png ,png
-                                       :application/x-ejn-mpl-pickle ,pickle)))))
-        (funcall display-fn 'm))
-      ;; Deferred, not called inline.
-      (should scheduled)
-      (should-not sync-called))))
-
 ;;; W8.3 — local viewer process manager
 
 (defvar ejn-w8.3--received nil
@@ -7684,11 +7718,18 @@ server process, which doubles as the manager's placeholder process."
    :filter (lambda (_proc string)
              (push string (car ejn-w8.3--received)))))
 
+(defun ejn-w8.3--make-pipe-viewer (_socket-path)
+  "Return a live process stub for viewer lifecycle tests."
+  (make-pipe-process :name "ejn-w8.3-pipe-viewer" :buffer nil :noquery t))
+
 (defmacro ejn-w8.3-with-clean-manager (&rest body)
   "Run BODY with fresh, isolated viewer-manager global state, then reap."
   (declare (indent 0))
   `(let ((emacs-jupyter-notebook-viewer--process nil)
-         (emacs-jupyter-notebook-viewer--socket-path nil))
+         (emacs-jupyter-notebook-viewer--socket-path nil)
+         (emacs-jupyter-notebook-viewer--socket-directory nil)
+         (emacs-jupyter-notebook-viewer--socket-directory-identity nil)
+         (emacs-jupyter-notebook-viewer--active-transaction nil))
      (unwind-protect
          (progn ,@body)
        (ignore-errors (emacs-jupyter-notebook-viewer-reap)))))
@@ -7701,7 +7742,7 @@ server process, which doubles as the manager's placeholder process."
            (emacs-jupyter-notebook-viewer-spawn-function
             (lambda (socket-path)
               (cl-incf spawn-count)
-              (ejn-w8.3--make-stub-server socket-path))))
+              (ejn-w8.3--make-pipe-viewer socket-path))))
       (let ((p1 (emacs-jupyter-notebook-viewer-ensure))
             (p2 (emacs-jupyter-notebook-viewer-ensure)))
         (should (= spawn-count 1))
@@ -7714,7 +7755,7 @@ server process, which doubles as the manager's placeholder process."
     (let* ((ejn-w8.3--received (list nil))
            (kill-emacs-hook nil)
            (emacs-jupyter-notebook-viewer-spawn-function
-            #'ejn-w8.3--make-stub-server))
+            #'ejn-w8.3--make-pipe-viewer))
       (emacs-jupyter-notebook-viewer-ensure)
       (should (memq #'emacs-jupyter-notebook-viewer-reap kill-emacs-hook)))))
 
@@ -7724,58 +7765,54 @@ server process, which doubles as the manager's placeholder process."
     (let* ((ejn-w8.3--received (list nil))
            (kill-emacs-hook nil)
            (emacs-jupyter-notebook-viewer-spawn-function
-            #'ejn-w8.3--make-stub-server))
+            (lambda (socket-path)
+              (with-temp-file socket-path (insert "socket"))
+              (ejn-w8.3--make-pipe-viewer socket-path))))
       (emacs-jupyter-notebook-viewer-ensure)
       (let ((socket-path emacs-jupyter-notebook-viewer--socket-path)
-            (proc emacs-jupyter-notebook-viewer--process))
-        (should (process-live-p proc))
+            (directory emacs-jupyter-notebook-viewer--socket-directory))
         (should (file-exists-p socket-path))
         (emacs-jupyter-notebook-viewer-reap)
-        (should-not (process-live-p proc))
+        (should-not (emacs-jupyter-notebook-viewer-live-p))
+        (should-not emacs-jupyter-notebook-viewer--socket-path)
+        (should-not emacs-jupyter-notebook-viewer--active-transaction)
         (should-not (file-exists-p socket-path))
-        (should (null emacs-jupyter-notebook-viewer--process))
-        (should (null emacs-jupyter-notebook-viewer--socket-path))
-        (should-not (memq #'emacs-jupyter-notebook-viewer-reap
-                          kill-emacs-hook))))))
+        (should-not (file-exists-p directory))
+        (should-not (memq #'emacs-jupyter-notebook-viewer-reap kill-emacs-hook))))))
 
-(ert-deftest ejn-w8.3-send-path-delivers-over-socket ()
-  "W8.3: the async hand-off writes the newline-terminated path to the socket."
+(ert-deftest ejn-w8.3-open-pickle-is-single-flight ()
+  "W8.3/EI4V: repeated opens cannot accumulate unbounded socket handoffs."
   (ejn-w8.3-with-clean-manager
-    (let* ((ejn-w8.3--received (list nil))
-           (emacs-jupyter-notebook-viewer-spawn-function
-            #'ejn-w8.3--make-stub-server))
-      (emacs-jupyter-notebook-viewer-send-path "/tmp/fig-123.pkl")
-      ;; Pump the event loop so the server's connection filter runs.
-      (let ((deadline (+ (float-time) 2)))
-        (while (and (null (car ejn-w8.3--received))
-                    (< (float-time) deadline))
-          (accept-process-output nil 0.05)))
-      (should (equal (apply #'concat (reverse (car ejn-w8.3--received)))
-                     "/tmp/fig-123.pkl\n")))))
+    (let (sent-states completions)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-ensure)
+                 #'ignore)
+                ((symbol-function 'emacs-jupyter-notebook-viewer--send-pickle-attempt)
+                 (lambda (state) (push state sent-states))))
+        (emacs-jupyter-notebook-viewer-open-pickle-file
+         '(:file "first") (lambda (accepted) (push (list 'first accepted) completions)))
+        (should (= (length sent-states) 1))
+        (should emacs-jupyter-notebook-viewer--active-transaction)
+        (emacs-jupyter-notebook-viewer-open-pickle-file
+         '(:file "second") (lambda (accepted) (push (list 'second accepted) completions)))
+        (should (= (length sent-states) 1))
+        (should (equal completions '((second nil))))
+        (emacs-jupyter-notebook-viewer--transaction-finish
+         emacs-jupyter-notebook-viewer--active-transaction t)
+        (should-not emacs-jupyter-notebook-viewer--active-transaction)
+        (should (equal completions '((first t) (second nil))))))))
 
-(ert-deftest ejn-w8.3-open-pickle-decodes-and-sends-existing-file ()
-  "W8.3: open-pickle decodes base64 to a real temp file and hands it off."
+(ert-deftest ejn-w8.3-reap-releases-active-handoff-once ()
+  "W8.3/EI4V: viewer reap fails an active handoff exactly once."
   (ejn-w8.3-with-clean-manager
-    (let* ((ejn-w8.3--received (list nil))
-           (emacs-jupyter-notebook-viewer-spawn-function
-            #'ejn-w8.3--make-stub-server)
-           (payload (base64-encode-string "PICKLEBYTES" t))
-           (tmp (emacs-jupyter-notebook-viewer-open-pickle payload)))
-      (unwind-protect
-          (progn
-            (should (file-exists-p tmp))
-            (with-temp-buffer
-              (set-buffer-multibyte nil)
-              (let ((coding-system-for-read 'binary))
-                (insert-file-contents-literally tmp))
-              (should (equal (buffer-string) "PICKLEBYTES")))
-            (let ((deadline (+ (float-time) 2)))
-              (while (and (null (car ejn-w8.3--received))
-                          (< (float-time) deadline))
-                (accept-process-output nil 0.05)))
-            (should (equal (apply #'concat (reverse (car ejn-w8.3--received)))
-                           (concat tmp "\n"))))
-        (when (file-exists-p tmp) (delete-file tmp))))))
+    (let* ((completions 0)
+           (state (list :pickle '(:file "p")
+                        :completion (lambda (_accepted) (cl-incf completions))
+                        :attempt 0 :token 0 :timer nil :connection nil :done nil)))
+      (setq emacs-jupyter-notebook-viewer--active-transaction state)
+      (emacs-jupyter-notebook-viewer-reap)
+      (emacs-jupyter-notebook-viewer-reap)
+      (should (= completions 1))
+      (should-not emacs-jupyter-notebook-viewer--active-transaction))))
 
 (ert-deftest ejn-w8.3-python-path-resolves-command ()
   "W8.3: `--python-path' resolves an absolute executable or PATH command,
@@ -7786,6 +7823,346 @@ and returns nil for a bogus command."
   (when (file-executable-p "/bin/sh")
     (should (equal (emacs-jupyter-notebook-viewer--python-path "/bin/sh")
                    "/bin/sh"))))
+
+(ert-deftest ejn-w8.3-confined-ack-is-fragmented-correlated-and-once ()
+  "Viewer hand-off sends descriptor identities and consumes one framed ACK."
+  (let* ((real-run-at-time (symbol-function 'run-at-time))
+         (real-delete (symbol-function 'delete-process))
+         (fake (make-pipe-process :name "ejn-w8-ack" :buffer nil :noquery t))
+         (sent nil) (completed nil) timer-callback timer network-args)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-live-p) (lambda () t))
+              ((symbol-function 'make-network-process)
+               (lambda (&rest args) (setq network-args args) fake))
+              ((symbol-function 'process-send-string) (lambda (_ string) (setq sent string)))
+              ((symbol-function 'delete-process) (lambda (&rest _) nil))
+              ((symbol-function 'run-at-time)
+               (lambda (&rest args)
+                 (setq timer-callback (nth 2 args))
+                 (setq timer (funcall real-run-at-time 100 nil #'ignore)))))
+      (let ((emacs-jupyter-notebook-viewer--socket-path "/tmp/ejn-viewer.sock")
+            (emacs-jupyter-notebook-viewer--next-request-id 0))
+        (emacs-jupyter-notebook-viewer--send-pickle-attempt
+         (list :pickle '(:root "/tmp/root" :file "/tmp/root/ejn-artifact-0123456789abcdef0123456789abcdef"
+                         :root-identity (7 . 11) :identity (7 . 12) :size 3
+                         :sha256 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+               :completion (lambda (accepted) (push accepted completed))
+              :attempt 0 :token 0 :timer nil :connection nil :done nil))
+        (should (eq (plist-get network-args :nowait) t))
+        (should (string-match-p "\\\"root_identity\\\":\\[11,7\\]" sent))
+        (should (string-match-p "\\\"file_identity\\\":\\[12,7\\]" sent))
+        (let ((filter (process-filter fake))
+              request-id)
+          (should (string-match "\\\"id\\\":\\\"\\([^\\\"]+\\)\\\"" sent))
+          (setq request-id (match-string 1 sent))
+          (should (equal request-id "v1"))
+          (funcall filter fake (format "{\"id\":\"%s\",\"accepted\":tr" request-id))
+          (should-not completed)
+          (should (equal (process-get fake 'ejn-viewer-ack-buffer)
+                         (format "{\"id\":\"%s\",\"accepted\":tr" request-id)))
+          (funcall filter fake (format "ue}\n{\"id\":\"%s\",\"accepted\":false}\n" request-id))
+          (should (equal (emacs-jupyter-notebook-viewer--parse-ack
+                          (format "{\"id\":\"%s\",\"accepted\":true}" request-id)
+                          request-id)
+                         '(t . t)))
+          (should (equal completed '(t)))
+          (should-not (emacs-jupyter-notebook-viewer--parse-ack
+                       "{\"id\":\"stale\",\"accepted\":true}" request-id))))
+      (when (timerp timer) (cancel-timer timer))
+      (when (process-live-p fake) (funcall real-delete fake)))))
+
+(ert-deftest ejn-w8.3-real-file-identities-are-accepted-by-python-viewer ()
+  "An Emacs descriptor crosses the real Python confinement identity seam."
+  (let* ((root (make-temp-file "ejn-w8-real-identity-" t))
+         (file (expand-file-name
+                "ejn-artifact-0123456789abcdef0123456789abcdef" root))
+         (viewer-dir (expand-file-name "viewer" default-directory))
+         (python (or (executable-find "python3")
+                     (ert-fail "python3 is required by the local test suite")))
+         (payload "identity-seam")
+         (real-delete (symbol-function 'delete-process))
+         process sent state timer)
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (with-temp-file file (insert payload))
+          (set-file-modes file #o600)
+          (let* ((root-id (file-attribute-file-identifier
+                           (file-attributes root 'integer)))
+                 (file-id (file-attribute-file-identifier
+                           (file-attributes file 'integer)))
+                 (pickle (list :root root :file file
+                               :root-identity root-id :identity file-id
+                               :size (string-bytes payload)
+                               :sha256 (ejn-ei4-test--content-sha256 file))))
+            (setq state (list :pickle pickle :completion #'ignore :attempt 0
+                              :token 0 :timer nil :connection nil :done nil))
+            (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-live-p)
+                       (lambda () t))
+                      ((symbol-function 'make-network-process)
+                       (lambda (&rest _)
+                         (setq process
+                               (make-pipe-process
+                                :name "ejn-w8-real-identity-send"
+                                :buffer nil :noquery t))))
+                      ((symbol-function 'process-send-string)
+                       (lambda (_process wire) (setq sent wire)))
+                      ((symbol-function 'run-at-time)
+                       (lambda (&rest _)
+                         (setq timer (timer-create))
+                         timer))
+                      ((symbol-function 'delete-process) (lambda (&rest _) nil)))
+              (let ((emacs-jupyter-notebook-viewer--socket-path
+                     "/tmp/ejn-viewer.sock"))
+                (emacs-jupyter-notebook-viewer--send-pickle-attempt state)))
+            (should sent)
+            (with-temp-buffer
+              (insert sent)
+              (let ((status
+                     (call-process-region
+                      (point-min) (point-max) python t t nil "-c"
+                      (concat
+                       "import json, os, sys; "
+                       "sys.path.insert(0, sys.argv[1]); import ejn_viewer; "
+                       "r=json.load(sys.stdin); "
+                       "fd=ejn_viewer.open_confined_pickle("
+                       "r['root'],r['path'],r['root_identity'],"
+                       "r['file_identity'],r['size'],r['sha256']); "
+                       "os.close(fd); print('accepted')")
+                      viewer-dir)))
+                (should (= status 0))
+                (should (equal (string-trim (buffer-string)) "accepted"))))))
+      (when (timerp timer) (cancel-timer timer))
+      (when (processp process) (ignore-errors (funcall real-delete process)))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest ejn-w8.3-confined-ack-false-completes-once ()
+  "A negative viewer ACK releases the lease and later duplicates stay inert."
+  (let* ((real-run-at-time (symbol-function 'run-at-time))
+         (real-delete (symbol-function 'delete-process))
+         (fake (make-pipe-process :name "ejn-w8-ack-false" :buffer nil :noquery t))
+         sent completed timer)
+    (unwind-protect
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-live-p) (lambda () t))
+                  ((symbol-function 'make-network-process) (lambda (&rest _) fake))
+                  ((symbol-function 'process-send-string)
+                   (lambda (_ string) (setq sent string)))
+                  ((symbol-function 'delete-process) (lambda (&rest _) nil))
+                  ((symbol-function 'run-at-time)
+                   (lambda (&rest args)
+                     (setq timer (funcall real-run-at-time 100 nil #'ignore))
+                     timer)))
+          (let ((emacs-jupyter-notebook-viewer--socket-path "/tmp/ejn-viewer.sock")
+                (emacs-jupyter-notebook-viewer--next-request-id 0))
+            (emacs-jupyter-notebook-viewer--send-pickle-attempt
+             (list :pickle '(:root "/tmp/root" :file "/tmp/root/ejn-artifact-0123456789abcdef0123456789abcdef"
+                             :root-identity (7 . 11) :identity (7 . 12) :size 3
+                             :sha256 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+                   :completion (lambda (accepted) (push accepted completed))
+                   :attempt 0 :token 0 :timer nil :connection nil :done nil))
+            (should (string-match "\\\"id\\\":\\\"\\([^\\\"]+\\)\\\"" sent))
+            (let ((request-id (match-string 1 sent))
+                  (filter (process-filter fake)))
+              (funcall filter fake (format "{\"id\":\"%s\",\"accepted\":false}\n"
+                                           request-id))
+              (should (equal completed '(nil)))
+              (funcall filter fake (format "{\"id\":\"%s\",\"accepted\":true}\n"
+                                           request-id))
+              (should (equal completed '(nil))))))
+      (when (timerp timer) (cancel-timer timer))
+      (when (process-live-p fake) (funcall real-delete fake)))))
+
+(ert-deftest ejn-w8.3-confined-ack-timeout-completes-once ()
+  "A missing ACK deadline closes its process and later ACKs stay inert."
+  (let* ((real-run-at-time (symbol-function 'run-at-time))
+         (real-delete (symbol-function 'delete-process))
+         (fake (make-pipe-process :name "ejn-w8-ack-timeout" :buffer nil :noquery t))
+         (deleted nil)
+         (completed nil)
+         timer filter)
+    (unwind-protect
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-live-p) (lambda () t))
+                  ((symbol-function 'make-network-process) (lambda (&rest _) fake))
+                  ((symbol-function 'process-send-string) (lambda (&rest _) nil))
+                  ((symbol-function 'delete-process)
+                   (lambda (process &rest args)
+                     (push process deleted)
+                     (when (processp process)
+                       (apply real-delete process args))))
+                  ((symbol-function 'run-at-time)
+                   (lambda (_seconds _repeat function &rest args)
+                     (setq timer (apply real-run-at-time 0.01 nil function args)))))
+          (let ((emacs-jupyter-notebook-viewer--socket-path "/tmp/ejn-viewer.sock")
+                (emacs-jupyter-notebook-viewer--next-request-id 0))
+            (emacs-jupyter-notebook-viewer--send-pickle-attempt
+             (list :pickle '(:root "/tmp/root" :file "/tmp/root/ejn-artifact-0123456789abcdef0123456789abcdef"
+                             :root-identity (7 . 11) :identity (7 . 12) :size 3
+                             :sha256 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+                   :completion (lambda (accepted) (push accepted completed))
+                   :attempt 0 :token 0 :timer nil :connection nil :done nil))
+            (setq filter (process-filter fake))
+            (accept-process-output nil 0.05)
+            (should (equal completed '(nil)))
+            (should (memq fake deleted))
+            (funcall filter fake "{\"id\":\"v1\",\"accepted\":true}\n")
+            (should (equal completed '(nil)))))
+      (when (timerp timer) (cancel-timer timer))
+      (when (process-live-p fake) (funcall real-delete fake)))))
+
+(ert-deftest ejn-w8.3-confined-ack-rejects-malformed-extra-and-oversize ()
+  "Malformed, schema-extra, and oversized viewer ACKs fail closed once."
+  (let* ((real-delete (symbol-function 'delete-process))
+         (real-run-at-time (symbol-function 'run-at-time))
+         (fake (make-pipe-process :name "ejn-w8-bad-ack" :buffer nil :noquery t))
+         (sent nil)
+         (completed nil)
+         timer)
+    (unwind-protect
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-live-p) (lambda () t))
+                  ((symbol-function 'make-network-process) (lambda (&rest _) fake))
+                  ((symbol-function 'process-send-string)
+                   (lambda (_ string) (setq sent string)))
+                  ((symbol-function 'delete-process) (lambda (&rest _) nil))
+                  ((symbol-function 'run-at-time)
+                   (lambda (&rest args)
+                     (setq timer (funcall real-run-at-time 100 nil #'ignore))
+                     (nth 2 args))))
+          (let ((emacs-jupyter-notebook-viewer--socket-path "/tmp/ejn-viewer.sock")
+                (emacs-jupyter-notebook-viewer--next-request-id 0))
+            (emacs-jupyter-notebook-viewer--send-pickle-attempt
+             (list :pickle '(:root "/tmp/root" :file "/tmp/root/ejn-artifact-0123456789abcdef0123456789abcdef"
+                             :root-identity (7 . 11) :identity (7 . 12) :size 3
+                             :sha256 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+                   :completion (lambda (accepted) (push accepted completed))
+                   :attempt 0 :token 0 :timer nil :connection nil :done nil))
+            (should (string-match "\\\"id\\\":\\\"\\([^\\\"]+\\)\\\"" sent))
+            (let ((request-id (match-string 1 sent))
+                  (filter (process-filter fake)))
+              (funcall filter fake "{not json}\n")
+              (funcall filter fake (format "{\"id\":\"%s\",\"accepted\":true,\"extra\":1}\n"
+                                           request-id))
+              (should-not completed)
+              (funcall filter fake (make-string 1025 ?x))
+              (should (equal completed '(nil)))
+              (funcall filter fake (format "{\"id\":\"%s\",\"accepted\":true}\n"
+                                           request-id))
+              (should (equal completed '(nil))))))
+      (when (timerp timer) (cancel-timer timer))
+      (when (process-live-p fake) (funcall real-delete fake)))))
+
+(ert-deftest ejn-w8.3-send-error-does-not-replay-ambiguous-frame ()
+  "A post-connect send error fails once; old callbacks remain inert."
+  (let* ((fake-a (make-pipe-process :name "ejn-w8-send-a" :buffer nil :noquery t))
+         (real-delete (symbol-function 'delete-process))
+         (send-count 0)
+         (completed nil)
+         timers)
+    (unwind-protect
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-live-p) (lambda () t))
+                  ((symbol-function 'make-network-process)
+                   (lambda (&rest _) fake-a))
+                  ((symbol-function 'process-send-string)
+                   (lambda (_conn _string)
+                     (cl-incf send-count)
+                     (error "send failed")))
+                  ((symbol-function 'delete-process) (lambda (&rest _) nil))
+                  ((symbol-function 'run-at-time)
+                   (lambda (seconds _repeat function &rest _args)
+                     (let ((timer (list seconds function)))
+                       (push timer timers)
+                       timer))))
+          (let ((emacs-jupyter-notebook-viewer--socket-path "/tmp/ejn-viewer.sock")
+                (emacs-jupyter-notebook-viewer-send-retry-delay 0)
+                (emacs-jupyter-notebook-viewer--next-request-id 0)
+                (state (list :pickle
+                             '(:root "/tmp/root" :file "/tmp/root/ejn-artifact-0123456789abcdef0123456789abcdef"
+                               :root-identity (7 . 11) :identity (7 . 12) :size 3
+                               :sha256 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+                             :completion (lambda (accepted) (push accepted completed))
+                             :attempt 0 :token 0 :timer nil :connection nil :done nil)))
+            (emacs-jupyter-notebook-viewer--send-pickle-attempt state)
+            (should (= send-count 1))
+            (let ((old-filter (process-filter fake-a))
+                  (old-timeout (cadar timers)))
+              (should-not emacs-jupyter-notebook-viewer--active-transaction)
+              (should (equal completed '(nil)))
+              (funcall old-filter fake-a "{\"id\":\"v1\",\"accepted\":true}\n")
+              (funcall old-timeout)
+              (should (= send-count 1))
+              (should (equal completed '(nil))))))
+      (dolist (proc (list fake-a))
+        (when (process-live-p proc) (funcall real-delete proc))))))
+
+(ert-deftest ejn-w8.3-connect-error-retries-with-bounded-token ()
+  "A pre-connect socket failure retries, and stale timers cannot finish it."
+  (let ((connect-count 0)
+        (completed nil)
+        timers
+        sent
+        conn)
+    (unwind-protect
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-live-p) (lambda () t))
+                  ((symbol-function 'make-network-process)
+                   (lambda (&rest _)
+                     (cl-incf connect-count)
+                     (if (= connect-count 1)
+                         (error "socket not ready")
+                       (setq conn
+                             (make-pipe-process
+                              :name "ejn-w8-connect" :buffer nil :noquery t)))))
+                  ((symbol-function 'process-send-string)
+                   (lambda (_conn string) (setq sent string)))
+                  ((symbol-function 'delete-process) (lambda (&rest _) nil))
+                  ((symbol-function 'run-at-time)
+                   (lambda (seconds _repeat function &rest _args)
+                     (let ((timer (list seconds function)))
+                       (push timer timers)
+                       timer))))
+          (let ((emacs-jupyter-notebook-viewer--socket-path "/tmp/ejn-viewer.sock")
+                (emacs-jupyter-notebook-viewer-send-retry-delay 0)
+                (state (list :pickle
+                             '(:root "/tmp/root" :file "/tmp/root/ejn-artifact-0123456789abcdef0123456789abcdef"
+                               :root-identity (7 . 11) :identity (7 . 12) :size 3
+                               :sha256 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+                             :completion (lambda (accepted) (push accepted completed))
+                             :attempt 0 :token 0 :timer nil :connection nil :done nil)))
+            (emacs-jupyter-notebook-viewer--send-pickle-attempt state)
+            (should (= connect-count 1))
+            (should-not completed)
+            (let ((retry (cadar timers)))
+              (funcall retry))
+            (should (= connect-count 2))
+            (should (string-match-p "\\\"id\\\":" sent))
+            (let ((old-retry (cadar (cdr timers))))
+              (when old-retry (funcall old-retry)))
+            (should (= connect-count 2))
+            (should-not completed)))
+      (when (and (processp conn) (process-live-p conn))
+        (delete-process conn)))))
+
+(ert-deftest ejn-w8.3-socket-directory-cleanup-pins-its-identity ()
+  "Cleanup removes only the exact private directory it created."
+  (let (path directory replacement)
+    (unwind-protect
+        (progn
+          (setq path (emacs-jupyter-notebook-viewer--new-socket-path)
+                directory emacs-jupyter-notebook-viewer--socket-directory)
+          (let ((attrs (file-attributes directory 'integer)))
+            (should (equal (file-attribute-user-id attrs) (user-uid)))
+            (should (= (logand (file-modes directory) #o7777) #o700)))
+          (with-temp-file path (insert "socket"))
+          (emacs-jupyter-notebook-viewer--cleanup-socket-directory)
+          (should-not (file-exists-p directory))
+          (setq path (emacs-jupyter-notebook-viewer--new-socket-path)
+                directory emacs-jupyter-notebook-viewer--socket-directory
+                replacement (concat directory "-old"))
+          (rename-file directory replacement)
+          (make-directory directory)
+          (set-file-modes directory #o700)
+          (emacs-jupyter-notebook-viewer--cleanup-socket-directory)
+          (should (file-directory-p directory)))
+      (ignore-errors (delete-directory directory t))
+      (ignore-errors (delete-directory replacement t))
+      (emacs-jupyter-notebook-viewer--cleanup-socket-directory))))
 
 ;;; W8.4 — viewer Python script
 
@@ -7844,136 +8221,61 @@ wiring.  Skipped when no local python3 is available in this environment."
         (goto-char (point-min))
         (should (re-search-forward "SELFCHECK OK" nil t))))))
 
-;;; W8.5 — interactive open command + error branches
-
-(ert-deftest ejn-w8.5-open-with-pickle-errors-without-python ()
-  "W8.5: opening a figure surfaces a friendly user-error when no local
-Python is available, and never calls the viewer.  The Python resolution is
-synchronous and instant (`executable-find'); the matplotlib probe is not."
-  (let ((opened nil)
-        (emacs-jupyter-notebook--viewer-support-cache nil)
-        (emacs-jupyter-notebook-local-python-command "ejn-nonexistent-python-xyz"))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
-               (lambda (b64) (setq opened b64))))
-      (should-error (emacs-jupyter-notebook-open-figure-with-pickle "abc")
-                    :type 'user-error)
-      (should (null opened)))))
-
-(ert-deftest ejn-w8.5-open-with-pickle-hands-off-when-cached ()
-  "W8.5: when matplotlib support is already cached the payload is handed off
-synchronously without spawning a probe."
-  (let ((opened nil)
-        (emacs-jupyter-notebook--viewer-support-cache t)
-        (emacs-jupyter-notebook-local-python-command "true"))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
-               (lambda (b64) (setq opened b64))))
-      (emacs-jupyter-notebook-open-figure-with-pickle "PAYLOAD64")
-      (should (equal opened "PAYLOAD64")))))
-
-(ert-deftest ejn-w8.5-async-probe-hands-off-when-matplotlib-present ()
-  "W8.5: the async matplotlib probe (exit 0) caches support and hands off.
-Uses `/bin/true' as a stand-in Python that exits 0."
-  (skip-unless (executable-find "true"))
-  (let ((opened nil)
-        (emacs-jupyter-notebook--viewer-support-cache nil)
-        (emacs-jupyter-notebook-local-python-command "true"))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
-               (lambda (b64) (setq opened b64))))
-      (emacs-jupyter-notebook-open-figure-with-pickle "PAYLOAD64")
-      (let ((deadline (+ (float-time) 3)))
-        (while (and (null opened) (< (float-time) deadline))
-          (accept-process-output nil 0.05)))
-      (should (equal opened "PAYLOAD64"))
-      (should (eq emacs-jupyter-notebook--viewer-support-cache t)))))
-
-(ert-deftest ejn-w8.5-async-probe-reports-missing-matplotlib ()
-  "W8.5: the async probe (nonzero exit) does NOT hand off and leaves the
-support cache unset.  Uses `/bin/false' as a stand-in Python that exits 1."
-  (skip-unless (executable-find "false"))
-  (let ((opened nil)
-        (emacs-jupyter-notebook--viewer-support-cache nil)
-        (emacs-jupyter-notebook-local-python-command "false"))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
-               (lambda (b64) (setq opened b64))))
-      (emacs-jupyter-notebook-open-figure-with-pickle "PAYLOAD64")
-      (let ((deadline (+ (float-time) 3)))
-        (while (and (process-list) (< (float-time) deadline))
-          (accept-process-output nil 0.05)))
-      (should (null opened))
-      (should (null emacs-jupyter-notebook--viewer-support-cache)))))
-
-(ert-deftest ejn-w8.5-hand-off-errors-when-viewer-fails ()
-  "W8.5: a spawn/hand-off failure becomes a friendly viewer-failed user-error."
-  (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
-             (lambda (_b64) (error "no viewer script"))))
-    (should-error (emacs-jupyter-notebook--viewer-hand-off "abc")
-                  :type 'user-error)))
+;;; W8.5 — interactive figure command surface
 
 (ert-deftest ejn-w8.5-open-interactive-errors-without-figure ()
-  "W8.5: `C-c j I' with no pickled figure for the cell signals a user-error."
-  (with-temp-buffer
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook--figure-pickle-for-current-cell)
-               (lambda () nil)))
-      (should-error (emacs-jupyter-notebook-open-figure-interactive)
-                    :type 'user-error))))
-
-(ert-deftest ejn-w8.5-open-interactive-dispatches-with-cell-pickle ()
-  "W8.5: `C-c j I' hands the current cell's pickle to the open helper."
-  (with-temp-buffer
-    (let ((dispatched nil))
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook--figure-pickle-for-current-cell)
-                 (lambda () "CELL64"))
-                ((symbol-function 'emacs-jupyter-notebook-open-figure-with-pickle)
-                 (lambda (b64) (setq dispatched b64))))
-        (emacs-jupyter-notebook-open-figure-interactive)
-        (should (equal dispatched "CELL64"))))))
-
-(ert-deftest ejn-w8.5-panel-latest-pickle-for-cell ()
-  "W8.5: the panel returns the newest pickle stashed for a cell key."
-  (with-temp-buffer
-    (let* ((buffer (current-buffer))
-           (panel (ejn-panel-ensure buffer))
-           (key '("x.py" . 7))
-           (h1 (ejn-panel-start-entry panel key ""))
-           (h2 (ejn-panel-start-entry panel key "")))
-      (ejn-panel-set-pickle h1 "old")
-      (ejn-panel-set-pickle h2 "new")
-      (should (equal (emacs-jupyter-notebook-panel-latest-pickle-for-cell buffer key)
-                     "new"))
-      (should (null (emacs-jupyter-notebook-panel-latest-pickle-for-cell
-                     buffer '("x.py" . 99)))))))
+  "W8.5: source command reports a friendly error when the cell has no figure."
+  (ejn-test-with-temp-buffer "# %%\nprint('no figure')\n"
+    (should-error (emacs-jupyter-notebook-open-figure-interactive)
+                  :type 'user-error)))
 
 (ert-deftest ejn-w8.5-panel-open-figure-errors-without-pickle ()
-  "W8.5: `v' in the panel on a pickle-less entry signals a user-error."
+  "W8.5: panel command reports a friendly error when the entry has no pickle."
   (with-temp-buffer
-    (let* ((buffer (current-buffer))
-           (panel (ejn-panel-ensure buffer)))
-      (ejn-panel-start-entry panel '("x.py" . 1) "")
-      (emacs-jupyter-notebook-panel-flush-now panel)
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) "print(1)")))
+      (ejn-panel-append-text handle "plain output")
       (with-current-buffer panel
-        (goto-char (point-max))
-        (cl-letf (((symbol-function 'emacs-jupyter-notebook-open-figure-with-pickle)
-                   (lambda (_b64) (error "should not be called"))))
-          (should-error (emacs-jupyter-notebook-panel-open-figure)
-                        :type 'user-error))))))
-
-(ert-deftest ejn-w8.5-panel-open-figure-dispatches-entry-pickle ()
-  "W8.5: `v' in the panel hands the entry-at-point's pickle to the open helper."
-  (with-temp-buffer
-    (let* ((buffer (current-buffer))
-           (panel (ejn-panel-ensure buffer))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
-           (dispatched nil))
-      (ejn-panel-set-pickle handle "ENTRY64")
-      (emacs-jupyter-notebook-panel-flush-now panel)
-      (with-current-buffer panel
+        (emacs-jupyter-notebook-panel--render panel)
         (goto-char (point-min))
-        (goto-char (next-single-property-change
-                    (point) 'emacs-jupyter-notebook-entry-id))
-        (cl-letf (((symbol-function 'emacs-jupyter-notebook-open-figure-with-pickle)
-                   (lambda (b64) (setq dispatched b64))))
-          (emacs-jupyter-notebook-panel-open-figure)))
-      (should (equal dispatched "ENTRY64")))))
+        (should-error (emacs-jupyter-notebook-panel-open-figure)
+                      :type 'user-error)))))
+
+(ert-deftest ejn-w8.5-disabled-pickle-viewer-releases-manual-lease ()
+  "EI4V: manual pickle opens release their lease when opt-in is disabled."
+  (let ((emacs-jupyter-notebook-enable-pickle-viewer nil)
+        (pickle (list :file "/tmp/p" :leases 1 :retired nil :deleted nil)))
+    (should-error (emacs-jupyter-notebook-open-figure-pickle-lease pickle)
+                  :type 'user-error)
+    (should (= (plist-get pickle :leases) 0))))
+
+(ert-deftest ejn-w8.5-missing-local-python-releases-manual-lease ()
+  "W8.5/EI4V: local setup errors also release the acquired panel lease."
+  (let ((emacs-jupyter-notebook-enable-pickle-viewer t)
+        (emacs-jupyter-notebook-local-python-command "ejn-python-missing")
+        (pickle (list :file "/tmp/p" :leases 1 :retired nil :deleted nil)))
+    (should-error (emacs-jupyter-notebook-open-figure-pickle-lease pickle)
+                  :type 'user-error)
+    (should (= (plist-get pickle :leases) 0))))
+
+(ert-deftest ejn-w8.5-open-uses-bounded-viewer-transaction-without-probe ()
+  "W8.5/EI4V: opening goes directly to the bounded viewer handoff."
+  (let ((emacs-jupyter-notebook-enable-pickle-viewer t)
+        (pickle (list :file "/tmp/p" :leases 1 :retired nil :deleted nil))
+        (handoffs 0))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer--python-path)
+               (lambda (_command) "/bin/python"))
+              ((symbol-function 'make-process)
+               (lambda (&rest _)
+                 (ert-fail "unbounded matplotlib probe was started")))
+              ((symbol-function 'emacs-jupyter-notebook--viewer-hand-off)
+               (lambda (leased)
+                 (should (eq leased pickle))
+                 (cl-incf handoffs))))
+      (emacs-jupyter-notebook-open-figure-pickle-lease pickle)
+      (should (= handoffs 1))
+      ;; The viewer transaction owns the lease until its bounded ACK/deadline.
+      (should (= (plist-get pickle :leases) 1)))))
 
 ;;; W11 — kernel lifecycle / GC
 
@@ -8934,25 +9236,42 @@ session does not pay an O(history) erase+reinsert on every stream flush."
 ;;; IR2 — artifact retirement and late callback quarantine
 
 (ert-deftest ejn-ir2-clear-deletes-existing-artifacts ()
-  "Clearing retires image files, image caches, and pickle bytes before entries vanish."
-  (with-temp-buffer
-    (let* ((source (current-buffer))
-           (panel (ejn-panel-ensure source))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
-           file directory)
-      (ejn-panel-set-image handle '(image :type png :data "image-bytes"))
-      (ejn-panel-set-pickle handle "pickle-bytes")
-      (setq file (plist-get (cdr (car (ejn-panel-entry-images handle))) :file)
-            directory (file-name-directory file))
-      (should (file-exists-p file))
-      (should (ejn-panel-entry-pickle handle))
-      (emacs-jupyter-notebook-clear-results)
-      (should-not (file-exists-p file))
-      (should-not (file-directory-p directory))
-      (should-not (ejn-panel-entry-live-p handle))
-      (with-current-buffer panel
-        (should-not emacs-jupyter-notebook-panel--entries)
-        (should-not emacs-jupyter-notebook-panel--inline-image-specs)))))
+  "Clearing retires image files and confined pickle artifacts before entries vanish."
+  (let* ((root (make-temp-file "ejn-ir2-pickle-" t))
+         (pickle-file nil))
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (setq pickle-file
+                (ejn-ei4v-test--artifact-file
+                 root "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "pickle-bytes"))
+          (with-temp-buffer
+            (let* ((source (current-buffer))
+                   (panel (ejn-panel-ensure source))
+                   (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
+                   image-file image-directory)
+              (ejn-panel-set-image handle '(image :type png :data "image-bytes"))
+              (setq image-file (plist-get (cdr (car (ejn-panel-entry-images handle))) :file)
+                    image-directory (file-name-directory image-file))
+              (should
+               (ejn-panel-set-published-pickle
+                handle root pickle-file
+                (ejn-ei4-test--content-sha256 pickle-file)
+                (file-attribute-size (file-attributes pickle-file 'integer))
+                (file-attribute-file-identifier
+                 (file-attributes root 'integer))))
+              (should (file-exists-p image-file))
+              (should (file-exists-p pickle-file))
+              (should (ejn-panel-entry-pickle handle))
+              (emacs-jupyter-notebook-clear-results)
+              (should-not (file-exists-p image-file))
+              (should-not (file-exists-p pickle-file))
+              (should-not (file-directory-p image-directory))
+              (should-not (ejn-panel-entry-live-p handle))
+              (with-current-buffer panel
+                (should-not emacs-jupyter-notebook-panel--entries)
+                (should-not emacs-jupyter-notebook-panel--inline-image-specs)))))
+      (ignore-errors (delete-directory root t)))))
 
 (ert-deftest ejn-ir2-late-image-after-clear-creates-no-file ()
   "A late image callback after clear never decodes or materializes a file."
@@ -8983,249 +9302,337 @@ session does not pay an O(history) erase+reinsert on every stream flush."
         (should-not emacs-jupyter-notebook-panel--entries)))))
 
 (ert-deftest ejn-ir2-late-pickle-after-clear-retains-no-bytes ()
-  "A late display cannot stash pickle bytes after its entry was retired."
-  (with-temp-buffer
-    (let* ((source (current-buffer))
-           (panel (ejn-panel-ensure source))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks source handle))
-           (display (cadr (assoc "display_data" callbacks)))
-           (stashes 0))
-      (emacs-jupyter-notebook-clear-results)
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook--maybe-stash-pickle)
-                 (lambda (&rest _) (cl-incf stashes)))
-                ((symbol-function 'jupyter-message-content)
-                 (lambda (_msg)
-                   '(:data (:application/x-ejn-mpl-pickle "pickle-bytes")))))
-        (funcall display 'late-message))
-      (should (= stashes 0))
-      (should-not (ejn-panel-entry-pickle handle))
-      (with-current-buffer panel
-        (should-not emacs-jupyter-notebook-panel--entries)))))
+  "A late confined pickle descriptor after clear is ignored before validation."
+  (let* ((root (make-temp-file "ejn-ir2-late-pickle-" t))
+         (file nil))
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (setq file
+                (ejn-ei4v-test--artifact-file
+                 root "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "pickle-bytes"))
+          (with-temp-buffer
+            (let* ((source (current-buffer))
+                   (panel (ejn-panel-ensure source))
+                   (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
+                   (descriptor (ejn-ei4v-test--descriptor root file nil "late"))
+                   (context (list :buffer source :entry-handle handle))
+                   validated)
+              (emacs-jupyter-notebook-clear-results)
+              (cl-letf (((symbol-function 'emacs-jupyter-notebook-panel--published-pickle)
+                         (lambda (&rest _)
+                           (setq validated t)
+                           (ert-fail "late pickle descriptor was validated"))))
+                (should (equal
+                         (emacs-jupyter-notebook-events-dispatch
+                          context `(:type display
+                                    :data (:ejn-published-pickle ,descriptor)
+                                    :display-id "late"))
+                         '((:action ignore)))))
+              (should-not validated)
+              (should-not (ejn-panel-entry-pickle handle))
+              (should (file-exists-p file))
+              (with-current-buffer panel
+                (should-not emacs-jupyter-notebook-panel--entries)))))
+      (ignore-errors (delete-directory root t)))))
 
 (ert-deftest ejn-ir2-clear-before-idle-pickle-open-does-not-materialize ()
-  "A queued auto-viewer handoff reads a live entry only when it actually runs."
-  (with-temp-buffer
-    (let* ((source (current-buffer))
-           (panel (ejn-panel-ensure source))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
-           (emacs-jupyter-notebook-viewer-auto-open t)
-           idle-callback
-           opened)
-      (cl-letf (((symbol-function 'run-with-idle-timer)
-                 (lambda (_delay _repeat function &rest _args)
-                   (setq idle-callback function)))
-                ((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
-                 (lambda (base64) (setq opened base64))))
-        (emacs-jupyter-notebook--maybe-stash-pickle
-         source handle '(:application/x-ejn-mpl-pickle "pickle-bytes"))
-        (should idle-callback)
-        (should (equal (ejn-panel-entry-pickle handle) "pickle-bytes"))
-        (emacs-jupyter-notebook-clear-results)
-        (funcall idle-callback))
-      (should-not opened)
-      (should-not (ejn-panel-entry-pickle handle)))))
+  "A queued auto-viewer handoff claims a live descriptor only when it runs."
+  (let* ((root (make-temp-file "ejn-ir2-idle-pickle-" t))
+         (file nil)
+         (real-cancel (symbol-function 'cancel-timer)))
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (setq file
+                (ejn-ei4v-test--artifact-file
+                 root "cccccccccccccccccccccccccccccccc" "pickle-bytes"))
+          (with-temp-buffer
+            (let* ((source (current-buffer))
+                   (panel (ejn-panel-ensure source))
+                   (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
+                   idle-callback timer opened)
+              (unwind-protect
+                  (cl-letf (((symbol-function 'run-with-idle-timer)
+                             (lambda (_delay _repeat function &rest _args)
+                               (setq idle-callback function)
+                               (setq timer (run-at-time 100 nil #'ignore))))
+                            ((symbol-function 'cancel-timer)
+                             (lambda (timer)
+                               (funcall real-cancel timer))))
+                    (should
+                     (ejn-panel-set-published-pickle
+                      handle root file
+                      (ejn-ei4-test--content-sha256 file)
+                      (file-attribute-size (file-attributes file 'integer))
+                      (file-attribute-file-identifier
+                       (file-attributes root 'integer))))
+                    (ejn-panel-schedule-pickle-open
+                     handle (lambda (pickle)
+                              (setq opened pickle)
+                              (ejn-panel-release-pickle pickle)))
+                    (should idle-callback)
+                    (should (ejn-panel-entry-pickle handle))
+                    (emacs-jupyter-notebook-clear-results)
+                    (funcall idle-callback)
+                    (should-not opened)
+                    (should-not (ejn-panel-entry-pickle handle))
+                    (should-not (file-exists-p file)))
+                (when (timerp timer) (funcall real-cancel timer))))))
+      (ignore-errors (delete-directory root t)))))
 
 (ert-deftest ejn-ir2-pickle-auto-open-coalesces-latest-update ()
-  "Rapid pickle updates retain one pending handoff and open only the newest."
-  (with-temp-buffer
-    (let* ((source (current-buffer))
-           (panel (ejn-panel-ensure source))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
-           (emacs-jupyter-notebook-viewer-auto-open t)
-           (timers nil)
-           (cancelled 0)
-           (opened nil)
-           (real-cancel (symbol-function 'cancel-timer)))
-      (unwind-protect
-          (cl-letf (((symbol-function 'run-with-idle-timer)
-                     (lambda (_delay _repeat function &rest _args)
-                       (let ((timer (run-at-time 100 nil #'ignore)))
-                         (push (cons timer function) timers)
-                         timer)))
-                    ((symbol-function 'cancel-timer)
-                     (lambda (timer)
-                       (cl-incf cancelled)
-                       (funcall real-cancel timer)))
-                    ((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
-                     (lambda (base64) (push base64 opened))))
-            (emacs-jupyter-notebook--maybe-stash-pickle
-             source handle '(:application/x-ejn-mpl-pickle "old-pickle"))
-            (emacs-jupyter-notebook--maybe-stash-pickle
-             source handle '(:application/x-ejn-mpl-pickle "new-pickle"))
-            (setq timers (nreverse timers))
-            (should (= (length timers) 2))
-            (should (= cancelled 1))
-            (should (eq (plist-get (ejn-panel-entry-snapshot handle)
-                                   :pickle-open-timer)
-                        (caar (last timers))))
-            ;; Even if an already-cancelled callback is dispatched manually,
-            ;; its token can no longer claim the entry's timer slot.
-            (funcall (cdr (car timers)))
-            (funcall (cdr (cadr timers)))
-            (should (equal opened '("new-pickle")))
-            (should-not (plist-get (ejn-panel-entry-snapshot handle)
-                                   :pickle-open-timer)))
-        (dolist (record timers)
-          (ignore-errors (funcall real-cancel (car record))))))))
+  "Rapid descriptor updates retain one pending handoff and open only the newest."
+  (let* ((root (make-temp-file "ejn-ir2-coalesce-" t))
+         (old-file nil)
+         (new-file nil)
+         (real-cancel (symbol-function 'cancel-timer)))
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (setq old-file
+                (ejn-ei4v-test--artifact-file
+                 root "dddddddddddddddddddddddddddddddd" "old-pickle"))
+          (setq new-file
+                (ejn-ei4v-test--artifact-file
+                 root "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" "new-pickle"))
+          (with-temp-buffer
+            (let* ((panel (ejn-panel-ensure (current-buffer)))
+                   (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
+                   (timers nil)
+                   (cancelled 0)
+                   (opened nil))
+              (unwind-protect
+                  (cl-letf (((symbol-function 'run-with-idle-timer)
+                             (lambda (_delay _repeat function &rest _args)
+                               (let ((timer (run-at-time 100 nil #'ignore)))
+                                 (push (cons timer function) timers)
+                                 timer)))
+                            ((symbol-function 'cancel-timer)
+                             (lambda (timer)
+                               (cl-incf cancelled)
+                               (funcall real-cancel timer))))
+                    (dolist (file (list old-file new-file))
+                      (should
+                       (ejn-panel-set-published-pickle
+                        handle root file
+                        (ejn-ei4-test--content-sha256 file)
+                        (file-attribute-size (file-attributes file 'integer))
+                        (file-attribute-file-identifier
+                         (file-attributes root 'integer))))
+                      (ejn-panel-schedule-pickle-open
+                       handle (lambda (pickle)
+                                (push (plist-get pickle :file) opened)
+                                (ejn-panel-release-pickle pickle))))
+                    (setq timers (nreverse timers))
+                    (should (= (length timers) 2))
+                    (should (= cancelled 1))
+                    (should (eq (plist-get (ejn-panel-entry-snapshot handle)
+                                           :pickle-open-timer)
+                                (caar (last timers))))
+                    (should-not (file-exists-p old-file))
+                    ;; Even if an already-cancelled callback is dispatched
+                    ;; manually, its token can no longer claim the entry.
+                    (funcall (cdr (car timers)))
+                    (funcall (cdr (cadr timers)))
+                    (should (equal opened (list new-file)))
+                    (should-not (plist-get (ejn-panel-entry-snapshot handle)
+                                           :pickle-open-timer)))
+                (dolist (record timers)
+                  (ignore-errors (funcall real-cancel (car record))))))))
+      (ignore-errors (delete-directory root t)))))
 
 (ert-deftest ejn-ir2-pending-clear-retires-pickle-and-auto-open ()
   "The next output after clear_output(wait=t) retires the old figure fully."
-  (with-temp-buffer
-    (let* ((source (current-buffer))
-           (panel (ejn-panel-ensure source))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
-           (emacs-jupyter-notebook-viewer-auto-open t)
-           idle-callback
-           opened
-           file)
-      (cl-letf (((symbol-function 'run-with-idle-timer)
-                 (lambda (_delay _repeat function &rest _args)
-                   (setq idle-callback function)
-                   (run-at-time 100 nil #'ignore)))
-                ((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
-                 (lambda (base64) (setq opened base64))))
-        (ejn-panel-set-image handle '(image :type png :data "image-bytes"))
-        (setq file (plist-get (cdr (car (ejn-panel-entry-images handle))) :file))
-        (emacs-jupyter-notebook--maybe-stash-pickle
-         source handle '(:application/x-ejn-mpl-pickle "old-pickle"))
-        (ejn-panel-clear-entry handle t)
-        (ejn-panel-append-text handle "replacement")
-        (should-not (file-exists-p file))
-        (should-not (ejn-panel-entry-pickle handle))
-        (should-not (plist-get (ejn-panel-entry-snapshot handle)
-                               :pickle-open-timer))
-        (funcall idle-callback))
-      (should-not opened))))
+  (let* ((root (make-temp-file "ejn-ir2-pending-pickle-" t))
+         (pickle-file nil)
+         (real-cancel (symbol-function 'cancel-timer)))
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (setq pickle-file
+                (ejn-ei4v-test--artifact-file
+                 root "ffffffffffffffffffffffffffffffff" "old-pickle"))
+          (with-temp-buffer
+            (let* ((panel (ejn-panel-ensure (current-buffer)))
+                   (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
+                   idle-callback timer opened image-file)
+              (unwind-protect
+                  (cl-letf (((symbol-function 'run-with-idle-timer)
+                             (lambda (_delay _repeat function &rest _args)
+                               (setq idle-callback function)
+                               (setq timer (run-at-time 100 nil #'ignore)))))
+                    (ejn-panel-set-image handle '(image :type png :data "image-bytes"))
+                    (setq image-file (plist-get (cdr (car (ejn-panel-entry-images handle))) :file))
+                    (should
+                     (ejn-panel-set-published-pickle
+                      handle root pickle-file
+                      (ejn-ei4-test--content-sha256 pickle-file)
+                      (file-attribute-size (file-attributes pickle-file 'integer))
+                      (file-attribute-file-identifier
+                       (file-attributes root 'integer))))
+                    (ejn-panel-schedule-pickle-open
+                     handle (lambda (pickle)
+                              (setq opened pickle)
+                              (ejn-panel-release-pickle pickle)))
+                    (ejn-panel-clear-entry handle t)
+                    (ejn-panel-append-text handle "replacement")
+                    (should-not (file-exists-p image-file))
+                    (should-not (file-exists-p pickle-file))
+                    (should-not (ejn-panel-entry-pickle handle))
+                    (should-not (plist-get (ejn-panel-entry-snapshot handle)
+                                           :pickle-open-timer))
+                    (funcall idle-callback)
+                    (should-not opened))
+                (when (timerp timer) (funcall real-cancel timer))))))
+      (ignore-errors (delete-directory root t)))))
 
 (ert-deftest ejn-ir2-pending-clear-display-replaces-old-figure ()
   "A replacement display after clear(wait) keeps only its new figure state."
-  (with-temp-buffer
-    (let* ((source (current-buffer))
-           (panel (ejn-panel-ensure source))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks source handle))
-           (clear (cadr (assoc "clear_output" callbacks)))
-           (display (cadr (assoc "display_data" callbacks)))
-           (emacs-jupyter-notebook-viewer-auto-open t)
-           (old-pickle "old-pickle")
-           (new-pickle "new-pickle")
-           (timers nil)
-           (opened nil)
-           old-file)
-      (unwind-protect
-          (cl-letf (((symbol-function 'run-with-idle-timer)
-                     (lambda (_delay _repeat function &rest _args)
-                       (let ((timer (run-at-time 100 nil #'ignore)))
-                         (push (cons timer function) timers)
-                         timer)))
-                    ((symbol-function 'create-image)
-                     (lambda (data &optional _type _data-p &rest _props)
-                       (list 'image :type 'png :data data)))
-                    ((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
-                     (lambda (pickle) (push pickle opened)))
-                    ((symbol-function 'jupyter-message-content)
-                     (lambda (message)
-                       (pcase message
-                         ('clear-message '(:wait t))
-                         ('display-message
-                          `(:data (:image/png ,(base64-encode-string "new-image" t)
-                                   :application/x-ejn-mpl-pickle ,new-pickle)))))))
-            (ejn-panel-set-image handle '(image :type png :data "old-image"))
-            (emacs-jupyter-notebook--maybe-stash-pickle
-             source handle (list emacs-jupyter-notebook-mpl-pickle-mime-type old-pickle))
-            (setq old-file (plist-get (cdr (car (ejn-panel-entry-images handle))) :file))
-            (funcall clear 'clear-message)
-            (funcall display 'display-message)
-            (let* ((entry (ejn-panel-entry-snapshot handle))
-                   (new-file (plist-get (cdr (car (ejn-panel-entry-images handle))) :file)))
-              (should-not (file-exists-p old-file))
-              (should (file-exists-p new-file))
-              (should (equal (plist-get entry :mpl-pickle) new-pickle))
-              (should (timerp (plist-get entry :pickle-open-timer)))
-              (dolist (timer (nreverse timers))
-                (funcall (cdr timer)))
-              (should (equal opened (list new-pickle)))))
-        (dolist (timer timers)
-          (ignore-errors (cancel-timer (car timer))))))))
+  (let* ((root (make-temp-file "ejn-ir2-replace-figure-" t))
+         (old-image nil)
+         (old-pickle nil)
+         (new-image nil)
+         (new-pickle nil))
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (setq old-image (ejn-ei4v-test--artifact-file
+                           root "11111111111111111111111111111111" "old-image"))
+          (setq old-pickle (ejn-ei4v-test--artifact-file
+                            root "22222222222222222222222222222222" "old-pickle"))
+          (setq new-image (ejn-ei4v-test--artifact-file
+                           root "33333333333333333333333333333333" "new-image"))
+          (setq new-pickle (ejn-ei4v-test--artifact-file
+                            root "44444444444444444444444444444444" "new-pickle"))
+          (with-temp-buffer
+            (let* ((source (current-buffer))
+                   (panel (ejn-panel-ensure source))
+                   (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
+                   (context (list :buffer source :entry-handle handle)))
+              (should
+               (ejn-panel-set-published-bundle
+                handle
+                (ejn-ei4v-test--descriptor root old-image "image/png" "fig")
+                (ejn-ei4v-test--descriptor root old-pickle nil "fig")
+                nil))
+              (ejn-panel-clear-entry handle t)
+              (emacs-jupyter-notebook-events-dispatch
+               context `(:type display
+                         :data (:ejn-published-image
+                                ,(ejn-ei4v-test--descriptor root new-image "image/png" "fig")
+                                :ejn-published-pickle
+                                ,(ejn-ei4v-test--descriptor root new-pickle nil "fig"))
+                         :display-id "fig"))
+              (let* ((entry (ejn-panel-entry-snapshot handle))
+                     (stored-image (car (ejn-panel-entry-images handle))))
+                (should-not (file-exists-p old-image))
+                (should-not (file-exists-p old-pickle))
+                (should (file-exists-p new-image))
+                (should (file-exists-p new-pickle))
+                (should (equal (plist-get (cdr stored-image) :file) new-image))
+                (should (equal (plist-get (plist-get entry :mpl-pickle) :file)
+                               new-pickle))))))
+      (ignore-errors (delete-directory root t)))))
 
 (ert-deftest ejn-ir2-pending-clear-text-display-removes-stale-image ()
   "A no-pickle text replacement after clear(wait) forces stale-image removal."
-  (with-temp-buffer
-    (let* ((source (current-buffer))
-           (panel (ejn-panel-ensure source))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks source handle))
-           (clear (cadr (assoc "clear_output" callbacks)))
-           (display (cadr (assoc "display_data" callbacks)))
-           (emacs-jupyter-notebook-viewer-auto-open t)
-           idle-callback
-           old-file
-           opened)
-      (unwind-protect
-          (cl-letf (((symbol-function 'run-with-idle-timer)
-                     (lambda (_delay _repeat function &rest _args)
-                       (setq idle-callback function)
-                       (run-at-time 100 nil #'ignore)))
-                    ((symbol-function 'emacs-jupyter-notebook-viewer-open-pickle)
-                     (lambda (pickle) (setq opened pickle)))
-                    ((symbol-function 'jupyter-message-content)
-                     (lambda (message)
-                       (pcase message
-                         ('clear-message '(:wait t))
-                         ('display-message '(:data (:text/plain "replacement")))))))
-            (ejn-panel-set-image handle '(image :type png :data "old-image"))
-            (setq old-file (plist-get (cdr (car (ejn-panel-entry-images handle))) :file))
-            (emacs-jupyter-notebook--maybe-stash-pickle
-             source handle '(:application/x-ejn-mpl-pickle "old-pickle"))
-            (funcall clear 'clear-message)
-            (funcall display 'display-message)
-            (emacs-jupyter-notebook-panel-flush-now panel)
-            (should-not (file-exists-p old-file))
-            (should-not (ejn-panel-entry-pickle handle))
-            (should-not (plist-get (ejn-panel-entry-snapshot handle)
-                                   :pickle-open-timer))
-            (with-current-buffer panel
-              (should (string-match-p "replacement" (buffer-string)))
-              (should-not (text-property-not-all
-                           (point-min) (point-max) 'display nil)))
-            (funcall idle-callback)
-            (should-not opened))
-        (with-current-buffer panel
-          (when-let ((timer (plist-get (ejn-panel-entry-snapshot handle)
-                                       :pickle-open-timer)))
-            (cancel-timer timer)))))))
+  (let* ((root (make-temp-file "ejn-ir2-text-replace-" t))
+         (pickle-file nil))
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (setq pickle-file
+                (ejn-ei4v-test--artifact-file
+                 root "55555555555555555555555555555555" "old-pickle"))
+          (with-temp-buffer
+            (let* ((source (current-buffer))
+                   (panel (ejn-panel-ensure source))
+                   (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
+                   (context (list :buffer source :entry-handle handle))
+                   old-file opened)
+              (ejn-panel-set-image handle '(image :type png :data "old-image"))
+              (setq old-file (plist-get (cdr (car (ejn-panel-entry-images handle))) :file))
+              (should
+               (ejn-panel-set-published-pickle
+                handle root pickle-file
+                (ejn-ei4-test--content-sha256 pickle-file)
+                (file-attribute-size (file-attributes pickle-file 'integer))
+                (file-attribute-file-identifier
+                 (file-attributes root 'integer))))
+              (ejn-panel-schedule-pickle-open
+               handle (lambda (pickle)
+                        (setq opened pickle)
+                        (ejn-panel-release-pickle pickle)))
+              (ejn-panel-clear-entry handle t)
+              (emacs-jupyter-notebook-events-dispatch
+               context '(:type display :data (:text/plain "replacement")))
+              (emacs-jupyter-notebook-panel-flush-now panel)
+              (should-not (file-exists-p old-file))
+              (should-not (file-exists-p pickle-file))
+              (should-not (ejn-panel-entry-pickle handle))
+              (should-not (plist-get (ejn-panel-entry-snapshot handle)
+                                     :pickle-open-timer))
+              (with-current-buffer panel
+                (should (string-match-p "replacement" (buffer-string)))
+                (should-not (text-property-not-all
+                             (point-min) (point-max) 'display nil)))
+              (should-not opened))))
+      (ignore-errors (delete-directory root t)))))
 
 (ert-deftest ejn-ir2-exit-cleanup-is-local-only ()
   "The normal-exit artifact reaper leaves registry, SSH, and kernels alone."
-  (with-temp-buffer
-    (let* ((source (current-buffer))
-           (panel (ejn-panel-ensure source))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
-           (file nil)
-           (durable-calls 0)
-           (remote-calls 0))
-      (ejn-panel-set-image handle '(image :type png :data "image-bytes"))
-      (setq file (plist-get (cdr (car (ejn-panel-entry-images handle))) :file))
-      (should (file-exists-p file))
-      (should (memq #'emacs-jupyter-notebook-panel--cleanup-published-artifacts-on-exit
-                    kill-emacs-hook))
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-save)
-                 (lambda (&rest _) (cl-incf durable-calls)))
-                ((symbol-function 'emacs-jupyter-notebook--remove-registry-entry)
-                 (lambda (&rest _) (cl-incf durable-calls)))
-                ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
-                 (lambda (&rest _) (cl-incf remote-calls)))
-                ((symbol-function 'emacs-jupyter-notebook--async-kill-remote-kernel)
-                 (lambda (&rest _) (cl-incf remote-calls)))
-                ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
-                 (lambda (&rest _) (cl-incf remote-calls)))
-                ((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
-                 (lambda (&rest _) (cl-incf remote-calls))))
-        (emacs-jupyter-notebook-panel--cleanup-published-artifacts-on-exit))
-      (should-not (file-exists-p file))
-      (should (= durable-calls 0))
-      (should (= remote-calls 0)))))
+  (let* ((root (make-temp-file "ejn-ir2-exit-pickle-" t))
+         (pickle-file nil))
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (setq pickle-file
+                (ejn-ei4v-test--artifact-file
+                 root "12121212121212121212121212121212" "pickle"))
+          (with-temp-buffer
+            (let* ((source (current-buffer))
+                   (panel (ejn-panel-ensure source))
+                   (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
+                   (file nil)
+                   (lease nil)
+                   (durable-calls 0)
+                   (remote-calls 0))
+              (ejn-panel-set-image handle '(image :type png :data "image-bytes"))
+              (setq file (plist-get (cdr (car (ejn-panel-entry-images handle))) :file))
+              (should
+               (ejn-panel-set-published-pickle
+                handle root pickle-file
+                (ejn-ei4-test--content-sha256 pickle-file)
+                (file-attribute-size (file-attributes pickle-file 'integer))
+                (file-attribute-file-identifier
+                 (file-attributes root 'integer))))
+              (setq lease (ejn-panel-acquire-pickle handle))
+              (should (file-exists-p file))
+              (should (file-exists-p pickle-file))
+              (should (memq #'emacs-jupyter-notebook-panel--cleanup-published-artifacts-on-exit
+                            kill-emacs-hook))
+              (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-save)
+                         (lambda (&rest _) (cl-incf durable-calls)))
+                        ((symbol-function 'emacs-jupyter-notebook--remove-registry-entry)
+                         (lambda (&rest _) (cl-incf durable-calls)))
+                        ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
+                         (lambda (&rest _) (cl-incf remote-calls)))
+                        ((symbol-function 'emacs-jupyter-notebook--async-kill-remote-kernel)
+                         (lambda (&rest _) (cl-incf remote-calls)))
+                        ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
+                         (lambda (&rest _) (cl-incf remote-calls)))
+                        ((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
+                         (lambda (&rest _) (cl-incf remote-calls))))
+                (emacs-jupyter-notebook-panel--cleanup-published-artifacts-on-exit))
+              (should-not (file-exists-p file))
+              (should (file-exists-p pickle-file))
+              (should (plist-get lease :retired))
+              (should (= durable-calls 0))
+              (should (= remote-calls 0))
+              (ejn-panel-release-pickle lease)
+              (should-not (file-exists-p pickle-file)))))
+      (ignore-errors (delete-directory root t)))))
 
 
 ;;; IR3 — total history and artifact retention budgets
@@ -9266,39 +9673,56 @@ session does not pay an O(history) erase+reinsert on every stream flush."
           (should (= (emacs-jupyter-notebook-panel--total-text-bytes) 3)))))))
 
 (ert-deftest ejn-ir3-artifact-budget-deletes-files ()
-  "The artifact cap deletes evicted image files and releases their entry."
-  (with-temp-buffer
-    (let ((emacs-jupyter-notebook-panel-max-history-entries 10)
-          (emacs-jupyter-notebook-panel-max-total-text-bytes 100)
-          (emacs-jupyter-notebook-panel-max-total-artifact-bytes 5)
-          (panel (ejn-panel-ensure (current-buffer))))
-      (let* ((first (ejn-panel-start-entry panel '("x.py" . 1) "first"))
-             (second (ejn-panel-start-entry panel '("x.py" . 2) "second")))
-        (ejn-panel-set-image first '(image :type png :data "aaaa"))
-        (let ((old-file (plist-get (cdr (car (ejn-panel-entry-images first))) :file)))
-          (ejn-panel-set-image second '(image :type png :data "bbbb"))
-          (should-not (file-exists-p old-file))
-          (should-not (ejn-panel-entry-live-p first))
-          (should (ejn-panel-entry-live-p second))
-          (with-current-buffer panel
-            (should (= (emacs-jupyter-notebook-panel--total-artifact-bytes) 4)))
-          ;; MIME payloads are in the same global artifact budget as files.
-          (let ((pickle-only (ejn-panel-start-entry panel '("x.py" . 3) "pickle")))
-            (ejn-panel-set-pickle pickle-only "oversize")
-            (should-not (ejn-panel-entry-live-p pickle-only)))
-          ;; File deletion between existence and attribute checks is harmless.
-          (let ((racy-file (make-temp-file "ejn-ir3-race-")))
-            (unwind-protect
-                (progn
-                  (cl-letf (((symbol-function 'file-attributes)
-                             (lambda (&rest _) (signal 'file-error '("gone")))))
-                    (should (= 0 (emacs-jupyter-notebook-panel--image-artifact-bytes
-                                  (list 'image :file racy-file)))))
-                  (cl-letf (((symbol-function 'file-attributes)
-                             (lambda (&rest _) nil)))
-                    (should (= 0 (emacs-jupyter-notebook-panel--image-artifact-bytes
-                                  (list 'image :file racy-file))))))
-              (delete-file racy-file))))))))
+  "The artifact cap deletes evicted image and pickle files."
+  (let* ((root (make-temp-file "ejn-ir3-pickle-budget-" t))
+         (pickle-file nil))
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (setq pickle-file
+                (ejn-ei4v-test--artifact-file
+                 root "66666666666666666666666666666666" "oversize"))
+          (with-temp-buffer
+            (let ((emacs-jupyter-notebook-panel-max-history-entries 10)
+                  (emacs-jupyter-notebook-panel-max-total-text-bytes 100)
+                  (emacs-jupyter-notebook-panel-max-total-artifact-bytes 5)
+                  (panel (ejn-panel-ensure (current-buffer))))
+              (let* ((first (ejn-panel-start-entry panel '("x.py" . 1) "first"))
+                     (second (ejn-panel-start-entry panel '("x.py" . 2) "second")))
+                (ejn-panel-set-image first '(image :type png :data "aaaa"))
+                (let ((old-file (plist-get (cdr (car (ejn-panel-entry-images first))) :file)))
+                  (ejn-panel-set-image second '(image :type png :data "bbbb"))
+                  (should-not (file-exists-p old-file))
+                  (should-not (ejn-panel-entry-live-p first))
+                  (should (ejn-panel-entry-live-p second))
+                  (with-current-buffer panel
+                    (should (= (emacs-jupyter-notebook-panel--total-artifact-bytes) 4)))
+                  ;; Confined pickle descriptors participate in the same
+                  ;; global artifact budget as file-backed images.
+                  (let ((pickle-only (ejn-panel-start-entry panel '("x.py" . 3) "pickle")))
+                    (should
+                     (ejn-panel-set-published-pickle
+                      pickle-only root pickle-file
+                      (ejn-ei4-test--content-sha256 pickle-file)
+                      (file-attribute-size (file-attributes pickle-file 'integer))
+                      (file-attribute-file-identifier
+                       (file-attributes root 'integer))))
+                    (should-not (ejn-panel-entry-live-p pickle-only))
+                    (should-not (file-exists-p pickle-file)))
+                  ;; File deletion between existence and attribute checks is harmless.
+                  (let ((racy-file (make-temp-file "ejn-ir3-race-")))
+                    (unwind-protect
+                        (progn
+                          (cl-letf (((symbol-function 'file-attributes)
+                                     (lambda (&rest _) (signal 'file-error '("gone")))))
+                            (should (= 0 (emacs-jupyter-notebook-panel--image-artifact-bytes
+                                          (list 'image :file racy-file)))))
+                          (cl-letf (((symbol-function 'file-attributes)
+                                     (lambda (&rest _) nil)))
+                            (should (= 0 (emacs-jupyter-notebook-panel--image-artifact-bytes
+                                          (list 'image :file racy-file))))))
+                      (delete-file racy-file))))))))
+      (ignore-errors (delete-directory root t)))))
 
 (ert-deftest ejn-ir3-latest-cell-survives-history-eviction ()
   "Eviction removes stale history before a cell's latest result."
@@ -9468,27 +9892,42 @@ session does not pay an O(history) erase+reinsert on every stream flush."
 
 (ert-deftest ejn-ir3s-cached-totals-match-recomputed-after-mutations ()
   "Cached panel totals track text, image, pickle, replacement, and clear deltas."
-  (with-temp-buffer
-    (let* ((panel (ejn-panel-ensure (current-buffer)))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) "code")))
-      (cl-labels ((assert-totals ()
-                    (with-current-buffer panel
-                      (let ((totals (emacs-jupyter-notebook-panel--recompute-totals)))
-                        (should (= emacs-jupyter-notebook-panel--retained-text-bytes
-                                   (plist-get totals :text)))
-                        (should (= emacs-jupyter-notebook-panel--retained-artifact-bytes
-                                   (plist-get totals :artifacts)))))))
-        (assert-totals)
-        (ejn-panel-append-text handle "stream")
-        (assert-totals)
-        (ejn-panel-set-image handle '(image :type png :data "image"))
-        (assert-totals)
-        (ejn-panel-set-pickle handle "pickle")
-        (assert-totals)
-        (ejn-panel-replace-text handle "replacement")
-        (assert-totals)
-        (ejn-panel-clear-entry handle)
-        (assert-totals)))))
+  (let* ((root (make-temp-file "ejn-ir3s-pickle-totals-" t))
+         (pickle-file nil))
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (setq pickle-file
+                (ejn-ei4v-test--artifact-file
+                 root "77777777777777777777777777777777" "pickle"))
+          (with-temp-buffer
+            (let* ((panel (ejn-panel-ensure (current-buffer)))
+                   (handle (ejn-panel-start-entry panel '("x.py" . 1) "code")))
+              (cl-labels ((assert-totals ()
+                            (with-current-buffer panel
+                              (let ((totals (emacs-jupyter-notebook-panel--recompute-totals)))
+                                (should (= emacs-jupyter-notebook-panel--retained-text-bytes
+                                           (plist-get totals :text)))
+                                (should (= emacs-jupyter-notebook-panel--retained-artifact-bytes
+                                           (plist-get totals :artifacts)))))))
+                (assert-totals)
+                (ejn-panel-append-text handle "stream")
+                (assert-totals)
+                (ejn-panel-set-image handle '(image :type png :data "image"))
+                (assert-totals)
+                (should
+                 (ejn-panel-set-published-pickle
+                  handle root pickle-file
+                  (ejn-ei4-test--content-sha256 pickle-file)
+                  (file-attribute-size (file-attributes pickle-file 'integer))
+                  (file-attribute-file-identifier
+                   (file-attributes root 'integer))))
+                (assert-totals)
+                (ejn-panel-replace-text handle "replacement")
+                (assert-totals)
+                (ejn-panel-clear-entry handle)
+                (assert-totals)))))
+      (ignore-errors (delete-directory root t)))))
 
 (ert-deftest ejn-ir3s-artifact-stats-happen-at-admission-not-on-stream ()
   "Streaming text does not re-stat retained image files for budget checks."
@@ -10549,12 +10988,10 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                                   :backend-request-id
                                   (plist-get record :backend-request-id)
                                   :panel-generation (plist-get record :generation)))
-                   render-called stash-called fringe-called)
+                   render-called fringe-called)
               (emacs-jupyter-notebook-clear-results)
               (cl-letf (((symbol-function 'emacs-jupyter-notebook--render-mime-result)
                          (lambda (&rest _) (setq render-called t)))
-                        ((symbol-function 'emacs-jupyter-notebook--maybe-stash-pickle)
-                         (lambda (&rest _) (setq stash-called t)))
                         ((symbol-function 'emacs-jupyter-notebook-fringe-set)
                          (lambda (&rest _) (setq fringe-called t))))
                 (should (equal
@@ -10574,7 +11011,6 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                           context '(:type status :execution-state "idle"))
                          '((:action status :state "idle"))))
                 (should-not render-called)
-                (should-not stash-called)
                 (should-not fringe-called))
               (with-current-buffer (plist-get handle :panel)
                 (should-not emacs-jupyter-notebook-panel--entries)
@@ -11247,9 +11683,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
             (let* ((image (car (ejn-panel-entry-images handle)))
                    (props (cdr image)))
               (should (equal (plist-get props :file) accepted))
-              (should-not (plist-member props :data))
-              (should-not (string-match-p "unsupported output"
-                                          (ejn-panel-entry-text handle))))
+              (should-not (plist-member props :data)))
             (should (file-exists-p accepted))
             ;; The same valid publication under stale ownership is rejected
             ;; by the core and immediately discarded by the helper adapter.
@@ -11607,6 +12041,382 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
               (should (= deletes 1)))))
       (when (buffer-live-p panel) (kill-buffer panel))
       (ignore-errors (delete-file file))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest ejn-ei4v-pickle-zero-budget-retires-publication ()
+  "A zero pickle budget retains neither metadata nor its publication file."
+  (let* ((root (make-temp-file "ejn-ei4v-pickle-" t))
+         (file (expand-file-name "ejn-artifact-0123456789abcdef0123456789abcdef" root))
+         panel)
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (with-temp-file file (insert "pickle"))
+          (set-file-modes file #o600)
+          (with-temp-buffer
+            (setq panel (ejn-panel-ensure (current-buffer)))
+            (let ((emacs-jupyter-notebook-panel-max-pickles 0)
+                  (handle (ejn-panel-start-entry panel '("p.py" . 1) "p"))
+                  (root-id (file-attribute-file-identifier (file-attributes root 'integer))))
+              (should (ejn-panel-set-published-pickle
+                       handle root file (ejn-ei4-test--content-sha256 file) 6 root-id))
+              (should-not (ejn-panel-entry-pickle handle))
+              (should-not (file-exists-p file)))))
+      (when (buffer-live-p panel) (kill-buffer panel))
+      (ignore-errors (delete-file file))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest ejn-ei4v-zero-pickle-budget-accepts-dual-event-thumbnail ()
+  "Pruning a bundled pickle cannot make the retained thumbnail unaccepted."
+  (let* ((root (make-temp-file "ejn-ei4v-zero-bundle-" t))
+         (image (ejn-ei4v-test--artifact-file
+                 root "40404040404040404040404040404040" "thumbnail"))
+         (pickle (ejn-ei4v-test--artifact-file
+                  root "50505050505050505050505050505050" "pickle"))
+         panel)
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (with-temp-buffer
+            (setq panel (ejn-panel-ensure (current-buffer)))
+            (let* ((emacs-jupyter-notebook-panel-max-pickles 0)
+                   (handle (ejn-panel-start-entry panel '("bundle.py" . 1) "plot()"))
+                   (context (list :buffer (current-buffer) :entry-handle handle))
+                   (event `(:type display
+                            :data (:ejn-published-image
+                                   ,(ejn-ei4v-test--descriptor
+                                     root image "image/png" "zero")
+                                   :ejn-published-pickle
+                                   ,(ejn-ei4v-test--descriptor
+                                     root pickle nil "zero"))
+                            :display-id "zero")))
+              ;; This return value is the helper backend's ownership-transfer
+              ;; decision.  It must stay true after pickle policy pruning.
+              (should (emacs-jupyter-notebook-events-dispatch context event))
+              (should (file-exists-p image))
+              (should-not (file-exists-p pickle))
+              (should (equal (plist-get (cdr (car (ejn-panel-entry-images handle)))
+                                        :file)
+                             image))
+              (should-not (ejn-panel-entry-pickle handle)))))
+      (when (buffer-live-p panel) (kill-buffer panel))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest ejn-ei4v-pickle-byte-budget-is-exact-and-evicts-one-byte-over ()
+  "Pickles remain at the byte limit and oldest ownership retires above it."
+  (let* ((root (make-temp-file "ejn-ei4v-byte-budget-" t))
+         (exact (ejn-ei4v-test--artifact-file
+                 root "10101010101010101010101010101010" "12345678"))
+         (over (ejn-ei4v-test--artifact-file
+                root "20202020202020202020202020202020" "x"))
+         panel)
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (with-temp-buffer
+            (setq panel (ejn-panel-ensure (current-buffer)))
+            (let* ((emacs-jupyter-notebook-panel-max-total-artifact-bytes 8)
+                   (emacs-jupyter-notebook-panel-max-pickles 10)
+                   (root-id (file-attribute-file-identifier
+                             (file-attributes root 'integer)))
+                   (exact-handle (ejn-panel-start-entry
+                                  panel '("budget.py" . 1) "exact")))
+              (should (ejn-panel-set-published-pickle
+                       exact-handle root exact
+                       (ejn-ei4-test--content-sha256 exact) 8 root-id))
+              (should (ejn-panel-entry-pickle exact-handle))
+              (should (file-exists-p exact))
+              (with-current-buffer panel
+                (should (= emacs-jupyter-notebook-panel--retained-artifact-bytes 8)))
+              (let ((over-handle (ejn-panel-start-entry
+                                  panel '("budget.py" . 2) "over")))
+                (should (ejn-panel-set-published-pickle
+                         over-handle root over
+                         (ejn-ei4-test--content-sha256 over) 1 root-id))
+                (should (ejn-panel-entry-pickle over-handle))
+                (should (file-exists-p over))
+                (should-not (file-exists-p exact))
+                (should-not (ejn-panel-entry-live-p exact-handle))
+                (with-current-buffer panel
+                  (should (= emacs-jupyter-notebook-panel--retained-artifact-bytes
+                             1)))))))
+      (when (buffer-live-p panel) (kill-buffer panel))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest ejn-ei4v-pickle-lease-defers-and-settles-retirement-once ()
+  "A viewer lease keeps a retired pickle alive until its one completion."
+  (let* ((root (make-temp-file "ejn-ei4v-lease-" t))
+         (file (expand-file-name "ejn-artifact-abcdefabcdefabcdefabcdefabcdefab" root))
+         panel)
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (with-temp-file file (insert "pickle"))
+          (set-file-modes file #o600)
+          (with-temp-buffer
+            (setq panel (ejn-panel-ensure (current-buffer)))
+            (let* ((handle (ejn-panel-start-entry panel '("p.py" . 1) "p"))
+                   (root-id (file-attribute-file-identifier (file-attributes root 'integer))))
+              (should (ejn-panel-set-published-pickle
+                       handle root file (ejn-ei4-test--content-sha256 file) 6 root-id))
+              (let ((lease (ejn-panel-acquire-pickle handle)))
+                (ejn-panel-clear-pickle handle)
+                (should (file-exists-p file))
+                (ejn-panel-release-pickle lease)
+                (ejn-panel-release-pickle lease)
+                (should-not (file-exists-p file))))))
+      (when (buffer-live-p panel) (kill-buffer panel))
+      (ignore-errors (delete-file file))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest ejn-ei4v-viewer-reap-releases-retired-panel-lease-once ()
+  "Viewer death settles an in-flight panel lease and unlinks exactly once."
+  (let* ((root (make-temp-file "ejn-ei4v-viewer-reap-" t))
+         (file (ejn-ei4v-test--artifact-file
+                root "30303030303030303030303030303030" "pickle"))
+         (real-delete-file (symbol-function 'delete-file))
+         (real-delete-process (symbol-function 'delete-process))
+         (deletes 0)
+         process timer panel)
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (with-temp-buffer
+            (setq panel (ejn-panel-ensure (current-buffer)))
+            (let* ((handle (ejn-panel-start-entry panel '("lease.py" . 1) "plot()"))
+                   (root-id (file-attribute-file-identifier
+                             (file-attributes root 'integer))))
+              (should (ejn-panel-set-published-pickle
+                       handle root file (ejn-ei4-test--content-sha256 file)
+                       6 root-id))
+              (let ((lease (ejn-panel-acquire-pickle handle))
+                    (emacs-jupyter-notebook-viewer--process nil)
+                    (emacs-jupyter-notebook-viewer--socket-path
+                     "/tmp/ejn-viewer.sock")
+                    (emacs-jupyter-notebook-viewer--socket-directory nil)
+                    (emacs-jupyter-notebook-viewer--socket-directory-identity nil)
+                    (emacs-jupyter-notebook-viewer--active-transaction nil))
+                (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-ensure)
+                           #'ignore)
+                          ((symbol-function 'emacs-jupyter-notebook-viewer-live-p)
+                           (lambda () t))
+                          ((symbol-function 'make-network-process)
+                           (lambda (&rest _)
+                             (setq process
+                                   (make-pipe-process
+                                    :name "ejn-ei4v-reap-send"
+                                    :buffer nil :noquery t))))
+                          ((symbol-function 'process-send-string) #'ignore)
+                          ((symbol-function 'run-at-time)
+                           (lambda (&rest _)
+                             (setq timer (timer-create))
+                             timer))
+                          ((symbol-function 'delete-file)
+                           (lambda (path &rest args)
+                             (when (equal path file) (cl-incf deletes))
+                             (apply real-delete-file path args))))
+                  (emacs-jupyter-notebook--viewer-hand-off lease)
+                  (should emacs-jupyter-notebook-viewer--active-transaction)
+                  (ejn-panel-clear-pickle handle)
+                  (should (file-exists-p file))
+                  (emacs-jupyter-notebook-viewer-reap)
+                  (emacs-jupyter-notebook-viewer-reap)
+                  (should-not (file-exists-p file))
+                  (should (= deletes 1))
+                  (should (= (plist-get lease :leases) 0)))))))
+      (when (timerp timer) (cancel-timer timer))
+      (when (processp process)
+        (ignore-errors (funcall real-delete-process process)))
+      (when (buffer-live-p panel) (kill-buffer panel))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest ejn-ei4v-pickle-delete-failure-remains-retriable ()
+  "A failed unlink leaves retired pickle metadata available for retry cleanup."
+  (let* ((root (make-temp-file "ejn-ei4v-delete-retry-" t))
+         (file (expand-file-name "ejn-artifact-99999999999999999999999999999998" root))
+         (real-delete (symbol-function 'delete-file))
+         panel)
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (with-temp-file file (insert "pickle"))
+          (set-file-modes file #o600)
+          (with-temp-buffer
+            (setq panel (ejn-panel-ensure (current-buffer)))
+            (let* ((handle (ejn-panel-start-entry panel '("p.py" . 1) "p"))
+                   (root-id (file-attribute-file-identifier
+                             (file-attributes root 'integer))))
+              (should (ejn-panel-set-published-pickle
+                       handle root file (ejn-ei4-test--content-sha256 file)
+                       6 root-id))
+              (let ((pickle (ejn-panel-entry-pickle handle)))
+                (cl-letf (((symbol-function 'delete-file)
+                           (lambda (path &rest _args)
+                             (if (equal path file)
+                                 (error "simulated unlink failure")
+                               (funcall real-delete path)))))
+                  (ejn-panel-clear-pickle handle))
+                (should (file-exists-p file))
+                (should (plist-get pickle :retired))
+                (should-not (plist-get pickle :deleted))
+                (emacs-jupyter-notebook-panel--retire-pickle pickle)
+                (should-not (file-exists-p file))
+                (should (plist-get pickle :deleted))))))
+      (when (buffer-live-p panel) (kill-buffer panel))
+      (ignore-errors (delete-file file))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest ejn-ei4v-pickle-admission-and-handoff-never-read-or-hash-bytes ()
+  "Pickle admission and viewer handoff use descriptors, not payload bytes."
+  (let* ((root (make-temp-file "ejn-ei4v-no-read-" t))
+         (file (expand-file-name "ejn-artifact-99999999999999999999999999999999" root))
+         (sha (make-string 64 ?a))
+         (canary "EJN_PICKLE_PAYLOAD_CANARY_never_on_the_wire")
+         process sent completed logs panel)
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (with-temp-file file (insert canary))
+          (set-file-modes file #o600)
+          (with-temp-buffer
+            (setq panel (ejn-panel-ensure (current-buffer)))
+            (let* ((handle (ejn-panel-start-entry panel '("p.py" . 1) "p"))
+                   (root-id (file-attribute-file-identifier
+                             (file-attributes root 'integer))))
+              (cl-letf (((symbol-function 'insert-file-contents-literally)
+                         (lambda (&rest _)
+                           (ert-fail "pickle bytes were read in Emacs")))
+                        ((symbol-function 'secure-hash)
+                         (lambda (&rest _)
+                           (ert-fail "pickle bytes were hashed in Emacs"))))
+                (should (ejn-panel-set-published-pickle
+                         handle root file sha (string-bytes canary) root-id))
+                (let ((emacs-jupyter-notebook-viewer--process (list :fake))
+                      (emacs-jupyter-notebook-viewer--socket-path "/tmp/ejn-viewer.sock")
+                      (emacs-jupyter-notebook-viewer--active-transaction nil)
+                      (emacs-jupyter-notebook-viewer--next-request-id 0))
+                  (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-ensure)
+                             #'ignore)
+                            ((symbol-function 'emacs-jupyter-notebook-viewer-live-p)
+                             (lambda () t))
+                            ((symbol-function 'make-network-process)
+                             (lambda (&rest args)
+                               (should (eq (plist-get args :nowait) t))
+                               (setq process
+                                     (make-pipe-process
+                                      :name "ejn-test-viewer-send"
+                                      :buffer nil
+                                      :noquery t))))
+                            ((symbol-function 'process-send-string)
+                             (lambda (_proc string)
+                               (setq sent string)))
+                            ((symbol-function 'emacs-jupyter-notebook-viewer--log)
+                             (lambda (format-string &rest args)
+                               (push (apply #'format format-string args) logs)))
+                            ((symbol-function 'run-at-time)
+                             (lambda (&rest _) nil))
+                            ((symbol-function 'delete-process)
+                             (lambda (&rest _) nil)))
+                    (emacs-jupyter-notebook-viewer-open-pickle-file
+                     (ejn-panel-entry-pickle handle)
+                     (lambda (ok) (push ok completed)))
+                    (should sent)
+                    (should-not (string-match-p canary sent))
+                    (should-not (string-match-p canary
+                                                (string-join logs "\n")))
+                    (funcall (process-filter process)
+                             process "{\"id\":\"v1\",\"accepted\":true}\n")
+                    (should (equal completed '(t)))))))))
+      (when (buffer-live-p panel) (kill-buffer panel))
+      (when (processp process)
+        (ignore-errors (delete-process process)))
+      (ignore-errors (delete-file file))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest ejn-ei4v-bundle-update-is-targeted-transactional-and-clears-stale-pickle ()
+  "A display-id update moves image and pickle together onto its old entry."
+  (let* ((root (make-temp-file "ejn-ei4v-bundle-" t))
+         (image-a (expand-file-name "ejn-artifact-11111111111111111111111111111111" root))
+         (pickle-a (expand-file-name "ejn-artifact-22222222222222222222222222222222" root))
+         (image-b (expand-file-name "ejn-artifact-33333333333333333333333333333333" root))
+         (pickle-b (expand-file-name "ejn-artifact-44444444444444444444444444444444" root))
+         (image-c (expand-file-name "ejn-artifact-55555555555555555555555555555555" root))
+         panel)
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (dolist (pair `((,image-a . "image-a") (,pickle-a . "pickle-a")
+                          (,image-b . "image-b") (,pickle-b . "pickle-b")
+                          (,image-c . "image-c")))
+            (with-temp-file (car pair) (insert (cdr pair)))
+            (set-file-modes (car pair) #o600))
+          (with-temp-buffer
+            (setq panel (ejn-panel-ensure (current-buffer)))
+            (let* ((root-id (file-attribute-file-identifier (file-attributes root 'integer)))
+                   (first (ejn-panel-start-entry panel '("bundle.py" . 1) "first"))
+                   (second (ejn-panel-start-entry panel '("bundle.py" . 2) "second"))
+                   (image (lambda (path)
+                            (list :root root :path path :mime "image/png"
+                                  :sha256 (ejn-ei4-test--content-sha256 path)
+                                  :size (file-attribute-size (file-attributes path 'integer))
+                                  :root-identity root-id :display-id "bundle-id")))
+                   (pickle (lambda (path)
+                             (list :root root :path path
+                                   :sha256 (ejn-ei4-test--content-sha256 path)
+                                   :size (file-attribute-size (file-attributes path 'integer))
+                                   :root-identity root-id :display-id "bundle-id"))))
+              (should (ejn-panel-set-published-bundle first
+                                                      (funcall image image-a)
+                                                      (funcall pickle pickle-a) nil))
+              (should (equal (ejn-panel-set-published-bundle second
+                                                              (funcall image image-b)
+                                                              (funcall pickle pickle-b) t)
+                             first))
+              (should-not (file-exists-p image-a))
+              (should-not (file-exists-p pickle-a))
+              (should (equal (plist-get (cdr (car (ejn-panel-entry-images first))) :file)
+                             image-b))
+              (should (equal (plist-get (ejn-panel-entry-pickle first) :file) pickle-b))
+              (should-not (ejn-panel-entry-images second))
+              ;; A later image-only update invalidates the old interactive
+              ;; figure on that same display target.
+              (should (ejn-panel-set-published-bundle second (funcall image image-c) nil t))
+              (should-not (ejn-panel-entry-pickle first))
+              (should-not (file-exists-p pickle-b)))))
+      (when (buffer-live-p panel) (kill-buffer panel))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest ejn-ei4v-invalid-or-unknown-bundle-is-not-admitted ()
+  "Malformed and unknown update bundles leave the panel untouched for discard."
+  (let* ((root (make-temp-file "ejn-ei4v-reject-" t))
+         (file (expand-file-name "ejn-artifact-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" root))
+         panel)
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (with-temp-file file (insert "pickle"))
+          (set-file-modes file #o600)
+          (with-temp-buffer
+            (setq panel (ejn-panel-ensure (current-buffer)))
+            (let* ((handle (ejn-panel-start-entry panel '("reject.py" . 1) "x"))
+                   (root-id (file-attribute-file-identifier (file-attributes root 'integer)))
+                   (descriptor (list :root root :path file
+                                     :sha256 (ejn-ei4-test--content-sha256 file)
+                                     :size 6 :root-identity root-id :display-id "missing"))
+                   (context (list :buffer (current-buffer) :entry-handle handle)))
+              (should-not (ejn-panel-set-published-bundle
+                           handle nil descriptor t))
+              (should-not (ejn-panel-entry-pickle handle))
+              ;; A malformed peer descriptor also returns a normal rejection,
+              ;; allowing helper-side atomic disposal instead of a callback error.
+              (emacs-jupyter-notebook-events-dispatch
+               context `(:type display :data (:ejn-published-pickle ,descriptor
+                                      :ejn-published-image (:root ,root :path ,file
+                                      :mime "image/png" :sha256 "bad" :size 6
+                                      :root-identity ,root-id))))
+              (should-not (ejn-panel-entry-pickle handle))
+              (should (file-exists-p file)))))
+      (when (buffer-live-p panel) (kill-buffer panel))
       (ignore-errors (delete-directory root t)))))
 
 (provide 'emacs-jupyter-notebook-tests)

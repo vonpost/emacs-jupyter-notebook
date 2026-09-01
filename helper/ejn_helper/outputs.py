@@ -83,7 +83,7 @@ class _OutputJob:
 @dataclass(slots=True)
 class _NormalizedEvent:
     event: BackendEvent
-    published: PublishedArtifact | None = None
+    published: tuple[PublishedArtifact, ...] = ()
 
 
 def _take_utf8(text: str, ceiling: int) -> tuple[str, int, bool]:
@@ -427,6 +427,11 @@ class OutputNormalizer:
             count = content.get("execution_count")
             if type(count) is int and 0 <= count < (1 << 53):
                 safe_content["execution_count"] = count
+        artifacts: dict[str, str] = {}
+        image_added = False
+        # A rich figure may carry its thumbnail and interactive pickle.  Keep
+        # exactly those two bounded payloads in one job so their publication
+        # leases transfer or roll back atomically at delivery.
         for mime in _ARTIFACT_MIMES:
             payload = data.get(mime)
             if payload is None:
@@ -437,11 +442,20 @@ class OutputNormalizer:
                 return None, 0, 0, "artifact exceeds the byte limit"
             if not payload.isascii():
                 return None, 0, 0, "invalid artifact"
-            safe_content["data"] = {mime: payload}
+            if mime == "application/x-ejn-mpl-pickle" or not image_added:
+                artifacts[mime] = payload
+                image_added = image_added or mime != "application/x-ejn-mpl-pickle"
+            if len(artifacts) == 2:
+                break
+        if artifacts:
+            encoded_bytes = sum(len(payload) for payload in artifacts.values())
+            if encoded_bytes > EJN_MAX_PENDING_ARTIFACT_BYTES:
+                return None, 0, 0, "artifact exceeds the byte limit"
+            safe_content["data"] = artifacts
             return (
                 {"msg_type": message_type, "content": safe_content},
-                retained + len(payload),
-                len(payload),
+                retained + encoded_bytes,
+                encoded_bytes,
                 None,
             )
         text = data.get("text/plain")
@@ -681,10 +695,9 @@ class OutputNormalizer:
                                 admitted = job.deliver(normalized.event) is not False
                             except Exception:
                                 admitted = False
-                        if normalized.published is not None and not admitted:
-                            await self._discard(
-                                attachment_state.store, normalized.published
-                            )
+                        if not admitted:
+                            for published in normalized.published:
+                                await self._discard(attachment_state.store, published)
             finally:
                 # A retired generation with an active artifact must keep its
                 # store open through publication/discard, but can be released
@@ -873,13 +886,11 @@ class OutputNormalizer:
             base["update"] = True
         if message_type == "execute_result" and type(content.get("execution_count")) is int:
             base["execution_count"] = content["execution_count"]
-        for mime in _ARTIFACT_MIMES:
-            payload = data.get(mime)
-            if payload is not None:
-                normalized = await self._artifact_event(
-                    state, event_name, base, mime, payload, store
-                )
-                return [normalized]
+        artifacts = [
+            (mime, data[mime]) for mime in _ARTIFACT_MIMES if mime in data
+        ]
+        if artifacts:
+            return [await self._artifact_event(state, event_name, base, artifacts, store)]
         text = data.get("text/plain")
         if isinstance(text, str):
             remaining = EJN_MAX_OUTPUT_TEXT_BYTES - state.text_bytes
@@ -907,33 +918,39 @@ class OutputNormalizer:
         state: _OutputState,
         event_name: str,
         base: dict[str, object],
-        mime: str,
-        payload: object,
+        artifacts: list[tuple[str, object]],
         store: ArtifactStore,
     ) -> BackendEvent | _NormalizedEvent:
-        if not isinstance(payload, str):
-            return self._marker(state, "artifact unavailable")
+        published: list[PublishedArtifact] = []
+        descriptors: dict[str, object] = {}
         try:
             if self._executor is None:
                 self._executor = ThreadPoolExecutor(
                     max_workers=1, thread_name_prefix="ejn-artifact"
                 )
-            future = self._executor.submit(store.store_base64, payload)
-            self._store_futures.add(future)
-            future.add_done_callback(self._store_futures.discard)
-            published = await self._await_store_future(future)
+            for mime, payload in artifacts:
+                if not isinstance(payload, str):
+                    raise ArtifactError("artifact unavailable")
+                future = self._executor.submit(store.store_base64, payload)
+                self._store_futures.add(future)
+                future.add_done_callback(self._store_futures.discard)
+                artifact = await self._await_store_future(future)
+                published.append(artifact)
+                descriptors[mime] = {
+                    "path": str(artifact.path),
+                    "bytes": artifact.byte_count,
+                    "sha256": artifact.sha256,
+                }
         except ArtifactError:
+            for artifact in published:
+                await self._discard(store, artifact)
             return self._marker(state, "invalid artifact")
         except Exception:
+            for artifact in published:
+                await self._discard(store, artifact)
             return self._marker(state, "artifact publication failed")
-        base["data"] = {
-            mime: {
-                "path": str(published.path),
-                "bytes": published.byte_count,
-                "sha256": published.sha256,
-            }
-        }
-        return _NormalizedEvent(BackendEvent(event_name, base), published)
+        base["data"] = descriptors
+        return _NormalizedEvent(BackendEvent(event_name, base), tuple(published))
 
     def close(self) -> None:
         """Stop admission, roll back unhanded work, and retain handed files."""

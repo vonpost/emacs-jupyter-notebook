@@ -92,9 +92,8 @@ Return (cons mime-type content) or nil.
 
 W8.2: the custom `application/x-ejn-mpl-pickle' MIME is deliberately NOT
 selected here — it is not a renderable thumbnail.  It rides alongside
-`image/png' and is stashed separately via
-`emacs-jupyter-notebook--select-mpl-pickle', so the PNG thumbnail path is
-completely unchanged whether or not a pickle is present."
+`image/png'; helper-published pickle files are admitted through the panel
+artifact API and never appear in this MIME plist."
   (cond
    ((plist-get data :image/png)
     (cons :image/png (plist-get data :image/png)))
@@ -103,52 +102,6 @@ completely unchanged whether or not a pickle is present."
    ((plist-get data :text/plain)
     (cons :text/plain (plist-get data :text/plain)))
    (t nil)))
-
-(defun emacs-jupyter-notebook--select-mpl-pickle (data)
-  "Return the base64 matplotlib-pickle payload from DATA plist, or nil.
-W8.2: recognizes the custom `application/x-ejn-mpl-pickle' MIME key so the
-interactive viewer (W8.5) can reopen the figure locally.  Only accepts a
-non-empty string payload."
-  (let ((payload (plist-get data emacs-jupyter-notebook-mpl-pickle-mime-type)))
-    (and (stringp payload)
-         (not (string-empty-p payload))
-         payload)))
-
-(declare-function emacs-jupyter-notebook-viewer-open-pickle "emacs-jupyter-notebook-viewer" (base64))
-
-(defun emacs-jupyter-notebook--maybe-stash-pickle (buffer handle data)
-  "Stash any matplotlib pickle in DATA onto HANDLE's entry.
-W8.2: extracts the `application/x-ejn-mpl-pickle' payload and stores it on
-the panel entry, leaving the PNG thumbnail path untouched.  W8.6: when
-`emacs-jupyter-notebook-viewer-auto-open' is non-nil and a pickle is
-present, also hand it to the local viewer.  BUFFER is the source buffer;
-best-effort, never raises out of a callback.  A retired HANDLE is ignored
-before inspecting DATA, so callers cannot accidentally retain or schedule a
-late pickle payload."
-  (when (ejn-panel-entry-live-p handle)
-    (let ((base64 (emacs-jupyter-notebook--select-mpl-pickle data)))
-    (if base64
-        (progn
-          (ejn-panel-set-pickle handle base64)
-          (when (and (bound-and-true-p emacs-jupyter-notebook-viewer-auto-open)
-                     (fboundp 'emacs-jupyter-notebook-viewer-open-pickle))
-            ;; W8.7(a): NEVER decode base64 + write the temp file on the
-            ;; IOPub callback thread — a large figure pickle would freeze
-            ;; Emacs during ordinary result streaming.  Coalesce it on the
-            ;; panel entry: rapid display updates produce one latest-payload
-            ;; handoff, and the closure holds no pickle bytes.
-            (ejn-panel-schedule-pickle-open
-             handle
-             (lambda (current-pickle)
-               (ignore-errors
-                 (when (buffer-live-p buffer)
-                   (with-current-buffer buffer
-                     (emacs-jupyter-notebook-viewer-open-pickle
-                      current-pickle))))))))
-      ;; W8.7(d): a display with no pickle key replaces any prior figure on
-      ;; this entry — drop the stale pickle so `v'/`C-c j I' can't reopen a
-      ;; no-longer-visible figure.
-        (ejn-panel-clear-pickle handle)))))
 
 (defun emacs-jupyter-notebook--render-image-data (base64-data)
   "Decode BASE64-DATA and return an image spec."
@@ -203,7 +156,7 @@ Each entry plist supports:
   :exec-count INTEGER-or-\"*\"
   :timestamp ISO-string
   :outputs ordered text/image segments
-  :mpl-pickle BASE64-or-nil
+  :mpl-pickle confined metadata plist or nil
   :pickle-open-timer TIMER-or-nil
   :pickle-open-token TOKEN-or-nil
   :pending-clear BOOL")
@@ -256,6 +209,10 @@ before a future implementation chooses to reuse entry ids.")
 Panel admission verifies content in Emacs before display.  Keeping this at
 4 MiB bounds that literal read and SHA-256 work below the UI responsiveness
 budget; larger originals belong in the asynchronous external-viewer path.")
+
+(defconst emacs-jupyter-notebook-panel--max-published-pickle-bytes 67108864
+  "Maximum bytes accepted for one helper-published matplotlib pickle.
+This finite ceiling matches the helper's decoded artifact ceiling.")
 
 (defvar emacs-jupyter-notebook-panel--text-materialization-count nil
   "Test instrument for text materializations, or nil when disabled.")
@@ -467,16 +424,18 @@ The matching slot is cleared atomically before the caller opens the viewer."
              (when (and (eq token (plist-get entry :pickle-open-token))
                         (eq timer (plist-get entry :pickle-open-timer)))
                (setq pickle (plist-get entry :mpl-pickle))
+               (when pickle
+                 (plist-put pickle :leases (1+ (or (plist-get pickle :leases) 0))))
                (setq entry (plist-put entry :pickle-open-timer nil))
                (setq entry (plist-put entry :pickle-open-token nil)))
              entry))
       pickle)))
 
 (defun ejn-panel-schedule-pickle-open (handle opener)
-  "Coalesce HANDLE's deferred pickle open and call OPENER with its live payload.
+  "Coalesce HANDLE's deferred pickle open and call OPENER with live metadata.
 Only one idle timer may be pending per entry.  Neither the timer nor OPENER
-captures the pickle bytes; the callback revalidates HANDLE and reads the
-entry payload only after claiming its current timer slot."
+captures artifact contents; the callback revalidates HANDLE and reads the
+entry metadata only after claiming its current timer slot."
   (when (ejn-panel-entry-live-p handle)
     (let ((token (list))
           timer)
@@ -1015,7 +974,7 @@ returned unchanged.  The file is mode 0600 and written without coding."
     ("image/webp" 'webp)
     (_ nil)))
 
-(defun emacs-jupyter-notebook-panel--published-file-sha256 (path size)
+(defun emacs-jupyter-notebook-panel--published-file-sha256 (path size limit)
   "Return PATH's SHA-256 after one bounded literal read of declared SIZE.
 No file-name handler is allowed on the helper's local publication path."
   (let ((file-name-handler-alist nil)
@@ -1025,7 +984,7 @@ No file-name handler is allowed on the helper's local publication path."
       ;; Read at most one byte beyond the admission ceiling.  A racing growth
       ;; can therefore fail validation without allocating an unbounded buffer.
       (insert-file-contents-literally
-       path nil 0 (1+ emacs-jupyter-notebook-panel--max-published-image-bytes))
+       path nil 0 (1+ limit))
       (unless (= (buffer-size) size)
         (error "published image size changed while reading"))
       (secure-hash 'sha256 (current-buffer)))))
@@ -1065,7 +1024,7 @@ child of that exact non-symlink root through validation and transfer.
                  (= (file-attribute-size attrs) size)
                  (string-equal
                   (emacs-jupyter-notebook-panel--published-file-sha256
-                   path-name size)
+                   path-name size emacs-jupyter-notebook-panel--max-published-image-bytes)
                   sha256)
                  ;; Hashing is not an ownership transfer until both paths are
                  ;; still valid, same objects observed before it.
@@ -1119,6 +1078,207 @@ place until this entry is cleared, replaced, evicted, or the panel exits.
        handle (emacs-jupyter-notebook-panel--published-image-spec
                root path mime sha256 size root-identity display-id) display-id)
       t)))
+
+(defun emacs-jupyter-notebook-panel--published-pickle (root path sha256 size root-identity)
+  "Validate a published pickle and return its confined panel metadata.
+The artifact is never read into Emacs.  The viewer verifies SHA-256 from the
+same identity-pinned bytes it executes in its bounded worker."
+  (unless (and (stringp root) (file-name-absolute-p root)
+               (stringp path) (file-name-absolute-p path)
+               (stringp sha256) (string-match-p "\\`[0-9a-f]\\{64\\}\\'" sha256)
+               (integerp size) (>= size 0)
+               (<= size emacs-jupyter-notebook-panel--max-published-pickle-bytes)
+               root-identity)
+    (error "invalid published pickle metadata"))
+  (let* ((root-name (directory-file-name (expand-file-name root)))
+         (path-name (expand-file-name path))
+         (root-attrs (and (not (file-symlink-p root-name))
+                          (file-attributes root-name 'integer)))
+         (attrs (and (not (file-symlink-p path-name))
+                     (file-attributes path-name 'integer)))
+         (identity (and attrs (file-attribute-file-identifier attrs))))
+    (unless (and root-attrs (file-directory-p root-name)
+                 (eq (file-attribute-type root-attrs) t)
+                 (equal (file-attribute-user-id root-attrs) (user-uid))
+                 (= (logand (file-modes root-name) #o7777) #o700)
+                 (equal root-identity (file-attribute-file-identifier root-attrs))
+                 (equal (file-name-directory (directory-file-name path-name))
+                        (file-name-as-directory root-name))
+                 attrs identity (file-regular-p path-name)
+                 (null (file-attribute-type attrs))
+                 (string-match-p "\\`ejn-artifact-[0-9a-f]\\{32\\}\\'"
+                                 (file-name-nondirectory path-name))
+                 (= (file-attribute-link-number attrs) 1)
+                 (equal (file-attribute-user-id attrs) (user-uid))
+                 (= (logand (file-modes path-name) #o7777) #o600)
+                 (= (file-attribute-size attrs) size)
+                 ;; Do not read/hash pickle bytes on Emacs's UI thread.  The
+                 ;; viewer recomputes SHA-256 from its pinned descriptor in
+                 ;; its bounded worker before any unpickle.
+                 (let ((post-root (and (not (file-symlink-p root-name))
+                                       (file-attributes root-name 'integer)))
+                       (post (and (not (file-symlink-p path-name))
+                                  (file-attributes path-name 'integer))))
+                   (and post-root post (file-directory-p root-name)
+                        (eq (file-attribute-type post-root) t)
+                        (equal (file-attribute-user-id post-root) (user-uid))
+                        (= (logand (file-modes root-name) #o7777) #o700)
+                        (equal root-identity
+                               (file-attribute-file-identifier post-root))
+                        (file-regular-p path-name)
+                        (null (file-attribute-type post))
+                        (string-match-p "\\`ejn-artifact-[0-9a-f]\\{32\\}\\'"
+                                        (file-name-nondirectory path-name))
+                        (= (file-attribute-link-number post) 1)
+                        (equal (file-attribute-user-id post) (user-uid))
+                        (= (logand (file-modes path-name) #o7777) #o600)
+                        (= (file-attribute-size post) size)
+                        (equal identity (file-attribute-file-identifier post)))))
+      (error "unsafe published pickle"))
+    (list :root root-name :root-identity root-identity :file path-name
+          :identity identity :sha256 sha256 :size size :leases 0 :retired nil :deleted nil)))
+
+(defun emacs-jupyter-notebook-panel--retire-pickle (pickle)
+  "Retire PICKLE, unlinking only after all viewer leases have released it."
+  (when (and (listp pickle) (not (plist-get pickle :deleted)))
+    (plist-put pickle :retired t)
+    (when (<= (or (plist-get pickle :leases) 0) 0)
+      (let ((file (plist-get pickle :file))
+            (identity (plist-get pickle :identity))
+            (root (plist-get pickle :root))
+            (root-identity (plist-get pickle :root-identity)))
+        (cond
+         ((and (stringp file) (not (file-exists-p file)))
+          (plist-put pickle :deleted t))
+         ((and (stringp file) identity root root-identity
+               (not (file-symlink-p root))
+               (let ((root-attrs (file-attributes root 'integer))
+                     (attrs (and (not (file-symlink-p file))
+                                 (file-attributes file 'integer))))
+                 (and root-attrs attrs (file-directory-p root)
+                      (eq (file-attribute-type root-attrs) t)
+                      (equal (file-attribute-user-id root-attrs) (user-uid))
+                      (= (logand (file-modes root) #o7777) #o700)
+                      (equal root-identity
+                             (file-attribute-file-identifier root-attrs))
+                      (file-regular-p file) (null (file-attribute-type attrs))
+                      (string-match-p "\\`ejn-artifact-[0-9a-f]\\{32\\}\\'"
+                                      (file-name-nondirectory file))
+                      (= (file-attribute-link-number attrs) 1)
+                      (equal (file-attribute-user-id attrs) (user-uid))
+                      (= (logand (file-modes file) #o7777) #o600)
+                      (equal identity (file-attribute-file-identifier attrs)))))
+          (condition-case nil
+              (progn
+                (delete-file file)
+                (unless (file-exists-p file)
+                  (plist-put pickle :deleted t)))
+            (error nil))))))))
+
+(defun emacs-jupyter-notebook-panel--set-pickle-metadata (handle pickle)
+  "Install already validated PICKLE metadata on HANDLE."
+  (when (ejn-panel-entry-live-p handle)
+    (emacs-jupyter-notebook-panel--update-entry
+     handle
+     (lambda (entry)
+       (let ((old (plist-get entry :mpl-pickle)))
+         (when old (emacs-jupyter-notebook-panel--retire-pickle old))
+         (setq entry (plist-put entry :artifact-bytes
+                                (+ (- (plist-get entry :artifact-bytes)
+                                      (or (plist-get old :size) 0))
+                                   (plist-get pickle :size))))
+         (plist-put entry :mpl-pickle pickle)))
+     t)
+    (emacs-jupyter-notebook-panel--prune-pickles (plist-get handle :panel))
+    (emacs-jupyter-notebook-panel--enforce-retention-budgets
+     (plist-get handle :panel))
+    t))
+
+(defun ejn-panel-set-published-pickle (handle root path sha256 size root-identity)
+  "Store one validated confined pickle metadata record on HANDLE."
+  (when (ejn-panel-entry-live-p handle)
+    (emacs-jupyter-notebook-panel--set-pickle-metadata
+     handle (emacs-jupyter-notebook-panel--published-pickle
+             root path sha256 size root-identity))))
+
+(defun ejn-panel-set-published-bundle (handle image pickle update-p)
+  "Atomically admit IMAGE and PICKLE descriptors, returning a boolean.
+For UPDATE-P, resolve DISPLAY-ID once before mutating either artifact so the
+pickle follows the image's existing cross-entry target."
+  (when (ejn-panel-entry-live-p handle)
+    (let* ((image-id (and image (plist-get image :display-id)))
+           (pickle-id (and pickle (plist-get pickle :display-id)))
+           (display-id (or image-id pickle-id))
+           (target (and update-p display-id
+                        (emacs-jupyter-notebook-panel--display-target
+                         (plist-get handle :panel) display-id 'image)))
+           (effective (or (car-safe target) handle)))
+      (when (and (or (null image-id) (null pickle-id)
+                     (equal image-id pickle-id))
+                 (or (not update-p) target))
+        ;; Resolve cheap display identity and target admission before touching
+        ;; file descriptors or constructing an image spec.
+        (let ((pickle-meta
+               (and pickle
+                    (emacs-jupyter-notebook-panel--published-pickle
+                     (plist-get pickle :root) (plist-get pickle :path)
+                     (plist-get pickle :sha256) (plist-get pickle :size)
+                     (plist-get pickle :root-identity))))
+              (image-spec
+               (and image
+                    (emacs-jupyter-notebook-panel--published-image-spec
+                     (plist-get image :root) (plist-get image :path)
+                     (plist-get image :mime) (plist-get image :sha256)
+                     (plist-get image :size) (plist-get image :root-identity)
+                     (plist-get image :display-id)))))
+        ;; Both paths normally enforce retention after each mutation.  Suppress
+        ;; that intermediate eviction: the bundle owns both files only after
+        ;; the target has accepted image and pickle together.
+        (let ((emacs-jupyter-notebook-panel-max-history-entries most-positive-fixnum)
+              (emacs-jupyter-notebook-panel-max-total-artifact-bytes most-positive-fixnum)
+              (emacs-jupyter-notebook-panel-max-pickles most-positive-fixnum))
+          (when image-spec
+            (if update-p
+                (ejn-panel-update-image effective image-spec display-id)
+              (ejn-panel-set-image effective image-spec)))
+          (when (and pickle-meta (ejn-panel-entry-live-p effective))
+            (emacs-jupyter-notebook-panel--set-pickle-metadata effective pickle-meta))
+          ;; A fresh image replaces the interactive figure associated with the
+          ;; target.  Do not leave a prior pickle available for `v'.
+          (when (and image-spec (null pickle-meta)
+                     (ejn-panel-entry-live-p effective))
+            (ejn-panel-clear-pickle effective)))
+        (when (and (ejn-panel-entry-live-p effective)
+                   (or (null pickle-meta)
+                       (equal (plist-get (ejn-panel-entry-snapshot effective) :mpl-pickle)
+                              pickle-meta)))
+          (emacs-jupyter-notebook-panel--prune-pickles
+           (plist-get effective :panel))
+          (emacs-jupyter-notebook-panel--enforce-retention-budgets
+           (plist-get effective :panel))
+          (and (ejn-panel-entry-live-p effective) effective)))))))
+
+(defun ejn-panel-acquire-pickle (handle)
+  "Return HANDLE's pickle metadata with one viewer lifetime lease, or nil."
+  (let (pickle)
+    (when (emacs-jupyter-notebook-panel--mutate-live-entry
+           handle
+           (lambda (entry)
+             (setq pickle (plist-get entry :mpl-pickle))
+             (when pickle
+               (plist-put pickle :leases (1+ (or (plist-get pickle :leases) 0))))
+             entry))
+      pickle)))
+
+(defun ejn-panel-release-pickle (pickle)
+  "Release one viewer lease on PICKLE and finish a deferred retirement."
+  (when (listp pickle)
+    (let ((leases (or (plist-get pickle :leases) 0)))
+      (when (> leases 0)
+        (plist-put pickle :leases (1- leases)))
+      (when (and (plist-get pickle :retired)
+                 (<= (or (plist-get pickle :leases) 0) 0))
+        (emacs-jupyter-notebook-panel--retire-pickle pickle)))))
 
 (defun emacs-jupyter-notebook-panel--owned-image-file-p (panel file)
   "Return non-nil when FILE belongs to PANEL's private image directory."
@@ -1207,7 +1367,7 @@ place until this entry is cleared, replaced, evicted, or the panel exits.
               ;; symbol in IMAGE-SPEC precedes its property list.
               sum (or (plist-get (cdr (cdr segment)) :ejn-artifact-bytes) 0))
      (let ((pickle (plist-get entry :mpl-pickle)))
-       (if (stringp pickle) (string-bytes pickle) 0))))
+       (or (plist-get pickle :size) 0))))
 
 (defun emacs-jupyter-notebook-panel--recompute-totals ()
   "Return recomputed text/artifact totals for test introspection."
@@ -1265,6 +1425,7 @@ configured budgets remain hard limits."
                                                    (plist-get entry :outputs))
     (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer entry))
     (setq entry (plist-put entry :outputs nil))
+    (emacs-jupyter-notebook-panel--retire-pickle (plist-get entry :mpl-pickle))
     (setq entry (plist-put entry :mpl-pickle nil))
     (setcdr cell entry)
     (setq emacs-jupyter-notebook-panel--inline-image-specs
@@ -1298,6 +1459,7 @@ normal Emacs exit; it never consults source, registry, SSH, or kernel state."
                                                        (plist-get (cdr cell) :outputs))
         (let ((entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
                       (cdr cell))))
+          (emacs-jupyter-notebook-panel--retire-pickle (plist-get entry :mpl-pickle))
           (setcdr cell (plist-put entry :mpl-pickle nil))))
       (dolist (spec emacs-jupyter-notebook-panel--inline-image-specs)
         (ignore-errors (image-flush spec t)))
@@ -1446,6 +1608,7 @@ accepting the next output.  This also cancels a queued auto-viewer handoff."
         (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
                      entry))
         (setq entry (plist-put entry :outputs nil))
+        (emacs-jupyter-notebook-panel--retire-pickle (plist-get entry :mpl-pickle))
         (setq entry (plist-put entry :mpl-pickle nil))
         (setq entry (emacs-jupyter-notebook-panel--entry-reset-output-accounting
                      entry))
@@ -1625,6 +1788,7 @@ replaced whatever figure the entry previously showed."
                                              (or text ""))))))
          (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
                       entry))
+         (emacs-jupyter-notebook-panel--retire-pickle (plist-get entry :mpl-pickle))
          (setq entry (plist-put entry :mpl-pickle nil))
          (setq entry (plist-put entry :output-text-bytes (string-bytes (or text ""))))
          (setq entry (plist-put entry :retained-text-bytes
@@ -1756,6 +1920,7 @@ If WAIT is non-nil, defer the clear until the next text arrives
            ;; W8.7(d): clearing the entry drops the figure too.
            (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
                         entry))
+           (emacs-jupyter-notebook-panel--retire-pickle (plist-get entry :mpl-pickle))
            (setq entry (plist-put entry :mpl-pickle nil))
            (setq entry (emacs-jupyter-notebook-panel--entry-reset-output-accounting
                         entry))
@@ -1765,14 +1930,16 @@ If WAIT is non-nil, defer the clear until the next text arrives
 
 (defun emacs-jupyter-notebook-panel--prune-pickles (panel)
   "Drop the matplotlib pickle from all but the newest N entries in PANEL.
-A5: `panel--entries' is append-only history and each `:mpl-pickle' is a
-multi-MB base64 string, so without bounding, an image-heavy session (re-run
-an `imshow' cell many times) retains every pickle and grows Emacs's heap
-without limit.  Only the interactive payload is dropped from older entries;
-their PNG thumbnail and text are untouched.  A non-positive
-`emacs-jupyter-notebook-panel-max-pickles' disables pruning."
-  (let ((max emacs-jupyter-notebook-panel-max-pickles))
-    (when (and (buffer-live-p panel) (integerp max) (> max 0))
+A5: `panel--entries' is append-only history and each `:mpl-pickle' owns a
+potentially large artifact file.  Without bounding, an image-heavy session
+(re-running an `imshow' cell many times) keeps every pickle reachable.  Only
+the interactive artifact is dropped from older entries; their PNG thumbnail
+and text are untouched.  A non-positive limit retains zero pickle artifacts."
+  (let ((max (if (and (integerp emacs-jupyter-notebook-panel-max-pickles)
+                      (> emacs-jupyter-notebook-panel-max-pickles 0))
+                 emacs-jupyter-notebook-panel-max-pickles
+               0)))
+    (when (buffer-live-p panel)
       (with-current-buffer panel
         (let ((kept 0))
           ;; Newest entries are appended to the end; walk newest-first.
@@ -1782,41 +1949,14 @@ their PNG thumbnail and text are untouched.  A non-positive
                   (setq kept (1+ kept))
                 (let ((entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
                               (cdr cell))))
-                  (cl-decf emacs-jupyter-notebook-panel--retained-artifact-bytes
-                           (string-bytes (plist-get entry :mpl-pickle)))
-                  (setq entry (plist-put entry :artifact-bytes
-                                         (- (plist-get entry :artifact-bytes)
-                                            (string-bytes (plist-get entry :mpl-pickle)))))
-                  (setcdr cell (plist-put entry :mpl-pickle nil)))))))))))
-
-(defun ejn-panel-set-pickle (handle base64)
-  "Stash BASE64 matplotlib-pickle payload on HANDLE's entry.
-W8.2: stored under `:mpl-pickle' independently of the rendered content or
-image, so the PNG thumbnail path is untouched.  The interactive viewer
-(W8.5) reads this field to reopen the figure locally.  A nil BASE64 is a
-no-op.  A5: after stashing, prune pickles beyond the newest N entries."
-  (when (and (ejn-panel-entry-live-p handle) base64)
-    (let* ((panel (plist-get handle :panel))
-           (old-entry (ejn-panel-entry-snapshot handle))
-           (force-full (and (plist-get old-entry :pending-clear)
-                            (cl-find 'image (plist-get old-entry :outputs)
-                                     :key #'car))))
-      (emacs-jupyter-notebook-panel--update-entry
-       handle
-       (lambda (entry)
-         (setq entry (emacs-jupyter-notebook-panel--entry-after-pending-clear
-                      panel entry))
-         (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
-                      entry))
-         (let ((old-pickle (plist-get entry :mpl-pickle)))
-           (setq entry (plist-put entry :artifact-bytes
-                                  (+ (- (plist-get entry :artifact-bytes)
-                                        (if (stringp old-pickle) (string-bytes old-pickle) 0))
-                                     (string-bytes base64))))
-           (plist-put entry :mpl-pickle base64)))
-       force-full)
-      (emacs-jupyter-notebook-panel--prune-pickles panel)
-      (emacs-jupyter-notebook-panel--enforce-retention-budgets panel))))
+                  (let ((pickle (plist-get entry :mpl-pickle)))
+                    (cl-decf emacs-jupyter-notebook-panel--retained-artifact-bytes
+                             (or (plist-get pickle :size) 0))
+                    (setq entry (plist-put entry :artifact-bytes
+                                           (- (plist-get entry :artifact-bytes)
+                                              (or (plist-get pickle :size) 0))))
+                    (emacs-jupyter-notebook-panel--retire-pickle pickle)
+                    (setcdr cell (plist-put entry :mpl-pickle nil))))))))))))
 
 (defun ejn-panel-clear-pickle (handle)
   "Drop any stashed matplotlib pickle on HANDLE's entry (W8.7(d))."
@@ -1836,13 +1976,14 @@ no-op.  A5: after stashing, prune pickles beyond the newest N entries."
          (let ((old-pickle (plist-get entry :mpl-pickle)))
            (setq entry (plist-put entry :artifact-bytes
                                   (- (plist-get entry :artifact-bytes)
-                                     (if (stringp old-pickle) (string-bytes old-pickle) 0))))
+                                     (or (plist-get old-pickle :size) 0))))
+           (emacs-jupyter-notebook-panel--retire-pickle old-pickle)
            (plist-put entry :mpl-pickle nil)))
        force-full)
       (emacs-jupyter-notebook-panel--enforce-retention-budgets panel))))
 
 (defun ejn-panel-entry-pickle (handle)
-  "Return the base64 matplotlib-pickle payload stashed on HANDLE's entry, or nil."
+  "Return HANDLE's confined matplotlib pickle metadata, or nil."
   (plist-get (ejn-panel-entry-snapshot handle) :mpl-pickle))
 
 (defun ejn-panel-entry-snapshot (handle)
@@ -2146,8 +2287,8 @@ The fringe values silently fall back to `left-margin'."
 
 ;;; External/static and interactive figure open (W18/W8.5)
 
-(declare-function emacs-jupyter-notebook-open-figure-with-pickle
-                  "emacs-jupyter-notebook" (base64))
+(declare-function emacs-jupyter-notebook-open-figure-pickle-lease
+                  "emacs-jupyter-notebook" (pickle))
 
 (defun emacs-jupyter-notebook-panel--entry-id-at-point ()
   "Return the id of the panel entry whose SECTION contains point.
@@ -2236,15 +2377,17 @@ placeholders.  On an entry header, fall back to its first image segment."
     (funcall emacs-jupyter-notebook-panel-external-open-function file)))
 
 (defun emacs-jupyter-notebook-panel--entry-pickle-at-point ()
-  "Return the matplotlib pickle stashed on the panel entry at point, or nil."
+  "Acquire the matplotlib pickle for the panel entry at point, or nil."
   (let ((id (emacs-jupyter-notebook-panel--entry-id-at-point)))
     (when id
-      (plist-get (emacs-jupyter-notebook-panel--entry (current-buffer) id)
-                 :mpl-pickle))))
+      (ejn-panel-acquire-pickle
+       (emacs-jupyter-notebook-panel--handle
+        (current-buffer) id
+        (plist-get (emacs-jupyter-notebook-panel--entry (current-buffer) id)
+                   :cell-key))))))
 
-(defun emacs-jupyter-notebook-panel-latest-pickle-for-cell (source-buffer cell-key)
-  "Return the newest pickle stashed for CELL-KEY in SOURCE-BUFFER's panel.
-Returns nil when no matching entry carries a pickle payload."
+(defun emacs-jupyter-notebook-panel-acquire-latest-pickle-for-cell (source-buffer cell-key)
+  "Acquire the newest pickle for CELL-KEY in SOURCE-BUFFER's panel, or nil."
   (let ((panel (emacs-jupyter-notebook-panel-buffer source-buffer)))
     (when (buffer-live-p panel)
       (with-current-buffer panel
@@ -2253,20 +2396,21 @@ Returns nil when no matching entry carries a pickle payload."
             (let ((entry (cdr cell)))
               (when (and (equal (plist-get entry :cell-key) cell-key)
                          (plist-get entry :mpl-pickle))
-                (setq found (plist-get entry :mpl-pickle)))))
-          found)))))
+                (setq found (emacs-jupyter-notebook-panel--handle
+                             panel (car cell) (plist-get entry :cell-key))))))
+          (and found (ejn-panel-acquire-pickle found)))))))
 
 (defun emacs-jupyter-notebook-panel-open-figure ()
   "Open the figure of the panel entry at point interactively (W8.5).
 Signals a `user-error' when point is not on an entry that carries a
-matplotlib pickle payload."
+matplotlib pickle artifact."
   (interactive)
   (unless (derived-mode-p 'emacs-jupyter-notebook-panel-mode)
     (user-error "Not in an EJN output panel"))
-  (let ((base64 (emacs-jupyter-notebook-panel--entry-pickle-at-point)))
-    (unless base64
-      (user-error "No interactive figure on this entry (no pickle payload)"))
-    (emacs-jupyter-notebook-open-figure-with-pickle base64)))
+  (let ((pickle (emacs-jupyter-notebook-panel--entry-pickle-at-point)))
+    (unless pickle
+      (user-error "No interactive figure on this entry (no pickle artifact)"))
+    (emacs-jupyter-notebook-open-figure-pickle-lease pickle)))
 
 ;;; Panel cleanup (W2.9)
 

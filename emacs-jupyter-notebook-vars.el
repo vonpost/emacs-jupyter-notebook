@@ -253,15 +253,22 @@ Windows."
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-panel-max-pickles 20
-  "Maximum number of panel entries that retain their matplotlib pickle payload.
-Each interactive-figure pickle stashed on a panel entry is a multi-MB
-base64 string.  The panel keeps full history, so an image-heavy session
-(re-running an `imshow' cell many times) would otherwise retain every
-pickle and grow Emacs's heap without bound.  Only the newest this-many
-entries keep the heavy payload used by the interactive viewer; older
-entries keep their PNG thumbnail and text but drop the pickle.  A
-non-positive value disables pruning (unbounded retention)."
+  "Maximum number of panel entries that retain matplotlib pickle artifacts.
+Each interactive-figure entry holds confined file metadata plus a deletion
+lease for a helper-spooled pickle artifact.  The panel keeps full history, so
+an image-heavy session (re-running an `imshow' cell many times) would
+otherwise keep every artifact file reachable.  Only the newest this-many
+entries keep the metadata used by the interactive viewer; older entries keep
+their PNG thumbnail and text but retire the pickle file.  Zero or a negative
+value retains no pickle artifacts."
   :type 'integer
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-enable-pickle-viewer nil
+  "Whether to permit locally unpickling interactive figure artifacts.
+Pickle is executable Python data supplied by the remote kernel.  Keep this
+disabled unless that kernel and its transport are explicitly trusted."
+  :type 'boolean
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-connection-retrieve-attempts 40

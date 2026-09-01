@@ -377,100 +377,64 @@ logged; watchdog injection must never break a connect or restart."
 
 ;;; W8.5 — open a stashed figure interactively in the local viewer
 
-(defvar emacs-jupyter-notebook--viewer-support-cache nil
-  "Cached result of the local-viewer matplotlib probe.
-`t' once the local Python has been confirmed to import matplotlib; nil
-until first probed (or after a failed probe, so a later install is picked
-up).  Resolving the Python executable itself is instant (`executable-find')
-and is never cached here.")
-
-(defun emacs-jupyter-notebook--viewer-hand-off (base64)
-  "Decode BASE64 and hand it to the local viewer, surfacing start failures.
+(defun emacs-jupyter-notebook--viewer-hand-off (pickle)
+  "Hand confined PICKLE metadata to the local viewer, surfacing start failures.
 The hand-off itself is asynchronous (see the viewer manager); only a
 synchronous spawn failure (missing script, unspawnable Python) is turned
 into a friendly `user-error'."
   (condition-case err
       (progn
-        (emacs-jupyter-notebook-viewer-open-pickle base64)
+        (emacs-jupyter-notebook-viewer-open-pickle-file
+         pickle (lambda (_accepted) (ejn-panel-release-pickle pickle)))
         (emacs-jupyter-notebook--log-append
          'viewer "handed figure to local interactive viewer")
         (message "emacs-jupyter-notebook: opening figure in local viewer"))
     (error
+     (ejn-panel-release-pickle pickle)
      (emacs-jupyter-notebook--log-append
       'viewer "interactive viewer failed to start: %s"
       (error-message-string err))
      (user-error "Interactive viewer failed to start: %s"
                  (error-message-string err)))))
 
-(defun emacs-jupyter-notebook--viewer-probe-matplotlib-async (python base64)
-  "Probe PYTHON for matplotlib WITHOUT blocking, then hand off BASE64.
-On success caches the result and hands the figure to the viewer; on
-failure logs and messages that matplotlib is unavailable.  W8.5
-remediation: the old synchronous `call-process' import check blocked
-Emacs; this replaces it with an async probe so the async rule holds."
-  (let ((buffer (current-buffer)))
-    (condition-case err
-        (make-process
-         :name "emacs-jupyter-notebook-viewer-mpl-probe"
-         :command (list python "-c" "import matplotlib")
-         :noquery t
-         :sentinel
-         (lambda (proc _event)
-           (when (memq (process-status proc) '(exit signal))
-             (if (and (eq (process-status proc) 'exit)
-                      (zerop (process-exit-status proc)))
-                 (progn
-                   (setq emacs-jupyter-notebook--viewer-support-cache t)
-                   (when (buffer-live-p buffer)
-                     (with-current-buffer buffer
-                       (emacs-jupyter-notebook--viewer-hand-off base64))))
-               (emacs-jupyter-notebook--log-append
-                'viewer "local Python (%s) has no matplotlib"
-                emacs-jupyter-notebook-local-python-command)
-               (message
-                "emacs-jupyter-notebook: local Python (%s) has no matplotlib; interactive viewer unavailable"
-                emacs-jupyter-notebook-local-python-command)))))
-      (error
-       (user-error "Failed to probe local Python: %s"
-                   (error-message-string err))))))
-
-(defun emacs-jupyter-notebook-open-figure-with-pickle (base64)
-  "Open the matplotlib figure encoded by BASE64 in the local viewer (W8.5).
+(defun emacs-jupyter-notebook-open-figure-pickle-lease (pickle)
+  "Open leased confined PICKLE metadata in the local viewer.
 Surfaces a friendly `user-error' when no local Python is configured/found.
-The matplotlib check and the viewer hand-off are BOTH asynchronous, so
-this never blocks Emacs; a missing local matplotlib is reported via
-`message' from the async probe rather than blocking on a subprocess."
+The viewer's bounded asynchronous spawn/ACK transaction diagnoses a missing
+matplotlib installation and releases the lease without a separate probe."
+  (unless emacs-jupyter-notebook-enable-pickle-viewer
+    (ejn-panel-release-pickle pickle)
+    (user-error "Interactive pickle viewer is disabled; customize `emacs-jupyter-notebook-enable-pickle-viewer' only for trusted kernels"))
   (let ((python (emacs-jupyter-notebook-viewer--python-path
                  emacs-jupyter-notebook-local-python-command)))
     (cond
      ((null python)
+      (ejn-panel-release-pickle pickle)
       (user-error
        "No local Python found; set `emacs-jupyter-notebook-local-python-command'"))
-     ((eq emacs-jupyter-notebook--viewer-support-cache t)
-      (emacs-jupyter-notebook--viewer-hand-off base64))
      (t
-      (emacs-jupyter-notebook--viewer-probe-matplotlib-async python base64)))))
+      (emacs-jupyter-notebook--viewer-hand-off pickle)))))
 
 (defun emacs-jupyter-notebook--figure-pickle-for-current-cell ()
   "Return the newest matplotlib pickle stashed for the current cell, or nil."
   (let ((cell-key (emacs-jupyter-notebook--current-cell-key)))
     (and cell-key
-         (emacs-jupyter-notebook-panel-latest-pickle-for-cell
+         (emacs-jupyter-notebook-panel-acquire-latest-pickle-for-cell
           (current-buffer) cell-key))))
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-open-figure-interactive ()
   "Open the current cell's latest figure interactively in the local viewer.
 W8.5: bound to `C-c j I'.  Looks up the newest panel entry for the cell at
-point that carries a matplotlib pickle payload and hands it to the local
+point that carries matplotlib pickle artifact metadata and hands it to the local
 viewer.  Signals a friendly `user-error' when the cell has no interactive
 figure or the local viewer is unavailable."
   (interactive)
-  (let ((base64 (emacs-jupyter-notebook--figure-pickle-for-current-cell)))
-    (unless base64
+  (let ((pickle (emacs-jupyter-notebook--figure-pickle-for-current-cell)))
+    (unless pickle
       (user-error
        "No interactive figure for this cell; run a cell that displays a matplotlib figure first"))
-    (emacs-jupyter-notebook-open-figure-with-pickle base64)))
+    (emacs-jupyter-notebook-open-figure-pickle-lease pickle)))
 
 (defvar-local emacs-jupyter-notebook--saved-imenu-create-index-function nil
   "Previous buffer-local value of `imenu-create-index-function'.")

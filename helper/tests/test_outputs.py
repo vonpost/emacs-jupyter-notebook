@@ -180,6 +180,74 @@ class OutputNormalizerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(set(reference), {"path", "bytes", "sha256"})
             self.assertFalse(contains(self.events[-1].data, payload))
 
+    async def test_figure_pickle_and_thumbnail_transfer_in_one_event(self):
+        png = base64.b64encode(b"thumbnail").decode("ascii")
+        pickle_payload = base64.b64encode(b"pickle").decode("ascii")
+        await self.submit(
+            "figure",
+            message(
+                "display_data",
+                {"data": {"image/png": png,
+                          "application/x-ejn-mpl-pickle": pickle_payload},
+                 "metadata": {}},
+            ),
+        )
+        data = self.events[-1].data["data"]
+        self.assertEqual(set(data), {"image/png", "application/x-ejn-mpl-pickle"})
+        self.assertTrue(Path(data["image/png"]["path"]).is_file())
+        self.assertTrue(Path(data["application/x-ejn-mpl-pickle"]["path"]).is_file())
+        self.assertFalse(contains(self.events[-1].data, png))
+        self.assertFalse(contains(self.events[-1].data, pickle_payload))
+
+    async def test_dual_artifact_second_publication_failure_rolls_back_both(self):
+        """A partial dual publication cannot strand the first artifact."""
+        png = base64.b64encode(b"thumbnail").decode("ascii")
+        pickle_payload = base64.b64encode(b"pickle").decode("ascii")
+        original = ArtifactStore.store_base64
+        calls = 0
+
+        def fail_second(store, payload):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("second publication failed")
+            return original(store, payload)
+
+        with mock.patch.object(ArtifactStore, "store_base64", new=fail_second):
+            await self.submit(
+                "dual-store-failure",
+                message(
+                    "display_data",
+                    {"data": {"image/png": png,
+                              "application/x-ejn-mpl-pickle": pickle_payload},
+                     "metadata": {}},
+                ),
+            )
+        self.assertEqual([event.name for event in self.events], ["stream"])
+        self.assertIn("artifact publication failed", self.events[0].data["text"])
+        self.assertEqual(list(self.directory.iterdir()), [])
+        self.assertEqual(self.normalizer._retained_bytes, 0)
+        self.assertEqual(self.normalizer._pending_artifact_bytes, 0)
+
+    async def test_dual_artifact_downstream_rejection_discards_every_lease(self):
+        """A false delivery acknowledgement rejects image and pickle together."""
+        png = base64.b64encode(b"thumbnail").decode("ascii")
+        pickle_payload = base64.b64encode(b"pickle").decode("ascii")
+        await self.submit(
+            "dual-delivery-rejected",
+            message(
+                "display_data",
+                {"data": {"image/png": png,
+                          "application/x-ejn-mpl-pickle": pickle_payload},
+                 "metadata": {}},
+            ),
+            deliver=lambda _event: False,
+        )
+        self.assertEqual(self.events, [])
+        self.assertEqual(list(self.directory.iterdir()), [])
+        self.assertEqual(self.normalizer._retained_bytes, 0)
+        self.assertEqual(self.normalizer._pending_artifact_bytes, 0)
+
     async def test_malformed_and_oversize_base64_become_small_markers(self):
         await self.submit(
             "malformed-artifact",
