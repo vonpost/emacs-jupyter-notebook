@@ -72,6 +72,61 @@ to the opaque start session in `ejn_session_id`.  Emacs validates both before
 launching or retrieving anything.  Legacy `:jupyter-command` values are
 rejected rather than interpreted.
 
+### Optional local helper transport
+
+The local Python helper is experimental and opt-in.  The default remains
+`legacy`, which uses the existing `emacs-jupyter` adapter.  During this
+migration, keep `emacs-jupyter` pinned to the known-working revision
+`3b9caed3e4cc5f4bc0348eb65d17098de76904e4`; upstream revision
+`05ea84067f784fb7cd1f829d7a0fadcad20466aa` rejects EJN's `:connect-p`
+constructor argument.  To select the helper, set the backend and its
+protocol-mode command before loading the package:
+
+```elisp
+(setq emacs-jupyter-notebook-backend 'helper)
+(setq emacs-jupyter-notebook-helper-command
+      '("ejn-helper" "--protocol"))
+```
+
+The helper is local only; it does not install anything on a remote host or
+change the remote kernel.  Its executable is resolved independently of
+`default-directory`, first through `exec-path` and then from the package
+checkout/build layout.  A missing executable is reported before a remote
+launch.  The bounded hello handshake rejects missing Python dependencies,
+malformed responses, and protocol-version mismatches without attempting a
+package installation or download.
+
+From a checkout with the repository's pinned Nix flake, build the closure and
+check the packaged executable explicitly:
+
+```sh
+nix build .#ejn-helper
+./result/bin/ejn-helper --version
+```
+
+The default bare command finds `result/bin/ejn-helper` beside the package
+source.  An absolute checkout path is also valid and remains independent of a
+source buffer's `default-directory`:
+
+```elisp
+(setq emacs-jupyter-notebook-helper-command
+      '("/absolute/path/to/emacs-jupyter-notebook/result/bin/ejn-helper"
+        "--protocol"))
+```
+
+An absolute Nix store closure path is valid as well:
+
+```elisp
+(setq emacs-jupyter-notebook-helper-command
+      '("/nix/store/...-ejn-helper-0.1.0/bin/ejn-helper" "--protocol"))
+```
+
+The flake supports only `x86_64-linux` and `aarch64-darwin`.  For a local
+development checkout, `nix develop` supplies the declared dependencies, but
+ordinary EJN startup executes only the configured helper command.  It never
+performs an implicit `nix build`, `nix run`, `pip install`, network download,
+remote provisioning, or legacy-session compatibility shim.
+
 ### ProxyJump / ssh config
 
 `ssh` and `scp` read your `~/.ssh/config`, and this package never bypasses it (no `-F none`, no `ProxyCommand` override). ProxyJump therefore works transparently: set the profile `:host` to the **`Host` alias** from your ssh config (not a raw IP) so its `ProxyJump`/`HostName`/`User`/`IdentityFile`/`Port` all apply, and leave `:port`/`:user`/`:identity-file` **unset** in the profile (those emit `-p`/`user@`/`-i`, which override the config). Connection multiplexing (on by default, `emacs-jupyter-notebook-ssh-control-master`) reuses one connection across the whole jump chain, so a ProxyJump setup is where it pays off most.

@@ -45,7 +45,7 @@
   priority-queue priority-tail priority-queue-bytes drain-timer pending-failure
   ping-id ping-timer late-responses last-event-seq control-sent control-acked control-timer
   wire-sequence protocol-version stderr-pending stderr-pending-bytes stderr-drain-timer
-  stderr-overflowed stderr-overflow-notice)
+  stderr-overflowed stderr-overflow-notice startup-exit-timer startup-diagnostic)
 
 (defvar-local emacs-jupyter-notebook--helper-session nil
   "The local helper session currently owned by this source buffer.")
@@ -64,6 +64,24 @@ It receives the helper SESSION and already-redacted bounded text.")
     "protocol-error" "frame-too-large" "credit-exhausted"
     "transport-error" "busy")
   "Closed set of helper v1 structured error codes.")
+
+(defconst emacs-jupyter-notebook-helper--missing-runtime-marker
+  "ejn-helper: missing-runtime-dependency"
+  "The sole stderr startup code admitted into a user-facing failure reason.")
+
+(defconst emacs-jupyter-notebook-helper--missing-runtime-reason
+  (concat "EJN helper runtime dependencies are unavailable; run "
+          "nix build .#ejn-helper or set emacs-jupyter-notebook-helper-command.")
+  "Fixed actionable failure for the recognized missing-runtime marker.")
+
+(defconst emacs-jupyter-notebook-helper--protocol-mismatch-reason
+  (concat "EJN helper protocol version mismatch; rebuild the matching helper "
+          "with nix build .#ejn-helper or update "
+          "emacs-jupyter-notebook-helper-command.")
+  "Fixed failure for a strictly recognized startup protocol mismatch.")
+
+(defconst emacs-jupyter-notebook-helper--missing-runtime-exit-status 78
+  "Reserved local helper exit status for a missing runtime dependency.")
 
 (defun emacs-jupyter-notebook-helper--bounded-positive-number
     (value fallback &optional allow-long-timeout)
@@ -143,7 +161,9 @@ empty or the executable cannot be found."
       (error "Helper command must be a non-empty argv list of strings"))
     (let ((program (emacs-jupyter-notebook-helper--resolve-program (car argv))))
       (unless program
-        (error "Cannot resolve helper executable: %s" (car argv)))
+        (error (concat "Cannot resolve EJN helper executable.  Run "
+                       "nix build .#ejn-helper or set "
+                       "emacs-jupyter-notebook-helper-command.")))
       (cons program (cdr argv)))))
 
 (defun emacs-jupyter-notebook-helper--owned-p (session process)
@@ -229,7 +249,13 @@ whose quoting or whitespace syntax was not anticipated."
     ;; its long-lived EJN log entry.
     ;; Values can straddle pipe chunks.  Complete lines are held in one bounded
     ;; slot, then redacted before private-buffer or log retention.
-    (setq text (emacs-jupyter-notebook-helper--redact-diagnostic-text text))
+    (setq text
+          (if (string-equal (string-trim text)
+                            emacs-jupyter-notebook-helper--missing-runtime-marker)
+              ;; This exact fixed code carries no caller or exception data and
+              ;; is the only startup stderr value interpreted by the supervisor.
+              emacs-jupyter-notebook-helper--missing-runtime-marker
+            (emacs-jupyter-notebook-helper--redact-diagnostic-text text)))
     (if (> (string-bytes text) emacs-jupyter-notebook-helper--stderr-log-max-bytes)
         (let ((suffix " [truncated]"))
           (concat (emacs-jupyter-notebook-helper--truncate-utf8-bytes
@@ -279,6 +305,15 @@ whose quoting or whitespace syntax was not anticipated."
         (funcall emacs-jupyter-notebook-helper-stderr-log-function session text)
       (error nil))))
 
+(defun emacs-jupyter-notebook-helper--record-startup-diagnostic (session text)
+  "Record only a fixed recognized startup diagnostic from already-redacted TEXT."
+  (when (and (eq (emacs-jupyter-notebook-helper-session-state session) 'starting)
+             (stringp text)
+             (string-equal (string-trim text)
+                           emacs-jupyter-notebook-helper--missing-runtime-marker))
+    (setf (emacs-jupyter-notebook-helper-session-startup-diagnostic session)
+          'missing-runtime-dependency)))
+
 (defun emacs-jupyter-notebook-helper--stderr-drain (session &optional final)
   "Drain complete stderr lines for SESSION outside its process filter.
 When FINAL is non-nil, flush a trailing unterminated diagnostic during local
@@ -306,6 +341,7 @@ logging error can never retain a secret-bearing process chunk."
               (if rest (string-bytes rest) 0))
         (when (and emit (> (length emit) 0))
           (let ((text (emacs-jupyter-notebook-helper--redact-stderr emit)))
+            (emacs-jupyter-notebook-helper--record-startup-diagnostic session text)
             (emacs-jupyter-notebook-helper--append-stderr session text)
             (emacs-jupyter-notebook-helper--stderr-log session text)))))))
 
@@ -622,6 +658,23 @@ local deadline or transport failure; ERROR is then a short local reason."
          (stringp (gethash "helper_version" result))
          (vectorp (gethash "capabilities" result)))))
 
+(defun emacs-jupyter-notebook-helper--hello-failure-reason (session object)
+  "Return a fixed reason for one strictly recognized invalid hello OBJECT."
+  (if (and (hash-table-p object)
+           (equal (gethash "kind" object) "response")
+           (equal (gethash "id" object)
+                  (emacs-jupyter-notebook-helper-session-hello-id session))
+           (or (and (integerp (gethash "v" object))
+                    (/= (gethash "v" object) ejn-helper-protocol-version))
+               (let ((result (gethash "result" object)))
+                 (and (eq (gethash "ok" object) t)
+                      (hash-table-p result)
+                      (integerp (gethash "version" result))
+                      (/= (gethash "version" result)
+                          ejn-helper-protocol-version)))))
+      emacs-jupyter-notebook-helper--protocol-mismatch-reason
+    "invalid helper hello response"))
+
 (defun emacs-jupyter-notebook-helper--hello-deadline (session)
   (let ((process (emacs-jupyter-notebook-helper-session-process session)))
     (when (and (processp process)
@@ -655,7 +708,8 @@ local deadline or transport failure; ERROR is then a short local reason."
         (emacs-jupyter-notebook-helper--schedule-ping session)
         (emacs-jupyter-notebook-helper--run-callback
          (emacs-jupyter-notebook-helper-session-ready-callback session) session))
-    (emacs-jupyter-notebook-helper--fail session "invalid helper hello response")))
+    (emacs-jupyter-notebook-helper--fail
+     session (emacs-jupyter-notebook-helper--hello-failure-reason session object))))
 
 (defun emacs-jupyter-notebook-helper--priority-event-p (object)
   "Return non-nil when event OBJECT bypasses ordinary output credit."
@@ -708,7 +762,8 @@ local deadline or transport failure; ERROR is then a short local reason."
     (emacs-jupyter-notebook-helper--queue-failure session "helper envelope is not an object"))
    ((and (eq (emacs-jupyter-notebook-helper-session-state session) 'starting)
          (not (emacs-jupyter-notebook-helper--hello-result-p session object)))
-    (emacs-jupyter-notebook-helper--queue-failure session "invalid helper hello response"))
+    (emacs-jupyter-notebook-helper--queue-failure
+     session (emacs-jupyter-notebook-helper--hello-failure-reason session object)))
    ((and (eq (emacs-jupyter-notebook-helper-session-state session) 'ready)
          (not (emacs-jupyter-notebook-helper--post-hello-envelope-p session object)))
     (emacs-jupyter-notebook-helper--queue-failure session "invalid helper post-hello envelope"))
@@ -956,12 +1011,43 @@ has completed; replenishing credit never precedes that decision.
         (unless (emacs-jupyter-notebook-helper-session-disposed session)
           (setf (emacs-jupyter-notebook-helper-session-ping-id session) id))))))
 
+(defun emacs-jupyter-notebook-helper--startup-exit-reason (session event)
+  "Return a fixed startup diagnostic or a generic PROCESS EVENT reason."
+  (if (eq (emacs-jupyter-notebook-helper-session-startup-diagnostic session)
+          'missing-runtime-dependency)
+      emacs-jupyter-notebook-helper--missing-runtime-reason
+    (format "helper exited: %s" event)))
+
+(defun emacs-jupyter-notebook-helper--settle-startup-exit (session process event)
+  "Asynchronously drain startup stderr, then fail only the owned SESSION."
+  (setf (emacs-jupyter-notebook-helper-session-startup-exit-timer session) nil)
+  (when (and (emacs-jupyter-notebook-helper--owned-p session process)
+             (eq (emacs-jupyter-notebook-helper-session-state session) 'starting))
+    ;; This is a zero-delay local settlement, not a blocking pipe read.  The
+    ;; reserved process exit status carries the dependency diagnosis; stderr
+    ;; is drained only for its existing bounded private log path.
+    (emacs-jupyter-notebook-helper--stderr-drain session t)
+    (emacs-jupyter-notebook-helper--fail
+     session (emacs-jupyter-notebook-helper--startup-exit-reason session event))))
+
 (defun emacs-jupyter-notebook-helper--sentinel (process event)
   "Observe a helper exit only while PROCESS is still the session's process."
   (let ((session (process-get process 'emacs-jupyter-notebook-helper-session)))
     (when (and session (emacs-jupyter-notebook-helper--owned-p session process))
-      (emacs-jupyter-notebook-helper--fail
-       session (format "helper exited: %s" (string-trim event))))))
+      (if (eq (emacs-jupyter-notebook-helper-session-state session) 'starting)
+          (progn
+            (when (= (process-exit-status process)
+                     emacs-jupyter-notebook-helper--missing-runtime-exit-status)
+              (setf (emacs-jupyter-notebook-helper-session-startup-diagnostic session)
+                    'missing-runtime-dependency))
+            (unless (timerp
+                     (emacs-jupyter-notebook-helper-session-startup-exit-timer session))
+              (setf (emacs-jupyter-notebook-helper-session-startup-exit-timer session)
+                    (run-at-time
+                     0 nil #'emacs-jupyter-notebook-helper--settle-startup-exit
+                     session process (string-trim event)))))
+        (emacs-jupyter-notebook-helper--fail
+         session (format "helper exited: %s" (string-trim event)))))))
 
 (defun emacs-jupyter-notebook-helper-dispose (session &optional reason)
   "Release SESSION's local process, timers, pipe, and stderr buffer.
@@ -975,6 +1061,8 @@ This never sends a protocol operation and never affects any durable state."
           (drain-timer (emacs-jupyter-notebook-helper-session-drain-timer session))
           (stderr-drain-timer
            (emacs-jupyter-notebook-helper-session-stderr-drain-timer session))
+          (startup-exit-timer
+           (emacs-jupyter-notebook-helper-session-startup-exit-timer session))
           (ping-timer (emacs-jupyter-notebook-helper-session-ping-timer session))
           (control-timer (emacs-jupyter-notebook-helper-session-control-timer session))
           (process (emacs-jupyter-notebook-helper-session-process session))
@@ -992,6 +1080,7 @@ This never sends a protocol operation and never affects any durable state."
             (emacs-jupyter-notebook-helper-session-decode-timer session) nil
             (emacs-jupyter-notebook-helper-session-drain-timer session) nil
             (emacs-jupyter-notebook-helper-session-stderr-drain-timer session) nil
+            (emacs-jupyter-notebook-helper-session-startup-exit-timer session) nil
             (emacs-jupyter-notebook-helper-session-ping-timer session) nil
             (emacs-jupyter-notebook-helper-session-control-timer session) nil
             (emacs-jupyter-notebook-helper-session-ping-id session) nil
@@ -1008,6 +1097,7 @@ This never sends a protocol operation and never affects any durable state."
       (emacs-jupyter-notebook-helper--cancel-timer decode-timer)
       (emacs-jupyter-notebook-helper--cancel-timer drain-timer)
       (emacs-jupyter-notebook-helper--cancel-timer stderr-drain-timer)
+      (emacs-jupyter-notebook-helper--cancel-timer startup-exit-timer)
       (emacs-jupyter-notebook-helper--cancel-timer ping-timer)
       (emacs-jupyter-notebook-helper--cancel-timer control-timer)
       (emacs-jupyter-notebook-helper--fail-pending-requests session reason)
@@ -1029,7 +1119,8 @@ This never sends a protocol operation and never affects any durable state."
             (emacs-jupyter-notebook-helper-session-stderr-pending session) nil
             (emacs-jupyter-notebook-helper-session-stderr-pending-bytes session) 0
             (emacs-jupyter-notebook-helper-session-stderr-overflowed session) nil
-            (emacs-jupyter-notebook-helper-session-stderr-overflow-notice session) nil)
+            (emacs-jupyter-notebook-helper-session-stderr-overflow-notice session) nil
+            (emacs-jupyter-notebook-helper-session-startup-diagnostic session) nil)
       (when (processp process)
         (process-put process 'emacs-jupyter-notebook-helper-session nil)
         (when (process-live-p process) (delete-process process)))

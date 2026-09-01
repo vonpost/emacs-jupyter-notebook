@@ -13882,6 +13882,186 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
         (when emacs-jupyter-notebook-mode
           (emacs-jupyter-notebook-mode -1))))))
 
+;;; EI11 -- opt-in helper dogfood and fail-fast local setup
+
+(defun ejn-ei11--write-executable (file contents)
+  "Write executable FILE containing CONTENTS for an isolated EI11 fixture."
+  (with-temp-file file
+    (insert contents))
+  (set-file-modes file #o700)
+  file)
+
+(ert-deftest ejn-ei11-helper-remains-opt-in-with-protocol-mode-default ()
+  "The helper is selectable, but the stable default remains legacy."
+  (should (eq emacs-jupyter-notebook-backend 'legacy))
+  (should (equal emacs-jupyter-notebook-helper-command
+                 '("ejn-helper" "--protocol")))
+  (should (assq 'helper emacs-jupyter-notebook-backend-implementations)))
+
+(ert-deftest ejn-ei11-helper-command-resolves-from-checkout-layout ()
+  "A checkout-local helper is found without depending on `default-directory'."
+  (let* ((root (make-temp-file "ejn-ei11-checkout-" t))
+         (bin (expand-file-name "bin" root))
+         (program (expand-file-name "ejn-helper" bin)))
+    (unwind-protect
+        (progn
+          (make-directory bin t)
+          (ejn-ei11--write-executable program "#!/bin/sh\nexit 0\n")
+          (let ((emacs-jupyter-notebook-helper--module-directory root)
+                (default-directory "/")
+                (exec-path nil))
+            (should
+             (equal
+              (emacs-jupyter-notebook-helper-resolve-argv
+               '("ejn-helper" "--protocol"))
+              (list (file-truename program) "--protocol")))))
+      (delete-directory root t))))
+
+(ert-deftest ejn-ei11-helper-command-resolves-through-straight-source-symlink ()
+  "A straight-style build symlink resolves beside its physical source tree."
+  (let* ((repo (make-temp-file "ejn-ei11-repo-" t))
+         (build (make-temp-file "ejn-ei11-build-" t))
+         (repo-module (expand-file-name "emacs-jupyter-notebook-helper.el" repo))
+         (build-module (expand-file-name "emacs-jupyter-notebook-helper.el" build))
+         (program (expand-file-name "bin/ejn-helper" repo)))
+    (unwind-protect
+        (progn
+          (with-temp-file repo-module (insert ";; source\n"))
+          (make-directory (file-name-directory program) t)
+          (ejn-ei11--write-executable program "#!/bin/sh\nexit 0\n")
+          (make-symbolic-link repo-module build-module)
+          (let ((emacs-jupyter-notebook-helper--module-directory
+                 (file-name-directory (file-truename build-module)))
+                (exec-path nil))
+            (should
+             (equal
+              (emacs-jupyter-notebook-helper-resolve-argv
+               '("ejn-helper" "--protocol"))
+              (list (file-truename program) "--protocol")))))
+      (delete-directory repo t)
+      (delete-directory build t))))
+
+(ert-deftest ejn-ei11-helper-command-resolves-from-nix-closure-layout ()
+  "A Nix result layout is resolved independently of the current directory."
+  (let* ((closure (make-temp-file "ejn-ei11-nix-" t))
+         (module-dir (expand-file-name "lib" closure))
+         (program (expand-file-name "result/bin/ejn-helper" closure)))
+    (unwind-protect
+        (progn
+          (make-directory module-dir t)
+          (make-directory (file-name-directory program) t)
+          (ejn-ei11--write-executable program "#!/bin/sh\nexit 0\n")
+          (let ((emacs-jupyter-notebook-helper--module-directory module-dir)
+                (default-directory "/")
+                (exec-path nil))
+            (should
+             (equal
+              (emacs-jupyter-notebook-helper-resolve-argv
+               '("ejn-helper" "--protocol"))
+              (list (file-truename program) "--protocol")))))
+      (delete-directory closure t))))
+
+(ert-deftest ejn-ei11-helper-command-rejects-missing-or-malformed-configuration ()
+  "Missing executables and malformed argv fail before process creation."
+  (let ((exec-path nil)
+        (emacs-jupyter-notebook-helper--module-directory "/tmp/ejn-no-helper"))
+    (let ((error-data
+           (should-error
+            (emacs-jupyter-notebook-helper-resolve-argv
+             '("does-not-exist" "--protocol"))
+            :type 'error)))
+      (should (string-match-p "nix build.*ejn-helper"
+                              (error-message-string error-data)))
+      (should (string-match-p "emacs-jupyter-notebook-helper-command"
+                              (error-message-string error-data))))
+    (should-error
+     (emacs-jupyter-notebook-helper-resolve-argv '("ejn-helper" 42))
+     :type 'error)
+    (should-error
+     (emacs-jupyter-notebook-helper-resolve-argv nil)
+     :type 'error)))
+
+(ert-deftest ejn-ei11-helper-missing-dependency-fails-with-bounded-diagnostic ()
+  "An executable that cannot import its runtime fails locally, without SSH."
+  (let* ((script (make-temp-file "ejn-ei11-missing-dependency-"))
+         (owner (generate-new-buffer " *ejn-ei11-owner*"))
+         (failure nil)
+         (stderr nil)
+         (session nil)
+         (emacs-jupyter-notebook-helper-command
+          (list script "--protocol"))
+         (emacs-jupyter-notebook-helper-stderr-log-function
+          (lambda (_session text) (setq stderr text))))
+    (unwind-protect
+        (progn
+          (ejn-ei11--write-executable
+           script
+           "#!/bin/sh\nprintf '%s\\n' 'ejn-helper: missing-runtime-dependency' >&2\nexit 78\n")
+          (setq session
+                (emacs-jupyter-notebook-helper-start
+                 :buffer owner
+                 :failure-callback (lambda (_session reason) (setq failure reason))))
+          (let ((deadline (+ (float-time) 2)))
+            (while (and (not (and failure stderr)) (< (float-time) deadline))
+              (accept-process-output nil 0.02)))
+          (should failure)
+          (should (string-match-p "runtime dependenc" failure))
+          (should (string-match-p "nix build.*ejn-helper" failure))
+          (should (string-match-p "missing-runtime-dependency" stderr))
+          (should (emacs-jupyter-notebook-helper-session-disposed session)))
+      (when (and session
+                 (not (emacs-jupyter-notebook-helper-session-disposed session)))
+        (emacs-jupyter-notebook-helper-dispose session "EI11 test cleanup"))
+      (when (buffer-live-p owner) (kill-buffer owner))
+      (when (file-exists-p script) (delete-file script)))))
+
+(ert-deftest ejn-ei11-helper-rejects-protocol-version-mismatch ()
+  "A hello response for another protocol version is rejected before ready."
+  (let* ((session (emacs-jupyter-notebook-helper--make-session
+                   :hello-id "hello" :state 'starting))
+         (result (make-hash-table :test 'equal))
+         (object (make-hash-table :test 'equal))
+         (failure nil))
+    (puthash "v" 99 object)
+    (puthash "kind" "response" object)
+    (puthash "id" "hello" object)
+    (puthash "ok" t object)
+    (puthash "version" 99 result)
+    (puthash "helper_version" "future" result)
+    (puthash "capabilities" [] result)
+    (puthash "result" result object)
+    (setf (emacs-jupyter-notebook-helper-session-failure-callback session)
+          (lambda (_session reason) (setq failure reason)))
+    (should-not (emacs-jupyter-notebook-helper--hello-result-p session object))
+    (emacs-jupyter-notebook-helper--handle-startup-object session object)
+    (should (string-match-p "protocol version mismatch" failure))
+    (should (string-match-p "rebuild.*ejn-helper" failure))
+    (should (emacs-jupyter-notebook-helper-session-disposed session))))
+
+(ert-deftest ejn-ei11-readme-documents-helper-commands-and-no-install-policy ()
+  "README names the opt-in selector, protocol command, and supported closure."
+  (let* ((test-file (locate-library "emacs-jupyter-notebook-tests"))
+         (root (and test-file
+                    (file-name-directory
+                     (directory-file-name (file-name-directory
+                                           (file-truename test-file))))))
+         (readme (with-temp-buffer
+                   (insert-file-contents
+                    (expand-file-name "README.md" (or root default-directory)))
+                  (buffer-string))))
+    (dolist (needle '("emacs-jupyter-notebook-backend 'helper"
+                      "emacs-jupyter-notebook-helper-command"
+                      "--protocol"
+                      "nix build .#ejn-helper"
+                      "./result/bin/ejn-helper --version"
+                      "3b9caed3e4cc5f4bc0348eb65d17098de76904e4"
+                      "05ea84067f784fb7cd1f829d7a0fadcad20466aa"
+                      "legacy"
+                      "x86_64-linux"
+                      "aarch64-darwin"
+                      "pip install"))
+      (should (string-match-p (regexp-quote needle) readme)))))
+
 (provide 'emacs-jupyter-notebook-tests)
 
 ;;; emacs-jupyter-notebook-tests.el ends here

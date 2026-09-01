@@ -65,6 +65,8 @@
   (should-not (emacs-jupyter-notebook-helper-session-stderr-buffer session))
   (should-not (emacs-jupyter-notebook-helper-session-decoder session))
   (should-not (emacs-jupyter-notebook-helper-session-hello-timer session))
+  (should-not (emacs-jupyter-notebook-helper-session-startup-exit-timer session))
+  (should-not (emacs-jupyter-notebook-helper-session-startup-diagnostic session))
   (should-not (emacs-jupyter-notebook-helper-session-partial-timer session))
   (should-not (emacs-jupyter-notebook-helper-session-decode-timer session))
   (should-not (emacs-jupyter-notebook-helper-session-drain-timer session))
@@ -175,9 +177,94 @@
       (ejn-et2--with-session (session "normal")
         (should (ejn-et2--await (lambda () failure) 3))
         (should-not ready)
-        (should (string-match-p "hello" failure))
+        (should (equal failure
+                       emacs-jupyter-notebook-helper--protocol-mismatch-reason))
         (should (emacs-jupyter-notebook-helper-session-disposed session))
         (ejn-et2--assert-no-local-leaks)))))
+
+(ert-deftest ejn-et2-startup-version-mismatches-have-one-fixed-reason ()
+  "Outer and negotiated hello version mismatches reveal no helper payload."
+  (dolist (versions '((2 1) (1 2)))
+    (ejn-et2--with-session (session "silent")
+      (let ((result (ejn-et3--object
+                     "version" (cadr versions)
+                     "helper_version" "untrusted-helper-detail"
+                     "capabilities" [])))
+        (ejn-et3--feed
+         session
+         (ejn-et3--object
+          "v" (car versions) "kind" "response"
+          "id" (emacs-jupyter-notebook-helper-session-hello-id session)
+          "ok" t "result" result))
+        (should (ejn-et2--await (lambda () failure) 1))
+        (should-not ready)
+        (should (equal failure
+                       emacs-jupyter-notebook-helper--protocol-mismatch-reason))
+        (should-not (string-match-p "untrusted" failure))
+        (should (emacs-jupyter-notebook-helper-session-disposed session))
+        (ejn-et2--assert-no-local-leaks)))))
+
+(ert-deftest ejn-et2-startup-dependency-marker-settles-asynchronously-and-leaks-nothing ()
+  "Only the exact fixed dependency marker becomes an actionable failure."
+  (let ((owner (generate-new-buffer " *ejn-et2-dependency-owner*"))
+        (emacs-jupyter-notebook-helper-hello-timeout 1)
+        (emacs-jupyter-notebook-helper-command
+         '("python3" "-c"
+           "import sys; sys.stderr.write('ejn-helper: missing-runtime-dependency\\n'); sys.stderr.flush(); raise SystemExit(78)"))
+        ready failure session)
+    (unwind-protect
+        (progn
+          (setq session
+                (emacs-jupyter-notebook-helper-start
+                 :buffer owner
+                 :ready-callback (lambda (&rest _) (setq ready t))
+                 :failure-callback (lambda (_session reason) (setq failure reason))))
+          (should (ejn-et2--await (lambda () failure) 1))
+          (should-not ready)
+          (should (equal failure
+                         emacs-jupyter-notebook-helper--missing-runtime-reason))
+          (should (emacs-jupyter-notebook-helper-session-disposed session))
+          (ejn-et2--assert-disposed-slots-cleared session)
+          (ejn-et2--assert-no-local-leaks))
+      (when (buffer-live-p owner) (kill-buffer owner))
+      (ejn-et2--clean))))
+
+(ert-deftest ejn-et2-startup-arbitrary-stderr-never-enters-failure-reason ()
+  "Generic startup failure ignores stderr text, including sensitive-looking text."
+  (let ((owner (generate-new-buffer " *ejn-et2-stderr-owner*"))
+        (emacs-jupyter-notebook-helper-hello-timeout 1)
+        (emacs-jupyter-notebook-helper-command
+         '("python3" "-c"
+           "import sys; sys.stderr.write('Traceback private detail token=topsecret\\n'); sys.stderr.flush(); raise SystemExit(2)"))
+        failure session)
+    (unwind-protect
+        (progn
+          (setq session
+                (emacs-jupyter-notebook-helper-start
+                 :buffer owner
+                 :failure-callback (lambda (_session reason) (setq failure reason))))
+          (should (ejn-et2--await (lambda () failure) 1))
+          (should (string-prefix-p "helper exited: " failure))
+          (should-not (string-match-p "Traceback\\|private\\|topsecret" failure))
+          (should (emacs-jupyter-notebook-helper-session-disposed session))
+          (ejn-et2--assert-disposed-slots-cleared session)
+          (ejn-et2--assert-no-local-leaks))
+      (when (buffer-live-p owner) (kill-buffer owner))
+      (ejn-et2--clean))))
+
+(ert-deftest ejn-et2-unresolvable-helper-command-has-a-fixed-actionable-error ()
+  "Resolution does not execute a command or expose arbitrary configured text."
+  (let ((emacs-jupyter-notebook-helper-command
+         '("definitely-not-an-ejn-helper-9c86a5" "--protocol")))
+    (condition-case err
+        (progn
+          (emacs-jupyter-notebook-helper-resolve-argv)
+          (ert-fail "expected helper resolution failure"))
+      (error
+       (should (equal (error-message-string err)
+                      (concat "Cannot resolve EJN helper executable.  Run "
+                              "nix build .#ejn-helper or set "
+                              "emacs-jupyter-notebook-helper-command.")))))))
 
 (ert-deftest ejn-et2-th1-silence-hits-the-hello-deadline ()
   (let ((ejn-et2--hello-timeout 0.12))

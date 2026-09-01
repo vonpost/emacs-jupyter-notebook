@@ -124,13 +124,17 @@ non-empty `:python-command' string list."
   :type '(repeat string)
   :group 'emacs-jupyter-notebook)
 
-(defcustom emacs-jupyter-notebook-helper-command '("ejn-helper")
+(defcustom emacs-jupyter-notebook-helper-command '("ejn-helper" "--protocol")
   "Local helper command argv.
 The first element names the executable and remaining elements are passed
-unchanged.  A bare executable name is resolved through `exec-path' and then
+unchanged.  The default invokes the helper's protocol mode; do not remove
+`--protocol' unless the replacement executable enters protocol mode by
+default.  A bare executable name is resolved through `exec-path' and then
 beside this package's source/build tree, so loading the package through a
 checkout or Nix result symlink does not make the command depend on the
-current default directory."
+current default directory.  Resolution never installs packages or downloads
+anything.  The bounded startup handshake rejects a helper with missing
+runtime dependencies or a protocol-version mismatch."
   :type '(repeat string)
   :group 'emacs-jupyter-notebook)
 

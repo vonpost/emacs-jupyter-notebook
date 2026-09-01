@@ -132,6 +132,24 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("private", stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
 
+    def test_protocol_missing_runtime_dependency_is_fixed_and_traceback_free(self):
+        stderr, stdout = io.StringIO(), io.StringIO()
+        with (
+            mock.patch(
+                "ejn_helper.__main__._protocol_runner",
+                side_effect=ModuleNotFoundError("private dependency detail"),
+            ),
+            mock.patch.object(sys, "stderr", stderr),
+            mock.patch.object(sys, "stdout", stdout),
+        ):
+            self.assertEqual(main(["--protocol"]), 78)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            stderr.getvalue(), "ejn-helper: missing-runtime-dependency\n"
+        )
+        self.assertNotIn("private", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
     def test_protocol_sigterm_silent_peer_exits_without_protocol_garbage(self):
         environment = os.environ.copy()
         environment["PYTHONPATH"] = str(HELPER_ROOT)
