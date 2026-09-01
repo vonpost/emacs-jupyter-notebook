@@ -1435,7 +1435,7 @@ be manager-reviewed for durable-kernel rules.
     and pending external-viewer ownership.  Its final focused EI9/EI4D run
     passed 34/34 with no remaining P0/P1 finding.
 
-- [~] owner=luna-ei10 claimed=2026-09-01 **EI10 Add static no-hang architecture assertions.**
+- [x] owner=luna-ei10 claimed=2026-09-01 landed=b0ad49a **EI10 Add static no-hang architecture assertions.**
   - Depends: EI9.
   - Files: `tests/emacs-jupyter-notebook-helper-backend-tests.el`,
     `helper/tests/test_architecture.py`.
@@ -1451,6 +1451,13 @@ be manager-reviewed for durable-kernel rules.
   - Tests: mutation fixtures prove each assertion detects its forbidden form
     without false-positive on comments/docstrings.
   - Narrow run: ERT selector `^ejn-ei10-` and Python architecture test.
+  - Landed verification: 9/9 focused EI10 ERTs and 14/14 Python architecture
+    tests pass.  The architecture suite rejects direct, aliased, async, PTY,
+    `os` spawn/exec, multiprocessing, and process-pool launches while admitting
+    only the fixed thumbnail worker.  Both canonical source runs passed
+    801/801 ERTs and 217/217 host helper tests (three expected host skips), and
+    production byte-compilation added no warnings beyond the two pre-existing
+    optional Evil variable references.
 
 - [ ] **EI11 Make helper selectable for local dogfood, still default legacy.**
   - Depends: EI10.
