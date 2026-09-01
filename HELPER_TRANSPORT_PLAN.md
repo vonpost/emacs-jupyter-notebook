@@ -1382,10 +1382,13 @@ be manager-reviewed for durable-kernel rules.
     found no P0/P1 defect.  Real relay and remote-outage smokes remain under the
     acceptance gates.
 
-- [~] owner=terra-ei8 claimed=2026-09-01 **EI8 Make status/log UI expose helper and request truth.**
+- [x] owner=terra-ei8 claimed=2026-09-01 landed=500da62 **EI8 Make status/log UI expose helper and request truth.**
   - Depends: EI7.
-  - Files: `emacs-jupyter-notebook.el`,
-    `tests/emacs-jupyter-notebook-helper-backend-tests.el`.
+  - Files: `emacs-jupyter-notebook-backend.el`,
+    `emacs-jupyter-notebook-helper-backend.el`,
+    `emacs-jupyter-notebook-helper.el`, `emacs-jupyter-notebook.el`,
+    `tests/emacs-jupyter-notebook-helper-backend-tests.el`,
+    `tests/emacs-jupyter-notebook-helper-process-tests.el`.
   - Deliverable: actual interactive status reports helper PID/state/protocol,
     active request state/age, queue length, kernel status, transport phase,
     retry countdown, last bounded error, and working cancel/restart-helper
@@ -1393,12 +1396,25 @@ be manager-reviewed for durable-kernel rules.
   - Tests: render each state, invoke each advertised action, oversized stderr,
     password/base64 canaries absent, stale session action cannot affect current.
   - Narrow run: ERT selector `^ejn-ei8-` plus IR5 status tests.
+  - Landed verification: 761 source-based ERTs and 203 host helper tests pass
+    (three expected host skips), including 15 focused EI8 status/log tests;
+    production Elisp byte-compiles with only the two pre-existing optional Evil
+    variable warnings, and generated artifacts were removed before the
+    canonical source rerun.  Independent review found and drove fixes for
+    process-filter redaction work, final stderr loss, retained status objects,
+    stale restart/cancel identities, active-reconnect restart wedging,
+    unavailable-helper actions, and redaction syntax bypasses; its final delta
+    audit found no P0/P1 defect.
 
 - [ ] **EI9 Add stale artifact cleanup and local lifecycle audit.**
   - Depends: EI8.
-  - Files: `emacs-jupyter-notebook-result.el`,
-    `emacs-jupyter-notebook-helper.el`, `emacs-jupyter-notebook.el`,
-    `tests/emacs-jupyter-notebook-helper-backend-tests.el`.
+  - Files: `emacs-jupyter-notebook-artifacts.el`,
+    `emacs-jupyter-notebook-result.el`,
+    `emacs-jupyter-notebook-helper.el`,
+    `emacs-jupyter-notebook-helper-backend.el`,
+    `emacs-jupyter-notebook.el`,
+    `tests/emacs-jupyter-notebook-helper-backend-tests.el`,
+    `tests/emacs-jupyter-notebook-tests.el`.
   - Deliverable: buffer/panel cleanup removes its artifact tree locally;
     kill-Emacs cleanup covers live trees; startup prunes only EJN-owned stale
     directories older than a bounded age with owner/mode/name validation.
