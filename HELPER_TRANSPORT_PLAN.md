@@ -1276,7 +1276,7 @@ be manager-reviewed for durable-kernel rules.
     coverage; a real aarch64-darwin closure smoke remains an acceptance-gate
     requirement because this host cannot execute it.
 
-- [ ] **EI5 Route completion, inspect, is-complete, heartbeat, and stdin.**
+- [~] owner=terra-ei5 claimed=2026-09-01 **EI5 Route completion, inspect, is-complete, heartbeat, and stdin.**
   - Depends: EI4D, HT10, HT11.
   - Files: `emacs-jupyter-notebook-helper-backend.el`,
     `emacs-jupyter-notebook.el`,
