@@ -1484,7 +1484,7 @@ be manager-reviewed for durable-kernel rules.
 
 ### Phase AG - integration and removal gates
 
-- [ ] **AG1 Run direct helper/local-kernel contract suite.**
+- [~] owner=terra-ag1 claimed=2026-09-01 **AG1 Run direct helper/local-kernel contract suite.**
   - Depends: HT13, EI11, TH3.
   - Files: tests only; production fixes require a new narrowly claimed row.
   - Deliverable: one integration runner covers connect, execute stream/result/
