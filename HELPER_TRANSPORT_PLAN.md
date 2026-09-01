@@ -1382,7 +1382,7 @@ be manager-reviewed for durable-kernel rules.
     found no P0/P1 defect.  Real relay and remote-outage smokes remain under the
     acceptance gates.
 
-- [ ] **EI8 Make status/log UI expose helper and request truth.**
+- [~] owner=terra-ei8 claimed=2026-09-01 **EI8 Make status/log UI expose helper and request truth.**
   - Depends: EI7.
   - Files: `emacs-jupyter-notebook.el`,
     `tests/emacs-jupyter-notebook-helper-backend-tests.el`.
