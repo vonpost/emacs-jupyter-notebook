@@ -245,6 +245,72 @@ without a `~' anchor) are returned unchanged."
                         (emacs-jupyter-notebook-ssh--scp-remote-path remote-file))
                 local-file)))
 
+(defun emacs-jupyter-notebook-ssh-scp-to-command (profile local-file remote-file)
+  "Return an SCP argv list copying LOCAL-FILE to REMOTE-FILE on PROFILE.
+The caller chooses a private sibling staging path and publishes it separately,
+so an interrupted upload can never replace the live connection file."
+  (append (list emacs-jupyter-notebook-scp-command "-p")
+          (emacs-jupyter-notebook-ssh--option-args profile t)
+          (emacs-jupyter-notebook-ssh--control-args)
+          (emacs-jupyter-notebook-ssh--keepalive-args)
+          (list local-file
+                (format "%s:%s"
+                        (emacs-jupyter-notebook-ssh-destination profile)
+                        (emacs-jupyter-notebook-ssh--scp-remote-path remote-file)))))
+
+(defun emacs-jupyter-notebook-ssh--restart-staging-paths-valid-p
+    (staging-file connection-file)
+  "Return non-nil for one private restart staging sibling and destination."
+  (and (stringp connection-file) (stringp staging-file)
+       (file-name-absolute-p connection-file)
+       (file-name-absolute-p staging-file)
+       (not (string-match-p "[\0\n\r]" connection-file))
+       (not (string-match-p "[\0\n\r]" staging-file))
+       (<= (string-bytes connection-file)
+           emacs-jupyter-notebook-ssh-kernelspec-max-text-bytes)
+       (<= (string-bytes staging-file)
+           emacs-jupyter-notebook-ssh-kernelspec-max-text-bytes)
+       (equal (file-name-directory staging-file)
+              (file-name-directory connection-file))
+       (string-match-p "\\`kernel-[[:alnum:]_.-]+\\.json\\'"
+                       (file-name-nondirectory connection-file))
+       (string-match-p
+        (concat "\\`" (regexp-quote (file-name-nondirectory connection-file))
+                "\\.restart-[[:alnum:]_.-]+\\'")
+        (file-name-nondirectory staging-file))))
+
+(defun emacs-jupyter-notebook-ssh-build-remote-publish-connection
+    (profile staging-file connection-file)
+  "Return bounded SSH argv that publishes STAGING-FILE as CONNECTION-FILE.
+The destination must be absent after a confirmed direct-kernel shutdown.  Do
+not overwrite it: a stale cancelled restart must never replace a later
+kernel's live connection file."
+  (unless (emacs-jupyter-notebook-ssh--restart-staging-paths-valid-p
+           staging-file connection-file)
+    (error "Restart connection publish paths are invalid"))
+  (emacs-jupyter-notebook-ssh-command
+   profile
+   (format "umask 077; test ! -e %s && test ! -L %s && test ! -L %s && test -f %s && chmod 600 %s && ln %s %s && rm -f -- %s"
+           (emacs-jupyter-notebook-ssh--quote-remote-path connection-file)
+           (emacs-jupyter-notebook-ssh--quote-remote-path connection-file)
+           (emacs-jupyter-notebook-ssh--quote-remote-path staging-file)
+           (emacs-jupyter-notebook-ssh--quote-remote-path staging-file)
+           (emacs-jupyter-notebook-ssh--quote-remote-path staging-file)
+           (emacs-jupyter-notebook-ssh--quote-remote-path staging-file)
+           (emacs-jupyter-notebook-ssh--quote-remote-path connection-file)
+           (emacs-jupyter-notebook-ssh--quote-remote-path staging-file))))
+
+(defun emacs-jupyter-notebook-ssh-build-remote-remove-restart-staging
+    (profile staging-file connection-file)
+  "Return bounded SSH argv unlinking only validated restart STAGING-FILE."
+  (unless (emacs-jupyter-notebook-ssh--restart-staging-paths-valid-p
+           staging-file connection-file)
+    (error "Restart connection cleanup paths are invalid"))
+  (emacs-jupyter-notebook-ssh-command
+   profile
+   (format "rm -f -- %s"
+           (emacs-jupyter-notebook-ssh--quote-remote-path staging-file))))
+
 (defun emacs-jupyter-notebook-ssh--remote-join (directory file)
   "Join remote DIRECTORY and FILE without invoking file handlers."
   (concat (string-remove-suffix "/" directory) "/" file))

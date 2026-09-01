@@ -335,25 +335,20 @@
         (should (= 1 (length errors)))
         (should (string-match-p "timed out" (cadar errors)))))))
 
-(ert-deftest ejn-ei1-restart-followup-waits-for-control-success ()
-  "Kernel-info and setup cannot overtake an asynchronous restart request."
+(ert-deftest ejn-ei1-restart-rejects-a-generic-backend-without-control ()
+  "The core must not issue destructive lifecycle work through a generic backend."
   (require 'emacs-jupyter-notebook)
-  (let (restart-success operations)
+  (let (operations)
     (ejn-ei1-test-with-fake-backend
         ((lambda (_session _request operation _payload success _failure _emit)
            (push operation operations)
-           (if (equal operation '(control . restart))
-               (setq restart-success success)
-             (funcall success 'ok))))
+           (funcall success 'ok)))
       (with-temp-buffer
         (let ((emacs-jupyter-notebook--client
                (emacs-jupyter-notebook-backend-session-create)))
-          (emacs-jupyter-notebook-restart-kernel)
-          (should (equal operations '((control . restart))))
-          (funcall restart-success 'restarted)
-          (ejn-ei1-test--run-timers)
-          (should (equal (nreverse operations)
-                         '((control . restart) (aux . kernel-info)))))))))
+          (should-error (emacs-jupyter-notebook-restart-kernel)
+                        :type 'user-error)
+          (should-not operations))))))
 
 (ert-deftest ejn-ei1-setup-logging-follows-backend-acknowledgement ()
   "Setup reports success or failure only after its execute request terminates."
@@ -389,7 +384,15 @@
                     jupyter-cmd))
          offenders)
     (cl-labels
-        ((direct-call
+        ((direct-elements
+          (tail)
+          (cond
+           ((null tail) nil)
+           ((consp tail)
+            (or (direct-call (car tail))
+                (direct-elements (cdr tail))))
+           (t (direct-call tail))))
+         (direct-call
           (form)
           (cond
            ((atom form) nil)
@@ -403,7 +406,9 @@
                   "\\`\\(?:jupyter-\\|emacs-jupyter-notebook-jupyter-\\)"
                   (symbol-name (car form))))
             (car form))
-           (t (cl-some #'direct-call form)))))
+           ;; Lisp constants may contain dotted pairs.  Recurse over the cons
+           ;; tree instead of requiring every source form to be a proper list.
+           (t (direct-elements form)))))
       (dolist (file (directory-files root t
                                      "\\`emacs-jupyter-notebook.*\\.el\\'"))
         (unless (equal file adapter)

@@ -100,6 +100,9 @@ DISPOSALS receives local-only disposal reasons."
           :remote-connection-file connection
           :remote-pid-sidecar (concat (string-remove-suffix ".json" connection) ".pid")
           :connection-file-tokens (list connection)
+          :remote-ports (list :shell_port 41000 :iopub_port 41001
+                              :stdin_port 41002 :hb_port 41003
+                              :control_port 41004)
           :local-connection-file "/tmp/ejn-durable.json")))
 
 (ert-deftest ejn-ei2-connect-orders-hello-attach-verify-and-defers-success ()
@@ -486,7 +489,11 @@ DISPOSALS receives local-only disposal reasons."
              (context (emacs-jupyter-notebook--async-new-context
                        :phase 'connect :profile '(:profile "p" :host "host")
                        :entry entry :session-id "ei2-core"
-                       :local-ports '(:shell_port 1001) :local-file "/tmp/ei2-core.json"
+                       :remote-ports (plist-get entry :remote-ports)
+                       :local-ports '(:shell_port 1001 :iopub_port 1002
+                                      :stdin_port 1003 :hb_port 1004
+                                      :control_port 1005)
+                       :local-file "/tmp/ei2-core.json"
                        :tunnel-process 'fake-tunnel :origin-buffer buffer))
              (verify nil) (core-failure nil))
         (setq emacs-jupyter-notebook--async-context context)
@@ -561,7 +568,11 @@ DISPOSALS receives local-only disposal reasons."
                      :requests (make-hash-table :test #'eql) :timers nil))
            (context (emacs-jupyter-notebook--async-new-context
                      :phase 'connect :entry entry :session-id "ei2-core"
-                     :local-ports '(:shell_port 1001) :local-file "/tmp/ephemeral.json"
+                     :remote-ports (plist-get entry :remote-ports)
+                     :local-ports '(:shell_port 1001 :iopub_port 1002
+                                    :stdin_port 1003 :hb_port 1004
+                                    :control_port 1005)
+                     :local-file "/tmp/ephemeral.json"
                      :client-unverified session :origin-buffer buffer
                      :error-callback (lambda (&rest _) nil)))
            shutdown remote-cleanup disposed)
@@ -584,7 +595,10 @@ DISPOSALS receives local-only disposal reasons."
                       ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
                        (lambda (&rest _) (setq remote-cleanup t))))
               (emacs-jupyter-notebook--async-connect-finalize
-               context buffer entry '(:shell_port 1001) "/tmp/ephemeral.json" session)
+               context buffer entry
+               '(:shell_port 1001 :iopub_port 1002 :stdin_port 1003
+                 :hb_port 1004 :control_port 1005)
+               "/tmp/ephemeral.json" session)
               (ejn-ei2-test--run-timers)
               (should-not emacs-jupyter-notebook--client)
               (should disposed)
@@ -619,7 +633,11 @@ DISPOSALS receives local-only disposal reasons."
                      :timers nil))
            (context (emacs-jupyter-notebook--async-new-context
                      :phase 'connect :entry entry :session-id "ei2-core"
-                     :local-ports '(:shell_port 1001) :local-file "/tmp/ei2-core.json"
+                     :remote-ports (plist-get entry :remote-ports)
+                     :local-ports '(:shell_port 1001 :iopub_port 1002
+                                    :stdin_port 1003 :hb_port 1004
+                                    :control_port 1005)
+                     :local-file "/tmp/ei2-core.json"
                      :client-unverified session :origin-buffer buffer
                      :error-callback (lambda (&rest _) nil)))
            disposed shutdown remote-cleanup)
@@ -645,7 +663,10 @@ DISPOSALS receives local-only disposal reasons."
                       ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
                        (lambda (&rest _) (setq remote-cleanup t))))
               (emacs-jupyter-notebook--async-connect-finalize
-               context buffer entry '(:shell_port 1001) "/tmp/ei2-core.json" session)
+               context buffer entry
+               '(:shell_port 1001 :iopub_port 1002 :stdin_port 1003
+                 :hb_port 1004 :control_port 1005)
+               "/tmp/ei2-core.json" session)
               (ejn-ei2-test--run-timers)
               (should-not emacs-jupyter-notebook--client)
               (should (emacs-jupyter-notebook-backend-session-closed session))
@@ -666,7 +687,11 @@ DISPOSALS receives local-only disposal reasons."
            (session (emacs-jupyter-notebook-backend-session-create nil buffer))
            (context (emacs-jupyter-notebook--async-new-context
                      :phase 'connect :entry entry :session-id "ei2-core"
-                     :local-ports '(:shell_port 1001) :local-file "/tmp/ei2-core.json"
+                     :remote-ports (plist-get entry :remote-ports)
+                     :local-ports '(:shell_port 1001 :iopub_port 1002
+                                    :stdin_port 1003 :hb_port 1004
+                                    :control_port 1005)
+                     :local-file "/tmp/ei2-core.json"
                      :client-unverified session :origin-buffer buffer
                      :callback (lambda (&rest _) (error "consumer failed"))))
            (heartbeat-started 0))
@@ -682,7 +707,9 @@ DISPOSALS receives local-only disposal reasons."
                     ((symbol-function 'emacs-jupyter-notebook--inject-idle-watchdog)
                      #'ignore))
             (should (emacs-jupyter-notebook--async-connect-finalize
-                     context buffer entry '(:shell_port 1001)
+                     context buffer entry
+                     '(:shell_port 1001 :iopub_port 1002 :stdin_port 1003
+                       :hb_port 1004 :control_port 1005)
                      "/tmp/ei2-core.json" session))
             (should (eq emacs-jupyter-notebook--client session))
             (should (emacs-jupyter-notebook-backend-session-installed-p session))
@@ -878,6 +905,7 @@ DISPOSALS receives local-only disposal reasons."
                                ("is_complete"
                                 (ejn-ei2-test--object "status" "complete"))
                                ("kernel_info" (ejn-ei2-test--kernel-info-result))
+                               ("interrupt" (ejn-ei2-test--object "interrupted" t))
                                (_ (ejn-ei2-test--object
                                    "status" "ok" "execution_count" 1)))) nil)
                    (format "ejn-request-test-%d" (length requests)))))
@@ -901,9 +929,8 @@ DISPOSALS receives local-only disposal reasons."
         (should (equal complete-result '(:status "complete")))
         (should (hash-table-p readiness-result))
         (should (equal (mapcar #'car requests)
-                       '("kernel_info" "is_complete" "execute")))
-        (should (string-match-p "Unsupported helper backend operation"
-                                (error-message-string control-error)))))))
+                       '("interrupt" "kernel_info" "is_complete" "execute")))
+        (should-not control-error)))))
 
 (ert-deftest ejn-ei2-transport-events-are-not-normalized-before-ei4 ()
   "Raw helper events do not reach the generic session event sink in EI2."
@@ -2094,6 +2121,68 @@ DISPOSALS receives local-only disposal reasons."
         (ejn-ei2-test--run-timers)
         (should-not prompted)
         (should-not replied)))))
+
+(ert-deftest ejn-ei6-helper-control-results-are-exact-and-restart-is-rejected ()
+  "EI6 admits only exact interrupt/shutdown acknowledgements, never restart."
+  (dolist (case '((interrupt "interrupted") (shutdown "shutdown")))
+    (let ((result (ejn-ei2-test--object (cadr case) t)))
+      (should-not
+       (condition-case nil
+           (emacs-jupyter-notebook-helper-backend--control-result
+            result (cadr case))
+         (error nil)))
+      (dolist (bad (list (ejn-ei2-test--object (cadr case) :false)
+                         (ejn-ei2-test--object (cadr case) t "extra" t)
+                         (ejn-ei2-test--object)))
+        (should-error
+         (emacs-jupyter-notebook-helper-backend--control-result
+          bad (cadr case))))))
+  (ejn-ei2-test-with-fake-helper (requests callbacks disposals)
+    (ejn-ei2-test-with-session
+      (let ((state (emacs-jupyter-notebook-helper-backend--make-state
+                    :helper 'fake)))
+        (setf (emacs-jupyter-notebook-backend-session-data session) state)
+        (emacs-jupyter-notebook-backend-session-mark-attached session)
+        (let (failure)
+          (emacs-jupyter-notebook-backend-control
+           session 'restart nil #'ignore
+           (lambda (_id reason) (setq failure reason)))
+          (ejn-ei2-test--run-timers)
+          (should (string-match-p "Unsupported helper backend operation"
+                                  (format "%s" failure)))
+          (should-not requests)
+          (should-not callbacks))
+        (let (failure)
+          (emacs-jupyter-notebook-backend-control
+           session 'interrupt '(:unexpected t) #'ignore
+           (lambda (_id reason) (setq failure reason)))
+          (ejn-ei2-test--run-timers)
+          (should (string-match-p "payload" (format "%s" failure)))
+          (should-not requests))))))
+
+(ert-deftest ejn-ei6-helper-control-dispatches-interrupt-and-shutdown ()
+  "EI6 maps both admitted controls to bounded helper requests."
+  (ejn-ei2-test-with-fake-helper (requests callbacks disposals)
+    (ejn-ei2-test-with-session
+      (let ((state (emacs-jupyter-notebook-helper-backend--make-state
+                    :helper 'fake))
+            results)
+        (setf (emacs-jupyter-notebook-backend-session-data session) state)
+        (dolist (operation '(interrupt shutdown))
+          (emacs-jupyter-notebook-backend-control
+           session operation nil
+           (lambda (_id value) (push value results))
+           #'ert-fail)
+          (funcall (car callbacks)
+                   nil
+                   (ejn-ei2-test--response
+                    (ejn-ei2-test--object
+                     (if (eq operation 'interrupt) "interrupted" "shutdown") t))
+                   nil))
+        (ejn-ei2-test--run-timers)
+        (should (= 2 (length results)))
+        (should (equal (mapcar #'car (nreverse requests))
+                       '("interrupt" "shutdown")))))))
 
 (provide 'emacs-jupyter-notebook-helper-backend-tests)
 

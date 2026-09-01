@@ -757,6 +757,16 @@ core can retain an attached helper for the existing PID busy arbitration.
        (eq (car operation) 'aux)
        (eq (cdr operation) 'kernel-info)))
 
+(defun emacs-jupyter-notebook-helper-backend--interrupt-operation-p (operation)
+  "Return non-nil for the sole admitted helper interrupt control operation."
+  (and (consp operation) (eq (car operation) 'control)
+       (eq (cdr operation) 'interrupt)))
+
+(defun emacs-jupyter-notebook-helper-backend--shutdown-operation-p (operation)
+  "Return non-nil for the sole admitted helper shutdown control operation."
+  (and (consp operation) (eq (car operation) 'control)
+       (eq (cdr operation) 'shutdown)))
+
 (defun emacs-jupyter-notebook-helper-backend--payload-object (operation payload)
   "Translate admitted helper OPERATIONS to a v1 params object."
   (cond
@@ -775,7 +785,19 @@ core can retain an attached helper for the existing PID busy arbitration.
      "detail_level" (or (plist-get payload :detail) 0)))
    ((emacs-jupyter-notebook-helper-backend--kernel-info-operation-p operation)
     (emacs-jupyter-notebook-helper-backend--make-object))
+   ((or (emacs-jupyter-notebook-helper-backend--interrupt-operation-p operation)
+        (emacs-jupyter-notebook-helper-backend--shutdown-operation-p operation))
+    (unless (null payload)
+      (error "Helper control operations require an empty payload"))
+    (emacs-jupyter-notebook-helper-backend--make-object))
    (t (error "Unsupported helper operation: %S" operation))))
+
+(defun emacs-jupyter-notebook-helper-backend--control-result (result field)
+  "Validate exact positive helper control RESULT containing FIELD."
+  (unless (and (hash-table-p result) (= (hash-table-count result) 1)
+               (eq (gethash field result) t))
+    (error "helper control returned an invalid result"))
+  nil)
 
 (defun emacs-jupyter-notebook-helper-backend--complete-result (result)
   "Validate and translate one bounded helper complete RESULT."
@@ -920,7 +942,9 @@ validates both values before it can send the Jupyter stdin reply."
                    (emacs-jupyter-notebook-helper-backend--complete-operation-p operation)
                    (emacs-jupyter-notebook-helper-backend--inspect-operation-p operation)
                    (emacs-jupyter-notebook-helper-backend--is-complete-operation-p operation)
-                   (emacs-jupyter-notebook-helper-backend--kernel-info-operation-p operation))
+                   (emacs-jupyter-notebook-helper-backend--kernel-info-operation-p operation)
+                   (emacs-jupyter-notebook-helper-backend--interrupt-operation-p operation)
+                   (emacs-jupyter-notebook-helper-backend--shutdown-operation-p operation))
          (error "Unsupported helper backend operation: %S" operation))
        (setf (emacs-jupyter-notebook-helper-backend-state-emit state) emit)
        (let* ((options (plist-get payload :options))
@@ -939,6 +963,10 @@ validates both values before it can send the Jupyter stdin reply."
                  "inspect")
                 ((emacs-jupyter-notebook-helper-backend--is-complete-operation-p operation)
                  "is_complete")
+                ((emacs-jupyter-notebook-helper-backend--interrupt-operation-p operation)
+                 "interrupt")
+                ((emacs-jupyter-notebook-helper-backend--shutdown-operation-p operation)
+                 "shutdown")
                 (t "kernel_info"))
           (if (eq operation 'input)
               (emacs-jupyter-notebook-helper-backend--input-payload-object payload)
@@ -982,6 +1010,20 @@ validates both values before it can send the Jupyter stdin reply."
                   (funcall success
                            (emacs-jupyter-notebook-helper-backend--kernel-info-result
                             result))
+                (error (funcall failure (error-message-string err))))))
+           ((emacs-jupyter-notebook-helper-backend--interrupt-operation-p operation)
+            (lambda (result)
+              (condition-case err
+                  (progn
+                    (emacs-jupyter-notebook-helper-backend--control-result result "interrupted")
+                    (funcall success nil))
+                (error (funcall failure (error-message-string err))))))
+           ((emacs-jupyter-notebook-helper-backend--shutdown-operation-p operation)
+            (lambda (result)
+              (condition-case err
+                  (progn
+                    (emacs-jupyter-notebook-helper-backend--control-result result "shutdown")
+                    (funcall success nil))
                 (error (funcall failure (error-message-string err))))))
            (t success))
           failure ledger-id
