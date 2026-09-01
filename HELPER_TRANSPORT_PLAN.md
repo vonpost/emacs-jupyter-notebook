@@ -1201,7 +1201,7 @@ be manager-reviewed for durable-kernel rules.
     pickle byte/count eviction, and payload canaries across panel/wire/log
     surfaces.  GUI coverage skips cleanly when matplotlib is unavailable.
 
-- [~] owner=terra-ei4d claimed=2026-09-01 **EI4D Reject compressed-image decoder bombs before Emacs image APIs.**
+- [x] owner=terra-ei4d claimed=2026-09-01 landed=2bd65c7 **EI4D Reject compressed-image decoder bombs before Emacs image APIs.**
   - Depends: EI4V.
   - Files: `helper/ejn_helper/image_metadata.py`,
     `helper/ejn_helper/thumbnail.py`,
@@ -1267,6 +1267,14 @@ be manager-reviewed for durable-kernel rules.
     check in the Nix closure (no dependency skip is accepted).
   - Narrow run: helper image-metadata/output tests plus ERT selector
     `^ejn-ei4d-` and all panel image tests, each under an external deadline.
+  - Landed verification: 677 source-based ERTs and 199 host helper tests pass;
+    byte compilation reports only the two pre-existing optional Evil variable
+    warnings.  The x86_64-linux Nix closure runs all 199 helper tests with
+    Pillow required and no skips, including real PNG/JPEG decoder-worker
+    success and corruption failure paths.  Darwin directory-fsync exceptions
+    and the bounded Apple Silicon address-space limit have deterministic unit
+    coverage; a real aarch64-darwin closure smoke remains an acceptance-gate
+    requirement because this host cannot execute it.
 
 - [ ] **EI5 Route completion, inspect, is-complete, heartbeat, and stdin.**
   - Depends: EI4D, HT10, HT11.
