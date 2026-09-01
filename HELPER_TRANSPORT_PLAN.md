@@ -1357,7 +1357,7 @@ be manager-reviewed for durable-kernel rules.
     in-memory state passed a final delta audit.  A real remote SSH lifecycle
     smoke remains an acceptance-gate requirement.
 
-- [~] owner=terra-ei7 claimed=2026-09-01 **EI7 Mark ambiguous work outcome-unknown and reconnect without replay.**
+- [x] owner=terra-ei7 claimed=2026-09-01 landed=fea9441 **EI7 Mark ambiguous work outcome-unknown and reconnect without replay.**
   - Depends: EI6, TH3.
   - Files: `emacs-jupyter-notebook-helper-backend.el`,
     `emacs-jupyter-notebook.el`, `emacs-jupyter-notebook-result.el`,
@@ -1371,6 +1371,16 @@ be manager-reviewed for durable-kernel rules.
     idle, and terminal; inspect fake-helper request log to prove zero replay;
     reconnect then new execution works; old late events ignored.
   - Narrow run: ERT selector `^ejn-ei7-` plus W19 tests.
+  - Landed verification: 746 source-based ERTs and 203 host helper tests pass
+    (three expected host skips), including 23 focused EI7 transport tests; the
+    v1 protocol fixture/self-rejection validator passes, production Elisp
+    byte-compiles with only the two pre-existing optional Evil variable
+    warnings, and generated artifacts were removed before the canonical source
+    rerun.  Independent audits found and drove fixes for interrupt-grace timer
+    cleanup, idle Jupyter-channel failure propagation, bounded internal setup,
+    and the admitted-false/transport-event ordering race; the final delta audit
+    found no P0/P1 defect.  Real relay and remote-outage smokes remain under the
+    acceptance gates.
 
 - [ ] **EI8 Make status/log UI expose helper and request truth.**
   - Depends: EI7.
