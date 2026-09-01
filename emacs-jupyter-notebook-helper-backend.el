@@ -14,6 +14,7 @@
 (require 'subr-x)
 (require 'emacs-jupyter-notebook-backend)
 (require 'emacs-jupyter-notebook-helper)
+(require 'emacs-jupyter-notebook-artifacts)
 (require 'emacs-jupyter-notebook-vars)
 
 (defconst emacs-jupyter-notebook-helper-backend--connect-timeout 30)
@@ -59,7 +60,7 @@ the mechanism that interrupts a long-running kernel execution."
 (cl-defstruct (emacs-jupyter-notebook-helper-backend-state
                (:constructor emacs-jupyter-notebook-helper-backend--make-state))
   "Local resources owned by one helper backend session."
-  helper artifact-dir artifact-identity request-map pending-events pending-event-sequence
+  helper artifact-dir artifact-identity artifact-capability request-map pending-events pending-event-sequence
   retired-request-ids retired-request-order pending-flush-timer emit closing retired close-timer
   close-success close-failure transport-failure)
 
@@ -115,31 +116,26 @@ written to Jupyter."
        (emacs-jupyter-notebook-helper-backend-state-closing state)
        (not (emacs-jupyter-notebook-helper-backend-state-retired state))))
 
+(defun emacs-jupyter-notebook-helper-backend--artifact-capability (state)
+  "Return STATE's exact helper artifact capability, never minting new authority."
+  (or (emacs-jupyter-notebook-helper-backend-state-artifact-capability state)
+      (let ((cap (emacs-jupyter-notebook-artifacts-capture
+                  'helper
+                  (emacs-jupyter-notebook-helper-backend-state-artifact-dir state)
+                  (emacs-jupyter-notebook-helper-backend-state-artifact-identity state))))
+        (when cap
+          (setf (emacs-jupyter-notebook-helper-backend-state-artifact-capability state) cap))
+        cap)))
+
 (defun emacs-jupyter-notebook-helper-backend--remove-artifacts (state)
-  "Remove only STATE's staging files, never panel-transferred publications."
-  (let ((directory (emacs-jupyter-notebook-helper-backend-state-artifact-dir state)))
-    (unwind-protect
-        (condition-case nil
-            (let* ((symlink (and (stringp directory) (file-symlink-p directory)))
-                   (attributes (and (stringp directory) (not symlink)
-                                    (file-attributes directory 'integer)))
-                   (identity (and attributes (file-attribute-file-identifier attributes))))
-              (cond
-               (symlink (delete-file directory))
-               ((and attributes (file-directory-p directory)
-                     (equal identity (emacs-jupyter-notebook-helper-backend-state-artifact-identity state))
-                     (equal (file-attribute-user-id attributes) (user-uid))
-                     (= (logand (file-modes directory) #o7777) #o700))
-                ;; Python atomically renames completed publications to
-                ;; `ejn-artifact-*'.  Never enumerate or retain those: their
-                ;; panel/crash lifetime is independent of this adapter.  The
-                ;; only local staging names are direct `.ejn-partial-*' files.
-                (dolist (file (directory-files directory t "\\`\\.ejn-partial-"))
-                  (ignore-errors (delete-file file)))
-                (when (null (directory-files directory nil "\\`[^.]"))
-                  (delete-directory directory)))))
-          (error nil))
-      (setf (emacs-jupyter-notebook-helper-backend-state-artifact-dir state) nil))))
+  "Retire only STATE's confined staging files and empty private root.
+Published `ejn-artifact-*' files intentionally keep a helper root alive for
+the panel's identity-bound leases or bounded crash pruning."
+  (when-let ((cap (emacs-jupyter-notebook-helper-backend--artifact-capability state)))
+    (ignore-errors (emacs-jupyter-notebook-artifacts-retire cap)))
+  (setf (emacs-jupyter-notebook-helper-backend-state-artifact-dir state) nil
+        (emacs-jupyter-notebook-helper-backend-state-artifact-identity state) nil
+        (emacs-jupyter-notebook-helper-backend-state-artifact-capability state) nil))
 
 (defun emacs-jupyter-notebook-helper-backend--dispose (state &optional reason)
   "Retire STATE's local helper and temporary artifacts exactly once."
@@ -165,38 +161,6 @@ written to Jupyter."
       (when helper
         (ignore-errors (emacs-jupyter-notebook-helper-dispose helper reason))))
     (emacs-jupyter-notebook-helper-backend--remove-artifacts state)))
-
-(defun emacs-jupyter-notebook-helper-backend--make-artifact-directory ()
-  "Atomically create and identify one private helper artifact directory.
-
-Return `(DIRECTORY . IDENTITY)'.  No caller receives DIRECTORY until its mode
-has been forced to 0700 and its identity is available for replacement-safe
-cleanup.  A failure after creation removes that just-created directory.
-"
-  (let (created directory complete)
-    (unwind-protect
-        (progn
-          (setq created (make-temp-file "ejn-helper-artifacts-" t))
-          ;; `make-temp-file' honours umask, but artifacts can contain code
-          ;; output; force the contract even under a permissive umask.
-          (set-file-modes created #o700)
-          ;; Python resolves ordinary ancestor aliases (notably Darwin's
-          ;; /var -> /private/var) before reporting publication paths.  Pin and
-          ;; advertise that same canonical spelling while the freshly-created
-          ;; final component is still known not to be a symlink.
-          (when (file-symlink-p created)
-            (error "helper artifact directory became a symlink"))
-          (setq directory (file-truename created))
-          (let* ((attributes (or (file-attributes directory 'integer)
-                                 (error "cannot stat helper artifact directory")))
-                 (identity (file-attribute-file-identifier attributes)))
-            (unless identity
-              (error "cannot identify helper artifact directory"))
-            (setq complete t)
-            (cons directory identity)))
-      (unless complete
-        (when created
-          (ignore-errors (delete-directory created t)))))))
 
 (defun emacs-jupyter-notebook-helper-backend--close-deadline ()
   "Return a close deadline which fires before the generic close deadline."
@@ -428,46 +392,16 @@ generation tuple before any presentation mutation.
 
 (defun emacs-jupyter-notebook-helper-backend--discard-publication (state path)
   "Unlink unaccepted helper publication PATH if its pinned identity is intact."
-  (let ((file-name-handler-alist nil)
-        (root (emacs-jupyter-notebook-helper-backend-state-artifact-dir state))
-        (root-identity
-         (emacs-jupyter-notebook-helper-backend-state-artifact-identity state)))
-    (condition-case nil
-        (when (and (stringp root) (file-name-absolute-p root)
-                   (stringp path) (file-name-absolute-p path)
-                   (string-match-p "\\`ejn-artifact-[0-9a-f]\\{32\\}\\'"
-                                   (file-name-nondirectory path)))
-          (let* ((root-name (directory-file-name (expand-file-name root)))
-                 (path-name (expand-file-name path))
-                 (root-attrs (and (not (file-symlink-p root-name))
-                                  (file-attributes root-name 'integer)))
-                 (attrs (and (not (file-symlink-p path-name))
-                             (file-attributes path-name 'integer)))
-                 (identity (and attrs (file-attribute-file-identifier attrs))))
-            (when (and root-attrs attrs identity
-                       (file-directory-p root-name)
-                       (eq (file-attribute-type root-attrs) t)
-                       (equal (file-attribute-user-id root-attrs) (user-uid))
-                       (= (logand (file-modes root-name) #o7777) #o700)
-                       (equal root-identity
-                              (file-attribute-file-identifier root-attrs))
-                       (equal (file-name-directory (directory-file-name path-name))
-                              (file-name-as-directory root-name))
-                       (file-regular-p path-name)
-                       (null (file-attribute-type attrs))
-                       (equal (file-attribute-user-id attrs) (user-uid))
-                       (= (logand (file-modes path-name) #o7777) #o600)
-                       (let ((post-root (and (not (file-symlink-p root-name))
-                                             (file-attributes root-name 'integer)))
-                             (post (and (not (file-symlink-p path-name))
-                                        (file-attributes path-name 'integer))))
-                         (and post-root post
-                              (equal root-identity
-                                     (file-attribute-file-identifier post-root))
-                              (equal identity (file-attribute-file-identifier post)))))
-              (delete-file path-name)
-              t)))
-      (error nil))))
+  (when-let ((cap (emacs-jupyter-notebook-helper-backend--artifact-capability state)))
+    ;; Pin the observed inode before asking the capability layer to perform
+    ;; its own pre-unlink revalidation.  A late rejected event can therefore
+    ;; never remove a newly published same-name replacement.
+    (let* ((path-name (and (stringp path) (expand-file-name path)))
+           (attrs (and path-name (not (file-symlink-p path-name))
+                       (file-attributes path-name 'integer)))
+           (identity (and attrs (file-attribute-file-identifier attrs))))
+      (and identity
+           (emacs-jupyter-notebook-artifacts-delete-leaf cap path-name identity)))))
 
 (defun emacs-jupyter-notebook-helper-backend--deliver-mapped-event
     (state helper-id mapping-value raw-event)
@@ -1058,11 +992,15 @@ validates both values before it can send the Jupyter stdin reply."
   "Implement the generic backend dispatch contract using the local helper."
   (pcase operation
     ('connect
-     (let* ((artifact (emacs-jupyter-notebook-helper-backend--make-artifact-directory))
-            (artifact-dir (car artifact))
+     (let* ((artifact-capability (emacs-jupyter-notebook-artifacts-create 'helper))
+            (artifact-dir (emacs-jupyter-notebook-artifacts-capability-root
+                           artifact-capability))
             (state (emacs-jupyter-notebook-helper-backend--make-state
                     :artifact-dir artifact-dir
-                    :artifact-identity (cdr artifact))))
+                    :artifact-identity
+                    (emacs-jupyter-notebook-artifacts-capability-root-identity
+                     artifact-capability)
+                    :artifact-capability artifact-capability)))
        (setf (emacs-jupyter-notebook-backend-session-data session) state)
        (emacs-jupyter-notebook-helper-backend--connect
         session state request payload

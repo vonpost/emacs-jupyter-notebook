@@ -9,9 +9,12 @@
 (require 'emacs-jupyter-notebook-backend)
 (require 'emacs-jupyter-notebook-helper-backend)
 (require 'emacs-jupyter-notebook)
+(require 'emacs-jupyter-notebook-artifacts)
 
 (defconst ejn-ei2-test--directory
   (file-name-directory (or load-file-name buffer-file-name)))
+
+(defvar ejn-ei2-test--artifact-capabilities (make-hash-table :test #'equal))
 
 (defun ejn-ei2-test--object (&rest pairs)
   (apply #'emacs-jupyter-notebook-helper-backend--make-object pairs))
@@ -49,8 +52,25 @@
   (accept-process-output nil 0.02))
 
 (defun ejn-ei2-test--artifact-directory ()
-  "Create a test-owned private artifact directory through production setup."
-  (car (emacs-jupyter-notebook-helper-backend--make-artifact-directory)))
+  "Create a test-owned private helper artifact directory and retain its cap."
+  (let* ((capability (emacs-jupyter-notebook-artifacts-create 'helper))
+         (root (emacs-jupyter-notebook-artifacts-capability-root capability)))
+    (puthash root capability ejn-ei2-test--artifact-capabilities)
+    root))
+
+(defun ejn-ei2-test--artifact-capability (root)
+  "Return the creation capability retained for fixture ROOT."
+  (gethash root ejn-ei2-test--artifact-capabilities))
+
+(defun ejn-ei2-test--artifact-leaf (root token)
+  "Return a strict helper publication leaf path derived from TOKEN."
+  (expand-file-name
+   (format "ejn-artifact-%s" (secure-hash 'md5 (format "%s" token))) root))
+
+(defun ejn-ei2-test--partial-leaf (root token)
+  "Return a strict helper staging leaf path derived from TOKEN."
+  (expand-file-name
+   (format ".ejn-partial-%s" (secure-hash 'md5 (format "%s" token))) root))
 
 (cl-defmacro ejn-ei2-test-with-fake-helper ((requests callbacks disposals) &body body)
   "Run BODY with a synchronous fake helper supervisor.
@@ -329,52 +349,27 @@ DISPOSALS receives local-only disposal reasons."
                   emacs-jupyter-notebook--kernel-status nil
                   emacs-jupyter-notebook--tunnel-dead nil)))))))
 
-(ert-deftest ejn-ei2-artifact-setup-cleans-up-on-chmod-failure ()
-  "A mode-setting error cannot leave an untracked artifact directory behind."
-  (let ((directory (make-temp-file "ejn-ei2-artifact-chmod-" t)))
-    (unwind-protect
-        (cl-letf (((symbol-function 'set-file-modes)
-                   (lambda (&rest _) (error "chmod failed"))))
-          (cl-letf (((symbol-function 'make-temp-file)
-                     (lambda (&rest _) directory)))
-            (should-error
-             (emacs-jupyter-notebook-helper-backend--make-artifact-directory))
-            (should-not (file-exists-p directory))))
-      (when (file-directory-p directory)
-        (delete-directory directory t)))))
-
-(ert-deftest ejn-ei2-artifact-setup-cleans-up-on-identity-failure ()
-  "A stat/identity error cannot leave an untracked artifact directory behind."
-  (let ((directory (make-temp-file "ejn-ei2-artifact-stat-" t)))
-    (unwind-protect
-        (cl-letf (((symbol-function 'make-temp-file)
-                   (lambda (&rest _) directory))
-                  ((symbol-function 'file-attributes)
-                   (lambda (&rest _) (error "stat failed"))))
-          (should-error
-           (emacs-jupyter-notebook-helper-backend--make-artifact-directory))
-          (should-not (file-exists-p directory)))
-      (when (file-directory-p directory)
-        (delete-directory directory t)))))
-
 (ert-deftest ejn-ei4-artifact-root-uses-canonical-ancestor-spelling ()
   "Artifact roots match helper paths across aliases such as Darwin's /var."
   (let* ((base (make-temp-file "ejn-ei4-root-alias-" t))
          (real (expand-file-name "real" base))
          (alias (expand-file-name "alias" base))
-         pair)
+         capability root)
     (unwind-protect
         (progn
           (make-directory real)
           (make-symbolic-link real alias)
           (let ((temporary-file-directory (file-name-as-directory alias)))
-            (setq pair
-                  (emacs-jupyter-notebook-helper-backend--make-artifact-directory)))
+            (setq capability
+                  (emacs-jupyter-notebook-artifacts-create 'helper)
+                  root
+                  (emacs-jupyter-notebook-artifacts-capability-root capability)))
           (should (string-prefix-p (file-name-as-directory (file-truename real))
-                                   (car pair)))
-          (should-not (string-prefix-p (file-name-as-directory alias) (car pair))))
-      (when (and pair (file-directory-p (car pair)))
-        (delete-directory (car pair) t))
+                                   root))
+          (should-not (string-prefix-p (file-name-as-directory alias) root)))
+      (when capability
+        (ignore-errors
+          (emacs-jupyter-notebook-artifacts-retire capability)))
       (when (file-symlink-p alias) (delete-file alias))
       (when (file-directory-p real) (delete-directory real t))
       (when (file-directory-p base) (delete-directory base t)))))
@@ -416,7 +411,7 @@ DISPOSALS receives local-only disposal reasons."
 (ert-deftest ejn-ei2-core-start-helper-resolution-fails-before-admission ()
   "Helper resolution rejects a start before profile, registry, or SSH work."
   (let ((source (make-temp-file "ejn-ei2-source-"))
-        profile context registry ssh artifacts)
+        profile context registry ssh)
     (unwind-protect
         (with-temp-buffer
           (setq buffer-file-name source)
@@ -430,16 +425,13 @@ DISPOSALS receives local-only disposal reasons."
                       ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
                        (lambda (&rest _) (setq registry t)))
                       ((symbol-function 'emacs-jupyter-notebook-ssh-start-bounded-process)
-                       (lambda (&rest _) (setq ssh t)))
-                      ((symbol-function 'emacs-jupyter-notebook-helper-backend--make-artifact-directory)
-                       (lambda () (setq artifacts t))))
+                       (lambda (&rest _) (setq ssh t))))
               (should-error (emacs-jupyter-notebook-start-remote-kernel "p"))
               (should-not (buffer-modified-p))
               (should-not profile)
               (should-not context)
               (should-not registry)
-              (should-not ssh)
-              (should-not artifacts))))
+              (should-not ssh))))
       (when (file-exists-p source) (delete-file source)))))
 
 (ert-deftest ejn-ei2-core-reconnect-helper-resolution-fails-before-pid-probe ()
@@ -564,7 +556,9 @@ DISPOSALS receives local-only disposal reasons."
            (state (emacs-jupyter-notebook-helper-backend--make-state
                    :helper 'fake-helper :artifact-dir artifact
                    :artifact-identity (file-attribute-file-identifier
-                                       (file-attributes artifact))))
+                                       (file-attributes artifact))
+                   :artifact-capability
+                   (ejn-ei2-test--artifact-capability artifact)))
            (session (emacs-jupyter-notebook-backend--make-session
                      :backend 'helper :data state :owner-buffer buffer
                      :requests (make-hash-table :test #'eql) :timers nil))
@@ -628,7 +622,9 @@ DISPOSALS receives local-only disposal reasons."
            (state (emacs-jupyter-notebook-helper-backend--make-state
                    :helper 'fake-helper :artifact-dir artifact
                    :artifact-identity (file-attribute-file-identifier
-                                       (file-attributes artifact))))
+                                       (file-attributes artifact))
+                   :artifact-capability
+                   (ejn-ei2-test--artifact-capability artifact)))
            (session (emacs-jupyter-notebook-backend--make-session
                      :backend 'helper :data state :owner-buffer buffer
                      :attached t :requests (make-hash-table :test #'eql)
@@ -775,37 +771,46 @@ DISPOSALS receives local-only disposal reasons."
         (should (= 1 (length disposals)))))))
 
 (ert-deftest ejn-ei2-artifact-cleanup-refuses-symlink-replacement ()
-  "A replaced artifact path cannot recursively delete a foreign target."
+  "A replaced artifact path cannot delete a foreign symlink target."
   (let* ((directory (ejn-ei2-test--artifact-directory))
          (target (make-temp-file "ejn-ei2-foreign-" t))
+         (original (concat directory "-original"))
+         (capability (emacs-jupyter-notebook-artifacts-capture
+                      'helper directory nil :no-lease))
          (state (emacs-jupyter-notebook-helper-backend--make-state
                  :artifact-dir directory
                  :artifact-identity
-                 (file-attribute-file-identifier (file-attributes directory))))
+                 (file-attribute-file-identifier (file-attributes directory))
+                 :artifact-capability capability))
          (sentinel (expand-file-name "keep" target)))
     (unwind-protect
         (progn
           (with-temp-file sentinel (insert "foreign"))
-          (delete-directory directory)
+          (rename-file directory original)
           (make-symbolic-link target directory)
           (emacs-jupyter-notebook-helper-backend--remove-artifacts state)
-          (should-not (file-symlink-p directory))
+          (should (file-symlink-p directory))
           (should (file-exists-p sentinel)))
       (when (file-symlink-p directory) (delete-file directory))
       (when (file-directory-p directory) (delete-directory directory t))
+      (when (file-directory-p original) (delete-directory original t))
       (when (file-directory-p target) (delete-directory target t)))))
 
 (ert-deftest ejn-ei2-artifact-cleanup-refuses-identity-mismatched-directory ()
   "A real replacement directory remains untouched when its identity differs."
   (let* ((directory (ejn-ei2-test--artifact-directory))
+         (original (concat directory "-original"))
+         (capability (emacs-jupyter-notebook-artifacts-capture
+                      'helper directory nil :no-lease))
          (state (emacs-jupyter-notebook-helper-backend--make-state
                  :artifact-dir directory
                  :artifact-identity
-                 (file-attribute-file-identifier (file-attributes directory))))
+                 (file-attribute-file-identifier (file-attributes directory))
+                 :artifact-capability capability))
          sentinel)
     (unwind-protect
         (progn
-          (delete-directory directory)
+          (rename-file directory original)
           (make-directory directory)
           (set-file-modes directory #o700)
           ;; Ensure this test models a distinct replacement even on filesystems
@@ -816,7 +821,8 @@ DISPOSALS receives local-only disposal reasons."
           (with-temp-file sentinel (insert "foreign"))
           (emacs-jupyter-notebook-helper-backend--remove-artifacts state)
           (should (file-exists-p sentinel)))
-      (when (file-directory-p directory) (delete-directory directory t)))))
+      (when (file-directory-p directory) (delete-directory directory t))
+      (when (file-directory-p original) (delete-directory original t)))))
 
 (ert-deftest ejn-ei2-artifact-stat-error-cannot-suppress-connect-failure ()
   "Conservative cleanup metadata failure still terminally retires the request."
@@ -1243,12 +1249,15 @@ DISPOSALS receives local-only disposal reasons."
 
 (ert-deftest ejn-ei4-unaccepted-helper-publications-are-discarded-safely ()
   "Rejected and malformed helper publications do not accumulate on disk."
-  (let* ((pair (emacs-jupyter-notebook-helper-backend--make-artifact-directory))
-         (root (car pair))
-         (identity (cdr pair))
+  (let* ((capability (emacs-jupyter-notebook-artifacts-create 'helper))
+         (root (emacs-jupyter-notebook-artifacts-capability-root capability))
+         (identity (emacs-jupyter-notebook-artifacts-capability-root-identity
+                    capability))
          (mapping '(:ledger-id 1 :backend-request-id 11))
          (state (emacs-jupyter-notebook-helper-backend--make-state
-                 :artifact-dir root :artifact-identity identity :emit #'ignore))
+                 :artifact-dir root :artifact-identity identity
+                 :artifact-capability capability
+                 :emit #'ignore))
          (make-event
           (lambda (path &optional malformed)
             (ejn-ei2-test--object
@@ -1288,8 +1297,8 @@ DISPOSALS receives local-only disposal reasons."
 
 (ert-deftest ejn-ei4-retired-wire-events-never-reenter-early-buffer ()
   "Late events for a tombstoned helper ID consume no pending-event capacity."
-  (let* ((pair (emacs-jupyter-notebook-helper-backend--make-artifact-directory))
-         (root (car pair))
+  (let* ((capability (emacs-jupyter-notebook-artifacts-create 'helper))
+         (root (emacs-jupyter-notebook-artifacts-capability-root capability))
          (image-path (expand-file-name
                       "ejn-artifact-00000000000000000000000000000009" root))
          (pickle-path (expand-file-name
@@ -1301,7 +1310,11 @@ DISPOSALS receives local-only disposal reasons."
                  (session (emacs-jupyter-notebook-backend-session-create nil (current-buffer))))
             (setq state
                   (emacs-jupyter-notebook-helper-backend--make-state
-                   :artifact-dir root :artifact-identity (cdr pair)
+                   :artifact-dir root
+                   :artifact-identity
+                   (emacs-jupyter-notebook-artifacts-capability-root-identity
+                    capability)
+                   :artifact-capability capability
                    :request-map mapping
                    :pending-events (make-hash-table :test #'equal)
                    :emit (lambda (event) (push event seen))))
@@ -1345,22 +1358,26 @@ DISPOSALS receives local-only disposal reasons."
 
 (ert-deftest ejn-ei4-helper-dispose-removes-only-partial-staging ()
   "Adapter cleanup preserves publications without retaining an unbounded map."
-  (let* ((root (ejn-ei2-test--artifact-directory))
-         (publication (expand-file-name "ejn-artifact-published" root))
-         (staging (expand-file-name ".ejn-partial-staging" root))
+  (let* ((capability (emacs-jupyter-notebook-artifacts-create 'helper))
+         (root (emacs-jupyter-notebook-artifacts-capability-root capability))
+         (publication (ejn-ei2-test--artifact-leaf root "published"))
+         (staging (ejn-ei2-test--partial-leaf root "staging"))
          (state (emacs-jupyter-notebook-helper-backend--make-state
                  :artifact-dir root
-                 :artifact-identity (file-attribute-file-identifier (file-attributes root)))))
+                 :artifact-identity (file-attribute-file-identifier (file-attributes root))
+                 :artifact-capability capability)))
     (unwind-protect
         (progn
           (with-temp-file publication (insert "published"))
           (set-file-modes publication #o600)
           (with-temp-file staging (insert "staging"))
+          (set-file-modes staging #o600)
           (emacs-jupyter-notebook-helper-backend--dispose state "test")
           (should (file-exists-p publication))
           (should-not (file-exists-p staging)))
       (ignore-errors (delete-file publication))
-      (ignore-errors (delete-directory root)))))
+      (ignore-errors (emacs-jupyter-notebook-artifacts-retire capability))
+      (when (file-directory-p root) (delete-directory root t)))))
 
 (ert-deftest ejn-ei4-normalizes-ht9-display-update-and-id ()
   "HT9's display_data/update flag retains the bounded display identity."

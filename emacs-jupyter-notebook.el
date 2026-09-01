@@ -1607,6 +1607,17 @@ swallowed so disable cannot raise."
       (emacs-jupyter-notebook--release-local-resources)
     (error
      (message "emacs-jupyter-notebook: mode-disable cleanup failed: %s"
+              (error-message-string err))))
+  ;; The registry and remote kernel remain durable reconnect surfaces, but
+  ;; panel images and their local helper artifacts belong to this buffer's
+  ;; interactive view.  Retire that local ownership on disable just as the
+  ;; source-buffer kill path does, without killing or otherwise changing the
+  ;; panel buffer itself.
+  (condition-case err
+      (when-let ((panel (emacs-jupyter-notebook-panel-buffer (current-buffer))))
+        (ejn-panel-clear-all panel))
+    (error
+     (message "emacs-jupyter-notebook: panel mode-disable cleanup failed: %s"
               (error-message-string err)))))
 
 (defun emacs-jupyter-notebook--kill-buffer-hook ()

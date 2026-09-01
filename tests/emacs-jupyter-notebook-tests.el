@@ -12,6 +12,7 @@
 (require 'benchmark)
 (require 'emacs-jupyter-notebook)
 (require 'emacs-jupyter-notebook-jupyter)
+(require 'emacs-jupyter-notebook-artifacts)
 
 (defun ejn-test-backend-session (&optional raw-client attached)
   "Create a test backend session with optional legacy RAW-CLIENT data.
@@ -95,9 +96,20 @@ busy-kernel reconnect arbitration may retain it after verification times out."
     (insert-file-contents-literally file)
     (secure-hash 'sha256 (current-buffer))))
 
+(defun ejn-ei4-test--artifact-root ()
+  "Create a real, identity-bound helper artifact root for a fixture."
+  (let ((capability (emacs-jupyter-notebook-artifacts-create 'helper)))
+    (cons (emacs-jupyter-notebook-artifacts-capability-root capability)
+          capability)))
+
+(defun ejn-ei4-test--artifact-leaf-name (token)
+  "Return a strict helper leaf name derived from TOKEN."
+  (format "ejn-artifact-%s"
+          (secure-hash 'md5 (format "%s" token))))
+
 (defun ejn-ei4v-test--artifact-file (root hex payload)
   "Create a confined EI4V artifact under ROOT from HEX and PAYLOAD."
-  (let ((file (expand-file-name (format "ejn-artifact-%s" hex) root)))
+  (let ((file (expand-file-name (ejn-ei4-test--artifact-leaf-name hex) root)))
     (with-temp-file file (insert payload))
     (set-file-modes file #o600)
     file))
@@ -117,7 +129,7 @@ busy-kernel reconnect arbitration may retain it after verification times out."
         (append (list :root root :root-identity root-identity :mime mime
                       :original leaf :preview nil)
                 (when display-id (list :display-id display-id)))
-      (append (list :root root :root-identity root-identity)
+        (append (list :root root :root-identity root-identity)
               leaf
               (when display-id (list :display-id display-id))))))
 
@@ -144,7 +156,7 @@ busy-kernel reconnect arbitration may retain it after verification times out."
 
 (defun ejn-ei4d-test--write-artifact (root hex bytes)
   "Write unibyte BYTES to a confined helper artifact below ROOT."
-  (let ((file (expand-file-name (format "ejn-artifact-%s" hex) root))
+  (let ((file (expand-file-name (ejn-ei4-test--artifact-leaf-name hex) root))
         (coding-system-for-write 'no-conversion))
     (write-region bytes nil file nil 'silent)
     (set-file-modes file #o600)
@@ -7551,7 +7563,7 @@ key never disturbs the existing PNG path."
 (ert-deftest ejn-w8.2-helper-bundle-stores-descriptor-and-renders-png ()
   "W8.2/EI4V: helper-published PNG and pickle metadata are retained together."
   (ejn-test-with-fresh-log-buffer
-    (let* ((root (make-temp-file "ejn-w8-bundle-" t))
+    (let* ((root (car (ejn-ei4-test--artifact-root)))
            (image-file nil)
            (pickle-file nil)
            (image-canary "RUpOX0lNQUdFX0JBU0U2NF9QYXlsb2FkX0NBTkFSWQ==")
@@ -7602,7 +7614,7 @@ key never disturbs the existing PNG path."
 
 (ert-deftest ejn-a5-panel-caps-retained-pickle-artifacts ()
   "A5/EI4V: only the newest `panel-max-pickles' entries keep pickle files."
-  (let ((root (make-temp-file "ejn-a5-pickle-cap-" t))
+  (let ((root (car (ejn-ei4-test--artifact-root)))
         files handles)
     (unwind-protect
         (progn
@@ -7639,7 +7651,7 @@ key never disturbs the existing PNG path."
 
 (ert-deftest ejn-w14-panel-open-figure-finds-pickle-off-header ()
   "W14/EI4V: panel `v' lookup finds descriptor metadata within an entry body."
-  (let* ((root (make-temp-file "ejn-w14-panel-v-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (image-file nil)
          (preview-file nil)
          (pickle-file nil))
@@ -7683,7 +7695,7 @@ key never disturbs the existing PNG path."
 
 (ert-deftest ejn-w8.7-replace-text-and-clear-entry-drop-pickle ()
   "W8.7(d)/EI4V: text replacement and clear retire interactive descriptors."
-  (let* ((root (make-temp-file "ejn-w8-drop-pickle-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (file-a nil)
          (file-b nil))
     (unwind-protect
@@ -7717,7 +7729,7 @@ key never disturbs the existing PNG path."
 
 (ert-deftest ejn-w8.7-auto-open-disabled-default-does-not-schedule ()
   "W8.7/EI4V: auto-open alone cannot load pickles without explicit opt-in."
-  (let* ((root (make-temp-file "ejn-w8-auto-disabled-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (file nil))
     (unwind-protect
         (progn
@@ -7991,7 +8003,7 @@ and returns nil for a bogus command."
 
 (ert-deftest ejn-w8.3-real-file-identities-are-accepted-by-python-viewer ()
   "An Emacs descriptor crosses the real Python confinement identity seam."
-  (let* ((root (make-temp-file "ejn-w8-real-identity-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (file (expand-file-name
                 "ejn-artifact-0123456789abcdef0123456789abcdef" root))
          (viewer-dir (expand-file-name "viewer" default-directory))
@@ -9223,7 +9235,7 @@ opener function with the backing file path."
 
 (ert-deftest ejn-ei4d-external-open-uses-durable-verified-snapshot ()
   "An immediate launcher exit cannot invalidate its verified snapshot path."
-  (let* ((root (make-temp-file "ejn-ei4d-open-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (original (ejn-ei4d-test--write-artifact
                     root "abababababababababababababababab"
                     (ejn-ei4d-test--png 2 3)))
@@ -9296,7 +9308,7 @@ opener function with the backing file path."
 
 (ert-deftest ejn-ei4d-external-open-is-single-flight-and-cancellable ()
   "Repeated `o' cancels one verifier rather than launching another process."
-  (let* ((root (make-temp-file "ejn-ei4d-open-cancel-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (original (ejn-ei4d-test--write-artifact
                     root "acacacacacacacacacacacacacacacac" "original"))
          (emacs-jupyter-notebook-panel--external-image-snapshots nil)
@@ -9341,7 +9353,7 @@ opener function with the backing file path."
 
 (ert-deftest ejn-ei4d-async-original-verifier-pins-and-snapshots-content ()
   "The real verifier bridges Emacs IDs and copies only exact pinned bytes."
-  (let* ((root (make-temp-file "ejn-ei4d-verify-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (file (ejn-ei4d-test--write-artifact
                 root "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd" "original"))
          panel)
@@ -9530,7 +9542,7 @@ session does not pay an O(history) erase+reinsert on every stream flush."
 
 (ert-deftest ejn-ir2-clear-deletes-existing-artifacts ()
   "Clearing retires image files and confined pickle artifacts before entries vanish."
-  (let* ((root (make-temp-file "ejn-ir2-pickle-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (pickle-file nil))
     (unwind-protect
         (progn
@@ -9596,7 +9608,7 @@ session does not pay an O(history) erase+reinsert on every stream flush."
 
 (ert-deftest ejn-ir2-late-pickle-after-clear-retains-no-bytes ()
   "A late confined pickle descriptor after clear is ignored before validation."
-  (let* ((root (make-temp-file "ejn-ir2-late-pickle-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (file nil))
     (unwind-protect
         (progn
@@ -9631,7 +9643,7 @@ session does not pay an O(history) erase+reinsert on every stream flush."
 
 (ert-deftest ejn-ir2-clear-before-idle-pickle-open-does-not-materialize ()
   "A queued auto-viewer handoff claims a live descriptor only when it runs."
-  (let* ((root (make-temp-file "ejn-ir2-idle-pickle-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (file nil)
          (real-cancel (symbol-function 'cancel-timer)))
     (unwind-protect
@@ -9676,7 +9688,7 @@ session does not pay an O(history) erase+reinsert on every stream flush."
 
 (ert-deftest ejn-ir2-pickle-auto-open-coalesces-latest-update ()
   "Rapid descriptor updates retain one pending handoff and open only the newest."
-  (let* ((root (make-temp-file "ejn-ir2-coalesce-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (old-file nil)
          (new-file nil)
          (real-cancel (symbol-function 'cancel-timer)))
@@ -9737,7 +9749,7 @@ session does not pay an O(history) erase+reinsert on every stream flush."
 
 (ert-deftest ejn-ir2-pending-clear-retires-pickle-and-auto-open ()
   "The next output after clear_output(wait=t) retires the old figure fully."
-  (let* ((root (make-temp-file "ejn-ir2-pending-pickle-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (pickle-file nil)
          (real-cancel (symbol-function 'cancel-timer)))
     (unwind-protect
@@ -9782,7 +9794,7 @@ session does not pay an O(history) erase+reinsert on every stream flush."
 
 (ert-deftest ejn-ir2-pending-clear-display-replaces-old-figure ()
   "A replacement display after clear(wait) keeps only its new figure state."
-  (let* ((root (make-temp-file "ejn-ir2-replace-figure-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (old-image nil)
          (old-pickle nil)
          (new-image nil)
@@ -9830,7 +9842,7 @@ session does not pay an O(history) erase+reinsert on every stream flush."
 
 (ert-deftest ejn-ir2-pending-clear-text-display-removes-stale-image ()
   "A no-pickle text replacement after clear(wait) forces stale-image removal."
-  (let* ((root (make-temp-file "ejn-ir2-text-replace-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (pickle-file nil))
     (unwind-protect
         (progn
@@ -9875,7 +9887,7 @@ session does not pay an O(history) erase+reinsert on every stream flush."
 
 (ert-deftest ejn-ir2-exit-cleanup-is-local-only ()
   "The normal-exit artifact reaper leaves registry, SSH, and kernels alone."
-  (let* ((root (make-temp-file "ejn-ir2-exit-pickle-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (pickle-file nil))
     (unwind-protect
         (progn
@@ -9967,7 +9979,7 @@ session does not pay an O(history) erase+reinsert on every stream flush."
 
 (ert-deftest ejn-ir3-artifact-budget-deletes-files ()
   "The artifact cap deletes evicted image and pickle files."
-  (let* ((root (make-temp-file "ejn-ir3-pickle-budget-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (pickle-file nil))
     (unwind-protect
         (progn
@@ -10185,7 +10197,7 @@ session does not pay an O(history) erase+reinsert on every stream flush."
 
 (ert-deftest ejn-ir3s-cached-totals-match-recomputed-after-mutations ()
   "Cached panel totals track text, image, pickle, replacement, and clear deltas."
-  (let* ((root (make-temp-file "ejn-ir3s-pickle-totals-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (pickle-file nil))
     (unwind-protect
         (progn
@@ -12767,9 +12779,10 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ei4-valid-artifact-routes-helper-to-panel-without-base64 ()
   "A real HT9 descriptor crosses correlation and transfers exact file ownership."
-  (let* ((pair (emacs-jupyter-notebook-helper-backend--make-artifact-directory))
-         (root (car pair))
-         (root-id (cdr pair))
+  (let* ((capability (emacs-jupyter-notebook-artifacts-create 'helper))
+         (root (emacs-jupyter-notebook-artifacts-capability-root capability))
+         (root-id (emacs-jupyter-notebook-artifacts-capability-root-identity
+                   capability))
          (accepted (expand-file-name
                     "ejn-artifact-00000000000000000000000000000001" root))
          (stale (expand-file-name
@@ -12812,6 +12825,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
             (setq state
                   (emacs-jupyter-notebook-helper-backend--make-state
                    :artifact-dir root :artifact-identity root-id
+                   :artifact-capability capability
                    :request-map (make-hash-table :test #'equal)))
             (setf (emacs-jupyter-notebook-backend-session-backend session) 'helper
                   (emacs-jupyter-notebook-backend-session-data session) state
@@ -12845,15 +12859,18 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
             (setq emacs-jupyter-notebook--client nil)))
       (when (buffer-live-p panel) (ejn-panel-clear-all panel))
       (when state (emacs-jupyter-notebook-helper-backend--dispose state "test cleanup"))
+      (when (and capability
+                 (emacs-jupyter-notebook-artifacts-capability-valid-p capability))
+        (ignore-errors (emacs-jupyter-notebook-artifacts-retire capability)))
       (when (file-directory-p root) (delete-directory root t)))))
 
 (ert-deftest ejn-ei4-published-images-pin-identity-and-replace-display-id ()
   "Published files transfer only after full validation and exact ID replacement."
-  (let* ((root (make-temp-file "ejn-ei4-publication-" t))
-         (first (expand-file-name "ejn-artifact-first" root))
-         (second (expand-file-name "ejn-artifact-second" root))
-         (unknown (expand-file-name "ejn-artifact-unknown" root))
-         (unsafe (expand-file-name "ejn-artifact-unsafe" root))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
+         (first (expand-file-name (ejn-ei4-test--artifact-leaf-name "first") root))
+         (second (expand-file-name (ejn-ei4-test--artifact-leaf-name "second") root))
+         (unknown (expand-file-name (ejn-ei4-test--artifact-leaf-name "unknown") root))
+         (unsafe (expand-file-name (ejn-ei4-test--artifact-leaf-name "unsafe") root))
          (root-id nil) (panel nil))
     (unwind-protect
         (with-temp-buffer
@@ -12933,7 +12950,8 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
           (should (file-symlink-p second))
           ;; Matching the child inode alone is insufficient: if the root was
           ;; replaced, even a hard link to the old file must survive cleanup.
-          (let* ((pinned (expand-file-name "ejn-artifact-root-pinned" root))
+          (let* ((pinned (expand-file-name
+                          (ejn-ei4-test--artifact-leaf-name "root-pinned") root))
                  (replacement (concat root "-old"))
                  (handle (ejn-panel-start-entry panel '("ei4.py" . 30) "root()")))
             (with-temp-file pinned (insert "root-pinned"))
@@ -12947,7 +12965,8 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
             (rename-file root replacement)
             (make-directory root)
             (set-file-modes root #o700)
-            (add-name-to-file (expand-file-name "ejn-artifact-root-pinned" replacement)
+            (add-name-to-file (expand-file-name (file-name-nondirectory pinned)
+                                               replacement)
                               pinned)
             (ejn-panel-clear-all panel)
             (should (file-exists-p pinned))
@@ -12959,11 +12978,11 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ei4-published-image-rejects-confinement-and-metadata-attacks ()
   "Every publication boundary check fails before panel ownership changes."
-  (let* ((root (make-temp-file "ejn-ei4-attacks-" t))
-         (valid (expand-file-name "valid" root))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
+         (valid (expand-file-name (ejn-ei4-test--artifact-leaf-name "valid") root))
          (nested-dir (expand-file-name "nested" root))
-         (nested (expand-file-name "nested-file" nested-dir))
-         (outside (make-temp-file "ejn-ei4-outside-"))
+         (nested (expand-file-name (ejn-ei4-test--artifact-leaf-name "nested-file") nested-dir))
+         (outside (make-temp-file (ejn-ei4-test--artifact-leaf-name "outside")))
          (root-link (concat root "-link"))
          (root-id nil) panel handle)
     (unwind-protect
@@ -13063,7 +13082,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 (ert-deftest ejn-ei4-published-image-retirement-and-budget-are-exact ()
   "Published files carry bounded image specs and obey byte eviction."
   (let ((emacs-jupyter-notebook-panel-max-total-artifact-bytes 16)
-        (root (make-temp-file "ejn-ei4-budget-" t))
+        (root (car (ejn-ei4-test--artifact-root)))
         panel files)
     (unwind-protect
         (progn
@@ -13072,7 +13091,9 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
             (with-temp-buffer
               (setq panel (ejn-panel-ensure (current-buffer)))
               (dotimes (index 100)
-                (let* ((path (expand-file-name (format "artifact-%03d" index) root))
+                (let* ((path (expand-file-name
+                              (ejn-ei4-test--artifact-leaf-name
+                               (format "artifact-%03d" index)) root))
                        (data (format "%04d" index)))
                   (with-temp-file path (insert data))
                   (set-file-modes path #o600)
@@ -13097,7 +13118,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                                      :artifacts
                                      (emacs-jupyter-notebook-panel--total-artifact-bytes)))))
               (let* ((handle (ejn-panel-start-entry panel '("retire.py" . 1) "x"))
-                     (path (expand-file-name "retire" root)))
+                     (path (expand-file-name (ejn-ei4-test--artifact-leaf-name "retire") root)))
                 (with-temp-file path (insert "once"))
                 (set-file-modes path #o600)
                 (ejn-panel-set-published-bundle
@@ -13118,9 +13139,9 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ei4-published-image-size-ceiling-bounds-content-read ()
   "The exact PPM ceiling reads only its header; one over reads nothing."
-  (let* ((root (make-temp-file "ejn-ei4-size-boundary-" t))
-         (exact (expand-file-name "exact" root))
-         (over (expand-file-name "over" root))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
+         (exact (expand-file-name (ejn-ei4-test--artifact-leaf-name "exact") root))
+         (over (expand-file-name (ejn-ei4-test--artifact-leaf-name "over") root))
          (bytes (ejn-ei4d-test--ppm 1 1))
          (limit (length bytes)))
     (unwind-protect
@@ -13162,9 +13183,9 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ei4-retirement-flushes-cache-and-unlinks-once ()
   "Repeated retirement flushes once and unlinks each bundle artifact once."
-  (let* ((root (make-temp-file "ejn-ei4-retire-count-" t))
-         (file (expand-file-name "image" root))
-         (preview (expand-file-name "preview" root))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
+         (file (expand-file-name (ejn-ei4-test--artifact-leaf-name "image") root))
+         (preview (expand-file-name (ejn-ei4-test--artifact-leaf-name "preview") root))
          (real-delete (symbol-function 'delete-file))
          (flushes 0) (deleted nil) panel)
     (unwind-protect
@@ -13209,7 +13230,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ei4v-pickle-zero-budget-retires-publication ()
   "A zero pickle budget retains neither metadata nor its publication file."
-  (let* ((root (make-temp-file "ejn-ei4v-pickle-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (file (expand-file-name "ejn-artifact-0123456789abcdef0123456789abcdef" root))
          panel)
     (unwind-protect
@@ -13232,7 +13253,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ei4v-zero-pickle-budget-accepts-dual-event-thumbnail ()
   "Pruning a bundled pickle cannot make the retained thumbnail unaccepted."
-  (let* ((root (make-temp-file "ejn-ei4v-zero-bundle-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (image (ejn-ei4v-test--artifact-file
                  root "40404040404040404040404040404040" "thumbnail"))
          (pickle (ejn-ei4v-test--artifact-file
@@ -13268,7 +13289,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ei4v-pickle-byte-budget-is-exact-and-evicts-one-byte-over ()
   "Pickles remain at the byte limit and oldest ownership retires above it."
-  (let* ((root (make-temp-file "ejn-ei4v-byte-budget-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (exact (ejn-ei4v-test--artifact-file
                  root "10101010101010101010101010101010" "12345678"))
          (over (ejn-ei4v-test--artifact-file
@@ -13309,7 +13330,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ei4v-pickle-lease-defers-and-settles-retirement-once ()
   "A viewer lease keeps a retired pickle alive until its one completion."
-  (let* ((root (make-temp-file "ejn-ei4v-lease-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (file (expand-file-name "ejn-artifact-abcdefabcdefabcdefabcdefabcdefab" root))
          panel)
     (unwind-protect
@@ -13335,7 +13356,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ei4v-viewer-reap-releases-retired-panel-lease-once ()
   "Viewer death settles an in-flight panel lease and unlinks exactly once."
-  (let* ((root (make-temp-file "ejn-ei4v-viewer-reap-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (file (ejn-ei4v-test--artifact-file
                 root "30303030303030303030303030303030" "pickle"))
          (real-delete-file (symbol-function 'delete-file))
@@ -13396,7 +13417,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ei4v-pickle-delete-failure-remains-retriable ()
   "A failed unlink leaves retired pickle metadata available for retry cleanup."
-  (let* ((root (make-temp-file "ejn-ei4v-delete-retry-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (file (expand-file-name "ejn-artifact-99999999999999999999999999999998" root))
          (real-delete (symbol-function 'delete-file))
          panel)
@@ -13432,11 +13453,13 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ei4v-pickle-admission-and-handoff-never-read-or-hash-bytes ()
   "Pickle admission and viewer handoff use descriptors, not payload bytes."
-  (let* ((root (make-temp-file "ejn-ei4v-no-read-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (file (expand-file-name "ejn-artifact-99999999999999999999999999999999" root))
          (sha (make-string 64 ?a))
          (canary "EJN_PICKLE_PAYLOAD_CANARY_never_on_the_wire")
-         process sent completed logs panel)
+         process sent completed logs panel
+         (real-insert-file-contents-literally
+          (symbol-function 'insert-file-contents-literally)))
     (unwind-protect
         (progn
           (set-file-modes root #o700)
@@ -13448,8 +13471,15 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                    (root-id (file-attribute-file-identifier
                              (file-attributes root 'integer))))
               (cl-letf (((symbol-function 'insert-file-contents-literally)
-                         (lambda (&rest _)
-                           (ert-fail "pickle bytes were read in Emacs")))
+                         (lambda (path &rest args)
+                           ;; Capability validation may read fixed metadata,
+                           ;; but the pickle payload itself must never be read
+                           ;; on Emacs's UI thread.
+                           (if (equal (expand-file-name path)
+                                      (expand-file-name file))
+                               (ert-fail "pickle bytes were read in Emacs")
+                             (apply real-insert-file-contents-literally
+                                    path args))))
                         ((symbol-function 'secure-hash)
                          (lambda (&rest _)
                            (ert-fail "pickle bytes were hashed in Emacs"))))
@@ -13499,7 +13529,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ei4v-bundle-update-is-targeted-transactional-and-clears-stale-pickle ()
   "A display-id update moves image and pickle together onto its old entry."
-  (let* ((root (make-temp-file "ejn-ei4v-bundle-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (image-a (expand-file-name "ejn-artifact-11111111111111111111111111111111" root))
          (pickle-a (expand-file-name "ejn-artifact-22222222222222222222222222222222" root))
          (image-b (expand-file-name "ejn-artifact-33333333333333333333333333333333" root))
@@ -13573,7 +13603,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ei4v-invalid-or-unknown-bundle-is-not-admitted ()
   "Malformed and unknown update bundles leave the panel untouched for discard."
-  (let* ((root (make-temp-file "ejn-ei4v-reject-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (file (expand-file-name "ejn-artifact-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" root))
          panel)
     (unwind-protect
@@ -13637,7 +13667,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ei4d-preview-admission-reads-only-fixed-header ()
   "Preview admission never hashes or synchronously reads its pixel payload."
-  (let* ((root (make-temp-file "ejn-ei4d-header-only-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (original (ejn-ei4d-test--write-artifact
                     root "10101010101010101010101010101010" "original"))
          (preview (ejn-ei4d-test--write-artifact
@@ -13672,7 +13702,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ei4d-published-unsafe-images-never-reach-native-apis ()
   "A helper original without a PPM preview never enters a native image API."
-  (let* ((root (make-temp-file "ejn-ei4d-native-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (original (ejn-ei4d-test--write-artifact
                     root "11111111111111111111111111111111"
                     (ejn-ei4d-test--png 65535 65535)))
@@ -13711,7 +13741,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ei4d-render-rechecks-only-bounded-inline-candidates ()
   "History length cannot turn native-boundary stat checks into O(all images)."
-  (let* ((root (make-temp-file "ejn-ei4d-history-" t)) panel)
+  (let* ((root (car (ejn-ei4-test--artifact-root))) panel)
     (unwind-protect
         (progn
           (set-file-modes root #o700)
@@ -13748,7 +13778,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ei4d-unsafe-original-obeys-existing-artifact-budget ()
   "A decoder-bomb placeholder still retires through the ordinary byte budget."
-  (let* ((root (make-temp-file "ejn-ei4d-budget-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (bomb (ejn-ei4d-test--write-artifact
                 root "44444444444444444444444444444444" (ejn-ei4d-test--png 4097 1024)))
          panel)
@@ -13768,7 +13798,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ei4d-native-calls-receive-only-the-ppm-preview ()
   "The compressed original is absent from every native image API argument."
-  (let* ((root (make-temp-file "ejn-ei4d-preview-" t))
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
          (original (ejn-ei4d-test--write-artifact
                     root "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" (ejn-ei4d-test--png 2 1)))
          (preview (ejn-ei4d-test--write-artifact
