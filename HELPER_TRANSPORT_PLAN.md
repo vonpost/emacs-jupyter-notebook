@@ -1357,7 +1357,7 @@ be manager-reviewed for durable-kernel rules.
     in-memory state passed a final delta audit.  A real remote SSH lifecycle
     smoke remains an acceptance-gate requirement.
 
-- [ ] **EI7 Mark ambiguous work outcome-unknown and reconnect without replay.**
+- [~] owner=terra-ei7 claimed=2026-09-01 **EI7 Mark ambiguous work outcome-unknown and reconnect without replay.**
   - Depends: EI6, TH3.
   - Files: `emacs-jupyter-notebook-helper-backend.el`,
     `emacs-jupyter-notebook.el`, `emacs-jupyter-notebook-result.el`,
