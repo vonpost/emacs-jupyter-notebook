@@ -117,6 +117,19 @@ These are binding for every workstream. Update only by appending a new entry.
   `retry-fresh-kernel`, plus the injected idle watchdog's self-shutdown).
   `prune-dead-kernels` is bound to `P` in the prefix map (`p` is already
   `backward-cell`); `w` still runs `clean-orphaned-kernels`.
+- **2026-09-01 / `restart-kernel` is an explicit allowed terminator.**
+  Supersedes the allowed-terminator list above.  HT12 proved that the direct
+  kernel launch shape cannot perform an in-place protocol restart: a Jupyter
+  `shutdown_request(restart=true)` exits the actual kernel and no manager
+  relaunches it.  The explicit user command
+  `emacs-jupyter-notebook-restart-kernel` therefore performs one confirmed
+  helper shutdown followed by a fresh direct launch on the same connection
+  metadata.  It may terminate only the currently attached, identity-bound
+  kernel and may launch its replacement only after shutdown confirmation; no
+  close, crash, timeout, reconnect, or background path inherits this authority.
+  The complete explicit terminator list is now `shutdown-kernel`,
+  `clean-orphaned-kernels`, `retry-fresh-kernel`, and `restart-kernel`, plus the
+  separately approved in-kernel idle watchdog.
 
 ## Cross-cutting changes
 

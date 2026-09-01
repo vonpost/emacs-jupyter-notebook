@@ -1300,23 +1300,50 @@ be manager-reviewed for durable-kernel rules.
     direct regression coverage.  A real aarch64-darwin closure smoke remains an
     acceptance-gate requirement because this host cannot execute it.
 
-- [ ] **EI6 Route explicit interrupt/restart/shutdown correctly.**
+- [~] owner=terra-ei6 claimed=2026-09-01 **EI6 Route explicit interrupt/restart/shutdown correctly.**
   - Depends: EI5, HT12R3.
   - Files: `emacs-jupyter-notebook-helper-backend.el`,
-    `emacs-jupyter-notebook.el`,
-    `tests/emacs-jupyter-notebook-helper-backend-tests.el`.
-  - Deliverable: interrupt affects only the active request.  Restart explicitly
-    asks the helper to shut down the current kernel, waits for confirmation,
-    asynchronously reuses HT12R2's direct launch with the same connection
-    metadata/ports, records the new kernel PID, reconnects the helper, verifies
-    kernel info, and reinjects formatter/watchdog exactly once.  Shutdown is the
-    only route to the helper shutdown op and removes durable state only after a
-    confirmed terminal result.  Close/reconnect/failure cannot dispatch
-    shutdown or launch a replacement.
-  - Tests: fake event ordering/timeouts/late success; restart failure at every
-    shutdown/launch/reconnect/verify boundary; new PID promotion only after
-    verification; restart reinjection once; shutdown failure preserves
-    registry; close and helper crash assert no terminating or launch op.
+    `emacs-jupyter-notebook.el`, `emacs-jupyter-notebook-ssh.el`,
+    `emacs-jupyter-notebook-connection.el`,
+    `tests/emacs-jupyter-notebook-helper-backend-tests.el`,
+    `tests/emacs-jupyter-notebook-tests.el`.
+  - Deliverable: helper control routing admits only exact bounded `interrupt`
+    and `shutdown` operations; helper `restart` remains unsupported.  Interrupt
+    is owned by the active dispatched/cancelling ledger record and never affects
+    queued, auxiliary, or stale work.  Every successful attach durably records
+    all five validated non-secret remote ports; restart rejects entries lacking
+    the new schema rather than guessing.
+  - Deliverable: before any irreversible action, restart reconstructs a private
+    0600 remote-port connection seed from the durable local connection file and
+    completes bounded kernelspec resolution.  Only then does it open a unique
+    FIFO gate and ask the exact installed helper to shut down the current
+    kernel.  After confirmed terminal shutdown it releases old local transport,
+    uploads the seed to a unique sibling staging path, atomically publishes it
+    at the original remote connection path, and reuses HT12R2's direct launch.
+    The identity-probed replacement PID remains context-only until a fresh
+    helper verifies kernel info; finalization then atomically promotes the new
+    PID/ports/local connection file and injects formatter/watchdog exactly once
+    before queued user work can run.
+  - Deliverable: preflight failure leaves the old kernel and durable entry
+    untouched.  Shutdown failure or ambiguity never launches a replacement and
+    preserves the registry/local connection file while retiring only suspect
+    local transport.  Every failure after confirmed shutdown retains a
+    provisional recoverable entry and removes local seed/process/timer state;
+    it never compensates by killing.  Explicit shutdown removes registry state
+    and the local connection file only after the helper confirms terminal
+    liveness.  Close, helper crash, heartbeat, reconnect, timeout, and late
+    callbacks cannot dispatch shutdown or launch a replacement.
+  - Tests: exact control results and restart rejection; no-active/queued/stale
+    interrupt; fake event ordering, synchronous throws, timeouts, cancellation,
+    and late success.  Restart preflight failures prove zero shutdown/launch;
+    post-shutdown failures cover staged restore/publish, launch admission,
+    sidecar/PID identity, tunnel, fresh helper attach/kernel-info, registry
+    promotion, and setup.  Assert provisional save precedes launch, the new PID
+    is absent from durable state until verification, all five remote ports and
+    the connection key survive reconstruction without entering the registry or
+    logs, setup runs once, and every process/timer/temp file is reclaimed.
+    Shutdown failure preserves registry/local file; confirmed shutdown removes
+    them in order.  Close and helper crash assert no terminating or launch op.
   - Narrow run: ERT selector `^ejn-ei6-` plus W1/W5/W11 lifecycle tests.
 
 - [ ] **EI7 Mark ambiguous work outcome-unknown and reconnect without replay.**
