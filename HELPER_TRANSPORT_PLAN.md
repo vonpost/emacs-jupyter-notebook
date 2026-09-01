@@ -1459,10 +1459,15 @@ be manager-reviewed for durable-kernel rules.
     production byte-compilation added no warnings beyond the two pre-existing
     optional Evil variable references.
 
-- [~] owner=luna-ei11 claimed=2026-09-01 **EI11 Make helper selectable for local dogfood, still default legacy.**
+- [x] owner=luna-ei11 claimed=2026-09-01 landed=9701321 **EI11 Make helper selectable for local dogfood, still default legacy.**
   - Depends: EI10.
   - Files: `emacs-jupyter-notebook-vars.el`, `README.md`,
-    `tests/emacs-jupyter-notebook-tests.el`.
+    `tests/emacs-jupyter-notebook-tests.el`.  Manager-approved scope expansion:
+    `emacs-jupyter-notebook-helper.el`, `helper/ejn_helper/__main__.py`,
+    `helper/tests/test_cli.py`, and
+    `tests/emacs-jupyter-notebook-helper-process-tests.el` were required so
+    missing-dependency and version diagnostics are actionable at the actual
+    async startup boundary rather than documented around a generic failure.
   - Deliverable: document exact Nix/helper command and temporary backend
     selector, fail fast with actionable diagnostics when helper/dependency is
     absent, document the temporary emacs-jupyter pin, and add no implicit pip
@@ -1470,6 +1475,12 @@ be manager-reviewed for durable-kernel rules.
   - Tests: command resolution in checkout, straight build symlink, Nix closure,
     missing command/dependency/version mismatch; README command names checked.
   - Narrow run: ERT selector `^ejn-ei11-`, full ERT, all helper unit tests.
+  - Landed verification: focused EI11 ERT passed 8/8, helper supervision ERT
+    passed 22/22, and CLI tests passed 10/10.  Both canonical source runs passed
+    813/813 ERTs and 218/218 helper tests (three expected host skips).
+    Production Elisp byte-compilation was clean; `nix build .#ejn-helper`
+    succeeded and the packaged executable reported version `0.1.0`.  Generated
+    bytecode and the `result` symlink were removed before the final source run.
 
 ### Phase AG - integration and removal gates
 
@@ -1477,9 +1488,12 @@ be manager-reviewed for durable-kernel rules.
   - Depends: HT13, EI11, TH3.
   - Files: tests only; production fixes require a new narrowly claimed row.
   - Deliverable: one integration runner covers connect, execute stream/result/
-    error/image/update/clear, aux requests, stdin, interrupt, restart, close,
-    reconnect, and explicit shutdown against TH2.  Assert request state/event
-    order, artifact constraints, cleanup, and unchanged kernel across close.
+    error/image/update/clear, aux requests, stdin, interrupt, close, reconnect,
+    and explicit shutdown against TH2.  Restart coverage exercises the binding
+    EJN orchestration contract: explicit shutdown, test-owned TH2 relaunch,
+    then a fresh helper attach.  Protocol v1 deliberately has no helper
+    `restart` operation.  Assert request state/event order, artifact
+    constraints, cleanup, and unchanged kernel across close.
   - Gate: 20 consecutive runs, zero failure/leak, each under 120 seconds.
 
 - [ ] **AG2 Run Emacs/helper/local-kernel end-to-end suite.**
