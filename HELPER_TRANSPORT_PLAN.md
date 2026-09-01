@@ -1503,7 +1503,7 @@ be manager-reviewed for durable-kernel rules.
     framing/CLI tests passed 15/15, and the canonical source suite passed
     813/813 ERTs plus 218/218 helper unit tests (three expected host skips).
 
-- [ ] **AG2 Run Emacs/helper/local-kernel end-to-end suite.**
+- [~] owner=terra-ag2 claimed=2026-09-02 **AG2 Run Emacs/helper/local-kernel end-to-end suite.**
   - Depends: AG1.
   - Files: `tests/emacs-jupyter-notebook-helper-e2e.el`, runner only.
   - Deliverable: source buffer -> helper -> TH2 kernel -> panel path without SSH
