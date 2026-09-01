@@ -1406,7 +1406,7 @@ be manager-reviewed for durable-kernel rules.
     unavailable-helper actions, and redaction syntax bypasses; its final delta
     audit found no P0/P1 defect.
 
-- [ ] **EI9 Add stale artifact cleanup and local lifecycle audit.**
+- [~] owner=terra-ei9 claimed=2026-09-01 **EI9 Add stale artifact cleanup and local lifecycle audit.**
   - Depends: EI8.
   - Files: `emacs-jupyter-notebook-artifacts.el`,
     `emacs-jupyter-notebook-result.el`,
