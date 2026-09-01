@@ -1300,7 +1300,7 @@ be manager-reviewed for durable-kernel rules.
     direct regression coverage.  A real aarch64-darwin closure smoke remains an
     acceptance-gate requirement because this host cannot execute it.
 
-- [~] owner=terra-ei6 claimed=2026-09-01 **EI6 Route explicit interrupt/restart/shutdown correctly.**
+- [x] owner=terra-ei6 claimed=2026-09-01 landed=28fe0d2 **EI6 Route explicit interrupt/restart/shutdown correctly.**
   - Depends: EI5, HT12R3.
   - Files: `emacs-jupyter-notebook-helper-backend.el`,
     `emacs-jupyter-notebook.el`, `emacs-jupyter-notebook-ssh.el`,
@@ -1313,15 +1313,17 @@ be manager-reviewed for durable-kernel rules.
     queued, auxiliary, or stale work.  Every successful attach durably records
     all five validated non-secret remote ports; restart rejects entries lacking
     the new schema rather than guessing.
-  - Deliverable: before any irreversible action, restart reconstructs a private
-    0600 remote-port connection seed from the durable local connection file and
-    completes bounded kernelspec resolution.  Only then does it open a unique
-    FIFO gate and ask the exact installed helper to shut down the current
-    kernel.  After confirmed terminal shutdown it releases old local transport,
-    uploads the seed to a unique sibling staging path, atomically publishes it
-    at the original remote connection path, and reuses HT12R2's direct launch.
-    The identity-probed replacement PID remains context-only until a fresh
-    helper verifies kernel info; finalization then atomically promotes the new
+  - Deliverable: at explicit restart admission, open a unique FIFO gate before
+    the reversible preflight so no queued work can pass the user's replacement
+    gesture.  A bounded asynchronous child reconstructs a private 0600
+    remote-port connection seed from the durable local connection file while
+    bounded kernelspec resolution runs; neither step can block Emacs.  Only
+    after both succeed does the exact installed helper receive shutdown.  After
+    confirmed terminal shutdown it releases old local transport, uploads the
+    seed to a unique sibling staging path, atomically publishes it at the
+    original remote connection path, and reuses HT12R2's direct launch.  The
+    identity-probed replacement PID remains context-only until a fresh helper
+    verifies kernel info; finalization then atomically promotes the new
     PID/ports/local connection file and injects formatter/watchdog exactly once
     before queued user work can run.
   - Deliverable: preflight failure leaves the old kernel and durable entry
@@ -1345,6 +1347,15 @@ be manager-reviewed for durable-kernel rules.
     Shutdown failure preserves registry/local file; confirmed shutdown removes
     them in order.  Close and helper crash assert no terminating or launch op.
   - Narrow run: ERT selector `^ejn-ei6-` plus W1/W5/W11 lifecycle tests.
+  - Landed verification: 723 source-based ERTs and 199 host helper tests pass
+    (three expected host skips), including 27 focused EI6 lifecycle tests;
+    production Elisp byte-compiles with only the two pre-existing optional Evil
+    variable warnings, and all generated artifacts were removed before the
+    canonical source rerun.  Independent review found no P0/P1 defects; its
+    seed-read blocking and post-shutdown registry-truth concerns were fixed and
+    the resulting async reader, disposer/watchdog coverage, and provisional
+    in-memory state passed a final delta audit.  A real remote SSH lifecycle
+    smoke remains an acceptance-gate requirement.
 
 - [ ] **EI7 Mark ambiguous work outcome-unknown and reconnect without replay.**
   - Depends: EI6, TH3.
