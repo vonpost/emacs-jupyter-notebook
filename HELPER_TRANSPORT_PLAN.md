@@ -1435,7 +1435,7 @@ be manager-reviewed for durable-kernel rules.
     and pending external-viewer ownership.  Its final focused EI9/EI4D run
     passed 34/34 with no remaining P0/P1 finding.
 
-- [ ] **EI10 Add static no-hang architecture assertions.**
+- [~] owner=luna-ei10 claimed=2026-09-01 **EI10 Add static no-hang architecture assertions.**
   - Depends: EI9.
   - Files: `tests/emacs-jupyter-notebook-helper-backend-tests.el`,
     `helper/tests/test_architecture.py`.
