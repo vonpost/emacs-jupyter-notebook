@@ -18,6 +18,8 @@
 (defvar emacs-jupyter-notebook--kernel-status nil)
 (declare-function emacs-jupyter-notebook--execution-current-p
                   "emacs-jupyter-notebook" (id))
+(declare-function emacs-jupyter-notebook--execution-input-current-p
+                  "emacs-jupyter-notebook" (id))
 (declare-function emacs-jupyter-notebook--execution-record
                   "emacs-jupyter-notebook" (id))
 (declare-function emacs-jupyter-notebook--execution-note-event
@@ -58,6 +60,9 @@ the core has validated admission."
                  (and record
                       (emacs-jupyter-notebook--execution-current-p request-id)
                       (memq (plist-get record :state) '(dispatched cancelling))
+                      (or (not (eq type 'input-request))
+                          (emacs-jupyter-notebook--execution-input-current-p
+                           request-id))
                       (equal generation (plist-get record :generation))
                       (cond
                        ((and backend-id
@@ -252,7 +257,13 @@ The timer rechecks request identity before prompt/reply so a retired source
 buffer or superseded execution cannot receive an input reply."
   (let ((thunk
          (lambda ()
-           (when (emacs-jupyter-notebook-events--request-current-p context)
+           (when (let ((buffer (plist-get context :buffer))
+                       (request-id (plist-get context :request-id)))
+                   (and (buffer-live-p buffer)
+                        (with-current-buffer buffer
+                          (or (null request-id)
+                              (emacs-jupyter-notebook--execution-input-current-p
+                               request-id)))))
              (let ((value (condition-case nil
                               (if password (read-passwd prompt) (read-string prompt))
                             (quit ""))))

@@ -33,6 +33,18 @@
 (defun ejn-ei2-test--closed-response ()
   (ejn-ei2-test--response (ejn-ei2-test--object "closed" t)))
 
+(defun ejn-ei2-test--kernel-info-result ()
+  "Return the minimum structurally useful helper kernel-info fixture."
+  (ejn-ei2-test--object
+   "protocol_version" "5.3" "implementation" "ipython"
+   "language_info" (ejn-ei2-test--object "name" "python")))
+
+(defun ejn-ei2-test--kernel-info-response ()
+  (ejn-ei2-test--response (ejn-ei2-test--kernel-info-result)))
+
+(defun ejn-ei2-test--input-response ()
+  (ejn-ei2-test--response (ejn-ei2-test--object "accepted" t)))
+
 (defun ejn-ei2-test--run-timers ()
   (accept-process-output nil 0.02))
 
@@ -111,7 +123,7 @@ DISPOSALS receives local-only disposal reasons."
         (funcall (car callbacks) nil (ejn-ei2-test--attached-response) nil)
         (should (emacs-jupyter-notebook-backend-session-attached-p session))
         (should (equal (caar requests) "kernel_info"))
-        (funcall (car callbacks) nil (ejn-ei2-test--response) nil)
+        (funcall (car callbacks) nil (ejn-ei2-test--kernel-info-response) nil)
         (should-not connected)
         (ejn-ei2-test--run-timers)
         (should (eq connected session))
@@ -141,7 +153,7 @@ DISPOSALS receives local-only disposal reasons."
                (funcall callback nil
                         (pcase operation
                           ("connect" (ejn-ei2-test--attached-response))
-                          ("kernel_info" (ejn-ei2-test--response))
+                          ("kernel_info" (ejn-ei2-test--kernel-info-response))
                           (_ (ejn-ei2-test--closed-response)))
                         nil)
                1))
@@ -164,7 +176,7 @@ DISPOSALS receives local-only disposal reasons."
                         (emacs-jupyter-notebook-backend-session-data session)))
         (setq state (emacs-jupyter-notebook-backend-session-data session))
         (funcall (car callbacks) nil (ejn-ei2-test--attached-response) nil)
-        (funcall (car callbacks) nil (ejn-ei2-test--response) nil)
+        (funcall (car callbacks) nil (ejn-ei2-test--kernel-info-response) nil)
         (ejn-ei2-test--run-timers)
         (emacs-jupyter-notebook-backend-close-local session #'ignore #'ignore)
         (should (equal (caar requests) "close"))
@@ -187,7 +199,7 @@ DISPOSALS receives local-only disposal reasons."
         (funcall (car callbacks) nil (ejn-ei2-test--attached-response) nil)
         (let ((verify (car callbacks)))
           (emacs-jupyter-notebook-backend-close-local session #'ignore #'ignore)
-          (funcall verify nil (ejn-ei2-test--response) nil)
+          (funcall verify nil (ejn-ei2-test--kernel-info-response) nil)
           (funcall (car callbacks) nil (ejn-ei2-test--closed-response) nil)
           (ejn-ei2-test--run-timers)
           (should-not success))))))
@@ -232,7 +244,7 @@ DISPOSALS receives local-only disposal reasons."
           (funcall (car callbacks) nil (ejn-ei2-test--attached-response) nil)
           (setq verify (car callbacks))
           (funcall helper-failure nil "transport lost")
-          (funcall verify nil (ejn-ei2-test--response) nil)
+          (funcall verify nil (ejn-ei2-test--kernel-info-response) nil)
           (ejn-ei2-test--run-timers)
           (should (string-match-p "transport lost" failure))
           (should (emacs-jupyter-notebook-helper-backend-state-retired state))
@@ -385,7 +397,7 @@ DISPOSALS receives local-only disposal reasons."
                       (setq b (emacs-jupyter-notebook-backend-session-create nil owner))
                       (emacs-jupyter-notebook-backend-connect
                        b "/tmp/b.json" #'ignore #'ignore)
-                      (funcall a-verify nil (ejn-ei2-test--response) nil)
+                      (funcall a-verify nil (ejn-ei2-test--kernel-info-response) nil)
                       (should-not
                        (emacs-jupyter-notebook-backend-session-attached-p b)))
                   (dolist (session (delq nil (list a b)))
@@ -675,7 +687,8 @@ DISPOSALS receives local-only disposal reasons."
             (should (eq emacs-jupyter-notebook--client session))
             (should (emacs-jupyter-notebook-backend-session-installed-p session))
             (should (eq (plist-get context :phase) 'done))
-            (should (= heartbeat-started 0))
+            ;; EI5 routes helper kernel-info through the common heartbeat.
+            (should (= heartbeat-started 1))
             (should-not emacs-jupyter-notebook--tunnel-dead))
         (setq emacs-jupyter-notebook--async-context nil
               emacs-jupyter-notebook--client nil)))))
@@ -705,7 +718,7 @@ DISPOSALS receives local-only disposal reasons."
         (should-not shutdown)
         (should-not deregister)
         (funcall (car callbacks) nil (ejn-ei2-test--closed-response) nil)
-        (funcall verify nil (ejn-ei2-test--response) nil)
+        (funcall verify nil (ejn-ei2-test--kernel-info-response) nil)
         (ejn-ei2-test--run-timers)
         (should disposals)
         (should-not (file-exists-p artifact))))))
@@ -719,7 +732,7 @@ DISPOSALS receives local-only disposal reasons."
         (setq state (emacs-jupyter-notebook-backend-session-data session)
               artifact (emacs-jupyter-notebook-helper-backend-state-artifact-dir state))
         (funcall (car callbacks) nil (ejn-ei2-test--attached-response) nil)
-        (funcall (car callbacks) nil (ejn-ei2-test--response) nil)
+        (funcall (car callbacks) nil (ejn-ei2-test--kernel-info-response) nil)
         (ejn-ei2-test--run-timers)
         (emacs-jupyter-notebook-backend-close-local
          session #'ignore (lambda (_id reason) (setq close-error reason)))
@@ -836,7 +849,7 @@ DISPOSALS receives local-only disposal reasons."
         (setq state (emacs-jupyter-notebook-backend-session-data session)
               artifact (emacs-jupyter-notebook-helper-backend-state-artifact-dir state))
         (funcall (car callbacks) nil (ejn-ei2-test--attached-response) nil)
-        (funcall (car callbacks) nil (ejn-ei2-test--response) nil)
+        (funcall (car callbacks) nil (ejn-ei2-test--kernel-info-response) nil)
         (ejn-ei2-test--run-timers)
         (emacs-jupyter-notebook-backend-close-local
          session #'ignore (lambda (_id reason) (setq close-error reason)))
@@ -861,10 +874,12 @@ DISPOSALS receives local-only disposal reasons."
                    (push (list operation params) requests)
                    (funcall callback 'fake
                             (ejn-ei2-test--response
-                             (if (equal operation "is_complete")
-                                 (ejn-ei2-test--object "status" "complete")
-                               (ejn-ei2-test--object "status" "ok"
-                                                    "execution_count" 1))) nil)
+                             (pcase operation
+                               ("is_complete"
+                                (ejn-ei2-test--object "status" "complete"))
+                               ("kernel_info" (ejn-ei2-test--kernel-info-result))
+                               (_ (ejn-ei2-test--object
+                                   "status" "ok" "execution_count" 1)))) nil)
                    (format "ejn-request-test-%d" (length requests)))))
         (emacs-jupyter-notebook-backend-execute
          session "user()" '(:ledger-id 7) #'ignore
@@ -887,7 +902,7 @@ DISPOSALS receives local-only disposal reasons."
         (should (hash-table-p readiness-result))
         (should (equal (mapcar #'car requests)
                        '("kernel_info" "is_complete" "execute")))
-        (should (string-match-p "unavailable until EI5"
+        (should (string-match-p "Unsupported helper backend operation"
                                 (error-message-string control-error)))))))
 
 (ert-deftest ejn-ei2-transport-events-are-not-normalized-before-ei4 ()
@@ -1442,6 +1457,643 @@ DISPOSALS receives local-only disposal reasons."
                                              "mime" "image/png" "width" 1 "height" 1)))))
           (should-error
            (emacs-jupyter-notebook-helper-backend--normalize-event state (raw bad)))))))
+
+(ert-deftest ejn-ei5-helper-auxiliary-operations-use-bounded-v1-requests ()
+  "Completion, inspect, completeness, and stdin use exact helper operations."
+  (with-temp-buffer
+    (let* ((emacs-jupyter-notebook-backend 'helper)
+           (session (emacs-jupyter-notebook-backend-session-create nil (current-buffer)))
+           (state (emacs-jupyter-notebook-helper-backend--make-state :helper 'fake))
+           requests complete inspect incomplete input)
+      (setf (emacs-jupyter-notebook-backend-session-data session) state)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper-request)
+                 (lambda (_helper operation params callback &rest keys)
+                   (push (list operation params (plist-get keys :timeout)) requests)
+                   (funcall callback 'fake
+                            (ejn-ei2-test--response
+                             (pcase operation
+                               ("complete" (ejn-ei2-test--object
+                                            "matches" ["print"] "cursor_start" 0
+                                            "cursor_end" 3 "status" "ok"))
+                               ("inspect" (ejn-ei2-test--object
+                                           "found" t "data"
+                                           (ejn-ei2-test--object "text/plain" "docs")))
+                               ("is_complete" (ejn-ei2-test--object "status" "complete"))
+                               (_ (ejn-ei2-test--object "accepted" t)))) nil)
+                   (format "wire-%d" (length requests)))))
+        (emacs-jupyter-notebook-backend-aux
+         session 'complete '(:code "pri" :cursor-pos 3)
+         (lambda (_id value) (setq complete value)) #'ert-fail)
+        (emacs-jupyter-notebook-backend-aux
+         session 'inspect '(:code "pri" :cursor-pos 3 :detail 1)
+         (lambda (_id value) (setq inspect value)) #'ert-fail)
+        (emacs-jupyter-notebook-backend-aux
+         session 'is-complete '(:code "x")
+         (lambda (_id value) (setq incomplete value)) #'ert-fail)
+        (emacs-jupyter-notebook-backend-input
+         session (cons "wire-execute" (make-string 32 ?a)) "answer"
+         (lambda (_id value) (setq input value)) #'ert-fail)
+        (ejn-ei2-test--run-timers)
+        (should (equal complete '(:matches ("print") :cursor_start 0 :cursor_end 3 :status "ok")))
+        (should (equal (plist-get (plist-get inspect :data) :text/plain) "docs"))
+        (should (equal incomplete '(:status "complete")))
+        (should-not input)
+        (should (equal (mapcar #'car (nreverse requests))
+                       '("complete" "inspect" "is_complete" "input_reply")))
+        (dolist (request requests)
+          (should (= (nth 2 request) emacs-jupyter-notebook-helper-backend--aux-timeout)))))))
+
+(ert-deftest ejn-ei5-input-normalization-and-lease-validation-are-strict ()
+  "Prompt events and input replies reject malformed or oversized secrets."
+  (let* ((state (emacs-jupyter-notebook-helper-backend--make-state))
+         (id (make-string 32 ?a))
+         (event (ejn-ei2-test--object "event" "input_request" "data"
+                                      (ejn-ei2-test--object
+                                       "input_id" id "prompt" "Password: " "password" t))))
+    (should (equal (emacs-jupyter-notebook-helper-backend--normalize-event state event)
+                   (list :type 'input-request :input-id id :prompt "Password: " :password t)))
+    (puthash "input_id" "wrong" (gethash "data" event))
+    (should-error (emacs-jupyter-notebook-helper-backend--normalize-event state event))
+    (should-error
+     (emacs-jupyter-notebook-helper-backend--input-payload-object
+      (list :request-id (cons "wire" id) :value (make-string 65537 ?x))))))
+
+(ert-deftest ejn-ei5-helper-heartbeat-failure-enters-existing-dead-path-once ()
+  "An idle helper kernel-info failure takes the normal one-shot retry path."
+  (with-temp-buffer
+    (let* ((emacs-jupyter-notebook-backend 'helper)
+           (session (emacs-jupyter-notebook-backend-session-create nil (current-buffer)))
+           (state (emacs-jupyter-notebook-helper-backend--make-state :helper 'fake))
+           (emacs-jupyter-notebook--client session)
+           (emacs-jupyter-notebook-mode t)
+           (emacs-jupyter-notebook--kernel-status 'idle)
+           (emacs-jupyter-notebook--tunnel-dead nil)
+           (emacs-jupyter-notebook-heartbeat-misses-allowed 1)
+           (scheduled 0))
+      (setf (emacs-jupyter-notebook-backend-session-data session) state)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper-request)
+                 (lambda (_helper operation _params callback &rest _keys)
+                   (should (equal operation "kernel_info"))
+                   (funcall callback 'fake nil "kernel-info unavailable")
+                   "heartbeat-wire"))
+                ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                 (lambda (&rest _) (cl-incf scheduled)))
+                ((symbol-function 'display-warning) #'ignore))
+        (emacs-jupyter-notebook--heartbeat-tick)
+        (should-not emacs-jupyter-notebook--tunnel-dead)
+        (ejn-ei2-test--run-timers)
+        (should emacs-jupyter-notebook--tunnel-dead)
+        (should (= scheduled 1))
+        ;; The stale callback/token cannot schedule a second retry.
+        (ejn-ei2-test--run-timers)
+        (should (= scheduled 1))))))
+
+(ert-deftest ejn-ei5-helper-heartbeat-is-single-flight-and-busy-safe ()
+  "Helper heartbeats neither overlap nor count long execution silence."
+  (with-temp-buffer
+    (let* ((emacs-jupyter-notebook-backend 'helper)
+           (session (emacs-jupyter-notebook-backend-session-create
+                     nil (current-buffer)))
+           (state (emacs-jupyter-notebook-helper-backend--make-state
+                   :helper 'fake))
+           (emacs-jupyter-notebook--client session)
+           (emacs-jupyter-notebook--kernel-status 'busy)
+           (emacs-jupyter-notebook--heartbeat-misses 1)
+           calls)
+      (setf (emacs-jupyter-notebook-backend-session-data session) state)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper-request)
+                 (lambda (&rest _)
+                   (cl-incf calls)
+                   "unexpected-heartbeat")))
+        (emacs-jupyter-notebook--heartbeat-tick)
+        (emacs-jupyter-notebook--heartbeat-on-miss)
+        (should-not calls)
+        (should (= emacs-jupyter-notebook--heartbeat-misses 0))
+        (should-not emacs-jupyter-notebook--tunnel-dead)
+        ;; Even while idle, a custom interval cannot start a second probe
+        ;; before the first token reaches its bounded reply or timeout.
+        (setq emacs-jupyter-notebook--kernel-status 'idle
+              emacs-jupyter-notebook--heartbeat-inflight 'existing-probe)
+        (emacs-jupyter-notebook--heartbeat-tick)
+        (should-not calls)
+        (should (eq emacs-jupyter-notebook--heartbeat-inflight
+                    'existing-probe))))))
+
+(ert-deftest ejn-ei5-stdin-prompts-defer-and-clear-passwords ()
+  "Normal, password, and quit replies leave the filter turn without prompting."
+  (dolist (case '((normal nil "answer") (password t "secret") (quit nil quit)))
+    (let ((source (generate-new-buffer " *ejn-ei5-input*")) seen secret)
+      (unwind-protect
+          (with-current-buffer source
+            (let ((session 'helper-session)
+                  (emacs-jupyter-notebook--client 'helper-session))
+              (setq secret (copy-sequence (if (eq (nth 2 case) 'quit)
+                                              "" (nth 2 case))))
+              (cl-letf (((symbol-function 'emacs-jupyter-notebook--execution-input-current-p)
+                         (lambda (_id) t))
+                        ((symbol-function 'emacs-jupyter-notebook-backend-input)
+                         (lambda (_client lease value &rest _)
+                           (setq seen (list lease (copy-sequence value)))))
+                        ((symbol-function 'read-string)
+                         (lambda (_prompt)
+                           (if (eq (nth 2 case) 'quit) (signal 'quit nil) secret)))
+                        ((symbol-function 'read-passwd)
+                         (lambda (_prompt) secret)))
+                (emacs-jupyter-notebook-events--schedule-input
+                 (list :buffer source :request-id nil
+                       :input-reply (emacs-jupyter-notebook--helper-input-reply
+                                     session 1 "wire" (make-string 32 ?a)))
+                 "Prompt: " (nth 1 case))
+                (should-not seen)
+                ;; Drain from another buffer: the lease closure must re-enter
+                ;; SOURCE rather than reading arbitrary buffer-local state.
+                (with-temp-buffer (ejn-ei2-test--run-timers))
+                (should (equal (caar seen) "wire"))
+                (should (equal (cadr seen)
+                               (if (eq (nth 2 case) 'quit) "" (nth 2 case))))
+                (when (nth 1 case)
+                  (should-not (equal secret "secret"))))))
+        (when (buffer-live-p source) (kill-buffer source))))))
+
+(ert-deftest ejn-ei5-helper-complete-inspect-real-replies-and-deadlines ()
+  "The fake helper exercises successful, malformed, and bounded aux replies."
+  (with-temp-buffer
+    (let* ((emacs-jupyter-notebook-backend 'helper)
+           (session (emacs-jupyter-notebook-backend-session-create nil
+                                                                    (current-buffer)))
+           (state (emacs-jupyter-notebook-helper-backend--make-state :helper 'fake))
+           requests pending complete inspect failures)
+      (setf (emacs-jupyter-notebook-backend-session-data session) state)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper-request)
+                 (lambda (_helper operation params callback &rest keys)
+                   (push (list operation params (plist-get keys :timeout)) requests)
+                   (push (list operation callback) pending)
+                   (format "ei5-aux-%d" (length requests)))))
+        (emacs-jupyter-notebook-backend-aux
+         session 'complete '(:code "pri" :cursor-pos 3)
+         (lambda (_id value) (setq complete value))
+         (lambda (_id reason) (push reason failures)))
+        (emacs-jupyter-notebook-backend-aux
+         session 'inspect '(:code "pri" :cursor-pos 3 :detail 1)
+         (lambda (_id value) (setq inspect value))
+         (lambda (_id reason) (push reason failures)))
+        (dolist (request pending)
+          (pcase (car request)
+            ("complete"
+             (funcall (cadr request) 'fake
+                      (ejn-ei2-test--response
+                       (ejn-ei2-test--object
+                        "matches" ["print"] "cursor_start" 0 "cursor_end" 3
+                        "status" "ok")) nil))
+            ("inspect"
+             (funcall (cadr request) 'fake
+                      (ejn-ei2-test--response
+                       (ejn-ei2-test--object
+                        "found" t "data"
+                        (ejn-ei2-test--object "text/plain" "docs"))) nil))))
+        (ejn-ei2-test--run-timers)
+        (should (equal complete
+                       '(:matches ("print") :cursor_start 0 :cursor_end 3
+                         :status "ok")))
+        (should (equal (plist-get (plist-get inspect :data) :text/plain) "docs"))
+        (should (= (length requests) 2))
+        (dolist (request requests)
+          (should (= (nth 2 request)
+                     emacs-jupyter-notebook-helper-backend--aux-timeout)))
+        ;; A malformed result must fail the operation, not reach the caller as
+        ;; a successful nil/partial plist.
+        (setq pending nil)
+        (emacs-jupyter-notebook-backend-aux
+         session 'complete '(:code "x" :cursor-pos 1) #'ignore
+         (lambda (_id reason) (push reason failures)))
+        (funcall (cadar pending) 'fake
+                 (ejn-ei2-test--response
+                  (ejn-ei2-test--object "matches" ["x"] "cursor_start" 4
+                                        "cursor_end" 1 "status" "ok")) nil)
+        (emacs-jupyter-notebook-backend-aux
+         session 'inspect '(:code "x" :cursor-pos 1) #'ignore
+         (lambda (_id reason) (push reason failures)))
+        (funcall (cadar pending) 'fake
+                 (ejn-ei2-test--response
+                  (ejn-ei2-test--object "found" t "data" "not-an-object")) nil)
+        (ejn-ei2-test--run-timers)
+        (should (= (length failures) 2))))))
+
+(ert-deftest ejn-ei5-malformed-kernel-info-fails-connect-and-heartbeat ()
+  "A successful envelope cannot make malformed readiness data healthy."
+  (ejn-ei2-test-with-fake-helper (requests callbacks disposals)
+    (ejn-ei2-test-with-session
+      (let (failure)
+        (emacs-jupyter-notebook-backend-connect
+         session "/tmp/c.json" #'ignore
+         (lambda (_id reason) (setq failure reason)))
+        (funcall (car callbacks) nil (ejn-ei2-test--attached-response) nil)
+        (funcall (car callbacks) nil (ejn-ei2-test--response) nil)
+        (ejn-ei2-test--run-timers)
+        (should (string-match-p "invalid result" failure))
+        (should disposals))))
+  (with-temp-buffer
+    (let* ((emacs-jupyter-notebook-backend 'helper)
+           (session (emacs-jupyter-notebook-backend-session-create
+                     nil (current-buffer)))
+           (state (emacs-jupyter-notebook-helper-backend--make-state
+                   :helper 'fake))
+           (emacs-jupyter-notebook--client session)
+           (emacs-jupyter-notebook--kernel-status 'idle)
+           (emacs-jupyter-notebook-heartbeat-misses-allowed 1)
+           scheduled)
+      (setf (emacs-jupyter-notebook-backend-session-data session) state)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper-request)
+                 (lambda (_helper _operation _params callback &rest _)
+                   (funcall callback 'fake (ejn-ei2-test--response) nil)
+                   "malformed-heartbeat"))
+                ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                 (lambda (&rest _) (setq scheduled t)))
+                ((symbol-function 'display-warning) #'ignore))
+        (emacs-jupyter-notebook--heartbeat-tick)
+        (ejn-ei2-test--run-timers)
+        (should emacs-jupyter-notebook--tunnel-dead)
+        (should scheduled)))))
+
+(ert-deftest ejn-ei5-malformed-input-acknowledgement-is-a-failure ()
+  "Only an exact accepted=true result acknowledges a stdin reply."
+  (with-temp-buffer
+    (let* ((emacs-jupyter-notebook-backend 'helper)
+           (session (emacs-jupyter-notebook-backend-session-create
+                     nil (current-buffer)))
+           (state (emacs-jupyter-notebook-helper-backend--make-state
+                   :helper 'fake))
+           (results (list (ejn-ei2-test--object "accepted" :false)
+                          (ejn-ei2-test--object "accepted" t "extra" t)))
+           failures
+           successes)
+      (setf (emacs-jupyter-notebook-backend-session-data session) state)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper-request)
+                 (lambda (_helper _operation _params callback &rest _)
+                   (funcall callback 'fake
+                            (ejn-ei2-test--response (pop results)) nil)
+                   "malformed-input-ack")))
+        (dotimes (_ 2)
+          (emacs-jupyter-notebook-backend-input
+           session (cons "wire-execute" (make-string 32 ?a)) "value"
+           (lambda (&rest _) (cl-incf successes))
+           (lambda (_id reason) (push reason failures))))
+        (ejn-ei2-test--run-timers)
+        (should (= (length failures) 2))
+        (should-not successes)))))
+
+(ert-deftest ejn-ei5-capf-with-helper-session-returns-under-five-ms ()
+  "A helper-backed CAPF miss only schedules work and never waits for it."
+  (with-temp-buffer
+    (python-mode)
+    (insert "# %%\nvalue.pri\n")
+    (goto-char (point-min))
+    (search-forward "pri")
+    (let ((emacs-jupyter-notebook-mode t)
+          (emacs-jupyter-notebook--client
+           (emacs-jupyter-notebook-backend-session-create nil (current-buffer)))
+          (emacs-jupyter-notebook--kernel-status 'idle)
+          (emacs-jupyter-notebook--completion-cache nil)
+          (emacs-jupyter-notebook--completion-cache-order nil)
+          (emacs-jupyter-notebook--completion-pending-key nil)
+          (emacs-jupyter-notebook--completion-pending-id nil)
+          (emacs-jupyter-notebook--completion-idle-timer nil)
+          (this-command 'self-insert-command)
+          scheduled)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--completion-schedule-request)
+                 (lambda (&rest _) (setq scheduled t))))
+        (let ((started (float-time)))
+          (should-not (emacs-jupyter-notebook-completion-at-point))
+          (should (< (- (float-time) started) 0.005)))
+        (should scheduled)))))
+
+(ert-deftest ejn-ei5-completion-cache-rejects-edited-cell-and-replaced-client ()
+  "A cache key cannot make a reply valid after cell or client ownership changes."
+  (with-temp-buffer
+    (python-mode)
+    (insert "# %%\nobj.pri\nother\n")
+    (goto-char (point-min))
+    (search-forward "pri")
+    (let* ((emacs-jupyter-notebook-mode t)
+           (emacs-jupyter-notebook--client 'client-a)
+           (emacs-jupyter-notebook--completion-cache nil)
+           (emacs-jupyter-notebook--completion-cache-order nil)
+           (key (emacs-jupyter-notebook--completion-key))
+           (reply '(:matches ("print") :cursor_start 0 :cursor_end 3)))
+      (emacs-jupyter-notebook--completion-cache-put key reply)
+      ;; This edit is after point, so the old key is intentionally unchanged.
+      (goto-char (point-max))
+      (insert "edited\n")
+      (emacs-jupyter-notebook--completion-after-change)
+      (search-backward "pri")
+      (should-not (emacs-jupyter-notebook--completion-result))
+      ;; A reply owned by the replaced client cannot repopulate the cache.
+      (let* ((live-key (emacs-jupyter-notebook--completion-key))
+             (context (emacs-jupyter-notebook--completion-context))
+             (request-id (cl-incf emacs-jupyter-notebook--completion-request-counter)))
+        (setq emacs-jupyter-notebook--completion-pending-key live-key
+              emacs-jupyter-notebook--completion-pending-id request-id
+              emacs-jupyter-notebook--client 'client-b)
+        (emacs-jupyter-notebook--completion-on-reply
+         (current-buffer) 'client-a live-key request-id nil context reply nil)
+        (should (or (null emacs-jupyter-notebook--completion-cache)
+                    (= 0 (hash-table-count
+                          emacs-jupyter-notebook--completion-cache))))))))
+
+(ert-deftest ejn-ei5-duplicate-completion-keeps-original-reply-live ()
+  "A de-duplicated request must not invalidate its in-flight owner."
+  (with-temp-buffer
+    (python-mode)
+    (insert "# %%\nobj.pri\n")
+    (goto-char (point-min))
+    (search-forward "pri")
+    (let ((emacs-jupyter-notebook--client 'client-a)
+          (emacs-jupyter-notebook--kernel-status 'idle)
+          (emacs-jupyter-notebook--completion-cache nil)
+          (emacs-jupyter-notebook--completion-cache-order nil)
+          (emacs-jupyter-notebook--completion-pending-key nil)
+          (emacs-jupyter-notebook--completion-pending-id nil)
+          (emacs-jupyter-notebook--completion-request-counter 0)
+          callback
+          (calls 0))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-aux)
+                 (lambda (_client _operation _payload success _failure)
+                   (cl-incf calls)
+                   (setq callback success))))
+        (emacs-jupyter-notebook--request-completion)
+        (let ((owner emacs-jupyter-notebook--completion-pending-id))
+          (emacs-jupyter-notebook--request-completion)
+          (should (= calls 1))
+          (should (= owner emacs-jupyter-notebook--completion-request-counter))
+          (should (= owner emacs-jupyter-notebook--completion-pending-id))
+          (funcall callback 1
+                   '(:matches ("print") :cursor_start 0 :cursor_end 3))
+          (should-not emacs-jupyter-notebook--completion-pending-id)
+          (should (emacs-jupyter-notebook--completion-result)))))))
+
+(ert-deftest ejn-ei5-explicit-completion-drops-late-context-replies ()
+  "Explicit completion accepts only the newest reply for the live context."
+  (with-temp-buffer
+    (python-mode)
+    (insert "# %%\nobj.pri\n")
+    (goto-char (point-min))
+    (search-forward "pri")
+    (let ((emacs-jupyter-notebook-mode t)
+          (emacs-jupyter-notebook--client 'client-a)
+          callbacks refreshes)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-aux)
+                (lambda (_client _operation _payload success _failure)
+                   (push success callbacks)))
+                ((symbol-function 'completion-in-region)
+                 (lambda (&rest _) (setq refreshes (1+ (or refreshes 0))))))
+        (emacs-jupyter-notebook--complete-explicit-now)
+        (emacs-jupyter-notebook--complete-explicit-now)
+        (let ((newest (car callbacks)) (older (cadr callbacks)))
+          (funcall older 1
+                   '(:matches ("old") :cursor_start 0 :cursor_end 3))
+          (should-not refreshes)
+          (funcall newest 2
+                   '(:matches ("new") :cursor_start 0 :cursor_end 3))
+          (should (= refreshes 1)))))))
+
+(ert-deftest ejn-ei5-explicit-completion-drops-moved-edited-and-replaced-context ()
+  "Explicit completion replies are no-ops after point, text, or client changes."
+  (dolist (mutation '(move edit client))
+    (with-temp-buffer
+      (python-mode)
+      (insert "# %%\nobj.pri\n")
+      (goto-char (point-min))
+      (search-forward "pri")
+      (let ((emacs-jupyter-notebook-mode t)
+            (emacs-jupyter-notebook--client 'client-a)
+            callback refreshes)
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-aux)
+                   (lambda (_client _operation _payload success _failure)
+                     (setq callback success)))
+                  ((symbol-function 'completion-in-region)
+                   (lambda (&rest _) (setq refreshes (1+ (or refreshes 0))))))
+          (emacs-jupyter-notebook--complete-explicit-now)
+          (pcase mutation
+            ('move (forward-char -1))
+            ('edit (goto-char (point-max)) (insert "changed\n")
+                   (search-backward "pri"))
+            ('client (setq emacs-jupyter-notebook--client 'client-b)))
+          (funcall callback 1
+                   '(:matches ("stale") :cursor_start 0 :cursor_end 3))
+          (should-not refreshes))))))
+
+(ert-deftest ejn-ei5-inspect-drops-older-reply ()
+  "Inspect only displays the newest reply for a repeated request."
+  (with-temp-buffer
+    (python-mode)
+    (insert "# %%\nrange(5)\n")
+    (goto-char (point-min))
+    (search-forward "range")
+    (let ((emacs-jupyter-notebook-mode t)
+          (emacs-jupyter-notebook--client 'client-a)
+          callbacks displayed)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-aux)
+                 (lambda (_client _operation _payload success _failure)
+                   (push success callbacks)))
+                ((symbol-function 'display-message-or-buffer)
+                 (lambda (text &rest _) (push text displayed))))
+        (emacs-jupyter-notebook-inspect-at-point)
+        (emacs-jupyter-notebook-inspect-at-point)
+        (funcall (cadr callbacks) 1 '(:found t :data (:text/plain "old")))
+        (should-not displayed)
+        (funcall (car callbacks) 2 '(:found t :data (:text/plain "new")))
+        (should (= (length displayed) 1))))))
+
+(ert-deftest ejn-ei5-inspect-drops-moved-edited-and-replaced-context ()
+  "Inspect replies are no-ops after point, text, or client changes."
+  (dolist (mutation '(move edit client))
+    (with-temp-buffer
+      (python-mode)
+      (insert "# %%\nrange(5)\n")
+      (goto-char (point-min))
+      (search-forward "range")
+      (let ((emacs-jupyter-notebook-mode t)
+            (emacs-jupyter-notebook--client 'client-a)
+            callback displayed)
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-aux)
+                   (lambda (_client _operation _payload success _failure)
+                     (setq callback success)))
+                  ((symbol-function 'display-message-or-buffer)
+                   (lambda (text &rest _) (push text displayed))))
+          (emacs-jupyter-notebook-inspect-at-point)
+          (pcase mutation
+            ('move (forward-char 1))
+            ('edit (goto-char (point-max))
+                   (insert "changed\n")
+                   (search-backward "range"))
+            ('client (setq emacs-jupyter-notebook--client 'client-b)))
+          (funcall callback 1 '(:found t :data (:text/plain "stale")))
+          (should-not displayed))))))
+
+(ert-deftest ejn-ei5-is-complete-late-client-and-id-are-no-ops ()
+  "Completeness replies cannot dispatch an old request while it is pending."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client 'client-a)
+          (emacs-jupyter-notebook--is-complete-request-id 7)
+          (emacs-jupyter-notebook--execution-active-id 41)
+          (emacs-jupyter-notebook--execution-queue '(41))
+          (emacs-jupyter-notebook--execution-ledger
+           (make-hash-table :test #'eql))
+          dispatched failed)
+      (emacs-jupyter-notebook--execution-put
+       '(:id 41 :state checking :is-complete-request-id 7))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--execution-dispatch)
+                 (lambda (&rest _) (setq dispatched t)))
+                ((symbol-function 'emacs-jupyter-notebook--execution-fail)
+                 (lambda (&rest _) (setq failed t))))
+        (emacs-jupyter-notebook--execution-after-completeness
+         41 'client-old 7 '(:status "complete"))
+        (emacs-jupyter-notebook--execution-after-completeness
+         41 'client-a 6 '(:status "complete"))
+        (should-not dispatched)
+        (should-not failed)
+        (should (eq (plist-get (emacs-jupyter-notebook--execution-record 41)
+                               :state)
+                    'checking))))))
+
+(ert-deftest ejn-ei5-helper-input-event-replies-after-filter-with-exact-lease ()
+  "Mapped helper stdin events prompt later and send one exact input_reply."
+  (dolist (case '((nil "answer") (t "password-canary") (nil quit)))
+    (with-temp-buffer
+      (python-mode)
+      (insert "# %%\ninput()\n")
+      (let* ((session (let ((emacs-jupyter-notebook-backend 'helper))
+                        (emacs-jupyter-notebook-backend-session-create
+                         nil (current-buffer))))
+             (state (emacs-jupyter-notebook-helper-backend--make-state
+                     :helper 'fake))
+             (panel (ejn-panel-ensure (current-buffer)))
+             (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+             (generation (plist-get handle :generation))
+             (input-id (make-string 32 ?a))
+             (requests nil)
+             (prompted nil)
+             (secret (copy-sequence (if (eq (cadr case) 'quit)
+                                        "" (cadr case)))))
+        (setf (emacs-jupyter-notebook-backend-session-data session) state
+              (emacs-jupyter-notebook-helper-backend-state-emit state)
+              (lambda (event)
+                (emacs-jupyter-notebook--backend-event session event)))
+        ;; These values must be actual buffer-local state: the deferred event
+        ;; timer runs after the dynamic extent that admitted the helper event.
+        (setq emacs-jupyter-notebook--client session
+              emacs-jupyter-notebook-mode t
+              emacs-jupyter-notebook--execution-active-id 1
+              emacs-jupyter-notebook--execution-queue '(1)
+              emacs-jupyter-notebook--execution-ledger
+              (make-hash-table :test #'eql))
+        (let (messages)
+          (emacs-jupyter-notebook--execution-put
+           (list :id 1 :state 'dispatched :backend-request-id 9
+                 :generation generation :panel-entry handle))
+          (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper-request)
+                     (lambda (_helper operation params callback &rest _keys)
+                       (let ((snapshot (copy-hash-table params)))
+                         ;; The real supervisor serializes synchronously before
+                         ;; the UI unwind clears its password string.
+                         (when-let ((value (gethash "value" snapshot)))
+                           (puthash "value" (copy-sequence value) snapshot))
+                         (push (list operation snapshot) requests))
+                       (funcall callback 'fake
+                                (ejn-ei2-test--response
+                                (ejn-ei2-test--object "accepted" t)) nil)
+                       "input-reply-wire"))
+                    ((symbol-function 'read-string)
+                     (lambda (_prompt) (setq prompted t)
+                       (if (eq (cadr case) 'quit)
+                           (signal 'quit nil)
+                         secret)))
+                    ((symbol-function 'read-passwd)
+                     (lambda (_prompt) (setq prompted t) secret))
+                    ((symbol-function 'message)
+                     (lambda (format-string &rest args)
+                       (push (apply #'format format-string args) messages)))
+                    ((symbol-function 'emacs-jupyter-notebook--log-append)
+                     (lambda (format-string &rest args)
+                       (push (apply #'format format-string args) messages))))
+            (should
+             (emacs-jupyter-notebook-helper-backend--deliver-mapped-event
+              state "wire-execute"
+              (list :ledger-id 1 :backend-request-id 9 :panel-generation generation)
+              (ejn-ei2-test--object
+               "event" "input_request" "request_id" "wire-execute"
+               "data" (ejn-ei2-test--object
+                        "input_id" input-id "prompt" "Prompt: "
+                        "password" (if (car case) t :false)))))
+            ;; The helper process callback/filter turn never enters a prompt.
+            (should-not prompted)
+            (ejn-ei2-test--run-timers)
+            (should prompted)
+            (should (= (length requests) 1))
+            (should (equal (caar requests) "input_reply"))
+            (should (equal (gethash "request_id" (cadar requests))
+                           "wire-execute"))
+            (should (equal (gethash "input_id" (cadar requests)) input-id))
+            (should (equal (gethash "value" (cadar requests))
+                           (if (eq (cadr case) 'quit) "" (cadr case))))
+            (dolist (message messages)
+              (should-not (string-match-p "password-canary" message)))))))))
+
+(ert-deftest ejn-ei5-helper-input-reply-rejects-stale-and-duplicate-leases ()
+  "A stale or already-consumed stdin lease must not send another request."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client 'client-a)
+          (emacs-jupyter-notebook-mode t)
+          (calls 0)
+          (reply (emacs-jupyter-notebook--helper-input-reply
+                  'client-a 1 "wire" (make-string 32 ?a))))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--execution-input-current-p)
+                 (lambda (_id) t))
+                ((symbol-function 'emacs-jupyter-notebook-backend-input)
+                 (lambda (&rest _) (cl-incf calls))))
+        (funcall reply "once")
+        (funcall reply "twice")
+        (should (= calls 1))
+        (setq emacs-jupyter-notebook--client 'client-b)
+        (funcall reply "stale")
+        (should (= calls 1))))))
+
+(ert-deftest ejn-ei5-stdin-cancellation-blocks-late-event-and-prompt ()
+  "Cancellation before delivery or timer execution cannot prompt or reply."
+  (with-temp-buffer
+    (python-mode)
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (generation (plist-get handle :generation))
+           (context (list :buffer (current-buffer) :request-id 1
+                          :backend-request-id 9 :panel-generation generation
+                          :entry-handle handle :input-reply
+                          (lambda (_value) (setq replied t))))
+           (event '(:type input-request :prompt "Prompt: " :password nil))
+           (emacs-jupyter-notebook--execution-active-id 1)
+           (emacs-jupyter-notebook--execution-queue '(1))
+           (emacs-jupyter-notebook--execution-ledger
+            (make-hash-table :test #'eql))
+           prompted replied)
+      (emacs-jupyter-notebook--execution-put
+       (list :id 1 :state 'dispatched :backend-request-id 9
+             :generation generation :panel-entry handle))
+      (cl-letf (((symbol-function 'read-string)
+                 (lambda (&rest _) (setq prompted t) "late")))
+        ;; Admit while dispatched, then cancel before the zero-delay prompt.
+        (should (emacs-jupyter-notebook-events-dispatch context event))
+        (let ((record (emacs-jupyter-notebook--execution-record 1)))
+          (emacs-jupyter-notebook--execution-put
+           (plist-put record :state 'cancelling)))
+        (ejn-ei2-test--run-timers)
+        (should-not prompted)
+        (should-not replied)
+        ;; A prompt arriving after cancellation is rejected at admission too.
+        (should (equal (emacs-jupyter-notebook-events-dispatch context event)
+                       '((:action ignore))))
+        (ejn-ei2-test--run-timers)
+        (should-not prompted)
+        (should-not replied)))))
 
 (provide 'emacs-jupyter-notebook-helper-backend-tests)
 

@@ -25,6 +25,9 @@ This stays above the helper runtime's 150s backend deadline and 160s
 dispatcher deadline.  Core busy arbitration caps at 45s, so it always decides
 whether an attached reconnect is usable before this terminal request expiry.")
 
+(defconst emacs-jupyter-notebook-helper-backend--aux-timeout 30
+  "Local deadline for one bounded helper auxiliary or stdin request.")
+
 (defun emacs-jupyter-notebook-helper-backend-ensure ()
   "Resolve the helper executable before any remote launch is admitted."
   (emacs-jupyter-notebook-helper-resolve-argv))
@@ -273,9 +276,19 @@ generation tuple before any presentation mutation.
                                         (or (null count) (and (integerp count) (>= count 0))))
                              (error "malformed helper execute reply"))
                            (list :type 'execute-reply :status status :execution-count count)))
-      ;; EI5 owns stdin request/reply correlation.  Do not create a prompt
-      ;; with no bounded reply route in EI4.
-      ("input_request" (error "helper stdin is unavailable until EI5"))
+      ("input_request"
+       (let ((input-id (gethash "input_id" data))
+             (prompt (gethash "prompt" data))
+             (password (gethash "password" data)))
+         (unless (and (stringp input-id)
+                      (= (string-bytes input-id) 32)
+                      (string-match-p "\\`[0-9a-f]+\\'" input-id)
+                      (stringp prompt)
+                      (<= (string-bytes prompt) 4096)
+                      (memq password '(t :false)))
+           (error "malformed helper input request"))
+         (list :type 'input-request :input-id input-id :prompt prompt
+               :password (eq password t))))
       ("output_truncated" (list :type 'truncation :text "[output truncated]\n"))
       ((or "display_data" "execute_result" "update_display_data")
        (let* ((payload (gethash "data" data))
@@ -703,7 +716,15 @@ core can retain an attached helper for the existing PID busy arbitration.
                         session state "kernel_info"
                         (emacs-jupyter-notebook-helper-backend--make-object)
                         emacs-jupyter-notebook-helper-backend--verify-timeout
-                        (lambda (verified) (funcall success verified))
+                        (lambda (verified)
+                          (condition-case err
+                              (funcall
+                               success
+                               (emacs-jupyter-notebook-helper-backend--kernel-info-result
+                                verified))
+                            (error
+                             (emacs-jupyter-notebook-helper-backend--verification-failure
+                              session request (error-message-string err) failure))))
                         (lambda (reason)
                           (emacs-jupyter-notebook-helper-backend--verification-failure
                            session request reason failure))))))
@@ -718,6 +739,18 @@ core can retain an attached helper for the existing PID busy arbitration.
        (eq (car operation) 'aux)
        (eq (cdr operation) 'is-complete)))
 
+(defun emacs-jupyter-notebook-helper-backend--complete-operation-p (operation)
+  "Return non-nil when OPERATION is the generic completion auxiliary call."
+  (and (consp operation)
+       (eq (car operation) 'aux)
+       (eq (cdr operation) 'complete)))
+
+(defun emacs-jupyter-notebook-helper-backend--inspect-operation-p (operation)
+  "Return non-nil when OPERATION is the generic inspect auxiliary call."
+  (and (consp operation)
+       (eq (car operation) 'aux)
+       (eq (cdr operation) 'inspect)))
+
 (defun emacs-jupyter-notebook-helper-backend--kernel-info-operation-p (operation)
   "Return non-nil for EI3's bounded post-restart readiness probe."
   (and (consp operation)
@@ -725,15 +758,94 @@ core can retain an attached helper for the existing PID busy arbitration.
        (eq (cdr operation) 'kernel-info)))
 
 (defun emacs-jupyter-notebook-helper-backend--payload-object (operation payload)
-  "Translate EI3's admitted operations to a v1 params object."
+  "Translate admitted helper OPERATIONS to a v1 params object."
   (cond
    ((or (eq operation 'execute)
         (emacs-jupyter-notebook-helper-backend--is-complete-operation-p operation))
     (emacs-jupyter-notebook-helper-backend--make-object
      "code" (plist-get payload :code)))
+   ((emacs-jupyter-notebook-helper-backend--complete-operation-p operation)
+    (emacs-jupyter-notebook-helper-backend--make-object
+     "code" (plist-get payload :code)
+     "cursor_pos" (plist-get payload :cursor-pos)))
+   ((emacs-jupyter-notebook-helper-backend--inspect-operation-p operation)
+    (emacs-jupyter-notebook-helper-backend--make-object
+     "code" (plist-get payload :code)
+     "cursor_pos" (plist-get payload :cursor-pos)
+     "detail_level" (or (plist-get payload :detail) 0)))
    ((emacs-jupyter-notebook-helper-backend--kernel-info-operation-p operation)
     (emacs-jupyter-notebook-helper-backend--make-object))
    (t (error "Unsupported helper operation: %S" operation))))
+
+(defun emacs-jupyter-notebook-helper-backend--complete-result (result)
+  "Validate and translate one bounded helper complete RESULT."
+  (let ((matches (and (hash-table-p result) (gethash "matches" result)))
+        (start (and (hash-table-p result) (gethash "cursor_start" result)))
+        (end (and (hash-table-p result) (gethash "cursor_end" result)))
+        (status (and (hash-table-p result) (gethash "status" result))))
+    (unless (and (or (listp matches) (vectorp matches))
+                 (cl-every #'stringp matches)
+                 (integerp start) (>= start 0)
+                 (integerp end) (>= end start)
+                 (member status '("ok" "error")))
+      (error "helper complete returned an invalid result"))
+    (list :matches (append matches nil)
+          :cursor_start start :cursor_end end :status status)))
+
+(defun emacs-jupyter-notebook-helper-backend--kernel-info-result (result)
+  "Validate and return one structurally useful helper kernel-info RESULT."
+  (let ((protocol (and (hash-table-p result)
+                       (gethash "protocol_version" result)))
+        (implementation (and (hash-table-p result)
+                             (gethash "implementation" result)))
+        (language (and (hash-table-p result)
+                       (gethash "language_info" result))))
+    (unless (and (stringp protocol) (not (string-empty-p protocol))
+                 (stringp implementation) (not (string-empty-p implementation))
+                 (hash-table-p language)
+                 (stringp (gethash "name" language))
+                 (not (string-empty-p (gethash "name" language))))
+      (error "helper kernel_info returned an invalid result"))
+    result))
+
+(defun emacs-jupyter-notebook-helper-backend--inspect-result (result)
+  "Validate and translate one bounded helper inspect RESULT."
+  (let ((found (and (hash-table-p result) (gethash "found" result)))
+        (data (and (hash-table-p result) (gethash "data" result))))
+    (unless (and (memq found '(t :false))
+                 (or (null data) (hash-table-p data)))
+      (error "helper inspect returned an invalid result"))
+    (let ((text (and (hash-table-p data) (gethash "text/plain" data))))
+      (unless (or (null text) (stringp text))
+        (error "helper inspect returned an invalid text result"))
+      (list :found (eq found t)
+            :data (if text (list :text/plain text) nil)))))
+
+(defun emacs-jupyter-notebook-helper-backend--input-payload-object (payload)
+  "Translate an EI5 input PAYLOAD into its exact helper prompt lease.
+
+The backend-neutral input API's request id carries the two opaque helper
+identifiers as a cons.  It is never rendered or logged, and the helper still
+validates both values before it can send the Jupyter stdin reply."
+  (let ((lease (plist-get payload :request-id))
+        (value (plist-get payload :value)))
+    (unless (and (consp lease)
+                 (stringp (car lease)) (> (length (car lease)) 0)
+                 (stringp (cdr lease))
+                 (= (string-bytes (cdr lease)) 32)
+                 (string-match-p "\\`[0-9a-f]+\\'" (cdr lease))
+                 (stringp value) (<= (string-bytes value) 65536))
+      (error "Helper input reply lacks a valid prompt lease"))
+    (emacs-jupyter-notebook-helper-backend--make-object
+     "request_id" (car lease) "input_id" (cdr lease) "value" value)))
+
+(defun emacs-jupyter-notebook-helper-backend--input-result (result)
+  "Validate one exact positive helper input-reply RESULT."
+  (unless (and (hash-table-p result)
+               (= (hash-table-count result) 1)
+               (eq (gethash "accepted" result) t))
+    (error "helper input_reply returned an invalid result"))
+  nil)
 
 (defun emacs-jupyter-notebook-helper-backend-dispatch
     (session request operation payload success failure emit)
@@ -804,9 +916,12 @@ core can retain an attached helper for the existing PID busy arbitration.
                     (emacs-jupyter-notebook-helper-backend--state-live-p session state))
          (error "Helper backend is not attached"))
        (unless (or (eq operation 'execute)
+                   (eq operation 'input)
+                   (emacs-jupyter-notebook-helper-backend--complete-operation-p operation)
+                   (emacs-jupyter-notebook-helper-backend--inspect-operation-p operation)
                    (emacs-jupyter-notebook-helper-backend--is-complete-operation-p operation)
                    (emacs-jupyter-notebook-helper-backend--kernel-info-operation-p operation))
-         (error "Helper backend operation is unavailable until EI5"))
+         (error "Unsupported helper backend operation: %S" operation))
        (setf (emacs-jupyter-notebook-helper-backend-state-emit state) emit)
        (let* ((options (plist-get payload :options))
               (ledger-id (and (eq operation 'execute)
@@ -817,11 +932,18 @@ core can retain an attached helper for the existing PID busy arbitration.
          (emacs-jupyter-notebook-helper-backend--request
           session state
           (cond ((eq operation 'execute) "execute")
+                ((eq operation 'input) "input_reply")
+                ((emacs-jupyter-notebook-helper-backend--complete-operation-p operation)
+                 "complete")
+                ((emacs-jupyter-notebook-helper-backend--inspect-operation-p operation)
+                 "inspect")
                 ((emacs-jupyter-notebook-helper-backend--is-complete-operation-p operation)
                  "is_complete")
                 (t "kernel_info"))
-          (emacs-jupyter-notebook-helper-backend--payload-object operation payload)
-          30
+          (if (eq operation 'input)
+              (emacs-jupyter-notebook-helper-backend--input-payload-object payload)
+            (emacs-jupyter-notebook-helper-backend--payload-object operation payload))
+          emacs-jupyter-notebook-helper-backend--aux-timeout
           (cond
            ((eq operation 'execute)
             (lambda (result)
@@ -832,9 +954,35 @@ core can retain an attached helper for the existing PID busy arbitration.
            ((emacs-jupyter-notebook-helper-backend--is-complete-operation-p operation)
             (lambda (result)
               (let ((status (and (hash-table-p result) (gethash "status" result))))
-                (if (stringp status)
+                (if (member status '("complete" "incomplete" "invalid" "unknown"))
                     (funcall success (list :status status))
                   (funcall failure "helper is_complete returned an invalid result")))))
+           ((emacs-jupyter-notebook-helper-backend--complete-operation-p operation)
+            (lambda (result)
+              (condition-case err
+                  (funcall success
+                           (emacs-jupyter-notebook-helper-backend--complete-result result))
+                (error (funcall failure (error-message-string err))))))
+           ((emacs-jupyter-notebook-helper-backend--inspect-operation-p operation)
+            (lambda (result)
+              (condition-case err
+                  (funcall success
+                           (emacs-jupyter-notebook-helper-backend--inspect-result result))
+                (error (funcall failure (error-message-string err))))))
+           ((eq operation 'input)
+            (lambda (result)
+              (condition-case err
+                  (progn
+                    (emacs-jupyter-notebook-helper-backend--input-result result)
+                    (funcall success nil))
+                (error (funcall failure (error-message-string err))))))
+           ((emacs-jupyter-notebook-helper-backend--kernel-info-operation-p operation)
+            (lambda (result)
+              (condition-case err
+                  (funcall success
+                           (emacs-jupyter-notebook-helper-backend--kernel-info-result
+                            result))
+                (error (funcall failure (error-message-string err))))))
            (t success))
           failure ledger-id
           (and (eq operation 'execute)
