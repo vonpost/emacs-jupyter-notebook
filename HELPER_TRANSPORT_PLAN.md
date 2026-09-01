@@ -1459,7 +1459,7 @@ be manager-reviewed for durable-kernel rules.
     production byte-compilation added no warnings beyond the two pre-existing
     optional Evil variable references.
 
-- [ ] **EI11 Make helper selectable for local dogfood, still default legacy.**
+- [~] owner=luna-ei11 claimed=2026-09-01 **EI11 Make helper selectable for local dogfood, still default legacy.**
   - Depends: EI10.
   - Files: `emacs-jupyter-notebook-vars.el`, `README.md`,
     `tests/emacs-jupyter-notebook-tests.el`.
