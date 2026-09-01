@@ -1484,7 +1484,7 @@ be manager-reviewed for durable-kernel rules.
 
 ### Phase AG - integration and removal gates
 
-- [~] owner=terra-ag1 claimed=2026-09-01 **AG1 Run direct helper/local-kernel contract suite.**
+- [x] owner=terra-ag1 claimed=2026-09-01 landed=c804318 **AG1 Run direct helper/local-kernel contract suite.**
   - Depends: HT13, EI11, TH3.
   - Files: tests only; production fixes require a new narrowly claimed row.
   - Deliverable: one integration runner covers connect, execute stream/result/
@@ -1495,6 +1495,13 @@ be manager-reviewed for durable-kernel rules.
     `restart` operation.  Assert request state/event order, artifact
     constraints, cleanup, and unchanged kernel across close.
   - Gate: 20 consecutive runs, zero failure/leak, each under 120 seconds.
+  - Landed verification: the final test-owned helper protocol runner completed
+    20/20 consecutive Nix-dev-shell repetitions against fresh direct kernels,
+    with every run taking 11-15 seconds.  It exercised the actual framed stdio
+    runtime rather than calling the Python backend directly.  Post-gate checks
+    found no helper/kernel process or AG1 temp/artifact root.  Focused
+    framing/CLI tests passed 15/15, and the canonical source suite passed
+    813/813 ERTs plus 218/218 helper unit tests (three expected host skips).
 
 - [ ] **AG2 Run Emacs/helper/local-kernel end-to-end suite.**
   - Depends: AG1.
