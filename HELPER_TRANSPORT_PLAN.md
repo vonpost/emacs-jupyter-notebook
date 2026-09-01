@@ -1201,7 +1201,7 @@ be manager-reviewed for durable-kernel rules.
     pickle byte/count eviction, and payload canaries across panel/wire/log
     surfaces.  GUI coverage skips cleanly when matplotlib is unavailable.
 
-- [ ] **EI4D Reject compressed-image decoder bombs before Emacs image APIs.**
+- [~] owner=terra-ei4d claimed=2026-09-01 **EI4D Reject compressed-image decoder bombs before Emacs image APIs.**
   - Depends: EI4V.
   - Files: `helper/ejn_helper/image_metadata.py`,
     `helper/ejn_helper/outputs.py`, `helper/tests/test_image_metadata.py`,
