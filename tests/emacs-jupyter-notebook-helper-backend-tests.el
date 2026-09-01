@@ -3162,6 +3162,682 @@ DISPOSALS receives local-only disposal reasons."
         (when (emacs-jupyter-notebook-helper-backend-state-p state)
           (emacs-jupyter-notebook-helper-backend--dispose state "EI7 race cleanup"))))))
 
+;; EI8 status/log tests use only local pipe processes and fake backend sessions.
+
+(defun ejn-ei8-test--fake-helper (owner state)
+  "Create a local fake helper process/session for EI8 status tests."
+  (let* ((stderr (generate-new-buffer " *ejn-ei8-stderr*"))
+         (process (make-process :name "ejn-ei8-helper"
+                                :command '("cat")
+                                :buffer nil
+                                :connection-type 'pipe
+                                :noquery t))
+         (session (emacs-jupyter-notebook-helper--make-session
+                   :id (cl-incf emacs-jupyter-notebook-helper--next-id)
+                   :owner-buffer owner :process process
+                   :stderr-process process :stderr-buffer stderr
+                   :state state :requests (make-hash-table :test #'equal)
+                   :protocol-version ejn-helper-protocol-version
+                   :decoder (ejn-helper-protocol-make-decoder
+                             ejn-helper-protocol-max-to-emacs-frame))))
+    (process-put process 'emacs-jupyter-notebook-helper-session session)
+    session))
+
+(ert-deftest ejn-ei8-status-snapshot-and-text-expose-helper-request-truth ()
+  "Status contains bounded helper, active-request, queue, and retry state."
+  (with-temp-buffer
+    (let* ((owner (current-buffer))
+           (helper (ejn-ei8-test--fake-helper owner 'ready))
+           (now (float-time))
+           (entry (list :profile "ei8-profile" :session-id "ei8-session"
+                        :remote-host "ei8-host" :remote-pid 8080
+                        :remote-connection-file "/remote/ei8.json"
+                        :local-connection-file "/tmp/ei8.json"
+                        :tunnel-ports '(:shell_port 1 :iopub_port 2
+                                        :stdin_port 3 :hb_port 4
+                                        :control_port 5)))
+           (context (list :phase 'tunnel :started-at (- now 11.0)
+                          :session-id "ei8-session"
+                          :entry entry
+                          :error (make-string 900 ?E)))
+           (retry-timer (run-at-time 300 nil #'ignore))
+           (record (list :id 1 :state 'dispatched
+                         :started-at (- now 7.0)
+                         :backend-request-id 42 :terminal nil))
+           snapshot text)
+      (unwind-protect
+          (progn
+            (setq-local emacs-jupyter-notebook--helper-session helper
+                        emacs-jupyter-notebook--session-entry entry
+                        emacs-jupyter-notebook--async-context context
+                        emacs-jupyter-notebook--kernel-status 'busy
+                        emacs-jupyter-notebook--tunnel-dead nil
+                        emacs-jupyter-notebook--reconnect-attempt 3
+                        emacs-jupyter-notebook--reconnect-timer retry-timer
+                        emacs-jupyter-notebook--reconnect-schedule-token 'ei8-token
+                        emacs-jupyter-notebook--reconnect-next-at (+ now 9.0)
+                        emacs-jupyter-notebook--execution-active-id 1
+                        emacs-jupyter-notebook--execution-queue '(1 2 3))
+            (emacs-jupyter-notebook--execution-put record)
+            (setq snapshot (emacs-jupyter-notebook-status-snapshot)
+                  text (emacs-jupyter-notebook--status-snapshot-text snapshot))
+            (should (= (plist-get snapshot :helper-pid)
+                       (process-id (emacs-jupyter-notebook-helper-session-process helper))))
+            (should (eq (plist-get snapshot :helper-state) 'ready))
+            (should (= (plist-get snapshot :helper-protocol)
+                       ejn-helper-protocol-version))
+            (should (eq (plist-get snapshot :active-execution-state) 'dispatched))
+            (should (<= 6.0 (plist-get snapshot :active-execution-age) 8.5))
+            ;; The active FIFO head is not counted as queued work.
+            (should (= (plist-get snapshot :queue-length) 2))
+            (should (eq (plist-get snapshot :kernel-status) 'busy))
+            (should (eq (plist-get snapshot :transport-phase) 'tunnel))
+            (should (= (plist-get snapshot :retry-count) 3))
+            (should (<= 7.0 (plist-get snapshot :retry-countdown) 10.0))
+            (should (stringp (plist-get snapshot :last-error)))
+            (should (<= (string-bytes (plist-get snapshot :last-error)) 512))
+            (dolist (label '("Helper PID:" "Helper state:" "Helper protocol:"
+                             "Active execution:" "Queue length:" "Transport phase:"
+                             "Retry countdown:" "Last error:"))
+              (should (string-match-p (regexp-quote label) text))))
+        (cancel-timer retry-timer)
+        (remhash 1 emacs-jupyter-notebook--execution-ledger)
+        (emacs-jupyter-notebook-helper-dispose helper "EI8 status cleanup")))))
+
+(ert-deftest ejn-ei8-real-evaluation-record-has-visible-age ()
+  "Normal evaluation reservation records a real status age."
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'ejn-panel-ensure) (lambda (_source) 'panel))
+              ((symbol-function 'ejn-panel-start-entry)
+               (lambda (&rest _) '(:generation 1)))
+              ((symbol-function 'emacs-jupyter-notebook-panel--display) #'ignore)
+              ((symbol-function 'ejn-panel-set-entry-status) #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook-fringe-set) #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook--execution-pump) #'ignore))
+      (let* ((id (emacs-jupyter-notebook--evaluate-code "print(1)" nil))
+             (record (emacs-jupyter-notebook--execution-record id))
+             (snapshot (progn
+                         (setq emacs-jupyter-notebook--execution-active-id id)
+                         (emacs-jupyter-notebook-status-snapshot))))
+        (should (numberp (plist-get record :started-at)))
+        (should (numberp (plist-get snapshot :active-execution-age)))
+        (should (<= 0 (plist-get snapshot :active-execution-age) 1.0))))))
+
+(ert-deftest ejn-ei8-status-error-is-redacted-and-byte-bounded ()
+  "Status diagnostics redact connection secrets before byte truncation."
+  (let* ((secret-values '("ei8-status-token" "ei8-status-key"
+                          "ei8-status-hmac" "ei8-status-password"
+                          "ei8-status-space" "ei8-status-flag"
+                          "ei8-status-escaped-suffix"))
+         (diagnostic
+          (concat (make-string 600 ?é) "\n"
+                  "token ei8-status-space with spaces\n"
+                  "--token=ei8-status-flag\n"
+                  "{\"token\":\"ei8-status-escaped\\\"ei8-status-escaped-suffix\"}\n"
+                  "{\"token\":\"ei8-status-token\","
+                  "\"key\":\"ei8-status-key\","
+                  "\"hmac\":\"ei8-status-hmac\"} "
+                  "ssh://user:ei8-status-password@example.test/\n"
+                  (make-string 100000 ?X)))
+         (bounded (emacs-jupyter-notebook--bounded-status-error diagnostic)))
+    (should (<= (string-bytes bounded)
+                emacs-jupyter-notebook--status-error-max-bytes))
+    (dolist (secret secret-values)
+      (should-not (string-match-p (regexp-quote secret) bounded)))))
+
+(ert-deftest ejn-ei8-status-snapshot-covers-each-helper-lifecycle-state ()
+  "Status reports no helper and every supervised helper lifecycle state."
+  (with-temp-buffer
+    (let ((source (current-buffer))
+          (states '(nil starting ready failed))
+          helpers)
+      (unwind-protect
+          (dolist (state states)
+            (let ((helper (and state (ejn-ei8-test--fake-helper source state))))
+              (when helper
+                (push helper helpers))
+              (setq-local emacs-jupyter-notebook--helper-session helper)
+              (let ((snapshot (emacs-jupyter-notebook-status-snapshot)))
+                (should (eq (plist-get snapshot :helper-state) state)))))
+        (setq emacs-jupyter-notebook--helper-session nil)
+        (dolist (helper helpers)
+          (when (emacs-jupyter-notebook-helper-session-p helper)
+            (emacs-jupyter-notebook-helper-dispose helper "EI8 state cleanup")))))))
+
+(ert-deftest ejn-ei8-restart-helper-is-hidden-when-unavailable-or-recovering ()
+  "Restart is never offered for absent, retired, or actively used helpers."
+  (let ((base '(:durable-session t)))
+    (dolist (snapshot
+             (list (append base '(:helper (:backend-state none)
+                                  :helper-state none))
+                   (append base '(:helper (:id 8 :backend-state retired)
+                                  :helper-id 8 :helper-state retired))
+                   (append base '(:helper (:id 9 :state ready)
+                                  :helper-id 9 :helper-state ready
+                                  :async-live t))))
+      (should-not
+       (rassq 'emacs-jupyter-notebook--restart-helper
+              (emacs-jupyter-notebook--status-suggestions-for snapshot)))))
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (helper (ejn-ei8-test--fake-helper source 'ready))
+           (entry '(:profile "p" :session-id "s" :remote-host "h"))
+           (context (list :phase 'probe :started-at (float-time)
+                          :status-token 'ei8-live-context))
+           (disposals 0) (schedules 0))
+      (unwind-protect
+          (progn
+            (setq-local emacs-jupyter-notebook--helper-session helper
+                        emacs-jupyter-notebook--session-entry entry
+                        emacs-jupyter-notebook--async-context context)
+            (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper-dispose)
+                       (lambda (&rest _) (cl-incf disposals)))
+                      ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                       (lambda (&rest _) (cl-incf schedules))))
+              (should-error (emacs-jupyter-notebook--restart-helper)
+                            :type 'user-error))
+            (should (= disposals 0))
+            (should (= schedules 0))
+            (should (eq emacs-jupyter-notebook--helper-session helper))
+            (should (eq emacs-jupyter-notebook--async-context context)))
+        (when (emacs-jupyter-notebook-helper-session-p helper)
+          (emacs-jupyter-notebook-helper-dispose helper "EI8 recovery cleanup"))))))
+
+(ert-deftest ejn-ei8-current-status-cancel-action-cancels-one-retry-locally ()
+  "The current retry button cancels exactly its retry, without remote work."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (entry '(:profile "p" :session-id "s" :remote-host "h"
+                     :remote-pid 17 :remote-connection-file "/r/kernel.json"))
+           (retry-token 'ei8-current-retry)
+           (retry-timer (run-at-time 300 nil #'ignore))
+           (status (generate-new-buffer " *ejn-ei8-current-cancel-status*"))
+           (cancels 0) (remote-calls 0))
+      (unwind-protect
+          (progn
+            (setq-local emacs-jupyter-notebook-mode t
+                        emacs-jupyter-notebook--session-entry entry
+                        emacs-jupyter-notebook--reconnect-timer retry-timer
+                        emacs-jupyter-notebook--reconnect-schedule-token retry-token
+                        emacs-jupyter-notebook--reconnect-next-at (+ (float-time) 30)
+                        emacs-jupyter-notebook--tunnel-dead t)
+            (emacs-jupyter-notebook--status-render status source)
+            (with-current-buffer status
+              (goto-char (point-min))
+              (should (search-forward "Cancel scheduled reconnect" nil t))
+              (let ((button (button-at (match-beginning 0))))
+                (should button)
+                (cl-letf (((symbol-function 'pop-to-buffer)
+                           (lambda (buffer) (set-buffer buffer)))
+                          ((symbol-function 'call-interactively)
+                           (lambda (command) (funcall command)))
+                          ((symbol-function 'emacs-jupyter-notebook--cancel-auto-reconnect)
+                           (lambda (&rest _)
+                             (cl-incf cancels)
+                             (when (timerp emacs-jupyter-notebook--reconnect-timer)
+                               (cancel-timer emacs-jupyter-notebook--reconnect-timer))
+                             (setq emacs-jupyter-notebook--reconnect-timer nil
+                                   emacs-jupyter-notebook--reconnect-schedule-token nil)))
+                          ((symbol-function 'emacs-jupyter-notebook--cancel-async-operation)
+                           (lambda (&rest _) (ert-fail "retry action touched async operation")))
+                          ((symbol-function 'emacs-jupyter-notebook--cancel-management-operation)
+                           (lambda (&rest _) (ert-fail "retry action touched management")))
+                          ((symbol-function 'emacs-jupyter-notebook-ssh-start-management-operation)
+                           (lambda (&rest _) (cl-incf remote-calls))))
+                  (button-activate button))))
+            (should (= cancels 1))
+            (should (= remote-calls 0))
+            (should-not emacs-jupyter-notebook--reconnect-timer)
+            (should-not emacs-jupyter-notebook--reconnect-schedule-token))
+        (when (timerp retry-timer) (cancel-timer retry-timer))
+        (when (buffer-live-p status) (kill-buffer status))))))
+
+(ert-deftest ejn-ei8-current-status-restart-helper-is-local-and-schedules-once ()
+  "Restart helper is local-only and admits one immediate reconnect retry."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (helper (ejn-ei8-test--fake-helper source 'failed))
+           (entry '(:profile "p" :session-id "s" :remote-host "h"
+                     :remote-pid 17 :remote-connection-file "/r/kernel.json"))
+           (status (generate-new-buffer " *ejn-ei8-current-restart-status*"))
+           (reconnects 0) (disposals 0) (remote-calls 0)
+           (registry-calls 0))
+      (unwind-protect
+          (progn
+            (setq-local emacs-jupyter-notebook-mode t
+                        emacs-jupyter-notebook--session-entry entry
+                        emacs-jupyter-notebook--helper-session helper
+                        emacs-jupyter-notebook--tunnel-dead t)
+            (emacs-jupyter-notebook--status-render status source)
+            (with-current-buffer status
+              (goto-char (point-min))
+              (should (search-forward "Restart helper" nil t))
+              (let ((button (button-at (match-beginning 0))))
+                (should button)
+                (cl-letf (((symbol-function 'pop-to-buffer)
+                           (lambda (buffer) (set-buffer buffer)))
+                          ((symbol-function 'call-interactively)
+                           (lambda (command) (funcall command)))
+                          ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                           (lambda (&optional immediate)
+                             ;; Explicit helper restart enters reconnect
+                             ;; immediately, independent of auto-reconnect.
+                             (should immediate)
+                             (should emacs-jupyter-notebook--tunnel-dead)
+                             (cl-incf reconnects)))
+                          ((symbol-function 'emacs-jupyter-notebook-helper-dispose)
+                           (lambda (&rest _) (cl-incf disposals)))
+                          ((symbol-function 'emacs-jupyter-notebook-backend-control)
+                           (lambda (&rest _) (cl-incf remote-calls)))
+                          ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
+                           (lambda (&rest _) (cl-incf remote-calls)))
+                          ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
+                           (lambda (&rest _) (cl-incf registry-calls)))
+                          ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
+                           (lambda (&rest _) (cl-incf registry-calls)))
+                          ((symbol-function 'emacs-jupyter-notebook--remove-registry-entry)
+                           (lambda (&rest _) (cl-incf registry-calls))))
+                  (button-activate button))))
+            (should (= reconnects 1))
+            (should (= disposals 1))
+            (should (= remote-calls 0))
+            (should (= registry-calls 0)))
+        (when (emacs-jupyter-notebook-helper-session-p helper)
+          (emacs-jupyter-notebook-helper-dispose helper "EI8 restart cleanup"))
+        (when (buffer-live-p status) (kill-buffer status))))))
+
+(ert-deftest ejn-ei8-stale-management-status-action-cannot-touch-replacement ()
+  "A management cancel button captures the old management token exactly."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (entry '(:profile "p" :session-id "s" :remote-host "h"))
+           (old (list :label "old management" :token 'old-management
+                      :started-at (- (float-time) 2)))
+           (new (list :label "new management" :token 'new-management
+                      :started-at (float-time)))
+           (status (generate-new-buffer " *ejn-ei8-stale-management-status*")))
+      (unwind-protect
+          (progn
+            (setq-local emacs-jupyter-notebook-mode t
+                        emacs-jupyter-notebook--session-entry entry
+                        emacs-jupyter-notebook--management-operation old)
+            (emacs-jupyter-notebook--status-render status source)
+            (with-current-buffer status
+              (goto-char (point-min))
+              (should (search-forward "Cancel the management operation" nil t))
+              (let ((button (button-at (match-beginning 0))))
+                (should button)
+                (with-current-buffer source
+                  (setq emacs-jupyter-notebook--management-operation new))
+                (cl-letf (((symbol-function 'pop-to-buffer)
+                           (lambda (buffer) (set-buffer buffer)))
+                          ((symbol-function 'call-interactively)
+                           (lambda (command) (funcall command)))
+                          ((symbol-function 'emacs-jupyter-notebook--cancel-management-operation)
+                           (lambda (&rest _) (ert-fail "stale button cancelled management replacement")))
+                          ((symbol-function 'emacs-jupyter-notebook--cancel-async-operation)
+                           (lambda (&rest _) (ert-fail "management action touched async operation")))
+                          ((symbol-function 'emacs-jupyter-notebook--cancel-auto-reconnect)
+                           (lambda (&rest _) (ert-fail "management action touched retry"))))
+                  (button-activate button))))
+            (should (eq (plist-get emacs-jupyter-notebook--management-operation :token)
+                        'new-management)))
+        (when (buffer-live-p status) (kill-buffer status))))))
+
+(ert-deftest ejn-ei8-current-active-execution-action-is-narrow ()
+  "The advertised execution cancel affects only the captured active record."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (record (list :id 91 :state 'dispatched :started-at (float-time)
+                         :status-token 'ei8-active-token))
+           (status (generate-new-buffer " *ejn-ei8-current-execution-status*"))
+           (cancels 0))
+      (unwind-protect
+          (progn
+            (setq-local emacs-jupyter-notebook-mode t
+                        emacs-jupyter-notebook--execution-active-id 91
+                        emacs-jupyter-notebook--execution-queue '(91))
+            (emacs-jupyter-notebook--execution-put record)
+            (emacs-jupyter-notebook--status-render status source)
+            (with-current-buffer status
+              (goto-char (point-min))
+              (should (search-forward "Cancel active execution" nil t))
+              (let ((button (button-at (match-beginning 0))))
+                (should button)
+                (cl-letf (((symbol-function 'pop-to-buffer)
+                           (lambda (buffer) (set-buffer buffer)))
+                          ((symbol-function 'emacs-jupyter-notebook--cancel-evaluation)
+                           (lambda () (cl-incf cancels)))
+                          ((symbol-function 'emacs-jupyter-notebook--cancel-auto-reconnect)
+                           (lambda (&rest _) (ert-fail "execution action touched retry")))
+                          ((symbol-function 'emacs-jupyter-notebook--cancel-management-operation)
+                           (lambda (&rest _)
+                             (ert-fail "execution action touched management"))))
+                  (button-activate button))))
+            (should (= cancels 1)))
+        (when (buffer-live-p status) (kill-buffer status))))))
+
+(ert-deftest ejn-ei8-helper-backend-snapshot-is-bounded-across-lifecycle ()
+  "Helper backend snapshots expose state, never payloads or artifacts."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (helper (ejn-ei8-test--fake-helper source 'ready))
+           (session (let ((emacs-jupyter-notebook-backend 'helper))
+                      (emacs-jupyter-notebook-backend-session-create nil source)))
+           (state (emacs-jupyter-notebook-helper-backend--make-state
+                   :helper helper
+                   :request-map (make-hash-table :test #'equal)
+                   :artifact-dir "/tmp/secret-artifact"
+                   :retired-request-ids (make-hash-table :test #'equal)))
+           snapshot)
+      (unwind-protect
+          (progn
+            (setf (emacs-jupyter-notebook-backend-session-data session) state)
+            (emacs-jupyter-notebook-backend-session-mark-attached session)
+            (emacs-jupyter-notebook-backend-session-mark-installed session)
+            (setq snapshot (emacs-jupyter-notebook-helper-backend-snapshot session))
+            (should (eq (plist-get snapshot :backend-state) 'active))
+            (dolist (forbidden '(:stderr :argv :artifact-dir :request-map
+                                 :connection-file :payload :requests
+                                 :client-object :context-object
+                                 :active-execution-record :helper-session-object))
+              (should-not (plist-member snapshot forbidden)))
+            (setf (emacs-jupyter-notebook-helper-backend-state-retired state) t)
+            (should (eq (plist-get (emacs-jupyter-notebook-helper-backend-snapshot session)
+                                   :backend-state)
+                        'retired))
+            (setf (emacs-jupyter-notebook-helper-backend-state-retired state) nil)
+            (setf (emacs-jupyter-notebook-backend-session-closed session) t)
+            (should (eq (plist-get (emacs-jupyter-notebook-helper-backend-snapshot session)
+                                   :backend-state)
+                        'closed))
+            (let ((empty (let ((emacs-jupyter-notebook-backend 'helper))
+                           (emacs-jupyter-notebook-backend-session-create nil source))))
+              (should (eq (plist-get
+                           (emacs-jupyter-notebook-helper-backend-snapshot empty)
+                           :backend-state)
+                          'none))))
+        (when (emacs-jupyter-notebook-helper-session-p helper)
+          (emacs-jupyter-notebook-helper-dispose helper "EI8 snapshot cleanup"))
+        (when (emacs-jupyter-notebook-helper-backend-state-p state)
+          (emacs-jupyter-notebook-helper-backend--dispose state "EI8 snapshot cleanup"))))))
+
+(ert-deftest ejn-ei8-stale-status-cancel-button-cannot-touch-replacement ()
+  "A status cancel action captures async/token identity, not current globals."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (entry '(:profile "p" :session-id "s" :remote-host "h"
+                     :remote-pid 17 :remote-connection-file "/r/kernel.json"))
+           (old-context (list :phase 'probe :started-at (- (float-time) 4)
+                              :entry entry :session-id "s"
+                              :status-token 'ei8-old-context
+                              :reconnect-owner 'automatic))
+           (new-context (list :phase 'retrieve :started-at (float-time)
+                              :entry entry :session-id "s"
+                              :status-token 'ei8-new-context
+                              :reconnect-owner 'automatic))
+           (old-client (ejn-ei7-test--session source))
+           (new-client (ejn-ei7-test--session source))
+           (status (generate-new-buffer " *ejn-ei8-stale-cancel-status*"))
+           (old-token 'old-retry-token) (new-token 'new-retry-token)
+           (new-timer (run-at-time 300 nil #'ignore)))
+      (unwind-protect
+          (progn
+            (setq-local emacs-jupyter-notebook-mode t
+                        emacs-jupyter-notebook--session-entry entry
+                        emacs-jupyter-notebook--tunnel-dead t
+                        emacs-jupyter-notebook--client old-client
+                        emacs-jupyter-notebook--async-context old-context
+                        emacs-jupyter-notebook--reconnect-schedule-token old-token
+                        emacs-jupyter-notebook--reconnect-timer nil)
+            (emacs-jupyter-notebook--status-render status source)
+            (with-current-buffer status
+              (goto-char (point-min))
+              (should (search-forward "Cancel reconnect" nil t))
+              (let ((button (button-at (match-beginning 0))))
+                (should button)
+                ;; Replace every identity-bearing local slot before the old
+                ;; button is activated.
+                (with-current-buffer source
+                  (setq emacs-jupyter-notebook--async-context new-context
+                        emacs-jupyter-notebook--client new-client
+                        emacs-jupyter-notebook--reconnect-schedule-token new-token
+                        emacs-jupyter-notebook--reconnect-timer new-timer))
+                (cl-letf (((symbol-function 'pop-to-buffer)
+                           (lambda (buffer) (set-buffer buffer)))
+                          ((symbol-function 'call-interactively)
+                           (lambda (command) (funcall command)))
+                          ((symbol-function 'emacs-jupyter-notebook--cancel-async-operation)
+                           (lambda (&rest _) (ert-fail "stale button cancelled replacement")))
+                          ((symbol-function 'emacs-jupyter-notebook--cancel-auto-reconnect)
+                           (lambda (&rest _) (ert-fail "stale button cancelled retry"))))
+                  (button-activate button))))
+            (should (eq emacs-jupyter-notebook--async-context new-context))
+            (should (eq emacs-jupyter-notebook--client new-client))
+            (should (eq emacs-jupyter-notebook--reconnect-schedule-token new-token))
+            (should (eq emacs-jupyter-notebook--reconnect-timer new-timer)))
+        (when (timerp new-timer) (cancel-timer new-timer))
+        (dolist (client (list old-client new-client))
+          (when (emacs-jupyter-notebook-backend-session-p client)
+            (when-let ((client-state
+                        (emacs-jupyter-notebook-backend-session-data client)))
+              (emacs-jupyter-notebook-helper-backend--dispose
+               client-state "EI8 stale client cleanup"))))
+        (when (buffer-live-p status) (kill-buffer status))))))
+
+(ert-deftest ejn-ei8-stale-restart-helper-action-cannot-touch-replacement ()
+  "A stale restart-helper action cannot dispose or replace a new helper."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (old-helper (ejn-ei8-test--fake-helper source 'failed))
+           (new-helper (ejn-ei8-test--fake-helper source 'ready))
+           (entry '(:profile "p" :session-id "s" :remote-host "h"
+                     :remote-pid 17 :remote-connection-file "/r/kernel.json"))
+           (status (generate-new-buffer " *ejn-ei8-stale-restart-status*"))
+           (disposals 0) (starts 0))
+      (unwind-protect
+          (progn
+            (setq-local emacs-jupyter-notebook-mode t
+                        emacs-jupyter-notebook--session-entry entry
+                        emacs-jupyter-notebook--helper-session old-helper)
+            (emacs-jupyter-notebook--status-render status source)
+            (with-current-buffer status
+              (goto-char (point-min))
+              (should (search-forward "Restart helper" nil t))
+              (let ((button (button-at (match-beginning 0))))
+                (should button)
+                (with-current-buffer source
+                  (setq emacs-jupyter-notebook--helper-session new-helper))
+                (cl-letf (((symbol-function 'pop-to-buffer)
+                           (lambda (buffer) (set-buffer buffer)))
+                          ((symbol-function 'call-interactively)
+                           (lambda (command) (funcall command)))
+                          ((symbol-function 'emacs-jupyter-notebook-helper-dispose)
+                           (lambda (&rest _) (cl-incf disposals)))
+                          ((symbol-function 'emacs-jupyter-notebook-helper-start)
+                           (lambda (&rest _) (cl-incf starts)))
+                          ((symbol-function 'emacs-jupyter-notebook--restart-helper)
+                           (lambda () (ert-fail "stale button invoked replacement"))))
+                  (button-activate button))))
+            (should (= disposals 0))
+            (should (= starts 0))
+            (should (eq emacs-jupyter-notebook--helper-session new-helper)))
+        (when (emacs-jupyter-notebook-helper-session-p old-helper)
+          (emacs-jupyter-notebook-helper-dispose old-helper "EI8 stale cleanup"))
+        (when (emacs-jupyter-notebook-helper-session-p new-helper)
+          (emacs-jupyter-notebook-helper-dispose new-helper "EI8 stale cleanup"))
+        (when (buffer-live-p status) (kill-buffer status))))))
+
+(ert-deftest ejn-ei8-stderr-is-deferred-bounded-redacted-and-disposed ()
+  "Hostile stderr is deferred, bounded, secret-free, and timer-cleaned."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (helper (ejn-ei8-test--fake-helper source 'ready))
+           (late-helper (ejn-ei8-test--fake-helper source 'ready))
+           (stderr (emacs-jupyter-notebook-helper-session-stderr-buffer helper))
+           (pipe (emacs-jupyter-notebook-helper-session-stderr-process helper))
+           (late-pipe (emacs-jupyter-notebook-helper-session-stderr-process late-helper))
+           (base64 (concat (make-string 440 ?A) "-_" (make-string 440 ?B)))
+           (canaries (list "hunter2"
+                           "ei8-secret-token"
+                           "ei8-secret-key"
+                           "ei8-secret-bearer"
+                           "ei8-json-token"
+                           "ei8-json-key"
+                           "ei8-json-hmac"
+                           "ei8-url-password"
+                           "ei8-space-secret"
+                           "ei8-flag-secret"
+                           "ei8-escaped-suffix"
+                           base64))
+           (chunks (list "safe helper diagnostic\n" "pass" "word=hunter2 token=ei8-"
+                         "secret-token private-key=ei8-"
+                         "secret-key Authorization: Bearer ei8-"
+                         "secret-bearer " (substring base64 0 450)
+                         (substring base64 450)
+                         " {\"tok" "en\":\"ei8-json-token\",\"key\":\"ei8-json-key\","
+                         "\"hmac\":\"ei8-json-hmac\"} https://ei8-user:ei8-"
+                         "url-password@example.test/path\n"
+                         "token ei8-space-secret with spaces\n"
+                         "--token=ei8-flag-secret\n"
+                         "{\"token\":\"prefix\\\"ei8-escaped-suffix\"}\n"))
+           (log-text nil) (messages nil)
+           drain-timer oversize-timer late-timer)
+      (unwind-protect
+          (progn
+            ;; Ownership is required: an orphaned session's stale pipe must
+            ;; be ignored rather than becoming a hidden log sink.
+            (setq-local emacs-jupyter-notebook--helper-session helper)
+            (let ((emacs-jupyter-notebook-helper-stderr-log-function
+                   (lambda (_session text) (push text log-text))))
+              (cl-letf (((symbol-function 'message)
+                         (lambda (format-string &rest args)
+                           (push (apply #'format format-string args) messages))))
+                (dolist (chunk chunks)
+                  (emacs-jupyter-notebook-helper--stderr-filter pipe chunk))
+                ;; Process-filter work must not synchronously surface diagnostics.
+                (should-not log-text)
+                (should-not messages)
+                (setq drain-timer
+                      (emacs-jupyter-notebook-helper-session-stderr-drain-timer helper))
+                (should (timerp drain-timer))
+                (ejn-ei2-test--run-timers))
+              (should (<= (buffer-size stderr)
+                          (emacs-jupyter-notebook-helper--stderr-limit)))
+              (should (cl-some (lambda (line)
+                                 (string-match-p "safe helper diagnostic" line))
+                               log-text))
+              (let ((all (concat (with-current-buffer stderr (buffer-string))
+                                 (mapconcat #'identity log-text "\n")
+                                 (emacs-jupyter-notebook--status-snapshot-text
+                                  (emacs-jupyter-notebook-status-snapshot)))))
+                (dolist (canary canaries)
+                  (should-not (string-match-p (regexp-quote canary) all))))
+              ;; The retention ceiling is a byte ceiling even for multibyte
+              ;; diagnostics, not merely a character-count approximation.
+              (emacs-jupyter-notebook-helper--stderr-filter
+               pipe (concat (make-string 40000 ?é) "\n"))
+              (ejn-ei2-test--run-timers)
+              (should (<= (with-current-buffer stderr
+                            (string-bytes (buffer-string)))
+                          (emacs-jupyter-notebook-helper--stderr-limit)))
+              ;; An unterminated hostile line must be dropped in full, rather
+              ;; than retaining a potentially meaningful suffix.
+              (emacs-jupyter-notebook-helper--stderr-filter
+               pipe (make-string
+                     (1+ emacs-jupyter-notebook-helper--stderr-pending-max-bytes)
+                     ?Z))
+              (setq oversize-timer
+                    (emacs-jupyter-notebook-helper-session-stderr-drain-timer helper))
+              (should (timerp oversize-timer))
+              (ejn-ei2-test--run-timers)
+              (should (string-match-p
+                       "line exceeded retention limit; dropped"
+                       (mapconcat #'identity log-text "\n")))
+              (should-not (emacs-jupyter-notebook-helper-session-stderr-pending helper))
+              ;; A queued drain that loses ownership before its zero-delay turn
+              ;; must become inert and must not surface a late diagnostic.
+              (setq-local emacs-jupyter-notebook--helper-session late-helper)
+              (emacs-jupyter-notebook-helper--stderr-filter late-pipe "late diagnostic\n")
+              (setq late-timer
+                    (emacs-jupyter-notebook-helper-session-stderr-drain-timer late-helper))
+              (should (timerp late-timer))
+              (setq-local emacs-jupyter-notebook--helper-session helper)
+              (let ((before (length log-text)))
+                (ejn-ei2-test--run-timers)
+                (should (= before (length log-text)))
+                (emacs-jupyter-notebook-helper-dispose late-helper "EI8 stderr cleanup")
+                (should (= before (length log-text))))
+              (should-not (memq drain-timer timer-list))
+              (should-not (memq oversize-timer timer-list))
+              (should-not (memq late-timer timer-list))
+              (should-not (emacs-jupyter-notebook-helper-session-raw-chunks late-helper))
+              (should (= (emacs-jupyter-notebook-helper-session-raw-bytes late-helper) 0))
+              (emacs-jupyter-notebook-helper-dispose helper "EI8 stderr cleanup")))
+        (when (timerp drain-timer) (cancel-timer drain-timer))
+        (when (timerp oversize-timer) (cancel-timer oversize-timer))
+        (when (timerp late-timer) (cancel-timer late-timer))
+        (when (emacs-jupyter-notebook-helper-session-p late-helper)
+          (emacs-jupyter-notebook-helper-dispose late-helper "EI8 final cleanup"))
+        (when (emacs-jupyter-notebook-helper-session-p helper)
+          (emacs-jupyter-notebook-helper-dispose helper "EI8 final cleanup"))))))
+
+(ert-deftest ejn-ei8-stderr-filter-only-bounds-and-defers-sanitization ()
+  "A huge stderr process callback only bounds bytes and arms the drain."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (helper (ejn-ei8-test--fake-helper source 'ready))
+           (pipe (emacs-jupyter-notebook-helper-session-stderr-process helper))
+           (redactions 0) (decodes 0) (logs 0))
+      (unwind-protect
+          (progn
+            (setq-local emacs-jupyter-notebook--helper-session helper)
+            (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper--redact-stderr)
+                       (lambda (&rest _)
+                         (cl-incf redactions)
+                         "would be sanitized later"))
+                      ((symbol-function 'emacs-jupyter-notebook-helper--stderr-text)
+                       (lambda (&rest _)
+                         (cl-incf decodes)
+                         "would be decoded later"))
+                      ((symbol-function 'emacs-jupyter-notebook-helper--stderr-log)
+                       (lambda (&rest _) (cl-incf logs))))
+              (emacs-jupyter-notebook-helper--stderr-filter
+               pipe (make-string (* 4 emacs-jupyter-notebook-helper--stderr-pending-max-bytes)
+                                 ?X))
+              (should (= redactions 0))
+              (should (= decodes 0))
+              (should (= logs 0))
+              (should (<= (emacs-jupyter-notebook-helper-session-stderr-pending-bytes helper)
+                          emacs-jupyter-notebook-helper--stderr-pending-max-bytes))
+              (should (timerp
+                       (emacs-jupyter-notebook-helper-session-stderr-drain-timer helper))))
+        (when (emacs-jupyter-notebook-helper-session-p helper)
+          (emacs-jupyter-notebook-helper-dispose helper "EI8 filter-only cleanup")))))))
+
+(ert-deftest ejn-ei8-stderr-reaches-real-ejn-log-only-after-deferred-drain ()
+  "The production stderr callback writes a redacted, owner-gated EJN log line."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (helper (ejn-ei8-test--fake-helper source 'ready))
+           (pipe (emacs-jupyter-notebook-helper-session-stderr-process helper))
+           (log-buffer-name emacs-jupyter-notebook--log-buffer-name))
+      (unwind-protect
+          (progn
+            (when-let ((old (get-buffer log-buffer-name))) (kill-buffer old))
+            (setq-local emacs-jupyter-notebook--helper-session helper)
+            (emacs-jupyter-notebook-helper--stderr-filter
+             pipe "safe real logger token=ei8-real-log-secret\n")
+            (should-not (get-buffer log-buffer-name))
+            (ejn-ei2-test--run-timers)
+            (should (buffer-live-p (get-buffer log-buffer-name)))
+            (let ((logged (with-current-buffer log-buffer-name (buffer-string))))
+              (should (string-match-p "safe real logger" logged))
+              (should-not (string-match-p "ei8-real-log-secret" logged))))
+        (when (emacs-jupyter-notebook-helper-session-p helper)
+          (emacs-jupyter-notebook-helper-dispose helper "EI8 real log cleanup"))
+        (when-let ((log (get-buffer log-buffer-name))) (kill-buffer log))))))
+
 (provide 'emacs-jupyter-notebook-helper-backend-tests)
 
 ;;; emacs-jupyter-notebook-helper-backend-tests.el ends here

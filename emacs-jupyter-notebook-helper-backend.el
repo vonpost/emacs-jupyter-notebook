@@ -762,6 +762,28 @@ BACKEND-REQUEST-ID, when non-nil, must match the mapped generic request."
          mapping)
         admitted))))
 
+(defun emacs-jupyter-notebook-helper-backend-snapshot (session)
+  "Return bounded helper transport facts for opaque backend SESSION.
+This is the only status-facing inspection API for the helper adapter.  It
+never returns request payloads, artifacts, stderr text, or connection data."
+  (when (and (emacs-jupyter-notebook-backend-session-p session)
+             (eq (emacs-jupyter-notebook-backend-session-backend session) 'helper))
+    (let* ((state (emacs-jupyter-notebook-backend-session-data session))
+           (helper (and (emacs-jupyter-notebook-helper-backend-state-p state)
+                        (emacs-jupyter-notebook-helper-backend-state-helper state)))
+           (snapshot (and helper
+                          (emacs-jupyter-notebook-helper-session-snapshot helper))))
+      (append
+       (list :backend 'helper
+             :backend-state
+             (cond ((not (emacs-jupyter-notebook-helper-backend-state-p state)) 'none)
+                   ((emacs-jupyter-notebook-helper-backend-state-retired state) 'retired)
+                   ((emacs-jupyter-notebook-backend-session-closed session) 'closed)
+                   (t 'active))
+             :attached (emacs-jupyter-notebook-backend-session-attached session)
+             :installed (emacs-jupyter-notebook-backend-session-installed session))
+       snapshot))))
+
 (defun emacs-jupyter-notebook-helper-backend--protocol-failure
     (state failure reason)
   "Escalate ambiguous or malformed helper data as fatal transport failure.

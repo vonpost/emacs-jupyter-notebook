@@ -18,6 +18,7 @@
 (cl-defstruct (emacs-jupyter-notebook-backend-session
                (:constructor emacs-jupyter-notebook-backend--make-session))
   "Opaque local handle for one backend attachment."
+  identity
   backend
   data
   owner-buffer
@@ -97,6 +98,7 @@ the asynchronous attachment.  FAILURE-SINK receives `(SESSION REASON)' once
 when the adapter proves its local transport is unusable independently of any
 single request."
   (emacs-jupyter-notebook-backend--make-session
+   :identity (gensym "ejn-backend-session-")
    :backend emacs-jupyter-notebook-backend
    :owner-buffer (or owner-buffer (current-buffer))
    :event-sink event-sink

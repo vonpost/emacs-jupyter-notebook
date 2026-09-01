@@ -22,6 +22,8 @@
 (defconst emacs-jupyter-notebook-helper--filter-max-frames 16)
 (defconst emacs-jupyter-notebook-helper--filter-max-payload-bytes 262144)
 (defconst emacs-jupyter-notebook-helper--max-late-responses 64)
+(defconst emacs-jupyter-notebook-helper--stderr-pending-max-bytes 65536)
+(defconst emacs-jupyter-notebook-helper--stderr-log-max-bytes 4096)
 (defvar emacs-jupyter-notebook-helper--ping-interval 5)
 (defvar emacs-jupyter-notebook-helper--ping-timeout 2)
 (defvar emacs-jupyter-notebook-helper--control-ack-timeout 2)
@@ -42,7 +44,8 @@
   decode-wire-size decode-timer event-queue event-tail event-queue-bytes
   priority-queue priority-tail priority-queue-bytes drain-timer pending-failure
   ping-id ping-timer late-responses last-event-seq control-sent control-acked control-timer
-  wire-sequence)
+  wire-sequence protocol-version stderr-pending stderr-pending-bytes stderr-drain-timer
+  stderr-overflowed stderr-overflow-notice)
 
 (defvar-local emacs-jupyter-notebook--helper-session nil
   "The local helper session currently owned by this source buffer.")
@@ -51,6 +54,10 @@
   "Live local helper sessions, used exclusively for local cleanup.")
 
 (defvar emacs-jupyter-notebook-helper--next-id 0)
+
+(defvar emacs-jupyter-notebook-helper-stderr-log-function nil
+  "Function called outside process filters with a helper stderr diagnostic.
+It receives the helper SESSION and already-redacted bounded text.")
 
 (defconst emacs-jupyter-notebook-helper--error-codes
   '("invalid-request" "invalid-event" "unsupported" "timeout"
@@ -163,8 +170,83 @@ empty or the executable cannot be found."
                 (error-message-string err))
        nil))))
 
-(defun emacs-jupyter-notebook-helper--append-stderr (session bytes)
-  "Append unibyte BYTES to SESSION's bounded stderr buffer."
+(defun emacs-jupyter-notebook-helper--stderr-text (bytes)
+  "Return a bounded printable representation of unibyte stderr BYTES."
+  (let ((text (condition-case nil
+                  (decode-coding-string bytes 'utf-8)
+                (error (decode-coding-string bytes 'binary)))))
+    ;; Keep terminal control bytes from creating misleading log lines while
+    ;; preserving ordinary newlines for diagnostic readability.
+    (replace-regexp-in-string "[^[:print:]\n\t]" "?" text t t)))
+
+(defun emacs-jupyter-notebook-helper--truncate-utf8-bytes (text limit)
+  "Return TEXT truncated at a UTF-8 byte LIMIT without splitting a character."
+  (if (<= (string-bytes text) limit)
+      text
+    (let ((index 0) (bytes 0) (length (length text)))
+      (while (and (< index length)
+                  (let ((next (string-bytes (substring text index (1+ index)))))
+                    (when (<= (+ bytes next) limit)
+                      (setq bytes (+ bytes next))
+                      t)))
+        (setq index (1+ index)))
+      (substring text 0 index))))
+
+(defun emacs-jupyter-notebook-helper--redact-diagnostic-text (text)
+  "Return TEXT with credential-like values conservatively removed.
+Sensitive keys and command-line flags consume the remainder of their line.
+This intentionally prefers losing diagnostic context over retaining a value
+whose quoting or whitespace syntax was not anticipated."
+  (let ((case-fold-search t))
+    (setq text
+          (replace-regexp-in-string
+           "\\([[:alpha:]][[:alnum:]+.-]*://\\)[^/@[:space:]]+@"
+           "\\1[REDACTED]@" text t nil))
+    (setq text
+          (replace-regexp-in-string
+           (concat
+            "\\_<\\(?:password\\|passwd\\|token\\|secret\\|authorization"
+            "\\|api[_-]?key\\|private[_-]?key\\|key\\|hmac\\|signature"
+            "\\|credential\\|cookie\\)\\_>[^\n]*")
+           "[REDACTED]" text t t))
+    (setq text
+          (replace-regexp-in-string
+           "\\_<Bearer\\_>[[:space:]]+[^[:space:],;]+"
+           "Bearer [REDACTED]" text t t))
+    ;; Unknown key=value fields can also carry helper or SSH credentials.
+    (setq text
+          (replace-regexp-in-string
+           "\\b\\([[:alnum:]_-]+\\)[[:space:]]*[=:][[:space:]]*[^[:space:],;]+"
+           "\\1=[REDACTED]" text t nil))
+    (replace-regexp-in-string
+     "[-_[:alnum:]+/]\\{64,\\}=*" "[BASE64 REDACTED]" text t t)))
+
+(defun emacs-jupyter-notebook-helper--redact-stderr (bytes)
+  "Return BYTES as bounded diagnostic text with credential-like data removed."
+  (let ((text (emacs-jupyter-notebook-helper--stderr-text bytes)))
+    ;; Deferred redaction is intentionally conservative: hiding an innocuous
+    ;; option is preferable to retaining a credential in a stderr buffer or
+    ;; its long-lived EJN log entry.
+    ;; Values can straddle pipe chunks.  Complete lines are held in one bounded
+    ;; slot, then redacted before private-buffer or log retention.
+    (setq text (emacs-jupyter-notebook-helper--redact-diagnostic-text text))
+    (if (> (string-bytes text) emacs-jupyter-notebook-helper--stderr-log-max-bytes)
+        (let ((suffix " [truncated]"))
+          (concat (emacs-jupyter-notebook-helper--truncate-utf8-bytes
+                   text (- emacs-jupyter-notebook-helper--stderr-log-max-bytes
+                           (string-bytes suffix)))
+                  suffix))
+      text)))
+
+(defun emacs-jupyter-notebook-helper--stderr-owner-current-p (session)
+  "Return non-nil when SESSION is still its owner's exact helper session."
+  (let ((owner (emacs-jupyter-notebook-helper-session-owner-buffer session)))
+    (and (buffer-live-p owner)
+         (eq (buffer-local-value 'emacs-jupyter-notebook--helper-session owner)
+             session))))
+
+(defun emacs-jupyter-notebook-helper--append-stderr (session text)
+  "Append already-redacted TEXT to SESSION's bounded private stderr buffer."
   (let ((buffer (emacs-jupyter-notebook-helper-session-stderr-buffer session))
         (limit (emacs-jupyter-notebook-helper--stderr-limit)))
     (when (buffer-live-p buffer)
@@ -172,13 +254,13 @@ empty or the executable cannot be found."
         (let ((inhibit-read-only t)
               ;; Retain at most LIMIT characters before conversion.  UTF-8 can
               ;; expand this bounded suffix, so apply the byte tail below too.
-              (incoming (if (multibyte-string-p bytes)
+              (incoming (if (multibyte-string-p text)
                             (encode-coding-string
-                             (if (> (length bytes) limit)
-                                 (substring bytes (- (length bytes) limit))
-                               bytes)
+                             (if (> (length text) limit)
+                                 (substring text (- (length text) limit))
+                               text)
                              'binary t)
-                          bytes)))
+                          text)))
           (set-buffer-multibyte nil)
           ;; Trim both sides before insertion, so one hostile pipe chunk never
           ;; makes this buffer temporarily exceed its hard retention limit.
@@ -190,11 +272,109 @@ empty or the executable cannot be found."
           (goto-char (point-max))
           (insert incoming))))))
 
+(defun emacs-jupyter-notebook-helper--stderr-log (session text)
+  "Deliver already-redacted helper stderr TEXT outside process filters."
+  (when (functionp emacs-jupyter-notebook-helper-stderr-log-function)
+    (condition-case nil
+        (funcall emacs-jupyter-notebook-helper-stderr-log-function session text)
+      (error nil))))
+
+(defun emacs-jupyter-notebook-helper--stderr-drain (session &optional final)
+  "Drain complete stderr lines for SESSION outside its process filter.
+When FINAL is non-nil, flush a trailing unterminated diagnostic during local
+disposal.  The raw pending slot is bounded and is cleared before logging so a
+logging error can never retain a secret-bearing process chunk."
+  (when (and session
+             (not (emacs-jupyter-notebook-helper-session-disposed session))
+             (emacs-jupyter-notebook-helper--stderr-owner-current-p session))
+    (setf (emacs-jupyter-notebook-helper-session-stderr-drain-timer session) nil)
+    (let* ((overflow-notice
+            (emacs-jupyter-notebook-helper-session-stderr-overflow-notice session))
+           (pending (emacs-jupyter-notebook-helper-session-stderr-pending session))
+           (cut (and (stringp pending)
+                     (or final (cl-position ?\n pending :from-end t))))
+           (emit (and cut (substring pending 0 (if final (length pending) (1+ cut)))))
+           (rest (and cut (unless final (substring pending (1+ cut))))))
+      (when overflow-notice
+        (setf (emacs-jupyter-notebook-helper-session-stderr-overflow-notice session) nil)
+        (let ((text "[helper stderr line exceeded retention limit; dropped]"))
+          (emacs-jupyter-notebook-helper--append-stderr session text)
+          (emacs-jupyter-notebook-helper--stderr-log session text)))
+      (when cut
+        (setf (emacs-jupyter-notebook-helper-session-stderr-pending session) rest
+              (emacs-jupyter-notebook-helper-session-stderr-pending-bytes session)
+              (if rest (string-bytes rest) 0))
+        (when (and emit (> (length emit) 0))
+          (let ((text (emacs-jupyter-notebook-helper--redact-stderr emit)))
+            (emacs-jupyter-notebook-helper--append-stderr session text)
+            (emacs-jupyter-notebook-helper--stderr-log session text)))))))
+
+(defun emacs-jupyter-notebook-helper--stderr-schedule-drain (session)
+  "Schedule one owned, deferred stderr drain for SESSION."
+  (unless (timerp (emacs-jupyter-notebook-helper-session-stderr-drain-timer session))
+    (setf (emacs-jupyter-notebook-helper-session-stderr-drain-timer session)
+          (run-at-time 0 nil #'emacs-jupyter-notebook-helper--stderr-drain session))))
+
+(defun emacs-jupyter-notebook-helper--stderr-enqueue (session bytes)
+  "Boundedly enqueue stderr BYTES for deferred redaction and logging.
+This runs inside a process filter, so it performs no decode, regexp work, log
+insertion, or callback.  An oversized unterminated line is discarded whole;
+retaining only its tail could separate a credential value from its label."
+  (let ((limit emacs-jupyter-notebook-helper--stderr-pending-max-bytes))
+    ;; Real stderr pipes are binary.  Treat a directly injected multibyte
+    ;; string as hostile instead of encoding it in the process filter.
+    (if (or (multibyte-string-p bytes)
+            (>= (length bytes) limit))
+        (progn
+          (setf (emacs-jupyter-notebook-helper-session-stderr-pending session) nil
+                (emacs-jupyter-notebook-helper-session-stderr-pending-bytes session) 0
+                ;; A newline at the end proves this oversized diagnostic has
+                ;; ended.  We intentionally discard its contents, but need not
+                ;; drop the next complete stderr line as collateral damage.
+                (emacs-jupyter-notebook-helper-session-stderr-overflowed session)
+                (not (and (> (length bytes) 0)
+                          (eq (aref bytes (1- (length bytes))) ?\n)))
+                (emacs-jupyter-notebook-helper-session-stderr-overflow-notice session) t)
+          (emacs-jupyter-notebook-helper--stderr-schedule-drain session))
+      (let ((incoming bytes))
+        (if (emacs-jupyter-notebook-helper-session-stderr-overflowed session)
+            ;; Drop until the next line boundary.  `incoming' is already capped,
+            ;; so even this recovery scan is finite in a process filter.
+            (when-let ((newline (cl-position ?\n incoming)))
+              (setf (emacs-jupyter-notebook-helper-session-stderr-overflowed session) nil)
+              ;; Only the prefix belongs to the oversized line.  Resume from the
+              ;; bounded suffix so a later unrelated diagnostic is not lost.
+              (let ((suffix (substring incoming (1+ newline))))
+                (when (> (length suffix) 0)
+                  (emacs-jupyter-notebook-helper--stderr-enqueue session suffix))
+                ;; Keep recovery deferred even with no suffix.  Apart from making
+                ;; ownership cancellation deterministic, this avoids inserting a
+                ;; process-filter-side marker for the discarded overflow line.
+                (emacs-jupyter-notebook-helper--stderr-schedule-drain session)))
+          (let* ((pending
+                  (or (emacs-jupyter-notebook-helper-session-stderr-pending session) ""))
+                 (combined (concat pending incoming)))
+            (if (>= (length combined) limit)
+                (progn
+                  (setf (emacs-jupyter-notebook-helper-session-stderr-pending session) nil
+                        (emacs-jupyter-notebook-helper-session-stderr-pending-bytes session) 0
+                        (emacs-jupyter-notebook-helper-session-stderr-overflowed session) t
+                        (emacs-jupyter-notebook-helper-session-stderr-overflow-notice session) t)
+                  (emacs-jupyter-notebook-helper--stderr-schedule-drain session))
+              (setf (emacs-jupyter-notebook-helper-session-stderr-pending session) combined
+                    (emacs-jupyter-notebook-helper-session-stderr-pending-bytes session)
+                    (length combined))
+              (when (cl-position ?\n combined)
+                (emacs-jupyter-notebook-helper--stderr-schedule-drain session)))))))))
+
 (defun emacs-jupyter-notebook-helper--stderr-filter (pipe bytes)
   (let ((session (process-get pipe 'emacs-jupyter-notebook-helper-session)))
     (when (and session
-               (not (emacs-jupyter-notebook-helper-session-disposed session)))
-      (emacs-jupyter-notebook-helper--append-stderr session bytes))))
+               (not (emacs-jupyter-notebook-helper-session-disposed session))
+               (eq pipe (emacs-jupyter-notebook-helper-session-stderr-process session)))
+      ;; A process filter may only update bounded local state and arm a timer.
+      ;; It must never insert UI text or invoke a callback.
+      (emacs-jupyter-notebook-helper--stderr-enqueue session bytes))))
 
 (defun emacs-jupyter-notebook-helper--clear-partial-deadline (session)
   (emacs-jupyter-notebook-helper--cancel-timer
@@ -467,7 +647,9 @@ local deadline or transport failure; ERROR is then a short local reason."
         (emacs-jupyter-notebook-helper--cancel-timer
          (emacs-jupyter-notebook-helper-session-hello-timer session))
         (setf (emacs-jupyter-notebook-helper-session-hello-timer session) nil
-              (emacs-jupyter-notebook-helper-session-state session) 'ready)
+              (emacs-jupyter-notebook-helper-session-state session) 'ready
+              (emacs-jupyter-notebook-helper-session-protocol-version session)
+              ejn-helper-protocol-version)
         (emacs-jupyter-notebook-helper--send-credit
          session emacs-jupyter-notebook-helper--initial-event-credit)
         (emacs-jupyter-notebook-helper--schedule-ping session)
@@ -791,18 +973,25 @@ This never sends a protocol operation and never affects any durable state."
           (partial-timer (emacs-jupyter-notebook-helper-session-partial-timer session))
           (decode-timer (emacs-jupyter-notebook-helper-session-decode-timer session))
           (drain-timer (emacs-jupyter-notebook-helper-session-drain-timer session))
+          (stderr-drain-timer
+           (emacs-jupyter-notebook-helper-session-stderr-drain-timer session))
           (ping-timer (emacs-jupyter-notebook-helper-session-ping-timer session))
           (control-timer (emacs-jupyter-notebook-helper-session-control-timer session))
           (process (emacs-jupyter-notebook-helper-session-process session))
           (stderr-process (emacs-jupyter-notebook-helper-session-stderr-process session))
           (stderr-buffer (emacs-jupyter-notebook-helper-session-stderr-buffer session))
           (owner (emacs-jupyter-notebook-helper-session-owner-buffer session)))
+      ;; Preserve a final process-exit diagnostic.  The drain's exact owner
+      ;; gate makes this inert for a superseded session, even when its old
+      ;; zero-delay timer is still queued.
+      (emacs-jupyter-notebook-helper--stderr-drain session t)
       (setf (emacs-jupyter-notebook-helper-session-disposed session) t
             (emacs-jupyter-notebook-helper-session-state session) 'disposed
             (emacs-jupyter-notebook-helper-session-hello-timer session) nil
             (emacs-jupyter-notebook-helper-session-partial-timer session) nil
             (emacs-jupyter-notebook-helper-session-decode-timer session) nil
             (emacs-jupyter-notebook-helper-session-drain-timer session) nil
+            (emacs-jupyter-notebook-helper-session-stderr-drain-timer session) nil
             (emacs-jupyter-notebook-helper-session-ping-timer session) nil
             (emacs-jupyter-notebook-helper-session-control-timer session) nil
             (emacs-jupyter-notebook-helper-session-ping-id session) nil
@@ -818,6 +1007,7 @@ This never sends a protocol operation and never affects any durable state."
       (emacs-jupyter-notebook-helper--cancel-timer partial-timer)
       (emacs-jupyter-notebook-helper--cancel-timer decode-timer)
       (emacs-jupyter-notebook-helper--cancel-timer drain-timer)
+      (emacs-jupyter-notebook-helper--cancel-timer stderr-drain-timer)
       (emacs-jupyter-notebook-helper--cancel-timer ping-timer)
       (emacs-jupyter-notebook-helper--cancel-timer control-timer)
       (emacs-jupyter-notebook-helper--fail-pending-requests session reason)
@@ -835,7 +1025,11 @@ This never sends a protocol operation and never affects any durable state."
             (emacs-jupyter-notebook-helper-session-priority-tail session) nil
             (emacs-jupyter-notebook-helper-session-priority-queue-bytes session) 0
             (emacs-jupyter-notebook-helper-session-pending-failure session) nil
-            (emacs-jupyter-notebook-helper-session-late-responses session) nil)
+            (emacs-jupyter-notebook-helper-session-late-responses session) nil
+            (emacs-jupyter-notebook-helper-session-stderr-pending session) nil
+            (emacs-jupyter-notebook-helper-session-stderr-pending-bytes session) 0
+            (emacs-jupyter-notebook-helper-session-stderr-overflowed session) nil
+            (emacs-jupyter-notebook-helper-session-stderr-overflow-notice session) nil)
       (when (processp process)
         (process-put process 'emacs-jupyter-notebook-helper-session nil)
         (when (process-live-p process) (delete-process process)))
@@ -850,6 +1044,31 @@ This never sends a protocol operation and never affects any durable state."
       (setq emacs-jupyter-notebook-helper--sessions
             (delq session emacs-jupyter-notebook-helper--sessions))
       (emacs-jupyter-notebook-helper--run-callback closed-callback session reason))))
+
+(defun emacs-jupyter-notebook-helper-session-snapshot (session)
+  "Return bounded local supervision facts for helper SESSION.
+The snapshot deliberately excludes stderr contents, command arguments, and
+wire payloads.  Consumers can use it for status UI without reaching through
+the session structure or exposing credentials."
+  (when (emacs-jupyter-notebook-helper-session-p session)
+    (let ((process (emacs-jupyter-notebook-helper-session-process session))
+          (requests (emacs-jupyter-notebook-helper-session-requests session))
+          (stderr-buffer
+           (emacs-jupyter-notebook-helper-session-stderr-buffer session)))
+      (list :id (emacs-jupyter-notebook-helper-session-id session)
+            :pid (and (processp process) (ignore-errors (process-id process)))
+            :state (emacs-jupyter-notebook-helper-session-state session)
+            :protocol (or (emacs-jupyter-notebook-helper-session-protocol-version session)
+                          (and (eq (emacs-jupyter-notebook-helper-session-state session)
+                                   'ready)
+                               ejn-helper-protocol-version))
+            :request-count (if (hash-table-p requests) (hash-table-count requests) 0)
+            :stderr-retained-bytes
+            (if (buffer-live-p stderr-buffer)
+                (with-current-buffer stderr-buffer (buffer-size))
+              0)
+            :stderr-pending-bytes
+            (or (emacs-jupyter-notebook-helper-session-stderr-pending-bytes session) 0)))))
 
 (defun emacs-jupyter-notebook-helper--owner-killed ()
   (when emacs-jupyter-notebook--helper-session

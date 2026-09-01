@@ -530,6 +530,9 @@ figure or the local viewer is unavailable."
 (defvar-local emacs-jupyter-notebook--reconnect-schedule-token nil
   "Identity token owned by the currently scheduled reconnect timer.")
 
+(defvar-local emacs-jupyter-notebook--reconnect-force nil
+  "Non-nil only for an explicit immediate local-transport reconnect.")
+
 (defvar-local emacs-jupyter-notebook--kernel-status nil
   "Current kernel status: `busy', `idle', or nil.")
 
@@ -771,6 +774,49 @@ crossing the misses-allowed threshold writes a `heartbeat-dead' line."
 Cleared by any new successful async transition.  W6.2 uses this to drive
 the ` EJN✗' lighter branch independently of `--tunnel-dead'.")
 
+(defvar-local emacs-jupyter-notebook--last-bounded-error nil
+  "Most recent bounded, redacted local transport diagnostic for status UI.")
+
+(defconst emacs-jupyter-notebook--status-error-max-bytes 512)
+(defconst emacs-jupyter-notebook--status-error-input-max-chars 4096)
+
+(defun emacs-jupyter-notebook--truncate-status-bytes (text limit)
+  "Return TEXT cut at UTF-8 byte LIMIT without splitting a character."
+  (if (<= (string-bytes text) limit)
+      text
+    (let ((index 0) (bytes 0))
+      (while (and (< index (length text))
+                  (let ((next (string-bytes (substring text index (1+ index)))))
+                    (when (<= (+ bytes next) limit)
+                      (setq bytes (+ bytes next))
+                      t)))
+        (setq index (1+ index)))
+      (substring text 0 index))))
+
+(defun emacs-jupyter-notebook--bounded-status-error (value)
+  "Return VALUE as a compact status-safe diagnostic string."
+  (let ((text (cond ((stringp value) value)
+                    ((and (consp value) (symbolp (car value)))
+                     (error-message-string value))
+                    (t (format "%s" value)))))
+    ;; Status refreshes every second.  Cap work before regexp redaction so a
+    ;; pathological diagnostic cannot make the status buffer itself a UI stall.
+    (when (> (length text) emacs-jupyter-notebook--status-error-input-max-chars)
+      (setq text (substring text 0 emacs-jupyter-notebook--status-error-input-max-chars)))
+    (setq text (emacs-jupyter-notebook-helper--redact-diagnostic-text text))
+    (if (> (string-bytes text) emacs-jupyter-notebook--status-error-max-bytes)
+        (let ((suffix " [truncated]"))
+          (concat (emacs-jupyter-notebook--truncate-status-bytes
+                   text (- emacs-jupyter-notebook--status-error-max-bytes
+                           (string-bytes suffix)))
+                  suffix))
+      text)))
+
+(defun emacs-jupyter-notebook--remember-status-error (value)
+  "Remember VALUE locally for status without retaining an unbounded error."
+  (setq emacs-jupyter-notebook--last-bounded-error
+        (emacs-jupyter-notebook--bounded-status-error value)))
+
 (defun emacs-jupyter-notebook--async-phase ()
   "Return the phase symbol of the in-flight async context, or nil.
 Returns nil when no context exists or the context is at terminal phase
@@ -816,6 +862,42 @@ Precedence (highest first):
    (emacs-jupyter-notebook--tunnel-process 'exited)
    (t 'none)))
 
+(defun emacs-jupyter-notebook--helper-status-snapshot ()
+  "Return the current helper facts through its public inspection API."
+  (let ((client emacs-jupyter-notebook--client))
+    (or (and client
+             (fboundp 'emacs-jupyter-notebook-helper-backend-snapshot)
+             (ignore-errors
+               (emacs-jupyter-notebook-helper-backend-snapshot client)))
+        ;; Startup failures can leave a local helper before a generic backend
+        ;; session is installed.  The public helper snapshot still gives the
+        ;; status UI the actual local process state in that narrow interval.
+        (and (boundp 'emacs-jupyter-notebook--helper-session)
+             emacs-jupyter-notebook--helper-session
+             (fboundp 'emacs-jupyter-notebook-helper-session-snapshot)
+             (ignore-errors
+               (emacs-jupyter-notebook-helper-session-snapshot
+                emacs-jupyter-notebook--helper-session))))))
+
+(defun emacs-jupyter-notebook--active-execution-status-snapshot ()
+  "Return active FIFO facts without exposing source code or panel handles."
+  (when-let* ((id emacs-jupyter-notebook--execution-active-id)
+              (record (emacs-jupyter-notebook--execution-record id)))
+    (list :id id
+          :state (plist-get record :state)
+          :age (when-let ((started (or (plist-get record :started-at)
+                                       (plist-get record :created-at))))
+                 (max 0 (- (float-time) started))))))
+
+(defun emacs-jupyter-notebook--transport-phase (async-live retry-scheduled)
+  "Return the user-facing local transport phase."
+  (cond
+   (async-live (plist-get emacs-jupyter-notebook--async-context :phase))
+   (retry-scheduled 'retry-wait)
+   (emacs-jupyter-notebook--tunnel-dead 'dead)
+   (emacs-jupyter-notebook--client 'connected)
+   (t 'offline)))
+
 (defun emacs-jupyter-notebook-status-snapshot ()
   "Return a plist describing the current buffer's notebook engine state."
   (let ((entry emacs-jupyter-notebook--session-entry)
@@ -825,17 +907,43 @@ Precedence (highest first):
         (retry-scheduled
          (and (timerp emacs-jupyter-notebook--reconnect-timer)
               emacs-jupyter-notebook--reconnect-schedule-token
-              t)))
+              t))
+        (helper (emacs-jupyter-notebook--helper-status-snapshot))
+        (active (emacs-jupyter-notebook--active-execution-status-snapshot)))
     (list :buffer (buffer-name)
           :file buffer-file-name
           :client (and emacs-jupyter-notebook--client t)
+          :durable-session (and entry t)
           :kernel-status emacs-jupyter-notebook--kernel-status
           :tunnel-state (emacs-jupyter-notebook--tunnel-state)
+          :transport-phase (emacs-jupyter-notebook--transport-phase
+                            async-live retry-scheduled)
+          :helper helper
+          :helper-id (plist-get helper :id)
+          :helper-pid (plist-get helper :pid)
+          :helper-state (or (plist-get helper :state)
+                            (plist-get helper :backend-state))
+          :helper-protocol (plist-get helper :protocol)
+          :active-execution-id (plist-get active :id)
+          :active-execution-state (plist-get active :state)
+          :active-execution-age (plist-get active :age)
+          :queue-length
+          (cl-count-if (lambda (id)
+                         (not (equal id emacs-jupyter-notebook--execution-active-id)))
+                       emacs-jupyter-notebook--execution-queue)
           :async-live async-live
           :async-phase (and async-live (plist-get context :phase))
           :reconnect-owner (and async-live
                                 (plist-get context :reconnect-owner))
-          :async-error (plist-get context :error)
+          :async-error (and (plist-get context :error)
+                            (emacs-jupyter-notebook--bounded-status-error
+                             (plist-get context :error)))
+          :last-error
+          (or emacs-jupyter-notebook--last-bounded-error
+              (and (plist-get context :error)
+                   (emacs-jupyter-notebook--bounded-status-error
+                    (plist-get context :error)))
+              "none")
           :async-age (when-let* ((live async-live)
                                  (started (plist-get context :started-at)))
                        (max 0 (- (float-time) started)))
@@ -846,6 +954,11 @@ Precedence (highest first):
           :retry-count emacs-jupyter-notebook--reconnect-attempt
           :retry-scheduled retry-scheduled
           :reconnect-next-in
+          (when (and retry-scheduled
+                     emacs-jupyter-notebook--reconnect-next-at)
+            (max 0 (- emacs-jupyter-notebook--reconnect-next-at
+                      (float-time))))
+          :retry-countdown
           (when (and retry-scheduled
                      emacs-jupyter-notebook--reconnect-next-at)
             (max 0 (- emacs-jupyter-notebook--reconnect-next-at
@@ -1222,6 +1335,7 @@ automatic reconnect loop after local resources are gone."
         (ignore-errors (set-process-sentinel tunnel #'ignore))
         (ignore-errors (emacs-jupyter-notebook--async-delete-process tunnel)))
       (setq emacs-jupyter-notebook--tunnel-dead t)
+      (emacs-jupyter-notebook--remember-status-error reason)
       (emacs-jupyter-notebook--log-append 'transport "local transport lost: %s" reason)
       (force-mode-line-update t)
       ;; The existing scheduler owns de-duplication through its timer/token
@@ -1458,8 +1572,10 @@ executes."
   (setq emacs-jupyter-notebook--client nil
         emacs-jupyter-notebook--async-context nil
         emacs-jupyter-notebook--async-last-error nil
+        emacs-jupyter-notebook--last-bounded-error nil
         emacs-jupyter-notebook--reconnect-attempt 0
         emacs-jupyter-notebook--reconnect-next-at nil
+        emacs-jupyter-notebook--reconnect-force nil
         emacs-jupyter-notebook--tunnel-process nil
         emacs-jupyter-notebook--tunnel-dead nil
         emacs-jupyter-notebook--kernel-status nil
@@ -2184,7 +2300,8 @@ when at least one entry is actually pruned.  Return a plist
     (cancel-timer emacs-jupyter-notebook--reconnect-timer))
   (setq emacs-jupyter-notebook--reconnect-timer nil
         emacs-jupyter-notebook--reconnect-next-at nil
-        emacs-jupyter-notebook--reconnect-schedule-token nil))
+        emacs-jupyter-notebook--reconnect-schedule-token nil
+        emacs-jupyter-notebook--reconnect-force nil))
 
 (defun emacs-jupyter-notebook--auto-reconnect-delay ()
   "Return the delay before this buffer's next automatic reconnect."
@@ -2200,7 +2317,7 @@ When IMMEDIATE is non-nil, run as soon as Emacs can dispatch the timer.
 Retries continue with capped exponential backoff until the transport comes
 back or a probe confirms that the registered kernel is no longer the same
 live process.  This function never starts or terminates a remote kernel."
-  (when (and emacs-jupyter-notebook-auto-reconnect
+  (when (and (or emacs-jupyter-notebook-auto-reconnect immediate)
              emacs-jupyter-notebook-mode
              emacs-jupyter-notebook--tunnel-dead
              emacs-jupyter-notebook--session-entry
@@ -2212,6 +2329,8 @@ live process.  This function never starts or terminates a remote kernel."
            (token (gensym "ejn-reconnect-")))
       (setq emacs-jupyter-notebook--reconnect-next-at (+ (float-time) delay)
             emacs-jupyter-notebook--reconnect-schedule-token token
+            emacs-jupyter-notebook--reconnect-force
+            (and immediate (not emacs-jupyter-notebook-auto-reconnect))
             emacs-jupyter-notebook--reconnect-timer
             (run-at-time delay nil
                          #'emacs-jupyter-notebook--auto-reconnect-fire
@@ -2234,47 +2353,50 @@ attempt.  Only the exact non-nil generation installed by
         (setq emacs-jupyter-notebook--reconnect-timer nil
               emacs-jupyter-notebook--reconnect-next-at nil
               emacs-jupyter-notebook--reconnect-schedule-token nil)
-        (when (and emacs-jupyter-notebook-auto-reconnect
-                   emacs-jupyter-notebook-mode
-                   emacs-jupyter-notebook--tunnel-dead
-                   emacs-jupyter-notebook--session-entry
-                   (not (emacs-jupyter-notebook--async-in-progress-p)))
-          (cl-incf emacs-jupyter-notebook--reconnect-attempt)
-          (let ((entry emacs-jupyter-notebook--session-entry))
-            (condition-case err
-                (emacs-jupyter-notebook--begin-reconnect
-                 entry
-                 (lambda (_context)
-                   (when (buffer-live-p buffer)
-                     (with-current-buffer buffer
-                       (emacs-jupyter-notebook--log-append
-                        'auto-reconnect "transport restored for `%s'"
-                        (buffer-name)))))
-                 (lambda (context error-data)
-                   (when (buffer-live-p buffer)
-                     (with-current-buffer buffer
-                       (if (emacs-jupyter-notebook--reconnect-terminal-p
-                            context)
-                           (emacs-jupyter-notebook--log-append
-                            'auto-reconnect
-                            "stopped after confirmed terminal probe: %s"
-                            error-data)
+        (let ((forced emacs-jupyter-notebook--reconnect-force))
+          (setq emacs-jupyter-notebook--reconnect-force nil)
+          (when (and (or emacs-jupyter-notebook-auto-reconnect forced)
+                     emacs-jupyter-notebook-mode
+                     emacs-jupyter-notebook--tunnel-dead
+                     emacs-jupyter-notebook--session-entry
+                     (not (emacs-jupyter-notebook--async-in-progress-p)))
+            (cl-incf emacs-jupyter-notebook--reconnect-attempt)
+            (let ((entry emacs-jupyter-notebook--session-entry))
+              (condition-case err
+                  (emacs-jupyter-notebook--begin-reconnect
+                   entry
+                   (lambda (_context)
+                     (when (buffer-live-p buffer)
+                       (with-current-buffer buffer
                          (emacs-jupyter-notebook--log-append
-                          'auto-reconnect "transient attempt failed: %s"
-                          error-data)))))
-                 'automatic)
-              (error
-               (setq emacs-jupyter-notebook--tunnel-dead t)
-               (emacs-jupyter-notebook--log-append
-                'auto-reconnect "could not start attempt: %s"
-                (error-message-string err))
-               (emacs-jupyter-notebook--schedule-auto-reconnect)))))))))
+                          'auto-reconnect "transport restored for `%s'"
+                          (buffer-name)))))
+                   (lambda (context error-data)
+                     (when (buffer-live-p buffer)
+                       (with-current-buffer buffer
+                         (if (emacs-jupyter-notebook--reconnect-terminal-p
+                              context)
+                             (emacs-jupyter-notebook--log-append
+                              'auto-reconnect
+                              "stopped after confirmed terminal probe: %s"
+                              error-data)
+                           (emacs-jupyter-notebook--log-append
+                            'auto-reconnect "transient attempt failed: %s"
+                            error-data)))))
+                   'automatic)
+                (error
+                 (setq emacs-jupyter-notebook--tunnel-dead t)
+                 (emacs-jupyter-notebook--log-append
+                  'auto-reconnect "could not start attempt: %s"
+                  (error-message-string err))
+                 (emacs-jupyter-notebook--schedule-auto-reconnect))))))))))
 
 ;;; Async machinery
 
 (defun emacs-jupyter-notebook--async-new-context (&rest properties)
   "Return a new async operation context initialized with PROPERTIES."
   (let ((context (list :phase nil
+                       :status-token (gensym "ejn-async-status-")
                        :started-at (float-time)
                        :profile nil
                        :entry nil
@@ -2434,7 +2556,8 @@ rule the remote kernel is NEVER shut down here; only LOCAL handles go."
     (emacs-jupyter-notebook--release-local-resources)
     (setq emacs-jupyter-notebook--session-entry nil))
   ;; W6.2: a brand-new operation clears the lingering ` EJN✗' state.
-  (setq emacs-jupyter-notebook--async-last-error nil)
+  (setq emacs-jupyter-notebook--async-last-error nil
+        emacs-jupyter-notebook--last-bounded-error nil)
   (force-mode-line-update t))
 
 (defun emacs-jupyter-notebook--async-add-callback (context callback)
@@ -2691,6 +2814,7 @@ underlying stderr matches a known SSH failure pattern."
       (when (buffer-live-p buffer)
         (with-current-buffer buffer
           (setq emacs-jupyter-notebook--async-last-error t)
+          (emacs-jupyter-notebook--remember-status-error error-data)
           (force-mode-line-update t))))
     (if-let ((callback (plist-get context :error-callback)))
         (funcall callback context error-data)
@@ -3425,6 +3549,7 @@ user traffic establishes responsiveness without retaining that request."
                   (emacs-jupyter-notebook-backend-session-mark-installed client)
                   (setq emacs-jupyter-notebook--client client)
                   (setq emacs-jupyter-notebook--tunnel-dead nil)
+                  (setq emacs-jupyter-notebook--last-bounded-error nil)
                   ;; W19: the transport is restored — reset the auto-reconnect
                   ;; backoff so the NEXT drop starts from the initial delay.
                   (emacs-jupyter-notebook--cancel-auto-reconnect)
@@ -4670,9 +4795,11 @@ returns is boundedly staged until its generic backend id can be validated."
          (panel (ejn-panel-ensure buffer))
          (handle (ejn-panel-start-entry panel cell-key code))
          (id (cl-incf emacs-jupyter-notebook--execution-counter))
-         (record (list :id id :code code :cell-key cell-key :panel-entry handle
-                       :generation (plist-get handle :generation) :state 'queued
-                       :reply-seen nil :idle-seen nil :terminal nil :timer nil))
+          (record (list :id id :code code :cell-key cell-key :panel-entry handle
+                        :generation (plist-get handle :generation) :state 'queued
+                       :status-token (gensym "ejn-execution-status-")
+                       :started-at (float-time) :reply-seen nil :idle-seen nil
+                       :terminal nil :timer nil))
          (modified (buffer-modified-p)))
     (emacs-jupyter-notebook-panel--display panel)
     (ejn-panel-set-entry-status handle 'queued)
@@ -5580,6 +5707,17 @@ the human-readable string shown in the status buffer."
       (push (cons "Cancel the management operation"
                   'emacs-jupyter-notebook-cancel-operation)
             actions))
+    (when (plist-get snapshot :active-execution-state)
+      (push (cons "Cancel active execution"
+                  'emacs-jupyter-notebook-cancel-operation)
+            actions))
+    (when (and (plist-get snapshot :helper-id)
+               (memq (plist-get snapshot :helper-state) '(starting ready failed))
+               (plist-get snapshot :durable-session)
+               (not recovery-active))
+      (push (cons "Restart helper and reconnect"
+                  'emacs-jupyter-notebook--restart-helper)
+            actions))
     (when (and (plist-get snapshot :client)
                (not (memq (plist-get snapshot :tunnel-state) '(dead exited)))
                (not (plist-get snapshot :async-live)))
@@ -5597,8 +5735,19 @@ the human-readable string shown in the status buffer."
     (format "Profile: %s" (or (plist-get snapshot :profile) "none"))
     (format "Session: %s" (or (plist-get snapshot :session-id) "none"))
     (format "Client: %s" (if (plist-get snapshot :client) "connected" "none"))
+    (format "Helper PID: %s" (or (plist-get snapshot :helper-pid) "none"))
+    (format "Helper state: %s" (or (plist-get snapshot :helper-state) "none"))
+    (format "Helper protocol: %s" (or (plist-get snapshot :helper-protocol) "none"))
     (format "Kernel status: %s" (or (plist-get snapshot :kernel-status) "unknown"))
     (format "Tunnel: %s" (plist-get snapshot :tunnel-state))
+    (format "Transport phase: %s" (or (plist-get snapshot :transport-phase) "offline"))
+    (format "Active execution: %s"
+            (or (plist-get snapshot :active-execution-state) "none"))
+    (format "Active execution age: %s"
+            (if-let ((age (plist-get snapshot :active-execution-age)))
+                (format "%.1fs" age)
+              "none"))
+    (format "Queue length: %d" (or (plist-get snapshot :queue-length) 0))
     (format "Live phase: %s" (or (plist-get snapshot :async-phase) "none"))
     (format "Attempt owner: %s"
             (or (plist-get snapshot :reconnect-owner) "none"))
@@ -5611,12 +5760,17 @@ the human-readable string shown in the status buffer."
             (if-let* ((delay (plist-get snapshot :reconnect-next-in)))
                 (format "%.1fs" delay)
               "none"))
+    (format "Retry countdown: %s"
+            (if-let ((delay (plist-get snapshot :retry-countdown)))
+                (format "%.1fs" delay)
+              "none"))
     (format "Management: %s"
             (if-let* ((label (plist-get snapshot :management-label)))
                 (format "%s (%.1fs; cancel with C-c j x)" label
                         (or (plist-get snapshot :management-age) 0.0))
               "none"))
     (format "Async error: %s" (or (plist-get snapshot :async-error) "none"))
+    (format "Last error: %s" (or (plist-get snapshot :last-error) "none"))
     (format "Remote host: %s" (or (plist-get snapshot :remote-host) "unknown"))
     (format "Remote PID: %s" (or (plist-get snapshot :remote-pid) "unknown"))
     (format "Remote connection: %s"
@@ -5626,27 +5780,165 @@ the human-readable string shown in the status buffer."
     (format "Tunnel ports: %S" (plist-get snapshot :tunnel-ports)))
    "\n"))
 
+(defun emacs-jupyter-notebook--status-action-identity ()
+  "Capture the immutable local identities that own a status action.
+Only bounded identity tokens and the local tunnel/registry handles are attached
+to a rendered button.  The public status snapshot contains none of them."
+  (let* ((client emacs-jupyter-notebook--client)
+         (context emacs-jupyter-notebook--async-context)
+         (active-id emacs-jupyter-notebook--execution-active-id)
+         (active-record (emacs-jupyter-notebook--execution-record active-id))
+         (helper (and (boundp 'emacs-jupyter-notebook--helper-session)
+                      emacs-jupyter-notebook--helper-session)))
+    (list :client-token
+          (and (emacs-jupyter-notebook-backend-session-p client)
+               (emacs-jupyter-notebook-backend-session-identity client))
+          :context-token (plist-get context :status-token)
+          :tunnel emacs-jupyter-notebook--tunnel-process
+          :entry emacs-jupyter-notebook--session-entry
+          :management-token
+          (plist-get emacs-jupyter-notebook--management-operation :token)
+          :retry-token emacs-jupyter-notebook--reconnect-schedule-token
+          :active-id active-id
+          :active-token (plist-get active-record :status-token)
+          :helper-id
+          (and (emacs-jupyter-notebook-helper-session-p helper)
+               (emacs-jupyter-notebook-helper-session-id helper)))))
+
+(defun emacs-jupyter-notebook--status-action-current-p (identity)
+  "Return non-nil when IDENTITY still names this exact local engine state."
+  (let* ((client emacs-jupyter-notebook--client)
+         (context emacs-jupyter-notebook--async-context)
+         (active-record
+          (emacs-jupyter-notebook--execution-record
+           emacs-jupyter-notebook--execution-active-id))
+         (helper (and (boundp 'emacs-jupyter-notebook--helper-session)
+                      emacs-jupyter-notebook--helper-session)))
+    (and (eq (plist-get identity :client-token)
+             (and (emacs-jupyter-notebook-backend-session-p client)
+                  (emacs-jupyter-notebook-backend-session-identity client)))
+       (eq (plist-get identity :context-token)
+           (plist-get context :status-token))
+       (eq (plist-get identity :tunnel) emacs-jupyter-notebook--tunnel-process)
+       (eq (plist-get identity :entry) emacs-jupyter-notebook--session-entry)
+       (eq (plist-get identity :management-token)
+           (plist-get emacs-jupyter-notebook--management-operation :token))
+       (eq (plist-get identity :retry-token)
+           emacs-jupyter-notebook--reconnect-schedule-token)
+       (equal (plist-get identity :active-id)
+              emacs-jupyter-notebook--execution-active-id)
+       (eq (plist-get identity :active-token)
+           (plist-get active-record :status-token))
+       (equal (plist-get identity :helper-id)
+              (and (emacs-jupyter-notebook-helper-session-p helper)
+                   (emacs-jupyter-notebook-helper-session-id helper))))))
+
+(defun emacs-jupyter-notebook--status-cancel-captured (identity kind)
+  "Cancel only the exact local operation described by IDENTITY and KIND."
+  (pcase kind
+    ('management
+     (when (emacs-jupyter-notebook--management-active-p
+            (plist-get identity :management-token))
+       (emacs-jupyter-notebook--cancel-management-operation)))
+    ('async
+     (let ((context emacs-jupyter-notebook--async-context))
+       (when (and (eq (plist-get identity :context-token)
+                      (plist-get context :status-token))
+                  (emacs-jupyter-notebook--async-in-progress-p))
+         (emacs-jupyter-notebook--cancel-async-operation
+          context "Operation cancelled"))))
+    ('retry
+     (when (and (eq (plist-get identity :retry-token)
+                    emacs-jupyter-notebook--reconnect-schedule-token)
+                (or (timerp emacs-jupyter-notebook--reconnect-timer)
+                    emacs-jupyter-notebook--reconnect-schedule-token))
+       (emacs-jupyter-notebook--cancel-auto-reconnect)))
+    ('execution
+     (when (and (equal (plist-get identity :active-id)
+                        emacs-jupyter-notebook--execution-active-id)
+                (eq (plist-get identity :active-token)
+                    (plist-get
+                     (emacs-jupyter-notebook--execution-record
+                      emacs-jupyter-notebook--execution-active-id)
+                     :status-token)))
+       (emacs-jupyter-notebook--cancel-evaluation)))))
+
+(defun emacs-jupyter-notebook--restart-helper ()
+  "Retire this exact local helper/tunnel and immediately reconnect it.
+The remote kernel, its connection file, and the durable registry are never
+changed.  Existing shared transport-loss handling marks admitted work as
+outcome-unknown before rebuilding only the local transport."
+  (interactive)
+  (let ((identity (emacs-jupyter-notebook--status-action-identity)))
+    (when (emacs-jupyter-notebook--async-in-progress-p)
+      (user-error "Cancel the active connection attempt before restarting the helper"))
+    (unless (plist-get identity :helper-id)
+      (user-error "No local helper is available to restart"))
+    (unless (plist-get identity :entry)
+      (user-error "No durable session is available for helper reconnect"))
+    (let ((client emacs-jupyter-notebook--client)
+          (tunnel emacs-jupyter-notebook--tunnel-process)
+          (helper emacs-jupyter-notebook--helper-session))
+      (unless (emacs-jupyter-notebook--status-action-current-p identity)
+        (user-error "Local helper changed; refresh status before restarting"))
+      ;; A connected helper belongs to the generic backend and is disposed by
+      ;; the shared local transport transition.  A failed pre-connect helper
+      ;; has no client yet, so retire only its exact buffer-owned process.
+      (if client
+          (emacs-jupyter-notebook--transport-lost
+           "user requested local helper restart" client tunnel)
+        (when (and helper
+                   (eq helper emacs-jupyter-notebook--helper-session))
+          (emacs-jupyter-notebook-helper-dispose helper "user requested helper restart"))
+        (emacs-jupyter-notebook--transport-lost
+         "user requested local helper restart" nil tunnel))
+      ;; Do not rely on the user preference for background recovery here: this
+      ;; is an explicit command and must start the existing reconnect path now.
+      (emacs-jupyter-notebook--cancel-auto-reconnect)
+      (emacs-jupyter-notebook--schedule-auto-reconnect t))))
+
+(defun emacs-jupyter-notebook--status-action-kind (label command)
+  "Return a narrow action kind for status LABEL and COMMAND."
+  (cond ((eq command 'emacs-jupyter-notebook--restart-helper) 'restart)
+        ((equal label "Cancel the management operation") 'management)
+        ((member label '("Cancel reconnect" "Cancel connection attempt")) 'async)
+        ((equal label "Cancel scheduled reconnect") 'retry)
+        ((equal label "Cancel active execution") 'execution)
+        (t 'command)))
+
 (defun emacs-jupyter-notebook--status-suggestion-button-action (button)
   "Activate suggested action carried by BUTTON.
 Switches back to the originating source buffer (recorded on the status
 buffer) and invokes the action's command there via `call-interactively'."
   (let* ((source (button-get button 'ejn-source-buffer))
-         (command (button-get button 'ejn-action)))
+         (command (button-get button 'ejn-action))
+         (identity (button-get button 'ejn-status-identity))
+         (kind (button-get button 'ejn-status-kind)))
     (cond
      ((not (buffer-live-p source))
       (message "emacs-jupyter-notebook: originating buffer no longer alive"))
-     ((not (commandp command))
+     ((not (and identity (symbolp command)))
       (message "emacs-jupyter-notebook: invalid suggested command %s" command))
      (t
       (pop-to-buffer source)
-      (call-interactively command)))))
+      (if (not (emacs-jupyter-notebook--status-action-current-p identity))
+          (message "emacs-jupyter-notebook: status action is stale; refresh status")
+        (pcase kind
+          ((or 'management 'async 'retry 'execution)
+           (emacs-jupyter-notebook--status-cancel-captured identity kind))
+          ('restart (emacs-jupyter-notebook--restart-helper))
+          ((guard (commandp command)) (call-interactively command))
+          (_ (message "emacs-jupyter-notebook: invalid suggested command %s" command))))))))
 
 (defun emacs-jupyter-notebook--status-render (status-buffer source-buffer)
   "Render STATUS-BUFFER with the current engine snapshot of SOURCE-BUFFER."
   (require 'button)
   (when (buffer-live-p source-buffer)
-    (let* ((snapshot (with-current-buffer source-buffer
-                       (emacs-jupyter-notebook-status-snapshot)))
+    (let* ((state (with-current-buffer source-buffer
+                    (list (emacs-jupyter-notebook-status-snapshot)
+                          (emacs-jupyter-notebook--status-action-identity))))
+           (snapshot (car state))
+           (identity (cadr state))
            (actions (emacs-jupyter-notebook--status-suggestions-for snapshot)))
       (with-current-buffer status-buffer
         (let ((inhibit-read-only t))
@@ -5663,7 +5955,10 @@ buffer) and invokes the action's command there via `call-interactively'."
                'help-echo (format "Run M-x %s" (cdr action))
                'action #'emacs-jupyter-notebook--status-suggestion-button-action
                'ejn-source-buffer source-buffer
-               'ejn-action (cdr action))
+               'ejn-action (cdr action)
+               'ejn-status-identity identity
+               'ejn-status-kind
+               (emacs-jupyter-notebook--status-action-kind (car action) (cdr action)))
               (insert "\n"))))
         (setq emacs-jupyter-notebook--status-source-buffer source-buffer
               emacs-jupyter-notebook--status-suggestion-actions actions)
@@ -5780,6 +6075,23 @@ After each append the buffer is truncated to
         (emacs-jupyter-notebook--log-truncate)
         (when was-at-end
           (goto-char (point-max)))))))
+
+(defun emacs-jupyter-notebook--helper-stderr-log (session text)
+  "Append SESSION's redacted stderr TEXT only while it owns its source buffer."
+  (when (and (emacs-jupyter-notebook-helper-session-p session)
+             (stringp text))
+    (let ((owner (emacs-jupyter-notebook-helper-session-owner-buffer session)))
+      (when (and (buffer-live-p owner)
+                 (eq (buffer-local-value
+                      'emacs-jupyter-notebook--helper-session owner)
+                     session))
+        (with-current-buffer owner
+          ;; The helper timer already redacted and byte-capped TEXT.  This
+          ;; callback is deliberately outside process-filter execution.
+          (emacs-jupyter-notebook--log-append 'helper-stderr "%s" text))))))
+
+(setq emacs-jupyter-notebook-helper-stderr-log-function
+      #'emacs-jupyter-notebook--helper-stderr-log)
 
 (defun emacs-jupyter-notebook-show-log-buffer ()
   "Show the global W6.6 async log buffer `*emacs-jupyter-notebook log*'."

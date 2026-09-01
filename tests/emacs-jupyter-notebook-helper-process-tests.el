@@ -359,37 +359,62 @@
 
 (ert-deftest ejn-et2-stderr-filter-never-inserts-an-oversized-chunk ()
   (let* ((emacs-jupyter-notebook-helper-stderr-max-bytes 32)
+         (owner (generate-new-buffer " *ejn-et2-stderr-owner*"))
          (buffer (generate-new-buffer " *ejn-et2-stderr*"))
-         (session (emacs-jupyter-notebook-helper--make-session :stderr-buffer buffer))
          (pipe (make-pipe-process :name "ejn-et2-stderr-pipe" :buffer nil
-                                  :coding 'binary :noquery t)))
+                                  :coding 'binary :noquery t))
+         (session (emacs-jupyter-notebook-helper--make-session
+                   :owner-buffer owner :stderr-process pipe :stderr-buffer buffer)))
     (unwind-protect
         (progn
+          (with-current-buffer owner
+            (setq-local emacs-jupyter-notebook--helper-session session))
           (process-put pipe 'emacs-jupyter-notebook-helper-session session)
-          (emacs-jupyter-notebook-helper--stderr-filter pipe (make-string 4096 ?x))
-          (should (= (buffer-size buffer) 32))
-          (emacs-jupyter-notebook-helper--stderr-filter pipe (make-string 4096 ?y))
-          (should (= (buffer-size buffer) 32))
+          (emacs-jupyter-notebook-helper--stderr-filter
+           pipe (concat (make-string 4096 ?x) "\n"))
+          ;; The process filter only enqueues; the bounded buffer is written by
+          ;; the deferred sanitizer.
+          (should (= (buffer-size buffer) 0))
+          (should (ejn-et2--await (lambda () (> (buffer-size buffer) 0))))
+          (should (<= (buffer-size buffer) 32))
+          (emacs-jupyter-notebook-helper--stderr-filter
+           pipe (concat (make-string 4096 ?y) "\n"))
+          (should (ejn-et2--await
+                   (lambda ()
+                     (not (timerp
+                           (emacs-jupyter-notebook-helper-session-stderr-drain-timer
+                            session))))))
+          (should (<= (buffer-size buffer) 32))
           (with-current-buffer buffer
-            (should (string= (buffer-string) (make-string 32 ?y)))))
-      (when (process-live-p pipe) (delete-process pipe))
-      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+            (should-not (multibyte-string-p (buffer-string)))
+            (should (string-match-p "REDACTED" (buffer-string)))))
+      (emacs-jupyter-notebook-helper-dispose session "ET2 stderr cleanup")
+      (when (buffer-live-p owner) (kill-buffer owner)))))
 
 (ert-deftest ejn-et2-stderr-filter-bounds-hostile-multibyte-input-before-encoding ()
   (let* ((emacs-jupyter-notebook-helper-stderr-max-bytes 32)
+         (owner (generate-new-buffer " *ejn-et2-multibyte-owner*"))
          (buffer (generate-new-buffer " *ejn-et2-multibyte-stderr*"))
-         (session (emacs-jupyter-notebook-helper--make-session :stderr-buffer buffer))
          (pipe (make-pipe-process :name "ejn-et2-multibyte-stderr-pipe" :buffer nil
-                                  :coding 'binary :noquery t)))
+                                  :coding 'binary :noquery t))
+         (session (emacs-jupyter-notebook-helper--make-session
+                   :owner-buffer owner :stderr-process pipe :stderr-buffer buffer)))
     (unwind-protect
         (progn
+          (with-current-buffer owner
+            (setq-local emacs-jupyter-notebook--helper-session session))
           (process-put pipe 'emacs-jupyter-notebook-helper-session session)
           (emacs-jupyter-notebook-helper--stderr-filter pipe (make-string 100000 ?\u03c0))
-          (should (= (buffer-size buffer) 32))
+          (should (= (buffer-size buffer) 0))
+          (should (= (emacs-jupyter-notebook-helper-session-stderr-pending-bytes
+                      session)
+                     0))
+          (should (ejn-et2--await (lambda () (> (buffer-size buffer) 0))))
+          (should (<= (buffer-size buffer) 32))
           (with-current-buffer buffer
             (should-not (multibyte-string-p (buffer-string)))))
-      (when (process-live-p pipe) (delete-process pipe))
-      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+      (emacs-jupyter-notebook-helper-dispose session "ET2 multibyte cleanup")
+      (when (buffer-live-p owner) (kill-buffer owner)))))
 
 (ert-deftest ejn-et3-filter-defers-event-callbacks-and-isolates-throws ()
   (let ((events nil)
