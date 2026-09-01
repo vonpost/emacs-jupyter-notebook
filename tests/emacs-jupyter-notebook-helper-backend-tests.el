@@ -3855,6 +3855,235 @@ DISPOSALS receives local-only disposal reasons."
           (emacs-jupyter-notebook-helper-dispose helper "EI8 real log cleanup"))
         (when-let ((log (get-buffer log-buffer-name))) (kill-buffer log))))))
 
+;;; EI10 — static no-hang architecture assertions
+
+(defun ejn-ei10--production-files ()
+  "Return non-legacy production Elisp files in the package root."
+  (let ((root (file-name-directory
+               (directory-file-name ejn-ei2-test--directory))))
+    (cl-remove-if
+     (lambda (file)
+       (equal (file-name-nondirectory file)
+              "emacs-jupyter-notebook-jupyter.el"))
+     (directory-files root t "\\`emacs-jupyter-notebook.*\\.el\\'"))))
+
+(defun ejn-ei10--read-forms (source)
+  "Read top-level forms from SOURCE with the Emacs Lisp reader.
+Comments are discarded by the reader and strings remain non-symbol atoms, so
+static scans cannot mistake prose for executable code.  Malformed or
+truncated source is an error rather than silently becoming a partial scan."
+  (with-temp-buffer
+    (insert source)
+    (emacs-lisp-mode)
+    (goto-char (point-min))
+    (let (forms)
+      (while (< (point) (point-max))
+        (let ((start (point)))
+          (condition-case err
+              (push (read (current-buffer)) forms)
+            (end-of-file
+             ;; A reader EOF is valid only when the remaining input consists
+             ;; of whitespace/comments.  Unmatched delimiters must fail the
+             ;; assertion instead of being silently truncated.
+             (goto-char start)
+             (forward-comment (buffer-size))
+             (skip-chars-forward " \t\r\n")
+             (if (= (point) (point-max))
+                 (goto-char (point-max))
+               (signal (car err) (cdr err)))))))
+      (nreverse forms))))
+
+(defun ejn-ei10--tree-contains-symbol-p (tree symbols)
+  "Return non-nil when TREE contains one symbol in SYMBOLS."
+  (let ((pending (list tree)) found)
+    (while (and pending (not found))
+      (let ((item (pop pending)))
+        (cond
+         ((symbolp item) (setq found (memq item symbols)))
+         ((consp item)
+          (unless (eq (car item) 'quote)
+            (push (car item) pending)
+            (push (cdr item) pending))))))
+    found))
+
+(defun ejn-ei10--direct-jupyter-call-p (forms)
+  "Return non-nil when FORMS contains a direct or indirect `jupyter-*' call.
+In addition to `(jupyter-foo ...)', recognize function designators passed to
+`funcall' and `apply'."
+  (let ((pending (list forms)) found)
+    (while (and pending (not found))
+      (let ((form (pop pending)))
+        (when (consp form)
+          (when (and (symbolp (car form))
+                     (string-prefix-p "jupyter-" (symbol-name (car form))))
+            (setq found t))
+          (when (and (memq (car form) '(funcall apply))
+                     (consp (cadr form))
+                     (memq (caadr form) '(function quote))
+                     (symbolp (cadadr form))
+                     (string-prefix-p "jupyter-"
+                                      (symbol-name (cadadr form))))
+            (setq found t))
+          (unless (eq (car form) 'quote)
+            (push (car form) pending)
+            (push (cdr form) pending)))))
+    found))
+
+(defun ejn-ei10--synchronous-process-form-p (forms)
+  "Return non-nil when FORMS contains a blocking process/I/O primitive."
+  (ejn-ei10--tree-contains-symbol-p
+   forms '(sleep-for sit-for accept-process-output process-file call-process
+           call-process-region shell-command shell-command-on-region)))
+
+(defun ejn-ei10--defconst-values (forms)
+  "Return an alist of numeric `defconst' values found in FORMS."
+  (let (values)
+    (dolist (form forms)
+      (when (and (consp form) (eq (car form) 'defconst)
+                 (symbolp (nth 1 form)))
+        (push (cons (nth 1 form) (nth 2 form)) values)))
+    values))
+
+(defun ejn-ei10--positive-defconsts-p (forms names)
+  "Return non-nil when every NAME has a positive numeric `defconst'."
+  (let ((values (ejn-ei10--defconst-values forms)))
+    (cl-every (lambda (name)
+                (let ((value (cdr (assq name values))))
+                  (and (numberp value) (> value 0))))
+              names)))
+
+(defun ejn-ei10--helper-wait-loop-p (forms)
+  "Return non-nil when a helper loop waits for process I/O or liveness."
+  (let ((pending (list forms)) found)
+    (while (and pending (not found))
+      (let ((form (pop pending)))
+        (when (consp form)
+          (when (and (eq (car form) 'while)
+                     (ejn-ei10--tree-contains-symbol-p
+                      (cdr form) '(accept-process-output sleep-for sit-for
+                                      process-live-p process-status)))
+            (setq found t))
+          (unless (eq (car form) 'quote)
+            (push (car form) pending)
+            (push (cdr form) pending)))))
+    found))
+
+(ert-deftest ejn-ei10-production-has-no-direct-jupyter-calls ()
+  "Direct `jupyter-*' calls remain confined to the legacy adapter."
+  (let (offenders)
+    (dolist (file (ejn-ei10--production-files))
+      (let* ((raw (with-temp-buffer
+                    (insert-file-contents file)
+                    (buffer-string)))
+             (forms (ejn-ei10--read-forms raw)))
+        (when (ejn-ei10--direct-jupyter-call-p forms)
+          (push (file-name-nondirectory file) offenders))))
+    (should-not offenders)))
+
+(ert-deftest ejn-ei10-jupyter-scanner-detects-code-but-ignores-prose ()
+  "The direct-call scanner catches a mutation without prose false positives."
+  (let* ((prose (ejn-ei10--read-forms
+                 "(defun prose () \"jupyter-eval\" nil)\n; (jupyter-eval x)\n"))
+         (mutation (ejn-ei10--read-forms
+                    "(defun prose () \"jupyter-eval\" nil)\n; (jupyter-eval x)\n(jupyter-eval x)\n"))
+         (indirect (ejn-ei10--read-forms
+                    "(funcall #'jupyter-eval x)\n(apply (function jupyter-inspect) args)\n")))
+    (should-not (ejn-ei10--direct-jupyter-call-p prose))
+    (should (ejn-ei10--direct-jupyter-call-p mutation))
+    (should (ejn-ei10--direct-jupyter-call-p indirect))))
+
+(ert-deftest ejn-ei10-reader-rejects-truncated-source ()
+  "Static checks must fail closed when source cannot be completely read."
+  (should-error (ejn-ei10--read-forms "(defun incomplete ()")))
+  (should-not (ejn-ei10--read-forms "; comment-only tail\n  \n"))
+
+(ert-deftest ejn-ei10-production-has-no-sleep-or-synchronous-processes ()
+  "Interactive production Elisp has no blocking sleep or process primitive."
+  (let (offenders)
+    (dolist (file (ejn-ei10--production-files))
+      (let* ((raw (with-temp-buffer
+                    (insert-file-contents file)
+                    (buffer-string)))
+             (forms (ejn-ei10--read-forms raw)))
+        (when (ejn-ei10--synchronous-process-form-p forms)
+          (push (file-name-nondirectory file) offenders))))
+    (should-not offenders)))
+
+(ert-deftest ejn-ei10-process-scanner-detects-blocking-mutation ()
+  "The no-blocking scanner catches sleep and synchronous remote process forms."
+  (let* ((prose (ejn-ei10--read-forms
+                 "(defun prose () \"sleep-for call-process ssh\" nil)\n; (sleep-for 1)\n"))
+         (mutation (ejn-ei10--read-forms
+                    "(defun prose () \"sleep-for call-process ssh\" nil)\n; (sleep-for 1)\n(sleep-for 1)\n(call-process \"ssh\")\n")))
+    (should-not (ejn-ei10--synchronous-process-form-p prose))
+    (should (ejn-ei10--synchronous-process-form-p mutation))))
+
+(ert-deftest ejn-ei10-frame-and-queue-constants-are-positive ()
+  "All Elisp frame and queue ceilings are present and finite."
+  (let* ((files (list (expand-file-name "emacs-jupyter-notebook-helper.el"
+                                       (file-name-directory
+                                        (directory-file-name ejn-ei2-test--directory)))
+                      (expand-file-name "emacs-jupyter-notebook-helper-protocol.el"
+                                       (file-name-directory
+                                        (directory-file-name ejn-ei2-test--directory)))))
+         (forms (cl-mapcan
+                 (lambda (file)
+                   (ejn-ei10--read-forms
+                    (with-temp-buffer
+                      (insert-file-contents file)
+                      (buffer-string))))
+                 files))
+         (names '(ejn-helper-protocol-max-to-emacs-frame
+                  ejn-helper-protocol-max-to-helper-frame
+                  ejn-helper-protocol-max-raw-accumulator
+                  ejn-helper-protocol-max-code-bytes
+                  emacs-jupyter-notebook-helper--initial-event-credit
+                  emacs-jupyter-notebook-helper--max-event-queue
+                  emacs-jupyter-notebook-helper--max-priority-queue
+                  emacs-jupyter-notebook-helper--max-response-frame
+                  emacs-jupyter-notebook-helper--filter-max-frames
+                  emacs-jupyter-notebook-helper--filter-max-payload-bytes
+                  emacs-jupyter-notebook-helper--max-late-responses)))
+    (should (ejn-ei10--positive-defconsts-p forms names))))
+
+(ert-deftest ejn-ei10-constant-scanner-rejects-nil-mutation ()
+  "The bounded-constant check rejects nil and ignores prose mutations."
+  (let ((names '(ejn-test-frame ejn-test-queue)))
+    (should
+     (ejn-ei10--positive-defconsts-p
+      (ejn-ei10--read-forms
+       "(defconst ejn-test-frame 16)\n(defconst ejn-test-queue 32)\n")
+      names))
+    (should-not
+     (ejn-ei10--positive-defconsts-p
+      (ejn-ei10--read-forms
+       "(defun prose () \"(defconst ejn-test-frame nil)\" nil)\n; (defconst ejn-test-queue nil)\n(defconst ejn-test-frame nil)\n(defconst ejn-test-queue 32)\n")
+      names))))
+
+(ert-deftest ejn-ei10-helper-has-no-process-wait-loop ()
+  "Helper I/O is callback/timer driven rather than a blocking wait loop."
+  (let ((root (file-name-directory
+               (directory-file-name ejn-ei2-test--directory))))
+    (dolist (name '("emacs-jupyter-notebook-helper.el"
+                    "emacs-jupyter-notebook-helper-backend.el"))
+      (let ((forms (ejn-ei10--read-forms
+                    (with-temp-buffer
+                      (insert-file-contents (expand-file-name name root))
+                      (buffer-string)))))
+        (should-not (ejn-ei10--helper-wait-loop-p forms))))))
+
+(ert-deftest ejn-ei10-wait-loop-scanner-detects-mutation ()
+  "The wait-loop scanner catches process waits while ignoring prose."
+  (let* ((prose (ejn-ei10--read-forms
+                 "(defun prose () \"(while pending (accept-process-output nil 1))\" nil)\n; (while pending (sleep-for 1))\n"))
+         (mutation (ejn-ei10--read-forms
+                    "(defun prose () \"(while pending (accept-process-output nil 1))\" nil)\n; (while pending (sleep-for 1))\n(while pending (accept-process-output nil 1))\n")))
+    (should-not (ejn-ei10--helper-wait-loop-p prose))
+    (should (ejn-ei10--helper-wait-loop-p mutation))
+    (should (ejn-ei10--helper-wait-loop-p
+             (ejn-ei10--read-forms
+              "(defun poll () (while (process-live-p process) (process-status process)))\n")))))
+
 (provide 'emacs-jupyter-notebook-helper-backend-tests)
 
 ;;; emacs-jupyter-notebook-helper-backend-tests.el ends here
