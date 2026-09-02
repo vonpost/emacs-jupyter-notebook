@@ -44,10 +44,9 @@
 
 Lifecycle events without a request id are transport-wide and remain admitted.
 Per-execution events require the active ledger record, its captured panel
-generation, and the execute request id admitted by the backend.  A legacy
-terminal callback can arrive while `backend-execute' is still returning that
-id; stage only its terminal evidence and defer all reducer presentation until
-the core has validated admission."
+generation, and the execute request id admitted by the helper.  A terminal
+event can arrive while `backend-execute' is still returning that id; stage
+only its terminal evidence until the core has validated admission."
   (let ((buffer (plist-get context :buffer))
         (request-id (plist-get context :request-id)))
     (or (null request-id)
@@ -105,12 +104,11 @@ replying, panel mutation, timer cancellation, or transport I/O.  Late and
 retired presentation events reduce to `:ignore', while status and matching
 request bookkeeping remain meaningful after a panel clear.
 
-The normalized schema is backend-neutral: stream has `:text' and `:name';
+The normalized schema is helper-neutral: stream has `:text' and `:name';
 clear has `:wait'; result/display/update-display have `:data'; error has
 `:traceback'/`:ename'/`:evalue'; execute-reply has `:status',
-`:execution-count', and optional `:watch-text'; status has
-`:execution-state'; input-request has `:prompt' and `:password'; and
-truncation has optional `:text'."
+`:execution-count'; status has `:execution-state'; input-request has `:prompt'
+and `:password'; and truncation has optional `:text'."
   (let ((type (plist-get event :type))
         (live (emacs-jupyter-notebook-events--entry-live-p context))
         (current (emacs-jupyter-notebook-events--request-current-p context)))
@@ -132,7 +130,6 @@ truncation has optional `:text'."
            (list (list :action 'clear :wait (and (plist-get event :wait) t)))
          '((:action ignore))))
       ((or 'result 'display 'update-display)
-       ;; EI1R preserves the legacy adapter's MIME plist (`:data') intact.
        ;; EI4 owns the one helper-v1 envelope -> plist translation, including
        ;; nested data/metadata/transient fields; reducers never invent another
        ;; wire shape here.
@@ -163,26 +160,17 @@ truncation has optional `:text'."
          '((:action ignore))))
       ('execute-reply
        (let* ((handle (plist-get context :entry-handle))
-              (snapshot (and live (ejn-panel-entry-snapshot handle)))
-              (same-cell nil))
-         (append (when (and current snapshot (memq (plist-get snapshot :status) '(running queued))
-                            (not same-cell))
-                   (let ((watch (plist-get event :watch-text))
-                         (status (emacs-jupyter-notebook-events--reply-status event)))
-                     (append
-                      (when (and (stringp watch) (not (string-empty-p watch)))
-                        (list (list :action 'append :text watch :result-seen t)))
-                      (when (and (not (plist-get context :had-result))
-                                 (not (and (stringp watch)
-                                           (not (string-empty-p watch))))
-                                 (eq status 'error))
-                        (list (list :action 'append
-                                    :text (format "%s: %s"
-                                                  (or (plist-get event :ename) "Error")
-                                                  (or (plist-get event :evalue) ""))
-                                    :face 'emacs-jupyter-notebook-result-error-face
-                                    :result-seen t)))
-                      nil))))))
+              (snapshot (and live (ejn-panel-entry-snapshot handle))))
+         (when (and current snapshot
+                    (memq (plist-get snapshot :status) '(running queued))
+                    (not (plist-get context :had-result))
+                    (eq (emacs-jupyter-notebook-events--reply-status event) 'error))
+           (list (list :action 'append
+                       :text (format "%s: %s"
+                                     (or (plist-get event :ename) "Error")
+                                     (or (plist-get event :evalue) ""))
+                       :face 'emacs-jupyter-notebook-result-error-face
+                       :result-seen t)))))
       ('status
        (let ((state (plist-get event :execution-state)))
          (unless (stringp state)
@@ -221,7 +209,7 @@ truncation has optional `:text'."
                   (ejn-panel-schedule-pickle-open
                    effective-handle #'emacs-jupyter-notebook-open-figure-pickle-lease)))
               t))
-          (let ((rendered (emacs-jupyter-notebook--render-mime-result data)))
+          (let ((rendered (plist-get data :text/plain)))
             (cond
              ((null rendered)
               (if (eq mode 'update-display)
@@ -231,13 +219,6 @@ truncation has optional `:text'."
                 (if display-id
                     (ejn-panel-set-display-text handle "[unsupported output format]" display-id)
                   (ejn-panel-append-text handle "[unsupported output format]"))))
-             ((get-text-property 0 'display rendered)
-              (let ((image (copy-tree (get-text-property 0 'display rendered))))
-                (when display-id
-                  (setcdr image (append (cdr image) (list :ejn-display-id display-id))))
-                (if (eq mode 'update-display)
-                    (ejn-panel-update-image handle image display-id)
-                  (ejn-panel-set-image handle image))))
              ((memq mode '(result update-display))
               (let ((text (ansi-color-apply rendered)))
                 (if display-id

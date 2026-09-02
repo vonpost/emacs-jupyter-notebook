@@ -10,6 +10,7 @@ from typing import Mapping
 class ExecutionState:
     jupyter_id: str
     reply: dict | None = None
+    busy: bool = False
     idle: bool = False
     terminal: bool = False
 
@@ -35,12 +36,13 @@ class ExecutionState:
         if not self.accepts(message):
             return False
         content = message.get("content", {})
-        if (
-            message.get("msg_type") == "status"
-            and isinstance(content, Mapping)
-            and content.get("execution_state") == "idle"
-            and not self.idle
-        ):
+        if message.get("msg_type") != "status" or not isinstance(content, Mapping):
+            return False
+        execution_state = content.get("execution_state")
+        if execution_state == "busy" and not self.busy and not self.idle:
+            self.busy = True
+            return True
+        if execution_state == "idle" and not self.idle:
             self.idle = True
             return True
         return False

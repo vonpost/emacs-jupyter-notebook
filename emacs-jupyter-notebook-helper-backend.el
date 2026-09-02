@@ -41,9 +41,7 @@ The core sends an interrupt at `emacs-jupyter-notebook-evaluation-timeout' and
 retires the local transport after one equal terminal grace.  This deadline is
 one second later, so it can only catch a stalled Emacs timer; it must never be
 the mechanism that interrupts a long-running kernel execution."
-  (let ((timeout emacs-jupyter-notebook-evaluation-timeout))
-    (unless (and (numberp timeout) (> timeout 0))
-      (error "Evaluation timeout must be a positive number"))
+  (let ((timeout (emacs-jupyter-notebook--effective-evaluation-timeout)))
     (1+ (* 2 timeout))))
 
 (defun emacs-jupyter-notebook-helper-backend-ensure ()
@@ -1002,6 +1000,11 @@ validates both values before it can send the Jupyter stdin reply."
                      artifact-capability)
                     :artifact-capability artifact-capability)))
        (setf (emacs-jupyter-notebook-backend-session-data session) state)
+       (emacs-jupyter-notebook-backend-session-set-local-disposer
+        session
+        (lambda (reason)
+          (when (eq state (emacs-jupyter-notebook-backend-session-data session))
+            (emacs-jupyter-notebook-helper-backend--dispose state reason))))
        (emacs-jupyter-notebook-helper-backend--connect
         session state request payload
         (lambda (_result) (funcall success session))
@@ -1020,40 +1023,51 @@ validates both values before it can send the Jupyter stdin reply."
          (progn
            (setf (emacs-jupyter-notebook-helper-backend-state-closing state) t)
            (setf (emacs-jupyter-notebook-helper-backend-state-close-success state) success
-                 (emacs-jupyter-notebook-helper-backend-state-close-failure state) failure
-                 (emacs-jupyter-notebook-helper-backend-state-close-timer state)
-                 (run-at-time (emacs-jupyter-notebook-helper-backend--close-deadline)
-                              nil
-                              (lambda ()
-                                (emacs-jupyter-notebook-helper-backend--finish-close
-                                 session state "helper local close timed out" t))))
+                 (emacs-jupyter-notebook-helper-backend-state-close-failure state) failure)
+           (condition-case deadline-error
+               (setf (emacs-jupyter-notebook-helper-backend-state-close-timer state)
+                     (run-at-time (emacs-jupyter-notebook-helper-backend--close-deadline)
+                                  nil
+                                  (lambda ()
+                                    (emacs-jupyter-notebook-helper-backend--finish-close
+                                     session state "helper local close timed out" t))))
+             (error
+              ;; Closing ownership is already published.  Without this timer
+              ;; no later event can be trusted to finish it, so dispose the
+              ;; helper and artifacts immediately through the normal path.
+              (emacs-jupyter-notebook-helper-backend--finish-close
+               session state
+               (format "cannot arm helper local close deadline: %s"
+                       (error-message-string deadline-error))
+               t)))
            ;; `close' is helper-local, not Jupyter shutdown.  Its outcome is
            ;; bounded separately from generic backend retirement.
-           (condition-case err
-               (emacs-jupyter-notebook-helper-request
-                (emacs-jupyter-notebook-helper-backend-state-helper state)
-                "close" (emacs-jupyter-notebook-helper-backend--make-object)
-                (lambda (_helper response error-data)
-                  (when (emacs-jupyter-notebook-helper-backend--close-live-p session state)
-                    (if error-data
-                        (emacs-jupyter-notebook-helper-backend--finish-close
-                         session state
-                         (emacs-jupyter-notebook-helper-backend--safe-message error-data) t)
-                      (condition-case response-error
-                          (let ((result
-                                 (emacs-jupyter-notebook-helper-backend--response-result response)))
-                            (if (emacs-jupyter-notebook-helper-backend--closed-result-p result)
+           (when (emacs-jupyter-notebook-helper-backend--close-live-p session state)
+             (condition-case err
+                 (emacs-jupyter-notebook-helper-request
+                  (emacs-jupyter-notebook-helper-backend-state-helper state)
+                  "close" (emacs-jupyter-notebook-helper-backend--make-object)
+                  (lambda (_helper response error-data)
+                    (when (emacs-jupyter-notebook-helper-backend--close-live-p session state)
+                      (if error-data
+                          (emacs-jupyter-notebook-helper-backend--finish-close
+                           session state
+                           (emacs-jupyter-notebook-helper-backend--safe-message error-data) t)
+                        (condition-case response-error
+                            (let ((result
+                                   (emacs-jupyter-notebook-helper-backend--response-result response)))
+                              (if (emacs-jupyter-notebook-helper-backend--closed-result-p result)
+                                  (emacs-jupyter-notebook-helper-backend--finish-close
+                                   session state "local close" nil)
                                 (emacs-jupyter-notebook-helper-backend--finish-close
-                                 session state "local close" nil)
-                              (emacs-jupyter-notebook-helper-backend--finish-close
-                               session state "helper close returned an invalid result" t)))
-                        (error
-                         (emacs-jupyter-notebook-helper-backend--finish-close
-                          session state (error-message-string response-error) t))))))
-                :timeout (emacs-jupyter-notebook-helper-backend--close-deadline))
-             (error
-              (emacs-jupyter-notebook-helper-backend--finish-close
-               session state (error-message-string err) t)))))))
+                                 session state "helper close returned an invalid result" t)))
+                          (error
+                           (emacs-jupyter-notebook-helper-backend--finish-close
+                            session state (error-message-string response-error) t))))))
+                  :timeout (emacs-jupyter-notebook-helper-backend--close-deadline))
+               (error
+                (emacs-jupyter-notebook-helper-backend--finish-close
+                 session state (error-message-string err) t))))))))
     (_
      (let ((state (emacs-jupyter-notebook-backend-session-data session)))
        (unless (and (emacs-jupyter-notebook-helper-backend-state-p state)

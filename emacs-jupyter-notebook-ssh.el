@@ -23,6 +23,9 @@
 (defconst emacs-jupyter-notebook-ssh-kernelspec-max-text-bytes 4096)
 (defconst emacs-jupyter-notebook-ssh-kernelspec-max-argv-bytes 16384)
 (defconst emacs-jupyter-notebook-ssh-kernelspec-max-env-bytes 16384)
+(defconst emacs-jupyter-notebook-ssh--management-output-hard-limit
+  (* 1024 1024)
+  "Immutable per-stream management output ceiling.")
 
 (defconst emacs-jupyter-notebook-ssh--kernelspec-resolver
   (concat
@@ -475,6 +478,25 @@ The resolver prefix is intentionally absent from the final process argv."
    profile
    (format "cat %s" (emacs-jupyter-notebook-ssh--quote-remote-path sidecar-file))))
 
+(defun emacs-jupyter-notebook-ssh-build-remote-inspect-pid-sidecar (profile entry)
+  "Return argv that distinguishes exact ENTRY sidecar bytes from absence.
+The host must emit a terminal marker.  Symlinks and non-regular objects fail
+without being interpreted as either a PID or safe absence."
+  (unless (emacs-jupyter-notebook-ssh-direct-entry-valid-p entry)
+    (error "Sidecar inspection requires a valid direct provisional entry"))
+  (let ((sidecar (emacs-jupyter-notebook-ssh--quote-remote-path
+                  (plist-get entry :remote-pid-sidecar))))
+    (emacs-jupyter-notebook-ssh-command
+     profile
+     (format
+      (concat "sidecar=%s; "
+              "if [ -f \"$sidecar\" ] && [ ! -L \"$sidecar\" ]; then "
+              "cat \"$sidecar\" && printf '__EJN_SIDECAR_DONE__\\n'; "
+              "elif [ ! -e \"$sidecar\" ] && [ ! -L \"$sidecar\" ]; then "
+              "printf '__EJN_SIDECAR_ABSENT__\\n__EJN_SIDECAR_DONE__\\n'; "
+              "else printf '__EJN_SIDECAR_UNSAFE__\\n' >&2; exit 1; fi")
+      sidecar))))
+
 (defun emacs-jupyter-notebook-ssh-build-remote-kill (profile pid)
   "Return an SSH argv list that asks the remote shell to terminate PID."
   (emacs-jupyter-notebook-ssh-command
@@ -635,7 +657,8 @@ and its PIDs stay UNKNOWN (never pruned)."
                            (and (integerp pid) (> pid 0) (<= pid 2147483647)))
                          pids))
     (error "Batch PID probe requires positive integer PIDs"))
-  (let* ((timeout (or connect-timeout emacs-jupyter-notebook-prune-ssh-timeout 5))
+  (let* ((timeout
+          (emacs-jupyter-notebook--effective-prune-ssh-timeout connect-timeout))
          (pid-list (mapconcat (lambda (p) (shell-quote-argument (format "%s" p)))
                               pids " "))
          (remote
@@ -863,28 +886,21 @@ Kinds (in priority order; the first matching pattern wins):
                     "`M-x emacs-jupyter-notebook-fetch-remote-log' for "
                     "details."))))))
 
-(defun emacs-jupyter-notebook-ssh-start-process (name argv &optional sentinel)
-  "Start ARGV asynchronously as process NAME and return the process."
-  (let ((stdout-buffer (generate-new-buffer (format " *%s*" name)))
-        (stderr-buffer (generate-new-buffer (format " *%s stderr*" name)))
-        process)
-    (condition-case err
-        (progn
-          (setq process
-                (make-process :name name
-                              :buffer stdout-buffer
-                              :command argv
-                              :connection-type 'pipe
-                              :noquery t
-                              :sentinel sentinel
-                              :stderr stderr-buffer))
-          (process-put process 'emacs-jupyter-notebook-stderr-buffer
-                       stderr-buffer)
-          process)
-      (error
-       (when (buffer-live-p stdout-buffer) (kill-buffer stdout-buffer))
-       (when (buffer-live-p stderr-buffer) (kill-buffer stderr-buffer))
-       (signal (car err) (cdr err))))))
+(defun emacs-jupyter-notebook-ssh-start-process
+    (name argv &optional sentinel output-limit)
+  "Start ARGV asynchronously as process NAME and return the process.
+OUTPUT-LIMIT defaults to the immutable management-stream ceiling.  Keep this
+constructor bounded from the `make-process' call itself: management callers
+replace the initial filters with their newest-tail filter immediately after
+creation, but a fast child must not get an unbounded buffer during that small
+handoff window."
+  (emacs-jupyter-notebook-ssh-start-bounded-process
+   name argv
+   (or output-limit
+       ;; This function is defined below, but all callers run after this file
+       ;; has finished loading and the constant is therefore available.
+       emacs-jupyter-notebook-ssh--management-output-hard-limit)
+   sentinel))
 
 (defun emacs-jupyter-notebook-ssh--bounded-output-filter (process output limit owner)
   "Append OUTPUT only while OWNER remains below binary-stream LIMIT."
@@ -928,6 +944,12 @@ protocol parser to distinguish truncated hostile output from a valid reply."
                             proc output limit process))))
           (process-put process 'emacs-jupyter-notebook-stderr-buffer stderr-buffer)
           (when-let ((stderr-process (get-buffer-process stderr-buffer)))
+            ;; The stderr buffer is backed by an internal process.  Its
+            ;; default sentinel may append a process-status diagnostic when
+            ;; the owning SSH process is killed for output overflow, bypassing
+            ;; the bounded output filter.  Silence it before returning the
+            ;; child to callers.
+            (set-process-sentinel stderr-process #'ignore)
             (set-process-filter
              stderr-process
              (lambda (proc output)
@@ -959,7 +981,7 @@ protocol parser to distinguish truncated hostile output from a valid reply."
         (minimum (1+ (string-bytes
                       emacs-jupyter-notebook-ssh--management-truncation-marker))))
     (if (and (integerp limit) (>= limit minimum))
-        limit
+        (min limit emacs-jupyter-notebook-ssh--management-output-hard-limit)
       emacs-jupyter-notebook-ssh--management-output-fallback)))
 
 (defun emacs-jupyter-notebook-ssh--management-buffer-bytes ()
@@ -1102,13 +1124,20 @@ OUTCOME is `success', `failed', `timeout', or `cancelled'."
 (defconst emacs-jupyter-notebook-ssh--management-timeout-fallback 60
   "Finite watchdog used when the management timeout is misconfigured.")
 
+(defconst emacs-jupyter-notebook-ssh--management-timeout-hard-limit 600
+  "Absolute upper bound for one user-visible management child.")
+
 (defun emacs-jupyter-notebook-ssh--management-timeout (timeout)
   "Return a positive management deadline for optional TIMEOUT."
   (let ((candidate (if (null timeout)
                        emacs-jupyter-notebook-management-process-timeout
                      timeout)))
-    (if (and (numberp candidate) (> candidate 0))
-        candidate
+    (if (and (numberp candidate) (> candidate 0)
+             (or (not (floatp candidate))
+                 (and (not (isnan candidate))
+                      (< (abs candidate) 1.0e+INF))))
+        (min candidate
+             emacs-jupyter-notebook-ssh--management-timeout-hard-limit)
       emacs-jupyter-notebook-ssh--management-timeout-fallback)))
 
 (defun emacs-jupyter-notebook-ssh-start-management-operation
@@ -1119,29 +1148,51 @@ callbacks run at most once; cancelling or timing out never changes durable
 kernel state.  TIMEOUT defaults to
 `emacs-jupyter-notebook-management-process-timeout'; invalid or non-positive
 values use a finite hard fallback, so management children cannot wedge Emacs."
-  (let (process)
+  (let (process setup-complete pending-outcome)
     (setq process
           (emacs-jupyter-notebook-ssh-start-process
            name argv
            (lambda (proc _event)
              (when (and (memq (process-status proc) '(exit signal))
                         (not (process-get proc 'ejn-management-finished)))
-               (emacs-jupyter-notebook-ssh--management-finish
-                proc
-                (if (and (eq (process-status proc) 'exit)
-                         (zerop (process-exit-status proc)))
-                    'success
-                  'failed))))))
-    (emacs-jupyter-notebook-ssh--management-install-output-filters process)
+               (let ((outcome
+                      (if (and (eq (process-status proc) 'exit)
+                               (zerop (process-exit-status proc)))
+                          'success
+                        'failed)))
+                 ;; A fast child can finish inside `make-process', before its
+                 ;; callbacks and watchdog exist.  Record that terminal state
+                 ;; until setup publishes every resource; finishing earlier
+                 ;; loses the callback and leaves a stale timer behind.
+                 (if setup-complete
+                     (emacs-jupyter-notebook-ssh--management-finish proc outcome)
+                   (setq pending-outcome outcome)))))
+           (emacs-jupyter-notebook-ssh--management-output-limit)))
+    ;; Publish callbacks first so any failure in filter/watchdog setup can use
+    ;; the same exact-once disposal path.  Returning an already-finished
+    ;; process is intentional and is supported by the higher-level management
+    ;; launcher, whose callback may complete before this starter returns.
     (process-put process 'ejn-management-success success)
     (process-put process 'ejn-management-failure failure)
-    (process-put
-     process 'ejn-management-timeout
-     (run-at-time
-      (emacs-jupyter-notebook-ssh--management-timeout timeout) nil
-      (lambda (proc)
-        (emacs-jupyter-notebook-ssh--management-finish proc 'timeout))
-      process))
+    (condition-case err
+        (progn
+          (emacs-jupyter-notebook-ssh--management-install-output-filters process)
+          (process-put
+           process 'ejn-management-timeout
+           (run-at-time
+            (emacs-jupyter-notebook-ssh--management-timeout timeout) nil
+            (lambda (proc)
+              (emacs-jupyter-notebook-ssh--management-finish proc 'timeout))
+            process))
+          (setq setup-complete t)
+          (when pending-outcome
+            (emacs-jupyter-notebook-ssh--management-finish
+             process pending-outcome)))
+      (error
+       (setq setup-complete t)
+       (message "emacs-jupyter-notebook: management process setup failed: %s"
+                (error-message-string err))
+       (emacs-jupyter-notebook-ssh--management-finish process 'failed)))
     process))
 
 (provide 'emacs-jupyter-notebook-ssh)

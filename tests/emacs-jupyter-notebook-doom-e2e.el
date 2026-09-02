@@ -69,6 +69,78 @@ Explicit identity-bound cleanup has its own separately bounded timeout."
   "Return the shared test-owned cleanup deadline in seconds."
   (ejn-doom-e2e--positive-number "EJN_DOOM_E2E_CLEANUP_TIMEOUT" 25 120))
 
+(defun ejn-doom-e2e--wait-step (seconds)
+  "Wait briefly while dispatching both process events and Emacs timers.
+The live E2E runs inside one server request.  Use the event-loop primitive
+directly: `sleep-for' can remain asleep when the process event which entered a
+tunnel sentinel deletes that same process during an isolated daemon request."
+  (accept-process-output nil (max 0.001 (min 0.2 seconds))))
+
+(defun ejn-doom-e2e--registry-call (file starter)
+  "Run registry STARTER against FILE with a bounded test-only wait.
+STARTER receives SUCCESS, FAILURE, and OWNER.  This helper is used only to
+coordinate optional E2E fixtures; production registry calls stay async."
+  (let ((owner (emacs-jupyter-notebook-registry-owner-create))
+        (done nil) (values nil) (failure nil)
+        (deadline (+ (float-time) (ejn-doom-e2e--cleanup-timeout))))
+    (let ((emacs-jupyter-notebook-registry-file file))
+      (funcall starter
+               (lambda (&rest result) (setq values result done t))
+               (lambda (&rest result) (setq failure result done t))
+               owner))
+    (while (and (not done) (< (float-time) deadline))
+      (ejn-doom-e2e--wait-step 0.02))
+    (unless done
+      (emacs-jupyter-notebook-registry-owner-cancel owner)
+      (error "Doom E2E registry transaction timed out"))
+    (emacs-jupyter-notebook-registry-owner-cancel owner)
+    (if failure
+        (error "Doom E2E registry transaction failed: %S" (car failure))
+      (car values))))
+
+(defun ejn-doom-e2e--registry-read (file)
+  "Read FILE through the bounded asynchronous registry bridge."
+  (ejn-doom-e2e--registry-call
+   file
+   (lambda (success failure owner)
+     (emacs-jupyter-notebook-registry-read-async
+      success failure :owner owner
+      :deadline (ejn-doom-e2e--cleanup-timeout)))))
+
+(defun ejn-doom-e2e--registry-create (file entry)
+  "Create ENTRY in FILE and return its revision-bearing persisted value."
+  ;; `make-temp-file' leaves an empty file, which is intentionally corrupt in
+  ;; the versioned worker format.  Test fixtures may remove only that known
+  ;; empty placeholder before their first create.
+  (when (and (file-exists-p file)
+             (= (file-attribute-size (file-attributes file 'integer)) 0))
+    (delete-file file))
+  (ejn-doom-e2e--registry-call
+   file
+   (lambda (success failure owner)
+     (emacs-jupyter-notebook-registry-create-async
+      entry success failure :owner owner
+      :deadline (ejn-doom-e2e--cleanup-timeout)))))
+
+(defun ejn-doom-e2e--registry-create-all (file entries)
+  "Create ENTRIES sequentially in FILE, returning persisted entries."
+  ;; This helper constructs a complete isolated fixture, so replacing an
+  ;; existing fixture is intentional and never models production mutation.
+  (when (file-exists-p file)
+    (delete-file file))
+  (let (persisted)
+    (dolist (entry entries (nreverse persisted))
+      (push (ejn-doom-e2e--registry-create file entry) persisted))))
+
+(defun ejn-doom-e2e--registry-replace (file entry revision)
+  "Replace ENTRY in FILE at exact REVISION and return persisted ENTRY."
+  (ejn-doom-e2e--registry-call
+   file
+   (lambda (success failure owner)
+     (emacs-jupyter-notebook-registry-replace-async
+      entry revision success failure :owner owner
+      :deadline (ejn-doom-e2e--cleanup-timeout)))))
+
 (defun ejn-doom-e2e--cleanup-budget (deadline phase &optional maximum)
   "Return remaining cleanup time before DEADLINE for PHASE.
 When MAXIMUM is non-nil, cap the returned per-operation share without granting
@@ -186,8 +258,8 @@ checks.  It is deliberately not an EJN UI path."
           (while (and (process-live-p process)
                       (not stdout-overflow) (not stderr-overflow)
                       (< (float-time) deadline))
-            (accept-process-output nil
-                                   (min 0.1 (max 0.01 (- deadline (float-time))))))
+            (ejn-doom-e2e--wait-step
+             (min 0.1 (max 0.01 (- deadline (float-time))))))
           (when (process-live-p process)
             (delete-process process)
             (error "Doom E2E command timed out after %.1fs: %s"
@@ -314,6 +386,13 @@ profile can be exercised without editing the user's configuration."
   '(error cancelled outcome-unknown)
   "Terminal panel statuses that make an E2E execution immediately fail.")
 
+(defun ejn-doom-e2e--busy-cell-seconds ()
+  "Return the finite remote sleep used by the busy-transport fault gate.
+The default keeps routine smoke runs short.  A release gate can set
+EJN_DOOM_E2E_BUSY_SECONDS to exercise a genuinely long-running cell, while the
+hard ceiling keeps the isolated process tree and its cleanup deadline bounded."
+  (ejn-doom-e2e--positive-number "EJN_DOOM_E2E_BUSY_SECONDS" 3 180))
+
 (defun ejn-doom-e2e--entry-for-exact-code (buffer code)
   "Return BUFFER's sole panel entry whose submitted CODE is exactly CODE.
 An E2E must not let output from a prior evaluation or unrelated cell satisfy a
@@ -338,7 +417,7 @@ once; waiting for unrelated global panel output would hide that failure."
   (let ((deadline (+ (float-time) timeout))
         entry)
     (while (and (not entry) (< (float-time) deadline))
-      (accept-process-output nil 0.1)
+      (ejn-doom-e2e--wait-step 0.1)
       (unless (buffer-live-p buffer)
         (error "E2E source buffer was killed while waiting for %s" label))
       (ejn-doom-e2e--check-async-error buffer)
@@ -375,6 +454,101 @@ once; waiting for unrelated global panel output would hide that failure."
              (plist-get (cdr image) :ejn-original)))
       (ejn-panel-entry-images entry)))
    timeout "published PNG panel output"))
+
+(defun ejn-doom-e2e--busy-execution-admitted-p (entry snapshot execution-id)
+  "Return non-nil when ENTRY and SNAPSHOT prove EXECUTION-ID is running.
+The gate intentionally uses the public status snapshot rather than inferring
+readiness from a non-nil client.  `dispatched' confirms that the exact FIFO
+execution was admitted by the backend; a live helper, live tunnel, and kernel
+`busy' status prove the local transport was healthy immediately before the
+test injects its local-only outage."
+  (and (listp entry)
+       (listp snapshot)
+       (eq (plist-get entry :status) 'running)
+       (integerp execution-id)
+       (integerp (plist-get snapshot :active-execution-id))
+       (= execution-id (plist-get snapshot :active-execution-id))
+       (eq (plist-get snapshot :active-execution-state) 'dispatched)
+       (eq (plist-get snapshot :kernel-status) 'busy)
+       (eq (plist-get snapshot :helper-state) 'ready)
+       (eq (plist-get snapshot :transport-phase) 'connected)
+       (eq (plist-get snapshot :tunnel-state) 'alive)))
+
+(defun ejn-doom-e2e--wait-for-admitted-busy-cell
+    (buffer code execution-id timeout)
+  "Wait until exact CODE is an admitted, actively busy EXECUTION-ID in BUFFER.
+Return a plist containing the exact entry and status snapshot.  A terminal
+entry before this state is a failure, since it would make a following fault
+injection unable to prove it interrupted a real in-flight execution."
+  (let ((deadline (+ (float-time) timeout))
+        admission)
+    (while (and (not admission) (< (float-time) deadline))
+      (ejn-doom-e2e--wait-step
+       (min 0.1 (max 0.01 (- deadline (float-time)))))
+      (unless (buffer-live-p buffer)
+        (error "E2E source buffer was killed before busy execution admission"))
+      (ejn-doom-e2e--check-async-error buffer)
+      (let ((entry (ejn-doom-e2e--entry-for-exact-code buffer code)))
+        (when entry
+          (let ((status (plist-get entry :status)))
+            (when (memq status ejn-doom-e2e--failed-entry-statuses)
+              (error "E2E busy cell reached terminal %S before admission: %s"
+                     status (ejn-doom-e2e--bounded-string code)))
+            (when (eq status 'ok)
+              (error "E2E busy cell completed before its busy state was observed"))
+            (with-current-buffer buffer
+              (let ((snapshot (emacs-jupyter-notebook-status-snapshot)))
+                (when (ejn-doom-e2e--busy-execution-admitted-p
+                       entry snapshot execution-id)
+                  (setq admission (list :entry entry :snapshot snapshot)))))))))
+    (unless admission
+      (error "Timed out after %.1fs waiting for admitted busy execution %s"
+             timeout execution-id))
+    admission))
+
+(defun ejn-doom-e2e--busy-cell-spec (busy-token)
+  "Return code and exact output for a finite BUSY-TOKEN state transition."
+  (unless (and (stringp busy-token) (not (string-empty-p busy-token)))
+    (error "Busy-cell token must be a non-empty string"))
+  (let ((output (format "EJN busy cell completed: %s" busy-token)))
+    (list :code
+          (format (concat "import time\n"
+                          "ejn_doom_e2e_busy_started = %S\n"
+                          "time.sleep(%s)\n"
+                          "ejn_doom_e2e_busy_completed = %S\n"
+                          "print(%S)\n")
+                  busy-token (ejn-doom-e2e--busy-cell-seconds) busy-token output)
+          :output output)))
+
+(defun ejn-doom-e2e--round-trip-spec (kernel-token phase nonce &optional busy-token)
+  "Return exact post-recovery code/output for KERNEL-TOKEN and fresh NONCE.
+When BUSY-TOKEN is non-nil, the returned code also proves the busy cell ran to
+completion in this exact remote kernel before its unique round trip executes."
+  (unless (and (stringp kernel-token) (not (string-empty-p kernel-token))
+               (stringp phase) (not (string-empty-p phase))
+               (stringp nonce) (not (string-empty-p nonce))
+               (or (null busy-token)
+                   (and (stringp busy-token) (not (string-empty-p busy-token)))))
+    (error "Round-trip inputs must be non-empty strings"))
+  (let ((output (format "EJN token verified after %s: %s" phase nonce)))
+    (list :code
+          (concat
+           (format "assert ejn_doom_e2e_token == %S\n" kernel-token)
+           (when busy-token
+             (format (concat "assert ejn_doom_e2e_busy_started == %S\n"
+                             "assert ejn_doom_e2e_busy_completed == %S\n")
+                     busy-token busy-token))
+           (format (concat "ejn_doom_e2e_last_round_trip = %S\n"
+                           "assert ejn_doom_e2e_last_round_trip == %S\n"
+                           "print(%S)\n")
+                   nonce nonce output))
+          :output output
+          :nonce nonce)))
+
+(defun ejn-doom-e2e--fresh-round-trip-nonce (kernel-token phase)
+  "Return a per-invocation round-trip nonce scoped to KERNEL-TOKEN and PHASE."
+  (format "%s:%s:%x:%x" kernel-token phase (emacs-pid)
+          (random most-positive-fixnum)))
 
 (defconst ejn-doom-e2e--png-signature
   (unibyte-string #x89 ?P ?N ?G ?\r ?\n #x1a ?\n)
@@ -439,12 +613,53 @@ compressed original used by the external viewer rather than the display file."
   (let ((deadline (+ (float-time) timeout))
         client)
     (while (and (not client) (< (float-time) deadline))
-      (accept-process-output nil 0.1)
+      (ejn-doom-e2e--wait-step 0.1)
       (unless (buffer-live-p buffer)
         (error "E2E source buffer was killed"))
       (ejn-doom-e2e--check-async-error buffer)
       (with-current-buffer buffer
         (setq client emacs-jupyter-notebook--client)))
+    (unless client
+      (with-current-buffer buffer
+        (let* ((panel (emacs-jupyter-notebook-panel-buffer buffer))
+               (operation
+                (plist-get emacs-jupyter-notebook--async-context
+                           :registry-operation))
+               (worker
+                (and operation
+                     (emacs-jupyter-notebook-registry-operation-process
+                      operation))))
+          (ejn-doom-e2e--record-progress
+           (format
+            "client wait expired: %s"
+            (ejn-doom-e2e--bounded-string
+             (list
+              :panel
+              (when (buffer-live-p panel)
+                (with-current-buffer panel
+                  (mapcar
+                   (lambda (cell)
+                     (let ((entry (cdr cell)))
+                       (list :status (plist-get entry :status)
+                             :text (ejn-doom-e2e--bounded-string
+                                    (ejn-panel-entry-text entry)))))
+                   emacs-jupyter-notebook-panel--entries)))
+              :registry-operation
+              (when operation
+                (list
+                 :finished
+                 (emacs-jupyter-notebook-registry-operation-finished operation)
+                 :process-status (and worker (process-status worker))
+                 :stdout-bytes
+                 (string-bytes
+                  (or (emacs-jupyter-notebook-registry-operation-stdout
+                       operation)
+                      ""))))
+              :status (emacs-jupyter-notebook-status-snapshot)
+              :async-phase
+              (plist-get emacs-jupyter-notebook--async-context :phase)
+              :async-error
+              (plist-get emacs-jupyter-notebook--async-context :error))))))))
     client))
 
 (defun ejn-doom-e2e--wait-for-shutdown (buffer timeout)
@@ -452,7 +667,7 @@ compressed original used by the external viewer rather than the display file."
   (let ((deadline (+ (float-time) timeout))
         done)
     (while (and (not done) (< (float-time) deadline))
-      (accept-process-output nil 0.1)
+      (ejn-doom-e2e--wait-step 0.1)
       (when (buffer-live-p buffer)
         (with-current-buffer buffer
           (when (eq (plist-get emacs-jupyter-notebook--async-context :phase)
@@ -477,8 +692,6 @@ compressed original used by the external viewer rather than the display file."
            (helper-state (plist-get snapshot :helper-state))
            (tunnel-pid (and (processp tunnel) (process-live-p tunnel)
                             (process-id tunnel))))
-      (unless (eq emacs-jupyter-notebook-backend 'helper)
-        (error "Doom E2E requires emacs-jupyter-notebook-backend to be helper"))
       (unless (and (emacs-jupyter-notebook-backend-session-p client)
                    (eq (emacs-jupyter-notebook-backend-session-backend client) 'helper))
         (error "Doom E2E did not attach a helper backend session"))
@@ -568,7 +781,7 @@ live BUFFER or private REGISTRY-FILE by the regression under test."
         (push emacs-jupyter-notebook--session-entry candidates)
         (push (plist-get emacs-jupyter-notebook--async-context :entry)
               candidates)))
-    (dolist (entry (emacs-jupyter-notebook-registry-load registry-file))
+    (dolist (entry (ejn-doom-e2e--registry-read registry-file))
       (push entry candidates))
     (cl-remove-duplicates (delq nil candidates) :test #'equal)))
 
@@ -650,7 +863,8 @@ injection phase."
   (let ((deadline (+ (float-time) timeout))
         recovery)
     (while (and (not recovery) (< (float-time) deadline))
-      (accept-process-output nil (min 0.1 (max 0.01 (- deadline (float-time)))))
+      (ejn-doom-e2e--wait-step
+       (min 0.1 (max 0.01 (- deadline (float-time)))))
       (ejn-doom-e2e--check-recovery-state buffer expected-identity)
       (with-current-buffer buffer
         (when (and emacs-jupyter-notebook--client
@@ -674,8 +888,8 @@ injection phase."
     ;; same ready process identities, to detect stale-local-state regressions.
     (let ((quiet-deadline (min deadline (+ (float-time) 0.4))))
       (while (< (float-time) quiet-deadline)
-        (accept-process-output nil
-                               (min 0.05 (max 0.01 (- quiet-deadline (float-time)))))
+        (ejn-doom-e2e--wait-step
+         (min 0.05 (max 0.01 (- quiet-deadline (float-time)))))
         (ejn-doom-e2e--check-recovery-state buffer expected-identity)
         (let ((current (ejn-doom-e2e--capture-identity buffer)))
           (unless (and (ejn-doom-e2e--same-remote-identity-p recovery current)
@@ -718,18 +932,50 @@ injection phase."
       (delete-process process)
       process)))
 
-(defun ejn-doom-e2e--verify-token (buffer token phase timeout)
-  "Execute a token assertion in BUFFER and await fresh PHASE output.
-The phase-unique history execution proves a fresh round trip without modifying
-the visited source or allowing an old panel result to satisfy the check."
-  (let ((output (format "EJN token verified after %s: %s" phase token)))
+(defun ejn-doom-e2e--run-local-transport-recovery
+    (buffer expected-identity kind deadline)
+  "Fault exactly one local KIND process and await its automatic recovery.
+KIND is `helper' or `tunnel'.  The fault remains strictly local: the exact-PID
+helpers below leave the durable remote entry and remote kernel untouched.  The
+returned plist contains the pre-fault and recovered process identities and a
+finite elapsed duration for the E2E metrics."
+  (unless (memq kind '(helper tunnel))
+    (error "Unsupported local transport fault kind %S" kind))
+  (let* ((label (format "%s recovery" kind))
+         (before (ejn-doom-e2e--capture-identity buffer))
+         (started-at (float-time)))
+    (ejn-doom-e2e--phase-budget deadline (format "%s fault injection" label))
+    (pcase kind
+      ('helper (ejn-doom-e2e--kill-local-helper buffer before))
+      ('tunnel (ejn-doom-e2e--kill-local-tunnel buffer before)))
+    (let ((after
+           (ejn-doom-e2e--wait-for-recovery
+            buffer expected-identity
+            (plist-get before :helper-pid)
+            (plist-get before :tunnel-pid)
+            (ejn-doom-e2e--phase-budget
+             deadline (format "waiting for automatic %s" label)))))
+      (list :kind kind :before before :after after
+            :seconds (- (float-time) started-at)))))
+
+(defun ejn-doom-e2e--verify-token
+    (buffer token phase timeout &optional busy-token)
+  "Execute a fresh token assertion in BUFFER and await its unique output.
+BUSY-TOKEN additionally requires a prior busy cell to have reached both of its
+kernel-side state assignments.  Every invocation carries an unpredictable
+round-trip nonce, so an old panel result cannot satisfy a later recovery
+check."
+  (let* ((spec (ejn-doom-e2e--round-trip-spec
+                token phase (ejn-doom-e2e--fresh-round-trip-nonce token phase)
+                busy-token))
+         (code (plist-get spec :code))
+         (output (plist-get spec :output)))
     (ejn-doom-e2e--record-progress (format "dispatching token after %s" phase))
-    (let ((code (format "assert ejn_doom_e2e_token == %S\nprint(%S)\n" token output)))
-      (with-current-buffer buffer
-        (emacs-jupyter-notebook--evaluate-code code nil))
-      (ejn-doom-e2e--record-progress (format "waiting for token after %s" phase))
-      (unless (ejn-doom-e2e--wait-for-result-text buffer code output timeout)
-        (error "Kernel-side token did not survive %s" phase)))
+    (with-current-buffer buffer
+      (emacs-jupyter-notebook--evaluate-code code nil))
+    (ejn-doom-e2e--record-progress (format "waiting for token after %s" phase))
+    (unless (ejn-doom-e2e--wait-for-result-text buffer code output timeout)
+      (error "Kernel-side token did not survive %s" phase))
     (ejn-doom-e2e--record-progress (format "token verified after %s" phase))
     output))
 
@@ -750,17 +996,21 @@ the visited source or allowing an old panel result to satisfy the check."
                           (equal (string-trim output)
                                  "__EJN_DEAD__\n__EJN_DONE__")))
           (unless dead
-            (accept-process-output nil (min 0.2 remaining)))))
+            (ejn-doom-e2e--wait-step (min 0.2 remaining)))))
       dead)))
 
 (defun ejn-doom-e2e--preserve-cleanup-entry (entry)
-  "Re-save captured ENTRY to this E2E's private registry for diagnosis.
+  "Reassert captured ENTRY at its exact revision for diagnosis.
 Return a short status string suitable for an error without masking the
 cleanup failure that prompted preservation."
   (condition-case err
       (progn
-        (emacs-jupyter-notebook-registry-save-entry (copy-sequence entry))
-        "captured entry re-saved")
+        (let ((file emacs-jupyter-notebook-registry-file)
+              (revision (plist-get entry :registry-revision)))
+          (unless (and (stringp file) (stringp revision))
+            (error "captured entry lacks registry file or revision"))
+          (ejn-doom-e2e--registry-replace file (copy-sequence entry) revision))
+        "captured entry reasserted")
     (error
      (format "captured-entry save failed: %s"
              (ejn-doom-e2e--bounded-string (error-message-string err))))))
@@ -963,13 +1213,18 @@ identity and is verified through an exact PID liveness probe."
          (tunnel-recovery-before nil)
          (tunnel-recovery-after nil)
          (tunnel-recovery-seconds nil)
+         (busy-token nil)
+         (busy-code nil)
+         (busy-execution-id nil)
+         (busy-admission nil)
+         (busy-recovery-before nil)
+         (busy-recovery-after nil)
+         (busy-recovery-seconds nil)
+         (busy-completion-identity nil)
          (cleanup-confirmed nil)
          (cleanup-error nil)
          (body-succeeded nil)
          metrics)
-    (unless (eq emacs-jupyter-notebook-backend 'helper)
-      (error "Doom E2E requires helper backend; current value is %S"
-             emacs-jupyter-notebook-backend))
     (let ((emacs-jupyter-notebook-default-profile profile-name)
           (emacs-jupyter-notebook-remote-profiles
            (list (cons profile-name profile)))
@@ -988,7 +1243,16 @@ identity and is verified through an exact PID liveness probe."
           ;; with only its retry delays shortened for a bounded test runtime.
           (emacs-jupyter-notebook-auto-reconnect t)
           (emacs-jupyter-notebook-reconnect-initial-delay 0.1)
-          (emacs-jupyter-notebook-reconnect-max-delay 0.5))
+          (emacs-jupyter-notebook-reconnect-max-delay 0.5)
+          ;; A post-recovery request may wait behind the deliberately busy
+          ;; kernel.  Keep its own watchdog beyond that bounded sleep so the
+          ;; long-cell gate measures recovery rather than its test fixture.
+          (emacs-jupyter-notebook-evaluation-timeout
+           (+ (ejn-doom-e2e--busy-cell-seconds) 120)))
+      ;; `make-temp-file' reserves a private name by creating an empty file,
+      ;; while production correctly treats an existing empty registry as
+      ;; corrupt.  First-run production behavior starts from a missing path.
+      (delete-file registry-file)
       (unwind-protect
           (progn
           ;; Phase 1: cold-start, actual PNG output, then a stateful text cell.
@@ -1062,7 +1326,9 @@ identity and is verified through an exact PID liveness probe."
           (with-current-buffer buffer2
             (python-mode)
             (emacs-jupyter-notebook-mode 1)
-            (let ((entry (emacs-jupyter-notebook--current-file-registry-entry)))
+            (let ((entry
+                   (emacs-jupyter-notebook-registry-latest-for-file
+                    source-file (ejn-doom-e2e--registry-read registry-file))))
               (unless entry
                 (error "No registry entry for %S after local buffer kill" source-file))
               (unless (ejn-doom-e2e--same-remote-identity-p
@@ -1095,18 +1361,11 @@ identity and is verified through an exact PID liveness probe."
             ;; Phase 3: kill only the actual helper subprocess.  Its process
             ;; sentinel, rather than a test-only reconnect call, must retire
             ;; local state and schedule automatic transport recovery.
-            (setq helper-recovery-before (ejn-doom-e2e--capture-identity buffer2))
-            (ejn-doom-e2e--phase-budget deadline "helper fault injection")
-            (let ((started-at (float-time)))
-              (ejn-doom-e2e--kill-local-helper buffer2 helper-recovery-before)
-              (setq helper-recovery-after
-                    (ejn-doom-e2e--wait-for-recovery
-                     buffer2 identity-before
-                     (plist-get helper-recovery-before :helper-pid)
-                     (plist-get helper-recovery-before :tunnel-pid)
-                     (ejn-doom-e2e--phase-budget
-                      deadline "waiting for automatic helper recovery"))
-                    helper-recovery-seconds (- (float-time) started-at)))
+            (let ((recovery (ejn-doom-e2e--run-local-transport-recovery
+                             buffer2 identity-before 'helper deadline)))
+              (setq helper-recovery-before (plist-get recovery :before)
+                    helper-recovery-after (plist-get recovery :after)
+                    helper-recovery-seconds (plist-get recovery :seconds)))
             (ejn-doom-e2e--verify-token
              buffer2 token "helper recovery"
              (ejn-doom-e2e--phase-budget
@@ -1116,24 +1375,60 @@ identity and is verified through an exact PID liveness probe."
             ;; Phase 4: independently kill only the active SSH tunnel.  The
             ;; core is expected to rebuild both local transport processes
             ;; against the unchanged durable remote kernel identity.
-            (setq tunnel-recovery-before (ejn-doom-e2e--capture-identity buffer2))
-            (ejn-doom-e2e--phase-budget deadline "tunnel fault injection")
-            (let ((started-at (float-time)))
-              (ejn-doom-e2e--kill-local-tunnel buffer2 tunnel-recovery-before)
-              (setq tunnel-recovery-after
-                    (ejn-doom-e2e--wait-for-recovery
-                     buffer2 identity-before
-                     (plist-get tunnel-recovery-before :helper-pid)
-                     (plist-get tunnel-recovery-before :tunnel-pid)
-                     (ejn-doom-e2e--phase-budget
-                      deadline "waiting for automatic tunnel recovery"))
-                    tunnel-recovery-seconds (- (float-time) started-at)))
+            (let ((recovery (ejn-doom-e2e--run-local-transport-recovery
+                             buffer2 identity-before 'tunnel deadline)))
+              (setq tunnel-recovery-before (plist-get recovery :before)
+                    tunnel-recovery-after (plist-get recovery :after)
+                    tunnel-recovery-seconds (plist-get recovery :seconds)))
             (ejn-doom-e2e--verify-token
              buffer2 token "tunnel recovery"
              (ejn-doom-e2e--phase-budget
               deadline "verifying state after tunnel recovery"))
             (ejn-doom-e2e--assert-source-pristine
              buffer2 source-baseline "tunnel recovery token proof")
+            ;; Phase 5: prove automatic recovery is safe while an execution is
+            ;; genuinely running.  The admission predicate ties the exact
+            ;; returned execution id to a `dispatched' ledger record, a live
+            ;; helper/tunnel, and the kernel's real busy status before the
+            ;; exact current tunnel PID is killed.  The post-recovery request
+            ;; waits behind the busy cell if necessary and proves its state
+            ;; transition completed in the same remote kernel.
+            (setq busy-token
+                  (format "%s-busy-%x" token (random most-positive-fixnum)))
+            (let ((spec (ejn-doom-e2e--busy-cell-spec busy-token)))
+              (setq busy-code (plist-get spec :code)))
+            (ejn-doom-e2e--record-progress "dispatching admitted busy cell before tunnel fault")
+            (setq busy-execution-id
+                  (with-current-buffer buffer2
+                    (emacs-jupyter-notebook--evaluate-code busy-code nil)))
+            (unless (integerp busy-execution-id)
+              (error "Busy E2E evaluation did not return an execution id: %S"
+                     busy-execution-id))
+            (setq busy-admission
+                  (ejn-doom-e2e--wait-for-admitted-busy-cell
+                   buffer2 busy-code busy-execution-id
+                   (ejn-doom-e2e--phase-budget
+                    deadline "waiting for admitted busy execution")))
+            (ejn-doom-e2e--record-progress
+             (format "busy execution %s admitted; injecting local tunnel fault"
+                     busy-execution-id))
+            (let ((recovery (ejn-doom-e2e--run-local-transport-recovery
+                             buffer2 identity-before 'tunnel deadline)))
+              (setq busy-recovery-before (plist-get recovery :before)
+                    busy-recovery-after (plist-get recovery :after)
+                    busy-recovery-seconds (plist-get recovery :seconds)))
+            (ejn-doom-e2e--verify-token
+             buffer2 token "busy tunnel recovery"
+             (ejn-doom-e2e--phase-budget
+              deadline "verifying busy kernel state after tunnel recovery")
+             busy-token)
+            (setq busy-completion-identity (ejn-doom-e2e--capture-identity buffer2))
+            (unless (ejn-doom-e2e--same-remote-identity-p
+                     identity-before busy-completion-identity)
+              (error "Busy recovery completed on a different remote kernel: before=%S after=%S"
+                     identity-before busy-completion-identity))
+            (ejn-doom-e2e--assert-source-pristine
+             buffer2 source-baseline "busy tunnel recovery completion proof")
             (setq metrics
                   (list :status 'ok
                         :profile profile-name
@@ -1166,7 +1461,25 @@ identity and is verified through an exact PID liveness probe."
                         :tunnel-pid-before-tunnel-fault
                         (plist-get tunnel-recovery-before :tunnel-pid)
                         :tunnel-pid-after-tunnel-recovery
-                        (plist-get tunnel-recovery-after :tunnel-pid))))
+                        (plist-get tunnel-recovery-after :tunnel-pid)
+                        :busy-execution-id busy-execution-id
+                        :busy-cell-seconds (ejn-doom-e2e--busy-cell-seconds)
+                        :busy-admission-state
+                        (plist-get (plist-get busy-admission :snapshot)
+                                   :active-execution-state)
+                        :busy-recovery-seconds busy-recovery-seconds
+                        :helper-pid-before-busy-tunnel-fault
+                        (plist-get busy-recovery-before :helper-pid)
+                        :helper-pid-after-busy-tunnel-recovery
+                        (plist-get busy-recovery-after :helper-pid)
+                        :tunnel-pid-before-busy-tunnel-fault
+                        (plist-get busy-recovery-before :tunnel-pid)
+                        :tunnel-pid-after-busy-tunnel-recovery
+                        (plist-get busy-recovery-after :tunnel-pid)
+                        :busy-completion-helper-pid
+                        (plist-get busy-completion-identity :helper-pid)
+                        :busy-completion-tunnel-pid
+                        (plist-get busy-completion-identity :tunnel-pid))))
           (setq body-succeeded t))
       ;; Cleanup must prove every run-owned candidate dead.  A regression may
       ;; have replaced the initially captured A with B; deleting this private
@@ -1203,12 +1516,100 @@ identity and is verified through an exact PID liveness probe."
   :tags '(:remote :doom :e2e)
   (ejn-doom-e2e-python-cell-evaluates-on-mother))
 
+(ert-deftest ejn-doom-e2e-busy-execution-admission-predicate ()
+  "Only an exact dispatched busy execution may authorize the fault phase."
+  (let ((entry '(:status running))
+        (snapshot '(:active-execution-id 41
+                    :active-execution-state dispatched
+                    :kernel-status busy
+                    :helper-state ready
+                    :transport-phase connected
+                    :tunnel-state alive)))
+    (should (ejn-doom-e2e--busy-execution-admitted-p entry snapshot 41))
+    (should-not
+     (ejn-doom-e2e--busy-execution-admitted-p
+      entry (plist-put (copy-sequence snapshot) :active-execution-state 'checking) 41))
+    (should-not
+     (ejn-doom-e2e--busy-execution-admitted-p
+      entry (plist-put (copy-sequence snapshot) :kernel-status 'idle) 41))
+    (should-not
+     (ejn-doom-e2e--busy-execution-admitted-p
+      entry (plist-put (copy-sequence snapshot) :active-execution-id 42) 41))
+    (should-not
+     (ejn-doom-e2e--busy-execution-admitted-p
+      '(:status queued) snapshot 41))))
+
+(ert-deftest ejn-doom-e2e-busy-duration-is-finite-and-hard-bounded ()
+  "The release gate may run a long cell but cannot create an unbounded wait."
+  (let ((process-environment (copy-sequence process-environment)))
+    (setenv "EJN_DOOM_E2E_BUSY_SECONDS" nil)
+    (should (= (ejn-doom-e2e--busy-cell-seconds) 3))
+    (setenv "EJN_DOOM_E2E_BUSY_SECONDS" "125")
+    (should (= (ejn-doom-e2e--busy-cell-seconds) 125))
+    (setenv "EJN_DOOM_E2E_BUSY_SECONDS" "181")
+    (should-error (ejn-doom-e2e--busy-cell-seconds))))
+
+(ert-deftest ejn-doom-e2e-wait-for-admitted-busy-cell-skips-queued-entry ()
+  "The bounded busy wait does not fault until the exact execution is live."
+  (let* ((snapshot '(:active-execution-id 41
+                     :active-execution-state dispatched
+                     :kernel-status busy
+                     :helper-state ready
+                     :transport-phase connected
+                     :tunnel-state alive))
+         (calls 0)
+         result)
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'ejn-doom-e2e--check-async-error)
+                 (lambda (&rest _args) nil))
+                ((symbol-function 'ejn-doom-e2e--entry-for-exact-code)
+                 (lambda (_buffer code)
+                   (should (equal code "busy-code"))
+                   (setq calls (1+ calls))
+                   (if (= calls 1) '(:status queued) '(:status running))))
+                ((symbol-function 'emacs-jupyter-notebook-status-snapshot)
+                 (lambda () snapshot)))
+        (setq result
+              (ejn-doom-e2e--wait-for-admitted-busy-cell
+               (current-buffer) "busy-code" 41 0.5))))
+    (should (= calls 2))
+    (should (eq (plist-get (plist-get result :entry) :status) 'running))
+    (should (equal (plist-get result :snapshot) snapshot))))
+
+(ert-deftest ejn-doom-e2e-round-trip-spec-requires-exact-state-and-nonce ()
+  "Round-trip specifications bind output freshness and busy completion state."
+  (let* ((first (ejn-doom-e2e--round-trip-spec
+                 "kernel-token" "first recovery" "nonce-one" "busy-token"))
+         (second (ejn-doom-e2e--round-trip-spec
+                  "kernel-token" "second recovery" "nonce-two"))
+         (first-code (plist-get first :code)))
+    (should (string-match-p
+             (regexp-quote "assert ejn_doom_e2e_token == \"kernel-token\"") first-code))
+    (should (string-match-p
+             (regexp-quote "assert ejn_doom_e2e_busy_started == \"busy-token\"")
+             first-code))
+    (should (string-match-p
+             (regexp-quote "assert ejn_doom_e2e_busy_completed == \"busy-token\"")
+             first-code))
+    (should (string-match-p (regexp-quote "nonce-one") first-code))
+    (should (equal (plist-get first :output)
+                   "EJN token verified after first recovery: nonce-one"))
+    (should-not (equal (plist-get first :code) (plist-get second :code)))
+    (should-not (equal (plist-get first :output) (plist-get second :output)))))
+
 (ert-deftest ejn-doom-e2e-recovery-rejects-foreign-entry-candidates ()
   "Only the source/profile/session-prefix-owned entry may be recovered."
   (let* ((source-file (make-temp-file "ejn-doom-owned-" nil ".py"))
-         (registry-file (make-temp-file "ejn-doom-owned-registry-"))
+         (registry-dir (make-temp-file "ejn-doom-owned-registry-" t))
+         (registry-file (expand-file-name "registry-v1.json" registry-dir))
          (profile "ejn-doom-e2e-private")
          (prefix "ejn-doom-owned-")
+         ;; The worker forbids two durable sessions for one local source.  Keep
+         ;; those mutually exclusive registry fixtures on distinct paths; the
+         ;; live/context candidates below still exercise the profile and
+         ;; session-prefix ownership checks against the real SOURCE-FILE.
+         (foreign-profile-file (concat source-file ".foreign-profile"))
+         (foreign-prefix-file (concat source-file ".foreign-prefix"))
          (make-entry
           (lambda (local-file entry-profile session)
             (let ((connection (format "/tmp/kernel-%s.json" session)))
@@ -1221,39 +1622,54 @@ identity and is verified through an exact PID liveness probe."
          (owned (funcall make-entry source-file profile (concat prefix "owned")))
          (wrong-source (funcall make-entry "/tmp/foreign.py" profile
                                (concat prefix "wrong-source")))
-         (wrong-profile (funcall make-entry source-file "foreign-profile"
+         (wrong-profile (funcall make-entry foreign-profile-file "foreign-profile"
                                 (concat prefix "wrong-profile")))
-         (wrong-prefix (funcall make-entry source-file profile "foreign-session")))
+         (wrong-prefix (funcall make-entry foreign-prefix-file profile "foreign-session"))
+         (wrong-profile-live (funcall make-entry source-file "foreign-profile"
+                                          (concat prefix "wrong-profile-live")))
+         (wrong-prefix-live (funcall make-entry source-file profile "foreign-session")))
     (unwind-protect
         (progn
-          (emacs-jupyter-notebook-registry-save
-           (list wrong-source wrong-profile wrong-prefix owned) registry-file)
+          (let ((persisted
+                 (ejn-doom-e2e--registry-create-all
+                  registry-file
+                  (list wrong-source wrong-profile wrong-prefix owned))))
+            (setq wrong-source (nth 0 persisted)
+                  wrong-profile (nth 1 persisted)
+                  wrong-prefix (nth 2 persisted)
+                  owned (nth 3 persisted)))
           (with-temp-buffer
             ;; These are the two non-registry recovery sources.  Both are
             ;; valid direct entries but deliberately fail a separate guard.
-            (setq emacs-jupyter-notebook--session-entry wrong-source
+            (setq emacs-jupyter-notebook--session-entry wrong-profile-live
                   emacs-jupyter-notebook--async-context
-                  (list :entry wrong-profile))
+                  (list :entry wrong-prefix-live))
             (should (equal
                      (ejn-doom-e2e--recover-test-owned-direct-entry
                       (current-buffer) source-file registry-file profile prefix)
                      owned)))
-          (emacs-jupyter-notebook-registry-save
-           (list wrong-source wrong-profile wrong-prefix) registry-file)
+          (let ((persisted
+                 (ejn-doom-e2e--registry-create-all
+                  registry-file
+                  (list wrong-source wrong-profile wrong-prefix))))
+            (setq wrong-source (nth 0 persisted)
+                  wrong-profile (nth 1 persisted)
+                  wrong-prefix (nth 2 persisted)))
           (with-temp-buffer
-            (setq emacs-jupyter-notebook--session-entry wrong-source
+            (setq emacs-jupyter-notebook--session-entry wrong-profile-live
                   emacs-jupyter-notebook--async-context
-                  (list :entry wrong-profile))
+                  (list :entry wrong-prefix-live))
             (should-not
              (ejn-doom-e2e--recover-test-owned-direct-entry
               (current-buffer) source-file registry-file profile prefix))))
-      (when (file-exists-p registry-file) (delete-file registry-file))
+      (when (file-directory-p registry-dir) (delete-directory registry-dir t))
       (when (file-exists-p source-file) (delete-file source-file)))))
 
 (ert-deftest ejn-doom-e2e-cleanup-covers-drifted-owned-entry ()
   "Cleanup proves both captured kernel A and a drifted test-owned kernel B."
   (let* ((source-file (make-temp-file "ejn-doom-owned-drift-" nil ".py"))
-         (registry-file (make-temp-file "ejn-doom-owned-drift-registry-"))
+         (registry-dir (make-temp-file "ejn-doom-owned-drift-registry-" t))
+         (registry-file (expand-file-name "registry-v1.json" registry-dir))
          (profile "ejn-doom-e2e-private-drift")
          (prefix (ejn-doom-e2e--session-prefix-for-source source-file))
          (make-entry
@@ -1271,8 +1687,14 @@ identity and is verified through an exact PID liveness probe."
          cleaned)
     (unwind-protect
         (progn
-          (emacs-jupyter-notebook-registry-save
-           (list captured drifted) registry-file)
+          (let ((persisted
+                 (ejn-doom-e2e--registry-create-all
+                  registry-file (list drifted))))
+            ;; The worker deliberately forbids two durable sessions for the
+            ;; same source.  A is retained only as the initial captured seed;
+            ;; B is the one durable, drifted current entry that cleanup must
+            ;; still discover and terminate alongside A.
+            (setq drifted (car persisted)))
           (with-temp-buffer
             (setq emacs-jupyter-notebook--session-entry drifted)
             (cl-letf (((symbol-function 'ejn-doom-e2e--shutdown-test-owned-kernel)
@@ -1290,13 +1712,14 @@ identity and is verified through an exact PID liveness probe."
                    (lambda (entry)
                      (ejn-doom-e2e--same-direct-entry-p drifted entry))
                    cleaned)))
-      (when (file-exists-p registry-file) (delete-file registry-file))
+      (when (file-directory-p registry-dir) (delete-directory registry-dir t))
       (when (file-exists-p source-file) (delete-file source-file)))))
 
 (ert-deftest ejn-doom-e2e-cleanup-refuses-foreign-identity-drift ()
   "A drifted foreign B retains all evidence and authorizes no termination."
   (let* ((source-file (make-temp-file "ejn-doom-foreign-drift-" nil ".py"))
-         (registry-file (make-temp-file "ejn-doom-foreign-drift-registry-"))
+         (registry-dir (make-temp-file "ejn-doom-foreign-drift-registry-" t))
+         (registry-file (expand-file-name "registry-v1.json" registry-dir))
          (profile "ejn-doom-e2e-private-foreign")
          (prefix (ejn-doom-e2e--session-prefix-for-source source-file))
          (connection-a (format "/tmp/kernel-%scaptured.json" prefix))
@@ -1320,8 +1743,13 @@ identity and is verified through an exact PID liveness probe."
          shutdown-called)
     (unwind-protect
         (progn
-          (emacs-jupyter-notebook-registry-save
-           (list captured foreign) registry-file)
+          (let ((persisted
+                 (ejn-doom-e2e--registry-create-all
+                  registry-file (list captured))))
+            ;; A conflicting B cannot be durable under the worker's
+            ;; one-local-source rule.  Keep it as the live foreign drift that
+            ;; the cleanup scan must reject before it can authorize any kill.
+            (setq captured (car persisted)))
           (with-temp-buffer
             (setq emacs-jupyter-notebook--session-entry foreign)
             (cl-letf (((symbol-function 'ejn-doom-e2e--shutdown-test-owned-kernel)
@@ -1331,14 +1759,15 @@ identity and is verified through an exact PID liveness probe."
                 (current-buffer) captured source-file registry-file
                 profile prefix))))
           (should-not shutdown-called)
-          (should (equal (emacs-jupyter-notebook-registry-load registry-file)
-                         (list captured foreign))))
-      (when (file-exists-p registry-file) (delete-file registry-file))
+          (should (equal (ejn-doom-e2e--registry-read registry-file)
+                         (list captured))))
+      (when (file-directory-p registry-dir) (delete-directory registry-dir t))
       (when (file-exists-p source-file) (delete-file source-file)))))
 
 (ert-deftest ejn-doom-e2e-cleanup-marker-mismatch-preserves-entry ()
-  "A bad remote cleanup marker retains the captured durable entry verbatim."
-  (let* ((registry-file (make-temp-file "ejn-doom-cleanup-registry-"))
+  "A bad cleanup marker preserves the exact entry data with a fresh revision."
+  (let* ((registry-dir (make-temp-file "ejn-doom-cleanup-registry-" t))
+         (registry-file (expand-file-name "registry-v1.json" registry-dir))
          (connection "/tmp/kernel-cleanup-marker.json")
          (entry
           (list :launch-kind 'direct :provisional nil :remote-pid 12345
@@ -1349,6 +1778,7 @@ identity and is verified through an exact PID liveness probe."
                 :connection-file-tokens (list "-f" connection))))
     (unwind-protect
         (let ((emacs-jupyter-notebook-registry-file registry-file))
+          (setq entry (ejn-doom-e2e--registry-create registry-file entry))
           (cl-letf (((symbol-function 'ejn-doom-e2e--remote-entry-dead-p)
                      (lambda (&rest _args) t))
                     ((symbol-function
@@ -1359,9 +1789,17 @@ identity and is verified through an exact PID liveness probe."
             (with-temp-buffer
               (should-error
                (ejn-doom-e2e--shutdown-test-owned-kernel (current-buffer) entry)))
-            (should (equal (emacs-jupyter-notebook-registry-load registry-file)
-                           (list entry)))))
-      (when (file-exists-p registry-file) (delete-file registry-file)))))
+            (let ((after (car (ejn-doom-e2e--registry-read registry-file))))
+              (should (ejn-doom-e2e--same-direct-entry-p entry after))
+              (should
+               (equal (emacs-jupyter-notebook-registry--entry-to-wire entry)
+                      (emacs-jupyter-notebook-registry--entry-to-wire after)))
+              ;; Reassertion is a CAS replacement, so its opaque worker
+              ;; revision must advance even though the entry data is exact.
+              (should (stringp (plist-get after :registry-revision)))
+              (should-not (equal (plist-get entry :registry-revision)
+                                 (plist-get after :registry-revision)))))))
+      (when (file-directory-p registry-dir) (delete-directory registry-dir t))))
 
 (ert-deftest ejn-doom-e2e-bounded-command-preserves-exact-stdout ()
   "Process sentinels cannot contaminate identity-bound marker output."
@@ -1515,6 +1953,16 @@ durable entry through an independently bounded remote cleanup instead."
                      ejn-doom-e2e--progress-output-limit)))
       (when (file-exists-p progress) (delete-file progress)))))
 
+(ert-deftest ejn-doom-e2e-wait-step-dispatches-timers ()
+  "The nested daemon wait primitive must run deferred async continuations."
+  (let (fired timer)
+    (unwind-protect
+        (progn
+          (setq timer (run-at-time 0 nil (lambda () (setq fired t))))
+          (ejn-doom-e2e--wait-step 0.02)
+          (should fired))
+      (when (timerp timer) (cancel-timer timer)))))
+
 (ert-deftest ejn-doom-e2e-evidence-files-stay-in-owned-directory ()
   "The optional live-E2E evidence root owns its source and registry files."
   (let* ((directory (make-temp-file "ejn-doom-evidence-" t))
@@ -1535,7 +1983,7 @@ durable entry through an independently bounded remote cleanup instead."
          (_ (setenv "EJN_DOOM_E2E_PROGRESS_FILE" nil))
          (stats
           (ert-run-tests-batch
-           "\\`ejn-doom-e2e-\\(bounded-command\\|evidence-files\\|failure-evidence\\|progress-file\\|recovery-rejects\\|cleanup-\\(?:marker-mismatch\\|covers-drifted\\|refuses-foreign\\|skips-public-shutdown\\)\\|provisional-entry\\|source-pristine\\)")))
+           "\\`ejn-doom-e2e-\\(bounded-command\\|busy-\\(?:duration\\|execution-admission\\)\\|evidence-files\\|failure-evidence\\|progress-file\\|recovery-rejects\\|round-trip-spec\\|wait-\\(?:for-admitted-busy-cell\\|step\\)\\|cleanup-\\(?:marker-mismatch\\|covers-drifted\\|refuses-foreign\\|skips-public-shutdown\\)\\|provisional-entry\\|source-pristine\\)")))
     (unless (zerop (ert-stats-completed-unexpected stats))
       (error "Doom E2E deterministic harness preflight failed")))
   (ejn-doom-e2e-python-cell-evaluates-on-mother))

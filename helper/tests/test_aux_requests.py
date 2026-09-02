@@ -161,6 +161,39 @@ class AuxiliaryRequestTests(unittest.IsolatedAsyncioTestCase):
         result = await inspect
         self.assertLessEqual(len(result.result["data"]["text/plain"].encode()), MAX_DOCUMENTATION_BYTES)
 
+    async def test_inspect_projects_mime_data_to_plain_text_before_response(self):
+        base64 = "EJN_INSPECT_BASE64_MUST_NOT_ESCAPE" * 4096
+        inspect = await self._request("inspect", {"code": "x", "cursor_pos": 1})
+        msg_id = await self._request_id("inspect")
+        await self.queues["shell"].put(self._message(msg_id, "inspect_reply", {
+            "found": True,
+            "status": "ok",
+            "data": {
+                "text/plain": "safe documentation",
+                "image/png": base64,
+                "text/html": "<img src='data:image/png;base64,ignored'>",
+                "application/json": {"nested": base64},
+            },
+            "metadata": {"source": "inspect"},
+        }))
+        result = await inspect
+        self.assertIsNone(result.error)
+        self.assertEqual(result.result, {
+            "found": True,
+            "status": "ok",
+            "data": {"text/plain": "safe documentation"},
+            "metadata": {"source": "inspect"},
+        })
+        response = encode(
+            {"v": 1, "kind": "response", "id": "inspect", "ok": True,
+             "result": result.result},
+            EJN_MAX_RESPONSE_FRAME,
+        )
+        self.assertNotIn(base64.encode(), response)
+        self.assertNotIn(b"image/png", response)
+        self.assertNotIn(b"text/html", response)
+        self.assertNotIn(b"application/json", response)
+
     async def test_nested_kernel_info_and_worst_case_aux_response_fit_frame(self):
         info = await self._request("kernel_info", {})
         msg_id = await self._request_id("kernel_info")

@@ -6,9 +6,8 @@
 
 ;;; Commentary:
 ;; The notebook core talks to this small, asynchronous contract rather than
-;; to an emacs-jupyter object.  A session is opaque outside this file.  The
-;; supervised local helper is the default; `legacy' remains an explicit
-;; fallback during the final dogfood gate.
+;; to a Jupyter client object.  A session is opaque outside this file and its
+;; transport is always the supervised local helper.
 
 ;;; Code:
 
@@ -30,7 +29,8 @@
   closed
   requests
   timers
-  dispatch-depth)
+  dispatch-depth
+  local-disposer)
 
 (cl-defstruct (emacs-jupyter-notebook-backend-request
                (:constructor emacs-jupyter-notebook-backend--make-request))
@@ -58,35 +58,17 @@ A dispatch function receives SESSION, REQUEST, OPERATION, PAYLOAD, SUCCESS,
 FAILURE, and EMIT.  It must return immediately; SUCCESS and FAILURE receive
 one value, and EMIT receives one normalized event plist.")
 
-(declare-function emacs-jupyter-notebook-jupyter-backend-dispatch
-                  "emacs-jupyter-notebook-jupyter"
-                  (session request operation payload success failure emit))
-(declare-function emacs-jupyter-notebook-jupyter-backend-ensure
-                  "emacs-jupyter-notebook-jupyter" ())
-
-(defun emacs-jupyter-notebook-backend--legacy-dispatch ()
-  "Return the legacy dispatcher, loading only the legacy adapter on demand."
-  (require 'emacs-jupyter-notebook-jupyter)
-  #'emacs-jupyter-notebook-jupyter-backend-dispatch)
-
 (defun emacs-jupyter-notebook-backend-ensure ()
-  "Validate that the selected backend can be started without connecting.
-
-This preserves the legacy adapter's early missing-package diagnostic while
-keeping that dependency behind the backend boundary."
-  (pcase emacs-jupyter-notebook-backend
-    ('legacy
-     (require 'emacs-jupyter-notebook-jupyter)
-     (emacs-jupyter-notebook-jupyter-backend-ensure))
-    (_ (emacs-jupyter-notebook-backend--dispatch-for
-        emacs-jupyter-notebook-backend))))
+  "Validate that the helper backend dispatcher is installed."
+  (emacs-jupyter-notebook-backend--dispatch-for 'helper))
 
 (defun emacs-jupyter-notebook-backend--dispatch-for (backend)
-  "Return dispatch function for BACKEND or signal a concise configuration error."
-  (or (cdr (assq backend emacs-jupyter-notebook-backend-implementations))
-      (pcase backend
-        ('legacy (emacs-jupyter-notebook-backend--legacy-dispatch))
-        (_ (error "No emacs-jupyter-notebook backend is configured for %S" backend)))))
+  "Return the helper dispatch function for BACKEND.
+Reject every other transport; there is no legacy fallback."
+  (unless (eq backend 'helper)
+    (error "Unsupported emacs-jupyter-notebook backend: %S" backend))
+  (or (cdr (assq 'helper emacs-jupyter-notebook-backend-implementations))
+      (error "The emacs-jupyter-notebook helper backend is not loaded")))
 
 (defun emacs-jupyter-notebook-backend-session-create
     (&optional event-sink owner-buffer failure-sink)
@@ -99,7 +81,7 @@ when the adapter proves its local transport is unusable independently of any
 single request."
   (emacs-jupyter-notebook-backend--make-session
    :identity (gensym "ejn-backend-session-")
-   :backend emacs-jupyter-notebook-backend
+   :backend 'helper
    :owner-buffer (or owner-buffer (current-buffer))
    :event-sink event-sink
    :failure-sink failure-sink
@@ -135,6 +117,28 @@ out."
   (when (emacs-jupyter-notebook-backend-session-live-p session)
     (setf (emacs-jupyter-notebook-backend-session-attached session) t)
     session))
+
+(defun emacs-jupyter-notebook-backend-session-set-local-disposer (session function)
+  "Set SESSION's local-only resource disposer to FUNCTION.
+
+FUNCTION receives one local failure reason.  It is an adapter hook for the
+rare case where generic close cannot create its own acknowledgement deadline:
+the generic layer still publishes closure first, but must synchronously retire
+the adapter's process and temporary files.  It must never perform a remote
+kernel operation."
+  (unless (emacs-jupyter-notebook-backend-session-p session)
+    (error "Not an emacs-jupyter-notebook backend session"))
+  (unless (or (null function) (functionp function))
+    (error "Backend local disposer must be a function or nil"))
+  (setf (emacs-jupyter-notebook-backend-session-local-disposer session) function)
+  session)
+
+(defun emacs-jupyter-notebook-backend--dispose-local (session reason)
+  "Run and clear SESSION's adapter-owned local disposer exactly once."
+  (when-let ((disposer (emacs-jupyter-notebook-backend-session-local-disposer
+                        session)))
+    (setf (emacs-jupyter-notebook-backend-session-local-disposer session) nil)
+    (emacs-jupyter-notebook-backend--call-safely disposer reason)))
 
 (defun emacs-jupyter-notebook-backend-session-attached-p (session)
   "Return non-nil when SESSION has usable local channel handles."
@@ -362,32 +366,50 @@ never terminate the durable remote kernel."
                       (setq terminal t)
                       (when (timerp deadline)
                         (cancel-timer deadline))
+                      ;; The adapter normally disposes before acknowledging
+                      ;; close.  Keep this idempotent fallback on every
+                      ;; terminal path so a timeout, dispatcher error, or
+                      ;; malformed adapter cannot strand local resources.
+                      (emacs-jupyter-notebook-backend--dispose-local session value)
                       (setf (emacs-jupyter-notebook-backend-session-data session) nil
                             (emacs-jupyter-notebook-backend-session-attached session) nil
                             (emacs-jupyter-notebook-backend-session-installed session) nil)
+                      ;; The adapter normally retires this itself before its
+                      ;; close callback.  Clearing it here also releases a
+                      ;; closure after an immediate generic deadline failure.
+                      (setf (emacs-jupyter-notebook-backend-session-local-disposer session) nil)
                       (emacs-jupyter-notebook-backend--defer-close
                        session (if failure-p error-callback callback) id value))))
-      ;; Retire before the legacy disposer runs so re-entrant and late replies
+      ;; Retire before the helper disposer runs so re-entrant and late replies
       ;; cannot mutate a replacement session in the same source buffer.
       (setf (emacs-jupyter-notebook-backend-session-closed session) t)
       (clrhash (emacs-jupyter-notebook-backend-session-requests session))
       (dolist (timer (emacs-jupyter-notebook-backend-session-timers session))
         (when (timerp timer) (cancel-timer timer)))
       (setf (emacs-jupyter-notebook-backend-session-timers session) nil)
-      (setq deadline
-            (run-at-time
-             (emacs-jupyter-notebook-backend--close-timeout) nil
-             (lambda ()
-               (finish "Backend local close timed out" t))))
-      (condition-case err
-          (funcall (emacs-jupyter-notebook-backend--dispatch-for
-                    (emacs-jupyter-notebook-backend-session-backend session))
-                   session nil 'close-local nil
-                   (lambda (value) (finish value nil))
-                   (lambda (reason) (finish reason t))
-                   #'ignore)
+      (condition-case deadline-error
+          (setq deadline
+                (run-at-time
+                 (emacs-jupyter-notebook-backend--close-timeout) nil
+                 (lambda ()
+                   (finish "Backend local close timed out" t))))
         (error
-         (finish err t)))
+         ;; There is no finite generic timer to recover this path later.
+         ;; Retire adapter-owned local resources synchronously, while leaving
+         ;; the durable remote kernel entirely untouched.
+         (finish (format "cannot arm backend local close deadline: %s"
+                         (error-message-string deadline-error))
+                 t)))
+      (unless terminal
+        (condition-case err
+            (funcall (emacs-jupyter-notebook-backend--dispatch-for
+                      (emacs-jupyter-notebook-backend-session-backend session))
+                     session nil 'close-local nil
+                     (lambda (value) (finish value nil))
+                     (lambda (reason) (finish reason t))
+                     #'ignore)
+          (error
+           (finish err t))))
       id))))
 
 (defun emacs-jupyter-notebook-backend-execute (session code options callback &optional error-callback)

@@ -34,6 +34,7 @@ class LocalKernelStdinTests(unittest.IsolatedAsyncioTestCase):
                             {
                                 "connection_file": str(fixture.connection_path),
                                 "artifact_dir": str(artifacts),
+                                "image_max_pixels": 4_194_304,
                             },
                         ),
                         12,
@@ -99,6 +100,7 @@ class LocalKernelStdinTests(unittest.IsolatedAsyncioTestCase):
                         {
                             "connection_file": str(fixture.connection_path),
                             "artifact_dir": str(artifacts),
+                            "image_max_pixels": 4_194_304,
                         },
                         lambda _event: None,
                         connected.set_result,

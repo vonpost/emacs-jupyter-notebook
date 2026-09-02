@@ -4,8 +4,7 @@
 
 ;;; Commentary:
 ;; These tests require an explicitly configured remote host.  They do not
-;; run as part of normal unit tests.  The emacs-jupyter integration smoke
-;; test skips unless emacs-jupyter is on `load-path'.
+;; run as part of normal unit tests.
 
 ;;; Code:
 
@@ -15,10 +14,6 @@
 (require 'emacs-jupyter-notebook)
 (require 'emacs-jupyter-notebook-result)
 
-(declare-function jupyter-eval "jupyter-client" (code &optional mime))
-(defvar jupyter-current-client)
-(defvar jupyter-default-timeout)
-
 (defconst ejn-remote-tests--command-timeout 25
   "Hard deadline in seconds for one optional smoke-test command.")
 
@@ -27,6 +22,59 @@
 
 (defconst ejn-remote-tests--connect-timeout 8
   "SSH connect timeout forced by the optional remote test suite.")
+
+(defconst ejn-remote-tests--registry-timeout 10
+  "Finite deadline for one optional registry test transaction.")
+
+(defun ejn-remote-tests--registry-call (file starter)
+  "Run registry STARTER against FILE, bounded for optional test orchestration.
+STARTER receives SUCCESS, FAILURE, and OWNER arguments.  This deliberately
+waits only in the test process; production registry calls remain asynchronous.
+Return the first SUCCESS value, or signal on timeout/failure."
+  (let ((owner (emacs-jupyter-notebook-registry-owner-create))
+        (done nil) (values nil) (failure nil)
+        (deadline (+ (float-time) ejn-remote-tests--registry-timeout)))
+    (let ((emacs-jupyter-notebook-registry-file file))
+      (funcall starter
+               (lambda (&rest result) (setq values result done t))
+               (lambda (&rest result) (setq failure result done t))
+               owner))
+    (while (and (not done) (< (float-time) deadline))
+      (accept-process-output nil 0.02))
+    (unless done
+      (emacs-jupyter-notebook-registry-owner-cancel owner)
+      (error "Remote test registry transaction timed out"))
+    (emacs-jupyter-notebook-registry-owner-cancel owner)
+    (if failure
+        (error "Remote test registry transaction failed: %S" (car failure))
+      (car values))))
+
+(defun ejn-remote-tests--registry-create (file entry)
+  "Create ENTRY in FILE and return its revision-bearing persisted entry."
+  (ejn-remote-tests--registry-call
+   file
+   (lambda (success failure owner)
+     (emacs-jupyter-notebook-registry-create-async
+      entry success failure :owner owner
+      :deadline ejn-remote-tests--registry-timeout))))
+
+(defun ejn-remote-tests--registry-replace (file entry revision)
+  "Replace FILE's ENTRY at exact REVISION and return persisted ENTRY."
+  (ejn-remote-tests--registry-call
+   file
+   (lambda (success failure owner)
+     (emacs-jupyter-notebook-registry-replace-async
+      entry revision success failure :owner owner
+      :deadline ejn-remote-tests--registry-timeout))))
+
+(defun ejn-remote-tests--registry-read (file)
+  "Read FILE through the bounded asynchronous registry bridge."
+  (ejn-remote-tests--registry-call
+   file
+   (lambda (success failure owner)
+     (emacs-jupyter-notebook-registry-read-async
+      success failure :owner owner
+      :deadline ejn-remote-tests--registry-timeout))))
 
 (defmacro ejn-remote-tests--with-bounded-transport (&rest body)
   "Run BODY with noninteractive, finite test-local remote transport bounds."
@@ -44,7 +92,7 @@
          (emacs-jupyter-notebook-management-process-timeout
           ejn-remote-tests--command-timeout)
          (emacs-jupyter-notebook-connection-attempt-timeout 60)
-         (emacs-jupyter-notebook-jupyter-connect-timeout 20))
+         (emacs-jupyter-notebook-connect-arbitration-timeout 20))
      ,@body))
 
 (defun ejn-remote-tests--run-command (argv &optional timeout)
@@ -154,6 +202,133 @@ for optional smoke tests only; production UI paths remain asynchronous."
          '("sh" "-c" "while :; do printf 0123456789abcdef; done") 2)
       (error (setq message-text (error-message-string err))))
     (should (string-match-p "exceeded [0-9]+-byte" message-text))))
+
+(ert-deftest ejn-remote-management-timeout-is-finite-and-bounded ()
+  "Management watchdog values remain finite while sane values are preserved."
+  (let ((emacs-jupyter-notebook-management-process-timeout 17))
+    (should (= (emacs-jupyter-notebook-ssh--management-timeout nil) 17))
+    (should (= (emacs-jupyter-notebook-ssh--management-timeout 23.5) 23.5))
+    (should (= (emacs-jupyter-notebook-ssh--management-timeout 601)
+               emacs-jupyter-notebook-ssh--management-timeout-hard-limit))
+    (should (= (emacs-jupyter-notebook-ssh--management-timeout
+                most-positive-fixnum)
+               emacs-jupyter-notebook-ssh--management-timeout-hard-limit))
+    (should (= (emacs-jupyter-notebook-ssh--management-timeout
+                1.0e+INF)
+               emacs-jupyter-notebook-ssh--management-timeout-fallback)))
+  (let ((emacs-jupyter-notebook-management-process-timeout 1.0e+INF))
+    (should (= (emacs-jupyter-notebook-ssh--management-timeout nil)
+               emacs-jupyter-notebook-ssh--management-timeout-fallback))))
+
+(defun ejn-remote-tests--local-shell-script (argv)
+  "Run the remote shell script in ARGV locally, without invoking SSH.
+Return a cons of the process status and combined stdout/stderr.  This is a
+test-only harness for command builders whose final argv element is the
+remote shell script."
+  (with-temp-buffer
+    (let ((status (call-process "sh" nil t nil "-c"
+                                (concat (car (last argv)) " 2>&1"))))
+      (cons status (buffer-string)))))
+
+(ert-deftest ejn-remote-inspect-pid-sidecar-has-exact-terminal-protocol ()
+  "The sidecar inspector distinguishes present, absent, and unsafe objects.
+Run its generated remote script through a local POSIX shell so this remains
+deterministic and never requires an SSH host."
+  (let* ((directory (make-temp-file "ejn-sidecar-inspect-" t))
+         (session "sidecar-test")
+         (connection-file (expand-file-name (format "kernel-%s.json" session)
+                                            directory))
+         (sidecar (concat (string-remove-suffix ".json" connection-file)
+                          ".pid"))
+         (entry (list :launch-kind 'direct :provisional t
+                      :session-id session
+                      :remote-connection-file connection-file
+                      :remote-pid-sidecar sidecar
+                      :connection-file-tokens (list connection-file)
+                      :remote-pid nil))
+         (profile '(:profile "sidecar-test" :host "example.invalid"
+                    :python-command ("python3")))
+         (argv (emacs-jupyter-notebook-ssh-build-remote-inspect-pid-sidecar
+                profile entry))
+         (script (car (last argv))))
+    (unwind-protect
+        (progn
+          (should (string-match-p
+                   "printf '__EJN_SIDECAR_DONE__\\\\n'" script))
+          (should (string-match-p
+                   "printf '__EJN_SIDECAR_ABSENT__\\\\n__EJN_SIDECAR_DONE__"
+                   script))
+          (should (string-match-p
+                   "printf '__EJN_SIDECAR_UNSAFE__" script))
+          (pcase-let ((`(,status . ,output)
+                       (ejn-remote-tests--local-shell-script argv)))
+            (should (zerop status))
+            (should (equal output
+                           "__EJN_SIDECAR_ABSENT__\n__EJN_SIDECAR_DONE__\n")))
+          (with-temp-file sidecar
+            (insert (format "EJN_PID=4242\nEJN_SESSION=%s\n" session)))
+          (pcase-let ((`(,status . ,output)
+                       (ejn-remote-tests--local-shell-script argv)))
+            (should (zerop status))
+            (should (equal output
+                           (format "EJN_PID=4242\nEJN_SESSION=%s\n__EJN_SIDECAR_DONE__\n"
+                                   session)))
+            (should (string-suffix-p "__EJN_SIDECAR_DONE__\n" output)))
+          (delete-file sidecar)
+          (make-symbolic-link "/dev/null" sidecar)
+          (pcase-let ((`(,status . ,output)
+                       (ejn-remote-tests--local-shell-script argv)))
+            (should-not (zerop status))
+            (should (string-match-p "__EJN_SIDECAR_UNSAFE__" output)))
+          (delete-file sidecar)
+          (make-directory sidecar)
+          (pcase-let ((`(,status . ,output)
+                       (ejn-remote-tests--local-shell-script argv)))
+            (should-not (zerop status))
+            (should (string-match-p "__EJN_SIDECAR_UNSAFE__" output))))
+      (when (file-directory-p directory)
+        (delete-directory directory t)))))
+
+(ert-deftest ejn-remote-transition-rows-are-unknown-and-retained-by-liveness ()
+  "A durable lifecycle row never reaches a destructive liveness probe."
+  (let* ((transition-entry
+          (list :profile "transition-test" :remote-host "example.invalid"
+                :remote-pid 4242 :transition-kind 'retry-fresh
+                :transition-token "token" :transition-stage 'admitted
+                :transition-expires-at (+ (floor (float-time)) 3600)))
+         (probe-called nil)
+         (classification
+          (emacs-jupyter-notebook--classify-registry-liveness
+           (list transition-entry)
+           (lambda (_profile _pids)
+             (setq probe-called t)
+             (list :answered t :alive nil :dead '(4242)))))
+         async-classification async-reason
+         (summary
+          (emacs-jupyter-notebook--registry-liveness-result
+           (list transition-entry) classification)))
+    (should-not probe-called)
+    (should (eq (emacs-jupyter-notebook--liveness-status
+                 transition-entry classification)
+                'unknown))
+    (should (= (plist-get summary :pruned) 0))
+    (should (equal (plist-get summary :pruned-entries) nil))
+    (should (equal (plist-get summary :kept-entries)
+                   (list transition-entry)))
+    (with-temp-buffer
+      (setq emacs-jupyter-notebook--management-operation
+            (list :token 'ejn-remote-transition-test))
+      (emacs-jupyter-notebook--classify-registry-liveness-async
+       (list transition-entry) 'ejn-remote-transition-test
+       (lambda (result reason)
+         (setq async-classification result
+               async-reason reason)))
+      (should (equal async-reason nil))
+      (should (eq (emacs-jupyter-notebook--liveness-status
+                   transition-entry async-classification)
+                  'unknown))
+      (should (equal async-classification
+                     (list (cons transition-entry 'unknown)))))))
 
 (defun ejn-remote-tests--exact-pid-dead-p (profile entry timeout)
   "Return non-nil only after ENTRY's exact PID probe reports dead by TIMEOUT.
@@ -305,9 +480,8 @@ overlays."
          (resolution (emacs-jupyter-notebook-ssh-build-kernelspec-resolution profile session-id))
          resolved launch remote-file
          (local-copy (make-temp-file "ejn-remote-connection-" nil ".json"))
-         (registry-file (let ((file (make-temp-file "ejn-remote-direct-registry-")))
-                          (delete-file file)
-                          file))
+         (registry-dir (make-temp-file "ejn-remote-direct-registry-" t))
+         (registry-file (expand-file-name "registry-v1.json" registry-dir))
          pid provisional-entry cleanup-entry cleanup-confirmed cleanup-error
          tunnel connection local-ports remote-ports)
     (unwind-protect
@@ -335,7 +509,8 @@ overlays."
                       :connection-file-tokens (plist-get launch :connection-tokens)
                       :remote-connection-file remote-file
                       :remote-pid-sidecar (plist-get launch :sidecar-file)))
-          (emacs-jupyter-notebook-registry-save-entry provisional-entry registry-file)
+          (setq provisional-entry
+                (ejn-remote-tests--registry-create registry-file provisional-entry))
           (should (string-match-p "EJN_LAUNCH_ADMITTED"
                                   (ejn-remote-tests--run-command
                                    (plist-get launch :argv))))
@@ -351,7 +526,10 @@ overlays."
                  :provisional nil))
           (setq cleanup-entry
                 (plist-put cleanup-entry :local-connection-file local-copy))
-          (emacs-jupyter-notebook-registry-save-entry cleanup-entry registry-file)
+          (setq cleanup-entry
+                (ejn-remote-tests--registry-replace
+                 registry-file cleanup-entry
+                 (plist-get provisional-entry :registry-revision)))
           (should (eq 'alive
                       (emacs-jupyter-notebook--classify-pid-probe
                        (ejn-remote-tests--run-command
@@ -391,7 +569,10 @@ overlays."
                    (ejn-remote-tests--recover-promoted-entry
                     profile provisional-entry 10)))
         (when cleanup-entry
-          (emacs-jupyter-notebook-registry-save-entry cleanup-entry registry-file)))
+          (setq cleanup-entry
+                (ejn-remote-tests--registry-replace
+                 registry-file cleanup-entry
+                 (plist-get provisional-entry :registry-revision)))))
       (when cleanup-entry
         (condition-case err
             (setq cleanup-confirmed
@@ -404,7 +585,8 @@ overlays."
       (if cleanup-confirmed
           (progn
             (when (file-exists-p local-copy) (delete-file local-copy))
-            (when (file-exists-p registry-file) (delete-file registry-file)))
+            (when (file-exists-p registry-file) (delete-file registry-file))
+            (when (file-directory-p registry-dir) (delete-directory registry-dir t)))
         (message (concat "Remote smoke cleanup unconfirmed; retained connection %s, "
                          "registry %s for session %s: %s")
                  local-copy registry-file session-id
@@ -414,22 +596,17 @@ overlays."
 
 (ert-deftest ejn-remote-async-start-connect-and-evaluate ()
   "Start, connect, and evaluate through the interactive async command path."
-  :tags '(:remote :emacs-jupyter :async)
-  (unless (require 'jupyter nil t)
-    (ert-skip "emacs-jupyter is not on load-path"))
-  (require 'jupyter-client)
+  :tags '(:remote :helper :async)
   (ejn-remote-tests--with-bounded-transport
     (let* ((profile (ejn-remote-tests--profile))
-         (registry-file (let ((file (make-temp-file "ejn-registry-")))
-                          (delete-file file)
-                          file))
+         (registry-dir (make-temp-file "ejn-registry-" t))
+         (registry-file (expand-file-name "registry-v1.json" registry-dir))
           (buffer (generate-new-buffer " *ejn-remote-async*"))
           cleanup-entry cleanup-confirmed cleanup-error
           (emacs-jupyter-notebook-registry-file registry-file))
      (unwind-protect
          (with-current-buffer buffer
            (let ((emacs-jupyter-notebook-default-profile (plist-get profile :profile))
-                 (emacs-jupyter-notebook-backend 'legacy)
                  (emacs-jupyter-notebook-remote-profiles
                   `((,(plist-get profile :profile) . ,profile)))
                  (emacs-jupyter-notebook-connection-retrieve-attempts 80)
@@ -441,9 +618,8 @@ overlays."
             (should (ejn-remote-tests--wait-for-phase buffer 'done 60))
             (setq cleanup-entry (ejn-remote-tests--capture-cleanup-entry buffer))
             (should cleanup-entry)
-            (let ((jupyter-current-client emacs-jupyter-notebook--client)
-                  (jupyter-default-timeout 30))
-              (should (equal (string-trim (jupyter-eval "6 * 7")) "42")))))
+            (emacs-jupyter-notebook--evaluate-code "6 * 7" nil)
+            (should (ejn-remote-tests--wait-for-result-text buffer "42" 30))))
       (setq cleanup-entry
             (or cleanup-entry (ejn-remote-tests--capture-cleanup-entry buffer)))
       (when cleanup-entry
@@ -454,29 +630,26 @@ overlays."
       (when (buffer-live-p buffer)
         (kill-buffer buffer))
       (if cleanup-confirmed
-          (when (file-exists-p registry-file) (delete-file registry-file))
-        (message "Remote legacy smoke cleanup unconfirmed; retained registry %s: %s"
+          (progn
+            (when (file-exists-p registry-file) (delete-file registry-file))
+            (when (file-directory-p registry-dir) (delete-directory registry-dir t)))
+        (message "Remote smoke cleanup unconfirmed; retained registry %s: %s"
                  registry-file (or cleanup-error "no promoted cleanup entry"))))
       (when cleanup-error (ert-fail cleanup-error)))))
 
 (ert-deftest ejn-remote-evaluate-cell-command ()
   "Test that the send-cell command works with real evaluation."
-  :tags '(:remote :emacs-jupyter :evaluation)
-  (unless (require 'jupyter nil t)
-    (ert-skip "emacs-jupyter is not on load-path"))
-  (require 'jupyter-client)
+  :tags '(:remote :helper :evaluation)
   (ejn-remote-tests--with-bounded-transport
     (let* ((profile (ejn-remote-tests--profile))
-         (registry-file (let ((file (make-temp-file "ejn-registry-")))
-                          (delete-file file)
-                          file))
+         (registry-dir (make-temp-file "ejn-registry-" t))
+         (registry-file (expand-file-name "registry-v1.json" registry-dir))
           (buffer (generate-new-buffer " *ejn-remote-eval-cell*"))
           cleanup-entry cleanup-confirmed cleanup-error
           (emacs-jupyter-notebook-registry-file registry-file))
      (unwind-protect
          (with-current-buffer buffer
            (let ((emacs-jupyter-notebook-default-profile (plist-get profile :profile))
-                 (emacs-jupyter-notebook-backend 'legacy)
                  (emacs-jupyter-notebook-remote-profiles
                   `((,(plist-get profile :profile) . ,profile)))
                  (emacs-jupyter-notebook-connection-retrieve-attempts 80)
@@ -501,22 +674,20 @@ overlays."
       (when (buffer-live-p buffer)
         (kill-buffer buffer))
       (if cleanup-confirmed
-          (when (file-exists-p registry-file) (delete-file registry-file))
-        (message "Remote legacy smoke cleanup unconfirmed; retained registry %s: %s"
+          (progn
+            (when (file-exists-p registry-file) (delete-file registry-file))
+            (when (file-directory-p registry-dir) (delete-directory registry-dir t)))
+        (message "Remote smoke cleanup unconfirmed; retained registry %s: %s"
                  registry-file (or cleanup-error "no promoted cleanup entry"))))
       (when cleanup-error (ert-fail cleanup-error)))))
 
 (ert-deftest ejn-remote-reconnect-prefers-current-file-kernel ()
   "Start a kernel, then reconnect from another buffer visiting the same file."
-  :tags '(:remote :emacs-jupyter :reconnect)
-  (unless (require 'jupyter nil t)
-    (ert-skip "emacs-jupyter is not on load-path"))
-  (require 'jupyter-client)
+  :tags '(:remote :helper :reconnect)
   (ejn-remote-tests--with-bounded-transport
     (let* ((profile (ejn-remote-tests--profile))
-         (registry-file (let ((file (make-temp-file "ejn-registry-")))
-                          (delete-file file)
-                          file))
+         (registry-dir (make-temp-file "ejn-registry-" t))
+         (registry-file (expand-file-name "registry-v1.json" registry-dir))
          (source-file (make-temp-file "ejn-source-" nil ".py"))
          (first-buffer (generate-new-buffer " *ejn-remote-reconnect-a*"))
           (second-buffer (generate-new-buffer " *ejn-remote-reconnect-b*"))
@@ -526,8 +697,8 @@ overlays."
          (progn
            (with-current-buffer first-buffer
              (setq buffer-file-name source-file)
+             (emacs-jupyter-notebook-mode 1)
              (let ((emacs-jupyter-notebook-default-profile (plist-get profile :profile))
-                   (emacs-jupyter-notebook-backend 'legacy)
                    (emacs-jupyter-notebook-remote-profiles
                     `((,(plist-get profile :profile) . ,profile)))
                    (emacs-jupyter-notebook-connection-retrieve-attempts 80)
@@ -536,17 +707,18 @@ overlays."
               (should (ejn-remote-tests--wait-for-phase first-buffer 'done 60))
               (setq cleanup-entry
                     (ejn-remote-tests--capture-cleanup-entry first-buffer))
-              (should cleanup-entry)
-              (when (process-live-p emacs-jupyter-notebook--tunnel-process)
-                (delete-process emacs-jupyter-notebook--tunnel-process))
-              (setq emacs-jupyter-notebook--tunnel-process nil)))
+              (should cleanup-entry)))
+           ;; The supported reconnect model has one source buffer per kernel.
+           ;; Killing the first source retires only its local helper/tunnel;
+           ;; the durable registry row and remote kernel remain available.
+           (kill-buffer first-buffer)
           (with-current-buffer second-buffer
             (setq buffer-file-name source-file)
+            (emacs-jupyter-notebook-mode 1)
             (insert "# %%\n6 * 7\n")
             (goto-char (point-min))
             (forward-line 1)
             (let ((emacs-jupyter-notebook-default-profile (plist-get profile :profile))
-                  (emacs-jupyter-notebook-backend 'legacy)
                   (emacs-jupyter-notebook-remote-profiles
                    `((,(plist-get profile :profile) . ,profile)))
                   (emacs-jupyter-notebook-connection-retrieve-attempts 80)
@@ -569,37 +741,27 @@ overlays."
       (if cleanup-confirmed
           (progn
             (when (file-exists-p registry-file) (delete-file registry-file))
+            (when (file-directory-p registry-dir) (delete-directory registry-dir t))
             (when (file-exists-p source-file) (delete-file source-file)))
-        (message (concat "Remote legacy reconnect cleanup unconfirmed; retained "
+        (message (concat "Remote reconnect cleanup unconfirmed; retained "
                          "registry %s and source %s: %s")
                  registry-file source-file
                  (or cleanup-error "no promoted cleanup entry"))))
       (when cleanup-error (ert-fail cleanup-error)))))
 
-(ert-deftest ejn-remote-default-adapters-parse-real-replies ()
-  "Exercise the DEFAULT complete/inspect/is-complete/kernel-info adapter
-impls against a REAL kernel, with NO adapter-var stubs.  Guards the seam
-every unit test mocks: the real `jupyter-*-request' construction, the
-reply-type strings, and the `jupyter-message-content' shapes.  This is the
-W8-class coverage — the adapters that PRODUCE the parsed replies are never
-run in the deterministic suite."
-  :tags '(:remote :emacs-jupyter :adapters)
-  (unless (require 'jupyter nil t)
-    (ert-skip "emacs-jupyter is not on load-path"))
-  (require 'jupyter-client)
+(ert-deftest ejn-remote-helper-parses-real-auxiliary-replies ()
+  "Exercise helper complete/inspect/is-complete/kernel-info against a real kernel."
+  :tags '(:remote :helper :auxiliary)
   (ejn-remote-tests--with-bounded-transport
     (let* ((profile (ejn-remote-tests--profile))
-         (registry-file (let ((f (make-temp-file "ejn-registry-"))) (delete-file f) f))
+         (registry-dir (make-temp-file "ejn-registry-" t))
+         (registry-file (expand-file-name "registry-v1.json" registry-dir))
          (buffer (generate-new-buffer " *ejn-remote-adapters*"))
          cleanup-entry cleanup-confirmed cleanup-error
          (emacs-jupyter-notebook-registry-file registry-file))
     (unwind-protect
         (with-current-buffer buffer
           (let ((emacs-jupyter-notebook-default-profile (plist-get profile :profile))
-                ;; This test covers the direct emacs-jupyter adapter seam.
-                ;; Keep that backend choice local so helper remains the default
-                ;; for the rest of the remote suite and normal operation.
-                (emacs-jupyter-notebook-backend 'legacy)
                 (emacs-jupyter-notebook-remote-profiles
                  `((,(plist-get profile :profile) . ,profile)))
                 (emacs-jupyter-notebook-connection-retrieve-attempts 120)
@@ -610,41 +772,54 @@ run in the deterministic suite."
             (setq cleanup-entry (ejn-remote-tests--capture-cleanup-entry buffer))
             (should cleanup-entry)
             (let ((client emacs-jupyter-notebook--client)
-                  reply done)
+                  reply failure done)
               (should client)
               (cl-flet ((await (fn)
-                          (setq reply nil done nil)
-                          (funcall fn (lambda (r _e) (setq reply r done t)))
+                          (setq reply nil failure nil done nil)
+                          (funcall fn
+                                   (lambda (_id result) (setq reply result done t))
+                                   (lambda (_id reason)
+                                     (setq failure reason done t)))
                           (let ((deadline (+ (float-time) 30)))
                             (while (and (not done) (< (float-time) deadline))
                               (accept-process-output nil 0.1)))
-                          (should done)))
+                          (should done)
+                          (when failure
+                            (ert-fail (format "helper auxiliary failed: %s"
+                                              failure)))))
                 ;; kernel_info_reply — the heartbeat's dependency.
-                (await (lambda (cb)
-                         (emacs-jupyter-notebook-jupyter-kernel-info client cb)))
+                (await (lambda (success failure)
+                         (emacs-jupyter-notebook-backend-aux
+                          client 'kernel-info nil success failure)))
                 (should reply)
-                (should (or (plist-get reply :implementation)
-                            (plist-get reply :language_info)))
+                (should (gethash "implementation" reply))
+                (should (gethash "language_info" reply))
                 ;; complete_reply — real :matches (a vector), real offsets.
-                (await (lambda (cb)
-                         (emacs-jupyter-notebook-jupyter-complete client "prin" 4 cb)))
+                (await (lambda (success failure)
+                         (emacs-jupyter-notebook-backend-aux
+                          client 'complete '(:code "prin" :cursor-pos 4)
+                          success failure)))
                 (should reply)
                 (should (member "print" (append (plist-get reply :matches) nil)))
                 (should (integerp (plist-get reply :cursor_start)))
                 (should (integerp (plist-get reply :cursor_end)))
                 ;; inspect_reply — found symbol has non-empty text/plain.
-                (await (lambda (cb)
-                         (emacs-jupyter-notebook-jupyter-inspect client "print" 5 0 cb)))
+                (await (lambda (success failure)
+                         (emacs-jupyter-notebook-backend-aux
+                          client 'inspect '(:code "print" :cursor-pos 5 :detail 0)
+                          success failure)))
                 (should reply)
                 (should (eq (plist-get reply :found) t))
                 (should (plist-get (plist-get reply :data) :text/plain))
                 ;; is_complete_reply — incomplete vs complete.
-                (await (lambda (cb)
-                         (emacs-jupyter-notebook-jupyter-is-complete client "if True:" cb)))
+                (await (lambda (success failure)
+                         (emacs-jupyter-notebook-backend-aux
+                          client 'is-complete '(:code "if True:") success failure)))
                 (should reply)
                 (should (member (plist-get reply :status) '("incomplete" "invalid")))
-                (await (lambda (cb)
-                         (emacs-jupyter-notebook-jupyter-is-complete client "1 + 1" cb)))
+                (await (lambda (success failure)
+                         (emacs-jupyter-notebook-backend-aux
+                          client 'is-complete '(:code "1 + 1") success failure)))
                 (should reply)
                 (should (equal (plist-get reply :status) "complete"))))))
       (setq cleanup-entry
@@ -656,8 +831,10 @@ run in the deterministic suite."
           (error (setq cleanup-error (error-message-string err)))))
       (when (buffer-live-p buffer) (kill-buffer buffer))
       (if cleanup-confirmed
-          (when (file-exists-p registry-file) (delete-file registry-file))
-        (message "Remote legacy adapter cleanup unconfirmed; retained registry %s: %s"
+          (progn
+            (when (file-exists-p registry-file) (delete-file registry-file))
+            (when (file-directory-p registry-dir) (delete-directory registry-dir t)))
+          (message "Remote helper cleanup unconfirmed; retained registry %s: %s"
                  registry-file (or cleanup-error "no promoted cleanup entry"))))
       (when cleanup-error (ert-fail cleanup-error)))))
 

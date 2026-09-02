@@ -154,6 +154,7 @@ class TcpRelayTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "connection_file": str(connection_path),
                     "artifact_dir": str(artifact_dir),
+                    "image_max_pixels": 4_194_304,
                 },
             )
             self.assertIsNone(connected.error)
@@ -182,6 +183,7 @@ class TcpRelayTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "connection_file": str(relay.connection_path),
                     "artifact_dir": str(artifact_dir),
+                    "image_max_pixels": 4_194_304,
                 },
             )
             self.assertIsNone(connected.error)

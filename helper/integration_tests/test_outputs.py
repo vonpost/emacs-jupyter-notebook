@@ -25,7 +25,7 @@ class OutputIntegrationTests(unittest.IsolatedAsyncioTestCase):
             assert fixture.connection_path is not None
             connected, _ = await request(
                 "connect",
-                {"connection_file": str(fixture.connection_path), "artifact_dir": str(artifact_dir)},
+                {"connection_file": str(fixture.connection_path), "artifact_dir": str(artifact_dir), "image_max_pixels": 4_194_304},
             )
             self.assertIsNone(connected.error)
             cases = (
@@ -41,11 +41,18 @@ class OutputIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 names = [event.name for event in events]
                 self.assertIn(expected, names)
                 self.assertEqual(names.count("execute_reply"), 1)
-                self.assertEqual(names.count("status"), 1)
+                statuses = [
+                    (index, event.data.get("execution_state"))
+                    for index, event in enumerate(events)
+                    if event.name == "status"
+                ]
+                self.assertEqual(
+                    [state for _index, state in statuses], ["busy", "idle"]
+                )
                 # The normalized IOPub worker flushes output before terminal
                 # idle, even when the shell reply races ahead of IOPub.
                 self.assertGreater(
-                    names.index("status"),
+                    statuses[-1][0],
                     max(index for index, name in enumerate(names) if name == expected),
                 )
             self.assertTrue(list(artifact_dir.iterdir()))

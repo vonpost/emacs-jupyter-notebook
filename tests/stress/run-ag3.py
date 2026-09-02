@@ -28,7 +28,7 @@ STATE_JSON_LIMIT = 1024 * 1024
 CONNECTION_JSON_LIMIT = 64 * 1024
 METRICS_JSON_LIMIT = 1024 * 1024
 ERROR_DETAIL_LIMIT = 240
-EXPECTED_ERT_SUMMARY = b"Ran 13 tests, 13 results as expected, 0 unexpected"
+EXPECTED_ERT_SUMMARY = b"Ran 17 tests, 17 results as expected, 0 unexpected"
 
 
 def die(message: str) -> RuntimeError:
@@ -204,7 +204,7 @@ def check_emacs_result(returncode: int, total: int, tail: bytearray) -> None:
             f"tail follows:\n{output_tail(tail)}")
     if EXPECTED_ERT_SUMMARY not in tail:
         raise die(
-            "Emacs exited successfully without the exact 13/13 ERT summary; "
+            "Emacs exited successfully without the exact 17/17 ERT summary; "
             f"bounded output tail follows:\n{output_tail(tail)}")
 
 

@@ -611,16 +611,25 @@ local deadline or transport failure; ERROR is then a short local reason."
            (request (emacs-jupyter-notebook-helper--make-request
                      :id id :op op :callback callback)))
       (puthash id request requests)
-      (setf (emacs-jupyter-notebook-helper-request-timer request)
-            (run-at-time
-             (emacs-jupyter-notebook-helper--bounded-positive-number
-              timeout 5 allow-long-timeout)
-             nil #'emacs-jupyter-notebook-helper--request-deadline session id request))
+      ;; A request is not admitted until its independent deadline exists.
+      ;; `puthash' happens first so the exact-once finisher can remove the
+      ;; provisional slot if timer allocation itself fails.
       (condition-case err
-          (emacs-jupyter-notebook-helper--send-envelope session id op params)
+          (progn
+            (setf (emacs-jupyter-notebook-helper-request-timer request)
+                  (run-at-time
+                   (emacs-jupyter-notebook-helper--bounded-positive-number
+                    timeout 5 allow-long-timeout)
+                   nil #'emacs-jupyter-notebook-helper--request-deadline session id request))
+            (condition-case send-error
+                (emacs-jupyter-notebook-helper--send-envelope session id op params)
+              (error
+               (emacs-jupyter-notebook-helper--finish-request
+                session request nil (format "cannot send helper request: %s"
+                                            (error-message-string send-error))))))
         (error
          (emacs-jupyter-notebook-helper--finish-request
-          session request nil (format "cannot send helper request: %s"
+          session request nil (format "cannot arm helper request deadline: %s"
                                       (error-message-string err)))))
       id)))
 
@@ -681,6 +690,48 @@ local deadline or transport failure; ERROR is then a short local reason."
                (emacs-jupyter-notebook-helper--owned-p session process)
                (eq (emacs-jupyter-notebook-helper-session-state session) 'starting))
       (emacs-jupyter-notebook-helper--fail session "helper hello timed out"))))
+
+(defun emacs-jupyter-notebook-helper--arm-hello-deadline (session)
+  "Arm SESSION's hello deadline without a timer-construction ownership race.
+Normally `run-at-time' cannot call its function until after it returns.  Keep
+the session correct if a test double or future timer wrapper invokes the
+deadline synchronously: disposal must not be followed by installing a stale
+timer handle or sending a hello frame."
+  (let ((pending (list 'emacs-jupyter-notebook-helper-pending-hello-timer
+                       (gensym "ejn-helper-hello-"))))
+    (setf (emacs-jupyter-notebook-helper-session-hello-timer session) pending)
+    (condition-case err
+        (let ((timer
+               (run-at-time
+                (emacs-jupyter-notebook-helper--bounded-positive-number
+                 emacs-jupyter-notebook-helper-hello-timeout 5)
+                nil #'emacs-jupyter-notebook-helper--hello-deadline session)))
+          (unless (timerp timer)
+            (error "helper hello deadline constructor returned no timer"))
+          (if (eq (emacs-jupyter-notebook-helper-session-hello-timer session)
+                  pending)
+              (setf (emacs-jupyter-notebook-helper-session-hello-timer session) timer)
+            (emacs-jupyter-notebook-helper--cancel-timer timer))
+          timer)
+      (error
+       (when (eq (emacs-jupyter-notebook-helper-session-hello-timer session)
+                 pending)
+         (setf (emacs-jupyter-notebook-helper-session-hello-timer session) nil))
+       (signal (car err) (cdr err))))))
+
+(defun emacs-jupyter-notebook-helper--send-hello (session process)
+  "Send SESSION's initial v1 hello frame through owned live PROCESS."
+  (let ((params (make-hash-table :test 'equal))
+        (hello (make-hash-table :test 'equal)))
+    (puthash "versions" (vector ejn-helper-protocol-version) params)
+    (puthash "v" ejn-helper-protocol-version hello)
+    (puthash "kind" "request" hello)
+    (puthash "id" (emacs-jupyter-notebook-helper-session-hello-id session) hello)
+    (puthash "op" "hello" hello)
+    (puthash "params" params hello)
+    (process-send-string process
+                         (ejn-helper-protocol-encode
+                          hello ejn-helper-protocol-max-to-helper-frame))))
 
 (defun emacs-jupyter-notebook-helper--fail (session reason)
   "Fail SESSION once, releasing only its local resources."
@@ -903,8 +954,30 @@ local deadline or transport failure; ERROR is then a short local reason."
   (let ((session (process-get process 'emacs-jupyter-notebook-helper-session)))
     (when (and session (emacs-jupyter-notebook-helper--owned-p session process)
                (not (emacs-jupyter-notebook-helper-session-pending-failure session)))
-      (emacs-jupyter-notebook-helper--raw-append
-       session (if (multibyte-string-p bytes) (encode-coding-string bytes 'binary t) bytes))
+      (let* ((decoder (emacs-jupyter-notebook-helper-session-decoder session))
+             (multibyte (multibyte-string-p bytes))
+             ;; `string-bytes' measures the encoded size without constructing
+             ;; a second string.  Do this admission check before
+             ;; `encode-coding-string', since an unexpected multibyte process
+             ;; chunk must not allocate beyond the raw accumulator ceiling.
+             (incoming-bytes (if multibyte (string-bytes bytes) (length bytes)))
+             (limit (emacs-jupyter-notebook-helper--accumulator-limit
+                     (emacs-jupyter-notebook-helper--frame-limit)))
+             (retained (+ (emacs-jupyter-notebook-helper-session-raw-bytes session)
+                          (ejn-helper-protocol-decoder-buffered-bytes decoder))))
+        (if (> (+ retained incoming-bytes) limit)
+            (emacs-jupyter-notebook-helper--queue-failure
+             session "helper raw accumulator exceeded")
+          (let ((wire (if multibyte
+                          (encode-coding-string bytes 'binary t)
+                        bytes)))
+            ;; Keep the raw append invariant after conversion as well.  This
+            ;; also protects against a coding implementation whose expansion
+            ;; differs from `string-bytes' for an unusual input string.
+            (if (> (+ retained (length wire)) limit)
+                (emacs-jupyter-notebook-helper--queue-failure
+                 session "helper raw accumulator exceeded")
+              (emacs-jupyter-notebook-helper--raw-append session wire)))))
       (unless (emacs-jupyter-notebook-helper-session-pending-failure session)
         (emacs-jupyter-notebook-helper--decode-raw session)))))
 
@@ -1203,57 +1276,79 @@ buffer disposes the prior local session before the new process is created."
                      :ready-callback ready-callback :failure-callback failure-callback
                      :closed-callback closed-callback :event-callback event-callback
                      :requests (make-hash-table :test 'equal))))
-      (with-current-buffer stderr-buffer (set-buffer-multibyte nil))
+      (with-current-buffer stderr-buffer
+        (set-buffer-multibyte nil))
       (with-current-buffer owner
         (let ((previous emacs-jupyter-notebook--helper-session))
-        ;; Claim ownership before the old close callback can reenter and start
-        ;; another session.  A reentrant replacement then supersedes this one.
-        (setq emacs-jupyter-notebook--helper-session session)
-        (add-hook 'kill-buffer-hook #'emacs-jupyter-notebook-helper--owner-killed nil t)
-        (when (boundp 'emacs-jupyter-notebook-mode)
-          (add-hook 'emacs-jupyter-notebook-mode-hook
-                    #'emacs-jupyter-notebook-helper--mode-hook nil t))
+          ;; Claim ownership before the old close callback can reenter and start
+          ;; another session.  A reentrant replacement then supersedes this one.
+          (setq emacs-jupyter-notebook--helper-session session)
+          (add-hook 'kill-buffer-hook #'emacs-jupyter-notebook-helper--owner-killed nil t)
+          (when (boundp 'emacs-jupyter-notebook-mode)
+            (add-hook 'emacs-jupyter-notebook-mode-hook
+                      #'emacs-jupyter-notebook-helper--mode-hook nil t))
           (when previous
             (emacs-jupyter-notebook-helper-dispose previous "superseded"))))
       (when (and (buffer-live-p owner)
                  (not (emacs-jupyter-notebook-helper-session-disposed session))
-               (eq (buffer-local-value 'emacs-jupyter-notebook--helper-session owner)
-                   session))
+                 (eq (buffer-local-value 'emacs-jupyter-notebook--helper-session owner)
+                     session))
         (push session emacs-jupyter-notebook-helper--sessions)
         (condition-case err
-        (let* ((argv (emacs-jupyter-notebook-helper-resolve-argv command))
-               (stderr-process
-                (make-pipe-process :name (format "ejn-helper-stderr-%d" id)
-                                   :buffer stderr-buffer :coding 'binary :noquery t
-                                   :filter #'emacs-jupyter-notebook-helper--stderr-filter)))
-          ;; The pipe is a local resource as soon as it exists.  Record it
-          ;; before `make-process' so its failure path can dispose the pipe.
-          (setf (emacs-jupyter-notebook-helper-session-stderr-process session) stderr-process)
-          (process-put stderr-process 'emacs-jupyter-notebook-helper-session session)
-          (let ((process
-                 (make-process :name (format "ejn-helper-%d" id)
-                               :command argv :connection-type 'pipe :coding 'binary :noquery t
-                               :stderr stderr-process
-                               :filter #'emacs-jupyter-notebook-helper--filter
-                               :sentinel #'emacs-jupyter-notebook-helper--sentinel)))
-            (setf (emacs-jupyter-notebook-helper-session-process session) process)
-            (process-put process 'emacs-jupyter-notebook-helper-session session)
-            (setf (emacs-jupyter-notebook-helper-session-hello-timer session)
-                  (run-at-time
-                   (emacs-jupyter-notebook-helper--bounded-positive-number
-                    emacs-jupyter-notebook-helper-hello-timeout 5)
-                   nil #'emacs-jupyter-notebook-helper--hello-deadline session))
-            (let ((params (make-hash-table :test 'equal))
-                  (hello (make-hash-table :test 'equal)))
-              (puthash "versions" (vector ejn-helper-protocol-version) params)
-              (puthash "v" ejn-helper-protocol-version hello)
-              (puthash "kind" "request" hello)
-              (puthash "id" (emacs-jupyter-notebook-helper-session-hello-id session) hello)
-              (puthash "op" "hello" hello)
-              (puthash "params" params hello)
-              (process-send-string process
-                                   (ejn-helper-protocol-encode
-                                    hello ejn-helper-protocol-max-to-helper-frame)))))
+            (let* ((argv (emacs-jupyter-notebook-helper-resolve-argv command))
+                   (stderr-process
+                    (make-pipe-process
+                     :name (format "ejn-helper-stderr-%d" id)
+                     :buffer stderr-buffer :coding 'binary :noquery t
+                     :filter #'emacs-jupyter-notebook-helper--stderr-filter))
+                   (setup-complete nil)
+                   (pending-terminal nil))
+              ;; The pipe is a local resource as soon as it exists.  Record it
+              ;; before `make-process' so its failure path can dispose the pipe.
+              (setf (emacs-jupyter-notebook-helper-session-stderr-process session)
+                    stderr-process)
+              (process-put stderr-process
+                           'emacs-jupyter-notebook-helper-session session)
+              (let ((process
+                     (make-process
+                      :name (format "ejn-helper-%d" id)
+                      :command argv :connection-type 'pipe :coding 'binary :noquery t
+                      :stderr stderr-process
+                      :filter #'emacs-jupyter-notebook-helper--filter
+                      ;; A child can exit while `make-process' is returning.
+                      ;; Its normal sentinel needs the session property and
+                      ;; every local resource below, so retain it first.
+                      :sentinel
+                      (lambda (child event)
+                        (if setup-complete
+                            (emacs-jupyter-notebook-helper--sentinel child event)
+                          (when (and (memq (process-status child) '(exit signal))
+                                     (not pending-terminal))
+                            (setq pending-terminal (cons child event))))))))
+                (setf (emacs-jupyter-notebook-helper-session-process session) process)
+                (process-put process 'emacs-jupyter-notebook-helper-session session)
+                (setq setup-complete t)
+                (cond
+                 (pending-terminal
+                  (emacs-jupyter-notebook-helper--sentinel
+                   (car pending-terminal) (cdr pending-terminal)))
+                 ((not (process-live-p process))
+                  ;; A process can be observed dead before Emacs has dispatched
+                  ;; its terminal sentinel.  Deliver it only after publication.
+                  (emacs-jupyter-notebook-helper--sentinel
+                   process "terminated during helper startup"))
+                 (t
+                  (emacs-jupyter-notebook-helper--arm-hello-deadline session)
+                  ;; An eager deadline wrapper may dispose SESSION during timer
+                  ;; construction.  Admit the hello frame only with live ownership.
+                  (when (and (emacs-jupyter-notebook-helper--owned-p session process)
+                             (eq (emacs-jupyter-notebook-helper-session-state session)
+                                 'starting)
+                             (process-live-p process)
+                             (timerp
+                              (emacs-jupyter-notebook-helper-session-hello-timer
+                               session)))
+                    (emacs-jupyter-notebook-helper--send-hello session process))))))
           (error
            (emacs-jupyter-notebook-helper--fail
             session (format "cannot start helper: %s" (error-message-string err))))))

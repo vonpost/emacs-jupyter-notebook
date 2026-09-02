@@ -1,8 +1,8 @@
 # Learnings
 
 Concrete things this codebase taught us while landing W1–W7. Read this
-before starting a workstream that touches the async pipeline, the Jupyter
-adapter, the panel, or the display layer. Each item is written so a future
+before starting a workstream that touches the async pipeline, the helper
+transport, the panel, or the display layer. Each item is written so a future
 agent (Claude, opencode, or human) can act on it directly.
 
 Cross-references file paths and (workstream/row) that surfaced the lesson.
@@ -23,16 +23,16 @@ By the time an `execute_reply`, `status=idle`, `complete_reply`, or
 - The buffer was killed.
 - A newer request superseded this one.
 
-**Rule:** every Jupyter callback must correlate itself with the request
-that spawned it before mutating buffer-local state. Thread a `request-id`
-through the closure and drop the callback body when the buffer-local
-"currently expected request-id" no longer matches.
+**Rule:** every normalized helper event must correlate itself with the
+execution record and backend request that spawned it before mutating
+buffer-local state. Drop an event whose request, panel generation, session,
+or owning buffer no longer matches.
 
-Concrete precedent: **W5.5** — the unconditional `--evaluation-timer` /
-`--evaluation-request` clearing in `execute_reply` and `status=idle`
-callbacks let stale replies cancel the timer for a newer hung
-evaluation. Fix pattern in `emacs-jupyter-notebook-jupyter.el`
-`--callbacks` (search for "W5.5" comments).
+Concrete precedent: **W5.5/EI3** — unconditional evaluation-state clearing in
+`execute_reply` and `status=idle` handling let stale replies cancel the timer
+for a newer hung evaluation. The current pattern is the execution ledger in
+`emacs-jupyter-notebook.el`: `--execution-note-event` accepts normalized
+events only for the exact live record and retires terminal ownership once.
 
 ### 2. `--async-context` at `:phase 'done` is a hazard
 
@@ -337,90 +337,36 @@ and mutated the wrong `--completion-pending-key`.
 
 ---
 
-## Adapter pattern for emacs-jupyter
+## Local helper adapter
 
-### 24. Function-var indirection is the mockability seam
+### 24. The process boundary is the transport safety boundary
 
-Every call into `emacs-jupyter` routes through a `defvar`:
+All Jupyter protocol work runs in the supervised local helper.  Production
+Elisp must contain no `jupyter-*` calls and must not decode base64 image or
+pickle payloads.  The helper publishes bounded artifact descriptors and Emacs
+admits them through the capability-checked panel API.
 
-```
-emacs-jupyter-notebook-jupyter-connect-function
-emacs-jupyter-notebook-jupyter-connect-async-function
-emacs-jupyter-notebook-jupyter-evaluate-function
-emacs-jupyter-notebook-jupyter-interrupt-function
-emacs-jupyter-notebook-jupyter-restart-function
-emacs-jupyter-notebook-jupyter-shutdown-function
-emacs-jupyter-notebook-jupyter-complete-function
-emacs-jupyter-notebook-jupyter-inspect-function
-emacs-jupyter-notebook-jupyter-is-complete-function
-emacs-jupyter-notebook-jupyter-kernel-info-function  ; added in W4.5
-```
+Tests replace the helper dispatch function at the backend contract, or run a
+test-owned local kernel through the real helper.  Do not reintroduce an
+in-process fallback: an Elisp timer cannot rescue the UI while synchronous ZMQ
+or a large Lisp read owns Emacs's main thread.
 
-Tests `cl-letf` the var, not the underlying `jupyter-*` function.
-Anyone adding new adapter surfaces MUST follow this pattern. Direct
-calls to `jupyter-*` from `emacs-jupyter-notebook.el` are a design
-regression.
+### 25. Helper retirement is local and deterministic
 
-### 25. Callbacks per Jupyter message type
-
-`--callbacks BUFFER ENTRY-HANDLE [CLIENT REQUEST-ID]` returns an alist
-keyed by Jupyter message-type string:
-`input_request, clear_output, stream, execute_result, display_data,
-update_display_data, error, execute_reply, status`. Each callback
-takes one `msg` argument.
-
-Two conventions worth preserving:
-
-- Every callback body is wrapped in `condition-case nil ... (error nil)`
-  so a bad callback can't wedge the whole subscription.
-- Callbacks that mutate buffer-local state check
-  `(buffer-live-p buffer)` and `(with-current-buffer buffer ...)` even
-  though they were subscribed on that buffer — the buffer may have
-  been killed between subscribe and dispatch.
-
-### 25b. emacs-jupyter client teardown is a minefield (W19 post-review)
-
-Two confirmed facts about the emacs-jupyter client I/O lifecycle that any
-reconnect / local-cleanup code must respect:
-
-- **`jupyter-disconnect` is a silent no-op here.** Its kernel-action handler
-  in `jupyter-kernel-process.el` is inverted — the `disconnect` action runs the
-  ioloop `START` (and `connect` runs `STOP`). For a client whose ioloop is
-  already alive, `disconnect` does nothing. To actually release a client's I/O,
-  unbind its `io` slot (`slot-makeunbound client 'io`); that makes the ZMQ
-  ioloop subprocess unreachable so emacs-jupyter's GC finalizer deletes it.
-- **The ioloop is a subprocess reclaimed only by a GC finalizer.** Each client
-  attachment starts a `zmq-start-process` ioloop. Nothing tears it down
-  deterministically; the finalizer on the ioloop object `delete-process`es it
-  once the object is collected. So any abandoned client keeps a live subprocess
-  until GC gets around to it.
-
-Consequences for this package:
-
-- A connect that fails / times out / is superseded leaves its
-  `:client-unverified` on the async context. `--async-fail` and
-  `--cancel-async-context-locally` MUST dispose it (`--dispose-unverified-client`),
-  or repeated failed recoveries accumulate ioloop subprocesses between GCs.
-- Disposing means: disconnect (release I/O) + clear the slot **in place with
-  `plist-put`, WITHOUT `--async-put`** — writing the context back to the buffer
-  would resurrect a superseded context into the buffer's async slot (the A2 bug).
-- Releasing a client's local I/O is SAFE and is NOT a kernel termination: our
-  clients are conn-info attachments (the kernel is launched out-of-band over
-  SSH), so there is no Emacs-launched process for `jupyter-shutdown` to kill.
-  This is why `jupyter-disconnect` (local I/O) is allowed on buffer-kill /
-  failure paths while `jupyter-shutdown` (a kernel terminator) is not — the W1.7
-  test pins that distinction.
+A failed, timed-out, or superseded connect must close and dispose its exact
+helper session, clear the async context's local handle without resurrecting a
+superseded context, and leave the remote kernel plus durable registry intact.
+Helper process death is transport loss, not evidence that the kernel died.
 
 ---
 
 ## Test discipline
 
-### 26. Adapter var stubs are the primary mocking tool
+### 26. Mock at the bounded backend contract
 
-Never `require 'jupyter` from a unit test. The dependency is real at
-runtime but the test loads `-jupyter.el` which only `require`s
-`emacs-jupyter` lazily via `--ensure`. Stubbing the adapter vars means
-tests run in a few seconds without any Jupyter installation.
+Deterministic unit tests replace the helper dispatch function or the external
+process starter.  They never require a Jupyter installation, SSH connection,
+remote host, or user Emacs configuration.
 
 ### 27. `cl-letf` around internal helpers can hide bugs
 
@@ -654,12 +600,11 @@ Recorded here so a future workstream doesn't rediscover the trade-off.
 - **Interactive image zoom for medical imaging.** Requires custom
   matplotlib backend + Emacs image transform. Documented in ROADMAP
   future workstreams.
-- **W6 log buffer wiring for W5 timeout messages.** W5.2 currently
-  emits `message` as a stand-in; W6.6 shipped a log buffer but the W5
-  timeout path was not retro-wired. Small follow-up.
-- **CC1 SCP retry buffer leak.** Documented in ROADMAP cross-cutting.
-  The W7.2 leak assertion is `:expected-result :failed` pending the
-  fix. One-line fix in `--async-retrieve-attempt`.
+- **Resolved since this section was written:** W5 evaluation timeouts now
+  append an `eval-timeout` record to the bounded W6 log, and CC1 disposes the
+  prior SCP process before every retry.  The W7.2 leak assertion is an ordinary
+  passing regression.  Keep historical deferred lists synchronized with the
+  current code so landed reliability work is not mistaken for an open hole.
 
 ---
 

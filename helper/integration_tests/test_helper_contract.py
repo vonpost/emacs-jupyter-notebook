@@ -306,19 +306,38 @@ class HelperProtocolContractTests(unittest.TestCase):
             lambda event: event.get("request_id") == request_id and event.get("event") == "execute_reply",
             f"execute reply for {request_id}",
         )
-        status = peer.await_event(
-            lambda event: event.get("request_id") == request_id and event.get("event") == "status",
+        busy = peer.await_event(
+            lambda event: event.get("request_id") == request_id
+            and event.get("event") == "status"
+            and event.get("data", {}).get("execution_state") == "busy",
+            f"busy status for {request_id}",
+        )
+        idle = peer.await_event(
+            lambda event: event.get("request_id") == request_id
+            and event.get("event") == "status"
+            and event.get("data", {}).get("execution_state") == "idle",
             f"terminal status for {request_id}",
         )
-        self.assertEqual(status["data"].get("execution_state"), "idle")
+        self.assertEqual(busy["data"].get("execution_state"), "busy")
+        self.assertEqual(idle["data"].get("execution_state"), "idle")
         events = [event for event in peer.events if event.get("request_id") == request_id]
         names = [event["event"] for event in events]
         self.assertEqual(names.count("execute_reply"), 1)
-        self.assertEqual(names.count("status"), 1)
+        statuses = [
+            event["data"].get("execution_state")
+            for event in events
+            if event["event"] == "status"
+        ]
+        self.assertEqual(statuses, ["busy", "idle"])
         # Shell execute_reply can arrive before later normalized IOPub output.
         # IOPub idle/status is the event that closes ordinary output, so it
         # must follow every ordinary event and nothing ordinary may follow it.
-        status_index = names.index("status")
+        status_index = max(
+            index
+            for index, event in enumerate(events)
+            if event["event"] == "status"
+            and event["data"].get("execution_state") == "idle"
+        )
         self.assertTrue(
             all(name in {"execute_reply", "status"} for name in names[status_index:])
         )

@@ -12,7 +12,7 @@
 ;; evaluation output.  The source buffer carries no result text and only
 ;; a fringe/margin indicator (W2.8) that cannot interfere with editing.
 ;;
-;; Public API used by `emacs-jupyter-notebook-jupyter.el' callbacks:
+;; Public API used by the normalized helper event reducer:
 ;;
 ;;   (ejn-panel-ensure SOURCE-BUFFER)        => panel buffer
 ;;   (ejn-panel-start-entry PANEL KEY CODE)  => handle (plist)
@@ -84,55 +84,6 @@
   "Face for the queued indicator in the source buffer's fringe."
   :group 'emacs-jupyter-notebook)
 
-;;; MIME helpers (still used by callbacks)
-
-(defconst emacs-jupyter-notebook-mpl-pickle-mime-type
-  :application/x-ejn-mpl-pickle
-  "Keyword MIME key for the W8 matplotlib figure pickle payload.
-Emitted alongside `image/png' by the injected remote formatter (W8.1).")
-
-(defun emacs-jupyter-notebook--select-mime-type (data)
-  "Select the best DISPLAYABLE MIME type from DATA plist.
-Return (cons mime-type content) or nil.
-
-W8.2: the custom `application/x-ejn-mpl-pickle' MIME is deliberately NOT
-selected here — it is not a renderable thumbnail.  It rides alongside
-`image/png'; helper-published pickle files are admitted through the panel
-artifact API and never appear in this MIME plist."
-  (cond
-   ((plist-get data :image/png)
-    (cons :image/png (plist-get data :image/png)))
-   ((plist-get data :image/jpeg)
-    (cons :image/jpeg (plist-get data :image/jpeg)))
-   ((plist-get data :text/plain)
-    (cons :text/plain (plist-get data :text/plain)))
-   (t nil)))
-
-(defun emacs-jupyter-notebook--render-image-data (base64-data)
-  "Decode BASE64-DATA and return an image spec."
-  (let* ((decoded (base64-decode-string base64-data))
-         (image (create-image decoded nil t
-                              :max-width emacs-jupyter-notebook-image-max-width
-                              :max-height emacs-jupyter-notebook-image-max-height)))
-    (unless image
-      (error "Image type not supported"))
-    image))
-
-(defun emacs-jupyter-notebook--render-mime-result (data)
-  "Render DATA plist into a displayable result.
-Return a string for text or a propertized string with display property
-for images.  Return nil if no suitable MIME type is found."
-  (let ((selected (emacs-jupyter-notebook--select-mime-type data)))
-    (when selected
-      (let ((mime (car selected))
-            (content (cdr selected)))
-        (if (memq mime '(:image/png :image/jpeg))
-            (condition-case nil
-                (propertize " " 'display
-                            (emacs-jupyter-notebook--render-image-data content))
-              (error (plist-get data :text/plain)))
-          content)))))
-
 (defun emacs-jupyter-notebook--last-bytes (text max-bytes)
   "Return the last MAX-BYTES bytes of TEXT."
   (if (<= (string-bytes text) max-bytes)
@@ -181,6 +132,15 @@ before a future implementation chooses to reuse entry ids.")
 (defvar-local emacs-jupyter-notebook-panel--flush-timer nil
   "Pending flush timer for streaming throttle.")
 
+(defvar-local emacs-jupyter-notebook-panel--sliced-render-timer nil
+  "Regular timer driving the current bounded full-panel render, if any.")
+
+(defvar-local emacs-jupyter-notebook-panel--sliced-render-generation 0
+  "Monotonic ownership token for bounded full-panel render callbacks.")
+
+(defvar-local emacs-jupyter-notebook-panel--sliced-render-job nil
+  "State of the current bounded full-panel render, or nil.")
+
 (defvar-local emacs-jupyter-notebook-panel--dirty nil
   "Non-nil when the panel needs a redisplay.")
 
@@ -223,18 +183,117 @@ before a future implementation chooses to reuse entry ids.")
 (defvar-local emacs-jupyter-notebook-panel--retained-artifact-bytes 0
   "Cached total image and MIME artifact bytes retained by this panel.")
 
+(defvar-local emacs-jupyter-notebook-panel--retained-output-segments 0
+  "Cached number of ordered output segments retained by this panel.")
+
 (defconst emacs-jupyter-notebook-panel--max-published-original-bytes 67108864
   "Maximum bytes retained for one compressed external-viewer original.")
 
 (defconst emacs-jupyter-notebook-panel--max-published-preview-bytes 4194304
   "Maximum byte length of a canonical helper-generated PPM preview.")
 
+(defconst emacs-jupyter-notebook-panel--max-inline-image-data-bytes
+  emacs-jupyter-notebook-panel--max-published-preview-bytes
+  "Maximum byte length accepted by the direct inline image API.
+The helper-only runtime publishes image artifacts rather than inline data.
+This narrow compatibility path remains synchronous, so it is deliberately
+limited to the same 4 MiB ceiling as a helper preview and rejected before any
+private artifact file is created.")
+
 (defconst emacs-jupyter-notebook-panel--hard-image-pixels 4194304
   "Immutable helper protocol pixel ceiling for native image previews.")
+
+(defconst emacs-jupyter-notebook-panel--hard-inline-images 32
+  "Immutable ceiling on native image specs materialized by one panel view.")
+
+(defconst emacs-jupyter-notebook-panel--hard-entry-output-segments 256
+  "Immutable ceiling on ordered output segments retained by one entry.")
+
+(defconst emacs-jupyter-notebook-panel--hard-output-segments 4096
+  "Immutable ceiling on ordered output segments retained by one panel.")
+
+(defconst emacs-jupyter-notebook-panel--hard-history-entries 200
+  "Immutable ceiling on entries retained by one panel.")
+
+(defconst emacs-jupyter-notebook-panel--hard-entry-text-bytes (* 10 1024 1024)
+  "Immutable ceiling on output text retained by one entry.")
+
+(defconst emacs-jupyter-notebook-panel--hard-total-text-bytes (* 20 1024 1024)
+  "Immutable ceiling on text retained by one panel.")
+
+(defconst emacs-jupyter-notebook-panel--hard-total-artifact-bytes
+  (* 100 1024 1024)
+  "Immutable ceiling on artifacts retained by one panel.")
+
+(defconst emacs-jupyter-notebook-panel--sliced-render-max-work-items 4
+  "Immutable maximum logical render operations performed in one idle tick.")
+
+(defconst emacs-jupyter-notebook-panel--sliced-render-max-text-bytes 65536
+  "Immutable maximum text bytes inserted by one bounded render tick.")
+
+(defconst emacs-jupyter-notebook-panel--sliced-render-max-clear-characters 8192
+  "Immutable maximum panel-buffer characters deleted by one render tick.")
+
+(defconst emacs-jupyter-notebook-panel--sliced-render-delay 0.001
+  "Immutable positive delay between bounded full-render slices.
+Using a regular timer rather than a zero-delay idle timer guarantees that an
+event-loop turn occurs between slices, even while Emacs would otherwise remain
+idle long enough to drain a whole retained history in one idle cycle.")
+
+(defconst emacs-jupyter-notebook-panel--header-scan-max-characters 8192
+  "Immutable maximum leading-code characters inspected for a panel header.")
+
+(defconst emacs-jupyter-notebook-panel--hard-external-image-snapshots 4
+  "Immutable ceiling on pending and retained external image snapshots.")
+
+(defconst emacs-jupyter-notebook-panel--hard-external-image-snapshot-ttl 3600
+  "Immutable lifetime ceiling in seconds for an external image snapshot.")
+
+(defconst emacs-jupyter-notebook-panel--segment-omission-text
+  "[additional output segments omitted]\n"
+  "Marker retained once when an entry reaches its structural output bound.")
 
 (defconst emacs-jupyter-notebook-panel--max-published-pickle-bytes 67108864
   "Maximum bytes accepted for one helper-published matplotlib pickle.
 This finite ceiling matches the helper's decoded artifact ceiling.")
+
+(defconst emacs-jupyter-notebook-panel--admitted-metadata-token
+  (make-symbol "ejn-admitted-metadata")
+  "Opaque token marking metadata that passed publication admission.
+The token lets redraws use the immutable cached admission record without
+mistaking an arbitrary user-created image plist for a helper publication.")
+
+(defun emacs-jupyter-notebook-panel--positive-clamped (value hard-limit)
+  "Return positive integer VALUE clamped to HARD-LIMIT, or zero."
+  (if (and (integerp value) (> value 0))
+      (min value hard-limit)
+    0))
+
+(defun emacs-jupyter-notebook-panel--entry-text-budget ()
+  "Return the effective immutable per-entry text budget."
+  (emacs-jupyter-notebook-panel--positive-clamped
+   emacs-jupyter-notebook-result-max-bytes
+   emacs-jupyter-notebook-panel--hard-entry-text-bytes))
+
+(defun emacs-jupyter-notebook-panel--output-segment-budget ()
+  "Return the effective immutable panel output-segment budget."
+  (emacs-jupyter-notebook-panel--positive-clamped
+   emacs-jupyter-notebook-panel-max-output-segments
+   emacs-jupyter-notebook-panel--hard-output-segments))
+
+(defun emacs-jupyter-notebook-panel--external-image-snapshot-budget ()
+  "Return the effective immutable external image snapshot budget."
+  (emacs-jupyter-notebook-panel--positive-clamped
+   emacs-jupyter-notebook-external-image-max-snapshots
+   emacs-jupyter-notebook-panel--hard-external-image-snapshots))
+
+(defun emacs-jupyter-notebook-panel--external-image-snapshot-ttl ()
+  "Return the effective bounded external image snapshot lifetime."
+  (let ((value emacs-jupyter-notebook-external-image-snapshot-ttl))
+    (if (and (numberp value) (> value 0))
+        (min value
+             emacs-jupyter-notebook-panel--hard-external-image-snapshot-ttl)
+      1)))
 
 (defun emacs-jupyter-notebook-panel--inline-image-pixel-budget ()
   "Return the configured helper preview budget, clamped to its hard ceiling."
@@ -303,6 +362,7 @@ history-log view appends every evaluation in time order."
   (when (timerp emacs-jupyter-notebook-panel--flush-timer)
     (cancel-timer emacs-jupyter-notebook-panel--flush-timer))
   (setq emacs-jupyter-notebook-panel--flush-timer nil)
+  (emacs-jupyter-notebook-panel--cancel-sliced-render)
   (emacs-jupyter-notebook-panel--cleanup-external-image-opens-for-panel
    (current-buffer))
   (emacs-jupyter-notebook-panel--retire-all-artifacts (current-buffer)))
@@ -417,7 +477,8 @@ payload, so late IOPub output cannot recreate retired local artifacts."
   "Apply UPDATER to the entry referenced by HANDLE and schedule a render.
 UPDATER is called with the current entry plist and must return a new plist.
 When FORCE-FULL is non-nil, rebuild the whole view because image-preview
-membership or entry ordering may have changed."
+membership or entry ordering may have changed.  FORCE-FULL may also be a
+function receiving OLD-ENTRY and NEW-ENTRY and returning that boolean."
   (when (ejn-panel-entry-live-p handle)
     (let ((panel (plist-get handle :panel))
           (id (plist-get handle :id)))
@@ -426,13 +487,19 @@ membership or entry ordering may have changed."
           (when entry
             (let ((old-text (emacs-jupyter-notebook-panel--entry-text-bytes entry))
                   (old-artifacts (emacs-jupyter-notebook-panel--entry-artifact-bytes entry))
+                  (old-segments (length (plist-get entry :outputs)))
                   (new (funcall updater entry)))
+              (when (functionp force-full)
+                (setq force-full (funcall force-full entry new)))
               (with-current-buffer panel
                 (cl-incf emacs-jupyter-notebook-panel--retained-text-bytes
                          (- (emacs-jupyter-notebook-panel--entry-text-bytes new) old-text))
                 (cl-incf emacs-jupyter-notebook-panel--retained-artifact-bytes
                          (- (emacs-jupyter-notebook-panel--entry-artifact-bytes new)
-                            old-artifacts)))
+                            old-artifacts))
+                (cl-incf emacs-jupyter-notebook-panel--retained-output-segments
+                         (- (length (plist-get new :outputs))
+                            old-segments)))
               (emacs-jupyter-notebook-panel--set-entry panel id new)
               (emacs-jupyter-notebook-panel--schedule-render
                panel id force-full))))))))
@@ -502,6 +569,29 @@ entry metadata only after claiming its current timer slot."
 
 ;;; Render scheduling (W2.4 throttle)
 
+(defconst emacs-jupyter-notebook-panel--hard-stream-throttle-min-ms 25)
+(defconst emacs-jupyter-notebook-panel--hard-stream-throttle-max-ms 1000)
+
+(defun emacs-jupyter-notebook-panel--stream-throttle-delay ()
+  "Return the immutable bounded panel flush delay in seconds."
+  (/ (emacs-jupyter-notebook--bounded-positive-option
+      emacs-jupyter-notebook-panel-stream-throttle-ms 50
+      emacs-jupyter-notebook-panel--hard-stream-throttle-min-ms
+      emacs-jupyter-notebook-panel--hard-stream-throttle-max-ms)
+     1000.0))
+
+(defun emacs-jupyter-notebook-panel--cancel-sliced-render ()
+  "Retire the current full render without changing retained panel state.
+The generation token blocks a callback queued before cancellation from
+writing stale output."
+  (when (or emacs-jupyter-notebook-panel--sliced-render-job
+            (timerp emacs-jupyter-notebook-panel--sliced-render-timer))
+    (when (timerp emacs-jupyter-notebook-panel--sliced-render-timer)
+      (cancel-timer emacs-jupyter-notebook-panel--sliced-render-timer))
+    (setq emacs-jupyter-notebook-panel--sliced-render-timer nil
+          emacs-jupyter-notebook-panel--sliced-render-job nil)
+    (cl-incf emacs-jupyter-notebook-panel--sliced-render-generation)))
+
 (defun emacs-jupyter-notebook-panel--schedule-render (panel &optional entry-id force-full)
   "Mark PANEL dirty and schedule a flush within the throttle window.
 
@@ -513,14 +603,25 @@ arriving while the timer is pending, and the next flush picks up whatever
 state the entries are in at flush time."
   (when (buffer-live-p panel)
     (with-current-buffer panel
+      ;; A partially rendered full view is only a presentation cache.  Any
+      ;; mutation invalidates it before the next scheduled callback can insert old
+      ;; segments or clear a newly accumulated stream suffix.
+      (let ((sliced-render-active-p
+             (or emacs-jupyter-notebook-panel--sliced-render-job
+                 (timerp emacs-jupyter-notebook-panel--sliced-render-timer))))
+        (emacs-jupyter-notebook-panel--cancel-sliced-render)
+        ;; The visible buffer is now a prefix of an old generation, so an
+        ;; entry-local replacement cannot safely find its true bounds.  Route
+        ;; the next pass through the bounded full renderer instead.
+        (when sliced-render-active-p
+          (setq force-full t)))
       (setq emacs-jupyter-notebook-panel--dirty t)
       (when entry-id
         (cl-pushnew entry-id emacs-jupyter-notebook-panel--dirty-entry-ids))
       (when force-full
         (setq emacs-jupyter-notebook-panel--force-full-render t))
       (unless (timerp emacs-jupyter-notebook-panel--flush-timer)
-        (let ((delay (/ (max 0 emacs-jupyter-notebook-panel-stream-throttle-ms)
-                        1000.0)))
+        (let ((delay (emacs-jupyter-notebook-panel--stream-throttle-delay)))
           (setq emacs-jupyter-notebook-panel--flush-timer
                 (run-at-time
                  delay nil
@@ -544,8 +645,8 @@ the incremental renderer."
         (setq emacs-jupyter-notebook-panel--dirty nil)
         (if (or emacs-jupyter-notebook-panel--force-full-render
                 (null emacs-jupyter-notebook-panel--dirty-entry-ids))
-            (emacs-jupyter-notebook-panel--render panel)
-          (emacs-jupyter-notebook-panel--render-dirty-entries panel))))))
+            (emacs-jupyter-notebook-panel--start-sliced-render panel)
+          (emacs-jupyter-notebook-panel--render-dirty-entries panel t))))))
 
 (defun emacs-jupyter-notebook-panel-flush-now (panel)
   "Force PANEL to render immediately, cancelling any pending throttle timer."
@@ -554,6 +655,7 @@ the incremental renderer."
       (when (timerp emacs-jupyter-notebook-panel--flush-timer)
         (cancel-timer emacs-jupyter-notebook-panel--flush-timer))
       (setq emacs-jupyter-notebook-panel--flush-timer nil)
+      (emacs-jupyter-notebook-panel--cancel-sliced-render)
       (setq emacs-jupyter-notebook-panel--dirty nil)
       (if (or emacs-jupyter-notebook-panel--force-full-render
               (null emacs-jupyter-notebook-panel--dirty-entry-ids))
@@ -632,20 +734,26 @@ no source-buffer marker is registered, e.g. in tests)."
 
 (defun emacs-jupyter-notebook-panel--native-image-safe-p (image)
   "Return non-nil when IMAGE may reach an Emacs native image API.
-Legacy image specs have no helper publication root and retain their existing
-rendering path.  A helper-published image is native-safe only through its
+Legacy image specs have no helper publication root and are presentation-only on
+graphical displays.  A helper-published image is native-safe only through its
 separate canonical PPM preview; its compressed original is never examined.
-The PPM bytes and digest are checked once at admission.  This last-boundary
-check revalidates only pinned identity, ownership, mode, and size so repeated
-redisplay cannot turn into multi-megabyte file reads on Emacs's UI thread."
+The PPM bytes, digest, identity, dimensions, and size are checked once at
+admission and then reused from the opaque cached metadata record, so repeated
+redisplay performs no file stat or content read on Emacs's UI thread."
   (let ((props (and (consp image) (cdr image))))
     (if (not (plist-member props :ejn-publication-root))
-        t
+        ;; Direct/legacy specs are retained for non-graphic batch rendering,
+        ;; but must never hand an unvalidated local file or inline payload to a
+        ;; graphical native decoder.  Helper publications use the strict PPM
+        ;; branch below.
+        (not (display-graphic-p))
       (let* ((preview (plist-get props :ejn-preview))
              (path (plist-get props :file))
              (width (and preview (plist-get preview :width)))
              (height (and preview (plist-get preview :height))))
         (and (listp preview)
+             (eq (plist-get preview :ejn-admitted)
+                 emacs-jupyter-notebook-panel--admitted-metadata-token)
              (eq (plist-get props :type) 'pbm)
              (equal path (plist-get preview :file))
              (emacs-jupyter-notebook-panel--inline-image-dimensions-safe-p
@@ -658,9 +766,9 @@ redisplay cannot turn into multi-megabyte file reads on Emacs's UI thread."
                          (plist-get preview :root-identity)
                          emacs-jupyter-notebook-panel--max-published-preview-bytes
                          nil nil nil
-                         (plist-get preview :artifact-capability))))
-                   (equal (plist-get checked :identity)
-                          (plist-get preview :identity)))
+                         (plist-get preview :artifact-capability)
+                         preview)))
+                   (eq checked preview))
                (error nil)))))))
 
 (defun emacs-jupyter-notebook-panel--native-preview-spec (image)
@@ -683,6 +791,32 @@ path because they do not carry helper publication fields."
            (when (plist-member props :max-height)
              (list :max-height (plist-get props :max-height)))))))))
 
+(defun emacs-jupyter-notebook-panel--trusted-preview-slice-rows (image)
+  "Return IMAGE's slice row count from admitted preview metadata.
+Unlike `image-size', this only uses the validated PPM dimensions and the
+explicit panel scale bounds.  Legacy specs have no trusted dimensions and
+therefore decline slicing rather than synchronously asking a native decoder."
+  (let* ((props (and (consp image) (cdr image)))
+         (preview (and props (plist-get props :ejn-preview)))
+         (width (and (listp preview) (plist-get preview :width)))
+         (height (and (listp preview) (plist-get preview :height)))
+         (raw-scale (and props (plist-get props :scale)))
+         (scale (if (and (numberp raw-scale) (> raw-scale 0)) raw-scale 1.0))
+         (max-width (and props (plist-get props :max-width)))
+         (max-height (and props (plist-get props :max-height)))
+         (rendered-width (and (integerp width) (* width scale)))
+         (rendered-height (and (integerp height) (* height scale)))
+         (ratio 1.0))
+    (when (and (emacs-jupyter-notebook-panel--inline-image-dimensions-safe-p
+               width height)
+               (> rendered-width 0) (> rendered-height 0))
+      (when (and (numberp max-width) (> max-width 0))
+        (setq ratio (min ratio (/ max-width (float rendered-width)))))
+      (when (and (numberp max-height) (> max-height 0))
+        (setq ratio (min ratio (/ max-height (float rendered-height)))))
+      (let ((char-height (max 1 (or (frame-char-height) 1))))
+        (max 1 (ceiling (* rendered-height ratio) char-height))))))
+
 (defun emacs-jupyter-notebook-panel--inline-image-admitted-p (image)
   "Return non-nil when IMAGE is a cheap candidate for bounded inline preview.
 This deliberately performs no file access.  The full fixed-header and identity
@@ -704,12 +838,39 @@ Newness follows entry creation ids, rather than source-position display order."
           (sort (copy-sequence entries)
                 (lambda (a b) (< (plist-get a :id) (plist-get b :id)))))
          (specs (emacs-jupyter-notebook-panel--image-specs creation-order))
-         (max emacs-jupyter-notebook-panel-max-inline-images))
+         (max (emacs-jupyter-notebook-panel--positive-clamped
+               emacs-jupyter-notebook-panel-max-inline-images
+               emacs-jupyter-notebook-panel--hard-inline-images)))
     (if (and (integerp max) (> max 0))
         (let ((safe (cl-remove-if-not
                      #'emacs-jupyter-notebook-panel--inline-image-admitted-p specs)))
           (last safe (min max (length safe))))
       nil)))
+
+(defun emacs-jupyter-notebook-panel--image-update-needs-full-p
+    (panel new-entry old-image new-image)
+  "Return non-nil when replacing OLD-IMAGE needs a full PANEL render.
+An existing inline image can be replaced incrementally when both old and new
+specs occupy the same inline admission state.  A transition between inline
+and placeholder changes another entry's materialization and therefore needs a
+complete view rebuild."
+  (if (null old-image)
+      t
+    (with-current-buffer panel
+      (let* ((old-inline (and (memq old-image
+                                    emacs-jupyter-notebook-panel--inline-image-specs)
+                              t))
+             (new-id (plist-get new-entry :id))
+             (prospective
+              (mapcar (lambda (entry)
+                        (if (= (plist-get entry :id) new-id)
+                            new-entry
+                          entry))
+                      (emacs-jupyter-notebook-panel--visible-entries)))
+             (new-inline
+              (emacs-jupyter-notebook-panel--bounded-inline-specs prospective))
+             (new-inline-p (and (memq new-image new-inline) t)))
+        (not (eq old-inline new-inline-p))))))
 
 (defun emacs-jupyter-notebook-panel--set-inline-specs (specs)
   "Install SPECS as the inline set, flushing previews that were demoted."
@@ -727,9 +888,10 @@ Newness follows entry creation ids, rather than source-position display order."
   "Insert a lightweight placeholder for IMAGE tagged with segment INDEX."
   (let* ((type (or (plist-get (cdr image) :type) 'image))
          (file (plist-get (cdr image) :file))
-         (bytes (and (stringp file)
-                     (file-exists-p file)
-                     (file-attribute-size (file-attributes file))))
+         ;; Admission already records the artifact size.  Never stat every
+         ;; retained placeholder during a full history render.
+         (bytes (or (plist-get (cdr image) :ejn-artifact-bytes)
+                    (plist-get (plist-get (cdr image) :ejn-original) :size)))
          (label (if bytes
                     (format "[%s image, %s]" type
                             (file-size-human-readable bytes))
@@ -767,14 +929,15 @@ configured inline previews; placeholder images never call `image-size'."
           ;; first native call.  Retirement can then flush exactly materialized
           ;; preview specs without touching original files or retained history.
           (plist-put (cdr image) :ejn-materialized t)
-          (if (and emacs-jupyter-notebook-panel-slice-images
-                   (display-graphic-p))
-              (condition-case nil
-                  (let* ((height (cdr (image-size native t)))
-                         (rows (max 1 (ceiling height (frame-char-height)))))
-                    (insert-sliced-image native " " nil rows 1))
-                (error (insert (propertize " " 'display native))))
-            (insert (propertize " " 'display native))))))
+          (let ((rows (and emacs-jupyter-notebook-panel-slice-images
+                           (display-graphic-p)
+                           (emacs-jupyter-notebook-panel--trusted-preview-slice-rows
+                            image))))
+            (if rows
+                (condition-case nil
+                    (insert-sliced-image native " " nil rows 1)
+                  (error (insert (propertize " " 'display native))))
+              (insert (propertize " " 'display native)))))))
     (add-text-properties
      start (point) (list 'emacs-jupyter-notebook-segment-index index))))
 
@@ -784,39 +947,154 @@ configured inline previews; placeholder images never call `image-size'."
          (status (or (plist-get entry :status) 'running))
          (ts (or (plist-get entry :timestamp) ""))
          (code (or (plist-get entry :code) ""))
-         (first-line (car (split-string code "\n" t)))
-         (title (if first-line
-                    (substring first-line 0
-                               (min (length first-line) 60))
-                  ""))
-         (status-s (pcase status
-                     ('running "running")
-                     ('ok "ok")
-                     ('error "error")
-                     ('cancelled "cancelled")
-                     ('outcome-unknown "outcome unknown")
-                     (_ (format "%s" status)))))
-    (propertize
-     (format "[%s] %s [%s] %s\n" count ts status-s title)
-     'face 'emacs-jupyter-notebook-result-header-face
-     'emacs-jupyter-notebook-entry-id (plist-get entry :id)
-     'emacs-jupyter-notebook-cell-key (plist-get entry :cell-key))))
+         ;; Preserve the established first nonempty-line title for ordinary
+         ;; source while putting a fixed upper bound on an adversarial cell
+         ;; made entirely of leading newlines.  `split-string' used to scan
+         ;; and allocate from the entire cell during every full render.
+         (scan-limit (min (length code)
+                          emacs-jupyter-notebook-panel--header-scan-max-characters))
+         (title-start 0))
+    (while (and (< title-start scan-limit)
+                (eq (aref code title-start) ?\n))
+      (cl-incf title-start))
+    (let ((title-end title-start)
+          ;; Reaching the scan cap means there may still be only newlines.
+          ;; Do not turn the next sixty of those into physical header lines.
+          (title-limit (if (>= title-start scan-limit)
+                           title-start
+                         (min (length code) (+ title-start 60)))))
+      (while (and (< title-end title-limit)
+                  (not (eq (aref code title-end) ?\n)))
+        (cl-incf title-end))
+      (let ((title (substring code title-start title-end))
+          (status-s (pcase status
+                      ('running "running")
+                      ('ok "ok")
+                      ('error "error")
+                      ('cancelled "cancelled")
+                      ('outcome-unknown "outcome unknown")
+                      (_ (format "%s" status)))))
+        (propertize
+         (format "[%s] %s [%s] %s\n" count ts status-s title)
+         'face 'emacs-jupyter-notebook-result-header-face
+         'emacs-jupyter-notebook-entry-id (plist-get entry :id)
+         'emacs-jupyter-notebook-cell-key (plist-get entry :cell-key))))))
 
 (defun emacs-jupyter-notebook-panel--text-state-p (value)
   "Return non-nil when VALUE is the internal streamed text representation."
   (and (listp value) (plist-member value :chunks)))
 
+(defconst emacs-jupyter-notebook-panel--hard-text-chunks 256
+  "Immutable retained chunk ceiling for one streamed text segment.")
+
+(defconst emacs-jupyter-notebook-panel--hard-pending-text-chunks 256
+  "Immutable unrendered suffix-chunk ceiling for one streamed text segment.")
+
+(defconst emacs-jupyter-notebook-panel--hard-text-chunk-bytes 65536
+  "Immutable byte ceiling for one retained streamed-text chunk.")
+
+(defconst emacs-jupyter-notebook-panel--text-chunk-character-step 8192
+  "Conservative character step used to construct byte-bounded text chunks.")
+
+(defun emacs-jupyter-notebook-panel--text-state-drop-oldest-chunk (state)
+  "Drop STATE's oldest whole chunk in bounded work and return STATE."
+  (when-let* ((chunks (plist-get state :chunks))
+              (chunk (car chunks)))
+    (let* ((chunk-bytes (string-bytes chunk))
+           (count (or (plist-get state :chunk-count) (length chunks)))
+           (line-count (or (plist-get state :last-line-chunks) 0)))
+      (setq state (plist-put state :chunks (cdr chunks)))
+      (setq state (plist-put state :chunk-count (1- count)))
+      (setq state (plist-put state :bytes
+                             (- (plist-get state :bytes) chunk-bytes)))
+      ;; The current line always occupies the final LINE-COUNT chunks.
+      (when (<= count line-count)
+        (setq state (plist-put state :last-line-chunks (1- line-count)))
+        (setq state (plist-put state :last-line-bytes
+                               (- (or (plist-get state :last-line-bytes) 0)
+                                  chunk-bytes))))
+      (when (null (cdr chunks))
+        (setq state (plist-put state :tail nil)))
+      state)))
+
+(defun emacs-jupyter-notebook-panel--text-state-note-pending (state text)
+  "Retain TEXT as a bounded incremental suffix for STATE."
+  (cond
+   ((plist-get state :pending-overflow) state)
+   ((>= (or (plist-get state :pending-count) 0)
+        emacs-jupyter-notebook-panel--hard-pending-text-chunks)
+    (setq state (plist-put state :pending nil))
+    (setq state (plist-put state :pending-count 0))
+    (plist-put state :pending-overflow t))
+   (t
+    (setq state (plist-put state :pending
+                           (cons text (plist-get state :pending))))
+    (plist-put state :pending-count
+               (1+ (or (plist-get state :pending-count) 0))))))
+
+(defun emacs-jupyter-notebook-panel--text-state-add-chunk
+    (state text current-line-p)
+  "Append nonempty TEXT to STATE and update bounded chunk accounting.
+CURRENT-LINE-P means TEXT belongs to the logical line after the last newline."
+  (unless (string-empty-p text)
+    (while (>= (or (plist-get state :chunk-count) 0)
+               emacs-jupyter-notebook-panel--hard-text-chunks)
+      (setq state
+            (emacs-jupyter-notebook-panel--text-state-drop-oldest-chunk state)))
+    (let ((cell (list text))
+          (bytes (string-bytes text)))
+      (if-let ((tail (plist-get state :tail)))
+          (setcdr tail cell)
+        (setq state (plist-put state :chunks cell)))
+      (setq state (plist-put state :tail cell))
+      (setq state (plist-put state :chunk-count
+                             (1+ (or (plist-get state :chunk-count) 0))))
+      (setq state (plist-put state :bytes
+                             (+ (plist-get state :bytes) bytes)))
+      (setq state
+            (emacs-jupyter-notebook-panel--text-state-note-pending state text))
+      (if current-line-p
+          (progn
+            (setq state (plist-put state :last-line-chunks
+                                   (1+ (or (plist-get state :last-line-chunks) 0))))
+            (setq state (plist-put state :last-line-bytes
+                                   (+ (or (plist-get state :last-line-bytes) 0)
+                                      bytes))))
+        (setq state (plist-put state :last-line-chunks 0))
+        (setq state (plist-put state :last-line-bytes 0)))))
+  state)
+
+(defun emacs-jupyter-notebook-panel--text-state-add-bounded-chunks
+    (state text current-line-p)
+  "Append TEXT to STATE as bounded pieces with CURRENT-LINE-P semantics."
+  (let ((start 0)
+        (length (length text)))
+    (while (< start length)
+      (let* ((end (min length
+                       (+ start
+                          emacs-jupyter-notebook-panel--text-chunk-character-step)))
+             (piece (substring text start end)))
+        ;; The conservative character step is already below the ceiling for
+        ;; ordinary Unicode.  Retain a byte check for unusual Emacs raw-byte
+        ;; characters without ever searching more than one small candidate.
+        (while (> (string-bytes piece)
+                  emacs-jupyter-notebook-panel--hard-text-chunk-bytes)
+          (setq end (+ start (max 1 (/ (- end start) 2))))
+          (setq piece (substring text start end)))
+        (setq state
+              (emacs-jupyter-notebook-panel--text-state-add-chunk
+               state piece current-line-p))
+        (setq start end))))
+  state)
+
 (defun emacs-jupyter-notebook-panel--make-text-state (text)
   "Return a chunked text state initialized with TEXT."
-  (let* ((chunk (or text ""))
-         (chunks (and (not (string-empty-p chunk)) (list chunk))))
-    (list :chunks chunks
-          :tail chunks
-          :bytes (string-bytes chunk)
-          :cache nil
-          :pending (and (not (string-empty-p chunk)) (list chunk))
-          :ends-newline (string-suffix-p "\n" chunk)
-          :rendered-ends-newline nil)))
+  (emacs-jupyter-notebook-panel--text-state-append
+   (list :chunks nil :tail nil :chunk-count 0 :bytes 0 :cache nil
+         :pending nil :pending-count 0 :pending-overflow nil
+         :last-line-chunks 0 :last-line-bytes 0
+         :ends-newline nil :rendered-ends-newline nil)
+   (or text "")))
 
 (defun emacs-jupyter-notebook-panel--text-state-value (segment)
   "Materialize SEGMENT's logical text once after its most recent mutation."
@@ -831,20 +1109,57 @@ configured inline previews; placeholder images never call `image-size'."
             text)))))
 
 (defun emacs-jupyter-notebook-panel--text-state-append (state text)
-  "Append TEXT to STATE in amortized constant time and return STATE."
+  "Append TEXT to STATE with immutable chunk bounds and return STATE."
   (unless (string-empty-p text)
-    (let ((cell (list text)))
-      (if-let ((tail (plist-get state :tail)))
-          (setcdr tail cell)
-        (setq state (plist-put state :chunks cell)))
-      (setq state (plist-put state :tail cell))
-      (setq state (plist-put state :pending
-                             (cons text (plist-get state :pending))))
-      (setq state (plist-put state :bytes
-                             (+ (plist-get state :bytes) (string-bytes text))))
-      (setq state (plist-put state :cache nil))
-      (setq state (plist-put state :ends-newline (string-suffix-p "\n" text))))
-  state))
+    ;; Split at the final newline.  That invariant lets a later carriage
+    ;; return discard the current terminal line by chunk count, without ever
+    ;; materializing or scanning retained history.
+    (let ((search 0) last-newline next)
+      (while (setq next (string-search "\n" text search))
+        (setq last-newline next
+              search (1+ next)))
+      (if last-newline
+          (let ((boundary (1+ last-newline)))
+            (setq state
+                  (emacs-jupyter-notebook-panel--text-state-add-bounded-chunks
+                   state (substring text 0 boundary) nil))
+            (when (< boundary (length text))
+              (setq state
+                    (emacs-jupyter-notebook-panel--text-state-add-bounded-chunks
+                     state (substring text boundary) t))))
+        (setq state
+              (emacs-jupyter-notebook-panel--text-state-add-bounded-chunks
+               state text t))))
+    (setq state (plist-put state :cache nil))
+    (setq state (plist-put state :ends-newline (string-suffix-p "\n" text))))
+  state)
+
+(defun emacs-jupyter-notebook-panel--text-state-drop-current-line (state)
+  "Drop STATE's current logical terminal line in bounded chunk work."
+  (let* ((count (or (plist-get state :chunk-count) 0))
+         (line-count (min count (or (plist-get state :last-line-chunks) 0)))
+         (keep (- count line-count))
+         (chunks (plist-get state :chunks)))
+    (cond
+     ((zerop keep)
+      (setq state (plist-put state :chunks nil))
+      (setq state (plist-put state :tail nil)))
+     ((> line-count 0)
+      (let ((tail (nthcdr (1- keep) chunks)))
+        (setcdr tail nil)
+        (setq state (plist-put state :tail tail)))))
+    (setq state (plist-put state :chunk-count keep))
+    (setq state (plist-put state :bytes
+                           (- (plist-get state :bytes)
+                              (or (plist-get state :last-line-bytes) 0))))
+    (setq state (plist-put state :last-line-chunks 0))
+    (setq state (plist-put state :last-line-bytes 0))
+    (setq state (plist-put state :pending nil))
+    (setq state (plist-put state :pending-count 0))
+    (setq state (plist-put state :pending-overflow nil))
+    (setq state (plist-put state :cache nil))
+    (setq state (plist-put state :ends-newline t))
+    state))
 
 (defun emacs-jupyter-notebook-panel--text-state-drop-front (state bytes)
   "Drop BYTES from STATE's oldest retained chunks and return STATE."
@@ -856,23 +1171,28 @@ configured inline previews; placeholder images never call `image-size'."
         (cl-incf emacs-jupyter-notebook-panel--text-trim-chunk-visits))
       (if (>= bytes chunk-bytes)
           (progn
-            (setq state (plist-put state :chunks (cdr chunks)))
-            (setq state (plist-put state :bytes (- (plist-get state :bytes)
-                                                    chunk-bytes)))
-            (setq bytes (- bytes chunk-bytes))
-            (when (null (cdr chunks))
-              (setq state (plist-put state :tail nil))))
+            (setq state
+                  (emacs-jupyter-notebook-panel--text-state-drop-oldest-chunk
+                   state))
+            (setq bytes (- bytes chunk-bytes)))
         (let ((kept (emacs-jupyter-notebook--last-bytes
                      chunk (- chunk-bytes bytes))))
           (setcar chunks kept)
           (setq state (plist-put state :bytes
                                  (- (plist-get state :bytes)
                                     (- chunk-bytes (string-bytes kept)))))
+          (when (= (or (plist-get state :chunk-count) 0)
+                   (or (plist-get state :last-line-chunks) 0))
+            (setq state (plist-put state :last-line-bytes
+                                   (- (or (plist-get state :last-line-bytes) 0)
+                                      (- chunk-bytes (string-bytes kept))))))
           (setq bytes 0)))))
   (setq state (plist-put state :cache nil))
   ;; Trimming always schedules a structural render, so stale incremental
   ;; chunks must not keep pre-cap stream strings alive until that render.
   (setq state (plist-put state :pending nil))
+  (setq state (plist-put state :pending-count 0))
+  (setq state (plist-put state :pending-overflow nil))
   state)
 
 (defun emacs-jupyter-notebook-panel--text-segment-bytes (segment)
@@ -898,6 +1218,8 @@ configured inline previews; placeholder images never call `image-size'."
     (when (emacs-jupyter-notebook-panel--text-state-p (cdr segment))
       (let ((state (cdr segment)))
         (setq state (plist-put state :pending nil))
+        (setq state (plist-put state :pending-count 0))
+        (setq state (plist-put state :pending-overflow nil))
         (setq state (plist-put state :rendered-ends-newline
                                (plist-get state :ends-newline)))
         (setcdr segment state)))))
@@ -918,16 +1240,36 @@ configured inline previews; placeholder images never call `image-size'."
   (insert "\n")
   (plist-put entry :stream-dirty-p nil))
 
-(defun emacs-jupyter-notebook-panel--render-stream-suffix (entry bounds)
+(defun emacs-jupyter-notebook-panel--pending-text-fits-p (pending max-bytes)
+  "Return non-nil when PENDING totals no more than MAX-BYTES bytes.
+The check traverses bounded chunk metadata without constructing the pending
+suffix string.  It lets ordinary scheduled patches decline a large suffix
+before `mapconcat' could allocate it on the UI thread."
+  (let ((bytes 0))
+    (while (and pending (<= bytes max-bytes))
+      (let ((chunk (pop pending)))
+        (unless (stringp chunk)
+          (setq bytes (1+ max-bytes)))
+        (when (stringp chunk)
+          (cl-incf bytes (string-bytes chunk)))))
+    (<= bytes max-bytes)))
+
+(defun emacs-jupyter-notebook-panel--render-stream-suffix
+    (entry bounds &optional max-bytes)
   "Insert ENTRY's pending trailing text chunks at BOUNDS without rebuilding it.
-Return non-nil when the existing rendered text segment could be extended."
+Return non-nil when the existing rendered text segment could be extended.
+When MAX-BYTES is non-nil, decline a larger pending suffix without allocating
+it so the caller can use the bounded full renderer instead."
   (let* ((segments (plist-get entry :outputs))
          (index (1- (length segments)))
          (segment (car (last segments)))
          (state (and segment (cdr segment))))
     (when (and (eq (car-safe segment) 'text)
                (emacs-jupyter-notebook-panel--text-state-p state)
-               (plist-get state :pending))
+               (plist-get state :pending)
+               (or (null max-bytes)
+                   (emacs-jupyter-notebook-panel--pending-text-fits-p
+                    (plist-get state :pending) max-bytes)))
       (let* ((property 'emacs-jupyter-notebook-text-segment-index)
              (start (text-property-any (car bounds) (cdr bounds) property index)))
         (when start
@@ -950,10 +1292,274 @@ Return non-nil when the existing rendered text segment could be extended."
              ((and (not old-auto-newline) (not new-ends-newline))
               (insert "\n")))
             (setq state (plist-put state :pending nil))
+            (setq state (plist-put state :pending-count 0))
+            (setq state (plist-put state :pending-overflow nil))
             (setq state (plist-put state :rendered-ends-newline new-ends-newline))
             (setcdr segment state)
             (plist-put entry :stream-dirty-p nil)
             t))))))
+
+(defun emacs-jupyter-notebook-panel--sliced-render-insert-text (text index)
+  "Insert bounded TEXT for output segment INDEX at point.
+TEXT is already capped by the render scheduler, so adding the normal fallback
+face directly to the panel buffer never copies an arbitrarily large segment."
+  (let ((start (point)))
+    (insert text)
+    (add-face-text-property
+     start (point) 'emacs-jupyter-notebook-result-face 'append)
+    (add-text-properties
+     start (point) (list 'emacs-jupyter-notebook-text-segment-index index))))
+
+(defun emacs-jupyter-notebook-panel--sliced-render-raw-text-piece
+    (text position)
+  "Return the next hard-bounded piece of TEXT after POSITION.
+The return value is `(PIECE . NEXT-POSITION)'.  This compatibility path is
+only for hand-constructed legacy segments; normal panel segments are already
+chunked by `--make-text-state'."
+  (let* ((length (length text))
+         (end (min length
+                   (+ position
+                      emacs-jupyter-notebook-panel--text-chunk-character-step)))
+         (piece (substring text position end)))
+    (while (> (string-bytes piece)
+              emacs-jupyter-notebook-panel--sliced-render-max-text-bytes)
+      (setq end (+ position (max 1 (/ (- end position) 2))))
+      (setq piece (substring text position end)))
+    (cons piece end)))
+
+(defun emacs-jupyter-notebook-panel--sliced-render-clear-text-pending (job)
+  "Finalize JOB's current text segment and return the advanced JOB state."
+  (let* ((segment (plist-get job :text-segment))
+         (state (plist-get job :text-state))
+         (had-content (plist-get job :text-had-content))
+         (ends-newline
+          (if state
+              (plist-get state :ends-newline)
+            (string-suffix-p "\n" (or (plist-get job :text-value) "")))))
+    ;; A streamed state remains unmodified until its last chunk has reached
+    ;; the buffer.  A mutation always cancels this generation first, so this
+    ;; cannot clear a pending suffix from a newer stream event.
+    (when state
+      (setq state (plist-put state :pending nil))
+      (setq state (plist-put state :pending-count 0))
+      (setq state (plist-put state :pending-overflow nil))
+      (setq state (plist-put state :rendered-ends-newline ends-newline))
+      (setcdr segment state))
+    (when (and had-content (not ends-newline))
+      (insert "\n"))
+    (setq job (plist-put job :text-segment nil))
+    (setq job (plist-put job :text-state nil))
+    (setq job (plist-put job :text-chunks nil))
+    (setq job (plist-put job :text-value nil))
+    (setq job (plist-put job :text-position nil))
+    (setq job (plist-put job :text-had-content nil))
+    (plist-put job :phase 'segments)))
+
+(defun emacs-jupyter-notebook-panel--sliced-render-finish-entry (job)
+  "Finish JOB's current entry and return the next-entry state."
+  (let ((entry (plist-get job :current-entry)))
+    (insert "\n")
+    (when entry
+      ;; `plist-put' can return a fresh plist when this optional key was not
+      ;; already present, so install it back in the durable entry table.
+      (emacs-jupyter-notebook-panel--set-entry
+       (current-buffer) (plist-get entry :id)
+       (plist-put entry :stream-dirty-p nil)))
+    (setq job (plist-put job :current-entry nil))
+    (setq job (plist-put job :current-segments nil))
+    (setq job (plist-put job :segment-index 0))
+    (plist-put job :phase 'entry)))
+
+(defun emacs-jupyter-notebook-panel--sliced-render-step
+    (job text-budget image-used clear-characters)
+  "Perform one bounded operation from full-render JOB.
+TEXT-BUDGET is the number of bytes already inserted in this timer callback.
+IMAGE-USED prevents more than one potentially decoding native image from
+being inserted in that callback.  CLEAR-CHARACTERS is the prefix already
+deleted from the prior view.  Return a plist with updated `:job' and optional
+`:text-bytes', `:clear-characters', `:image-p', `:blocked', or `:complete'
+flags."
+  (pcase (plist-get job :phase)
+    ('begin
+     ;; `erase-buffer' can itself be a visible pause for a retained 20 MiB
+     ;; history.  Retire the old presentation in small character slices
+     ;; before inserting the new header.  The panel is ordinary multibyte
+     ;; text, so this is also comfortably under the text-byte work budget.
+     (if (> (buffer-size) 0)
+         (if (> clear-characters 0)
+             (list :job job :blocked t)
+           (let ((count
+                  (min (buffer-size)
+                       emacs-jupyter-notebook-panel--sliced-render-max-clear-characters)))
+             (delete-region (point-min) (+ (point-min) count))
+             (list :job job :clear-characters count :blocked t)))
+       (insert (propertize
+                (format "Output panel — view: %s   (H toggle, RET visit, q bury)\n\n"
+                        emacs-jupyter-notebook-panel--view)
+                'face 'emacs-jupyter-notebook-result-header-face))
+       (when (and (eq emacs-jupyter-notebook-panel--view 'history)
+                  emacs-jupyter-notebook-panel--history-evicted-p)
+         (insert (propertize "[older output evicted]\n\n"
+                             'face 'emacs-jupyter-notebook-result-header-face)))
+       (list :job (plist-put job :phase 'entry))))
+    ('entry
+     (let ((remaining (plist-get job :remaining-entries)))
+       (if (null remaining)
+           (list :job job :complete t)
+         (let ((entry (car remaining)))
+           (insert (emacs-jupyter-notebook-panel--format-header entry))
+           (setq job (plist-put job :remaining-entries (cdr remaining)))
+           (setq job (plist-put job :current-entry entry))
+           (setq job (plist-put job :current-segments
+                                (plist-get entry :outputs)))
+           (setq job (plist-put job :segment-index 0))
+           (list :job (plist-put job :phase 'segments))))))
+    ('segments
+     (let ((segments (plist-get job :current-segments)))
+       (if (null segments)
+           (list :job (emacs-jupyter-notebook-panel--sliced-render-finish-entry
+                       job))
+         (let* ((segment (car segments))
+                (index (plist-get job :segment-index)))
+           (setq job (plist-put job :current-segments (cdr segments)))
+           (setq job (plist-put job :segment-index (1+ index)))
+           (pcase (car-safe segment)
+             ('image
+              (if image-used
+                  ;; Restore the segment so the next timer callback sees it.
+                  (progn
+                    (setq job (plist-put job :current-segments segments))
+                    (setq job (plist-put job :segment-index index))
+                    (list :job job :blocked t))
+                (emacs-jupyter-notebook-panel--insert-image
+                 (cdr segment) index
+                 (member (cdr segment)
+                         (plist-get job :inline-image-specs)))
+                (unless (bolp) (insert "\n"))
+                (list :job job :image-p t)))
+             ('text
+              (let ((value (cdr segment)))
+                (setq job (plist-put job :text-segment segment))
+                (setq job (plist-put job :text-state
+                                     (and (emacs-jupyter-notebook-panel--text-state-p
+                                           value)
+                                          value)))
+                (setq job (plist-put job :text-chunks
+                                     (and (emacs-jupyter-notebook-panel--text-state-p
+                                           value)
+                                          (plist-get value :chunks))))
+                (setq job (plist-put job :text-value
+                                     (unless (emacs-jupyter-notebook-panel--text-state-p
+                                             value)
+                                       value)))
+                (setq job (plist-put job :text-position 0))
+                (setq job (plist-put job :text-had-content nil))
+                (setq job (plist-put job :text-index index))
+                (list :job (plist-put job :phase 'text))))
+             (_ (list :job job)))))))
+    ('text
+     (let ((state (plist-get job :text-state))
+           (index (plist-get job :text-index)))
+       (if state
+           (if-let ((chunks (plist-get job :text-chunks)))
+               (let* ((piece (car chunks))
+                      (bytes (string-bytes piece)))
+                 (if (> (+ text-budget bytes)
+                        emacs-jupyter-notebook-panel--sliced-render-max-text-bytes)
+                     (list :job job :blocked t)
+                   (emacs-jupyter-notebook-panel--sliced-render-insert-text
+                    piece index)
+                   (setq job (plist-put job :text-chunks (cdr chunks)))
+                   (setq job (plist-put job :text-had-content t))
+                   (list :job job :text-bytes bytes)))
+             (list :job (emacs-jupyter-notebook-panel--sliced-render-clear-text-pending
+                         job)))
+         (let* ((text (or (plist-get job :text-value) ""))
+                (position (or (plist-get job :text-position) 0)))
+           (if (>= position (length text))
+               (list :job (emacs-jupyter-notebook-panel--sliced-render-clear-text-pending
+                           job))
+             (let* ((next (emacs-jupyter-notebook-panel--sliced-render-raw-text-piece
+                           text position))
+                    (piece (car next))
+                    (bytes (string-bytes piece)))
+               (if (> (+ text-budget bytes)
+                      emacs-jupyter-notebook-panel--sliced-render-max-text-bytes)
+                   (list :job job :blocked t)
+                 (emacs-jupyter-notebook-panel--sliced-render-insert-text
+                  piece index)
+                 (setq job (plist-put job :text-position (cdr next)))
+                 (setq job (plist-put job :text-had-content t))
+                 (list :job job :text-bytes bytes))))))))
+    (_ (list :job job :complete t))))
+
+(defun emacs-jupyter-notebook-panel--sliced-render-arm (panel token)
+  "Schedule PANEL's next bounded full-render slice for TOKEN."
+  (setq emacs-jupyter-notebook-panel--sliced-render-timer
+        (run-at-time
+         emacs-jupyter-notebook-panel--sliced-render-delay nil
+         (lambda ()
+           (when (buffer-live-p panel)
+             (with-current-buffer panel
+               (emacs-jupyter-notebook-panel--sliced-render-tick panel token)))))))
+
+(defun emacs-jupyter-notebook-panel--sliced-render-tick (panel token)
+  "Render one bounded timer slice for PANEL when TOKEN still owns it."
+  (when (buffer-live-p panel)
+    (with-current-buffer panel
+      (when (and (= token emacs-jupyter-notebook-panel--sliced-render-generation)
+                 emacs-jupyter-notebook-panel--sliced-render-job)
+        (let ((inhibit-read-only t)
+              (job emacs-jupyter-notebook-panel--sliced-render-job)
+              (work 0)
+              (text-bytes 0)
+              (clear-characters 0)
+              (image-used nil)
+              complete blocked)
+          (setq emacs-jupyter-notebook-panel--sliced-render-timer nil)
+          (while (and (< work emacs-jupyter-notebook-panel--sliced-render-max-work-items)
+                      (not complete) (not blocked))
+            (let ((result
+                   (emacs-jupyter-notebook-panel--sliced-render-step
+                    job text-bytes image-used clear-characters)))
+              (setq job (plist-get result :job))
+              (cl-incf work)
+              (cl-incf text-bytes (or (plist-get result :text-bytes) 0))
+              (cl-incf clear-characters
+                       (or (plist-get result :clear-characters) 0))
+              (setq image-used (or image-used (plist-get result :image-p)))
+              (setq complete (plist-get result :complete))
+              (setq blocked (plist-get result :blocked))))
+          (setq emacs-jupyter-notebook-panel--sliced-render-job job)
+          (if complete
+              (progn
+                (setq emacs-jupyter-notebook-panel--sliced-render-job nil)
+                (cl-incf emacs-jupyter-notebook-panel--render-count)
+                (if (eq emacs-jupyter-notebook-panel--view 'history)
+                    (goto-char (point-max))
+                  (goto-char (point-min))))
+            (emacs-jupyter-notebook-panel--sliced-render-arm panel token)))))))
+
+(defun emacs-jupyter-notebook-panel--start-sliced-render (panel)
+  "Start a cancellable, bounded full render of PANEL on regular timers.
+Only fixed-size state is prepared synchronously.  The callback inserts at
+most `--sliced-render-max-text-bytes' text bytes and one image per tick."
+  (with-current-buffer panel
+    (emacs-jupyter-notebook-panel--cancel-sliced-render)
+    (let* ((entries (emacs-jupyter-notebook-panel--visible-entries))
+           (inline (emacs-jupyter-notebook-panel--bounded-inline-specs entries))
+           (token (cl-incf emacs-jupyter-notebook-panel--sliced-render-generation)))
+      (setq emacs-jupyter-notebook-panel--dirty-entry-ids nil)
+      (setq emacs-jupyter-notebook-panel--force-full-render nil)
+      (emacs-jupyter-notebook-panel--set-inline-specs inline)
+      (setq emacs-jupyter-notebook-panel--sliced-render-job
+            (list :phase 'begin
+                  :remaining-entries entries
+                  :inline-image-specs inline
+                  :current-entry nil
+                  :current-segments nil
+                  :segment-index 0))
+      (emacs-jupyter-notebook-panel--sliced-render-arm panel token))))
 
 (defun emacs-jupyter-notebook-panel--entry-bounds (id)
   "Return the rendered buffer bounds for entry ID, or nil."
@@ -966,45 +1572,83 @@ Return non-nil when the existing rendered text segment could be extended."
           (setq pos (next-single-property-change pos property nil (point-max))))
         (cons start pos)))))
 
-(defun emacs-jupyter-notebook-panel--render-dirty-entries (panel)
+(defun emacs-jupyter-notebook-panel--render-dirty-entries
+    (panel &optional sliced-fallback)
   "Incrementally re-render dirty entries in PANEL.
 Falls back to a full render if an affected visible entry has no existing
 section, which means ordering or view membership changed unexpectedly."
   (with-current-buffer panel
-    (let* ((ids (prog1 emacs-jupyter-notebook-panel--dirty-entry-ids
-                  (setq emacs-jupyter-notebook-panel--dirty-entry-ids nil)))
-           (visible (emacs-jupyter-notebook-panel--visible-entries))
-           (inline emacs-jupyter-notebook-panel--inline-image-specs)
-           (was-at-end (= (point) (point-max)))
-           (fallback nil)
-           (inhibit-read-only t))
+    (let ((ids (prog1 emacs-jupyter-notebook-panel--dirty-entry-ids
+                 (setq emacs-jupyter-notebook-panel--dirty-entry-ids nil))))
       (setq emacs-jupyter-notebook-panel--force-full-render nil)
-      (dolist (id ids)
-        (let ((entry (cl-find id visible :key (lambda (e) (plist-get e :id))))
-              (bounds (emacs-jupyter-notebook-panel--entry-bounds id)))
-          (cond
-           ((and entry bounds (plist-get entry :stream-dirty-p)
-                 (emacs-jupyter-notebook-panel--render-stream-suffix entry bounds)))
-           ((and entry bounds)
-            (save-excursion
-              (goto-char (car bounds))
-              (delete-region (car bounds) (cdr bounds))
-              (emacs-jupyter-notebook-panel--insert-entry entry inline)))
-           ((and (null entry) bounds)
-            (delete-region (car bounds) (cdr bounds)))
-           (entry
-            (setq fallback t)))))
-      (if fallback
-          (emacs-jupyter-notebook-panel--render panel)
-        (cl-incf emacs-jupyter-notebook-panel--render-count)
-        (when was-at-end
-          (goto-char (point-max)))))))
+      (if sliced-fallback
+          ;; This is the ordinary timer path.  Replacing one whole retained
+          ;; entry can still be 10 MiB, and a coalesced stream can carry up to
+          ;; 256 chunks, so only one bounded suffix patch is permitted here.
+          ;; Everything else restarts as a fully sliced presentation rebuild.
+          (if (/= (length ids) 1)
+              (emacs-jupyter-notebook-panel--start-sliced-render panel)
+            (let* ((visible (emacs-jupyter-notebook-panel--visible-entries))
+                   (entry (cl-find (car ids) visible
+                                   :key (lambda (e) (plist-get e :id))))
+                   (bounds (and entry
+                                (emacs-jupyter-notebook-panel--entry-bounds
+                                 (car ids))))
+                   (was-at-end (= (point) (point-max)))
+                   (inhibit-read-only t))
+              (if (and entry bounds (plist-get entry :stream-dirty-p)
+                       (emacs-jupyter-notebook-panel--render-stream-suffix
+                        entry bounds
+                        emacs-jupyter-notebook-panel--sliced-render-max-text-bytes))
+                  (progn
+                    (cl-incf emacs-jupyter-notebook-panel--render-count)
+                    (when was-at-end (goto-char (point-max))))
+                (emacs-jupyter-notebook-panel--start-sliced-render panel))))
+        ;; `flush-now' and direct diagnostic callers retain the former
+        ;; synchronous incremental behaviour; no ordinary command reaches
+        ;; this branch.
+        (let* ((visible (emacs-jupyter-notebook-panel--visible-entries))
+               ;; A same-entry image replacement may swap one inline spec for
+               ;; another without changing admission membership.  Refresh the
+               ;; bounded spec list before reinserting the dirty entry, while
+               ;; the caller's structural check decides whether another entry
+               ;; needs a full rebuild.
+               (inline (progn
+                         (emacs-jupyter-notebook-panel--set-inline-specs
+                          (emacs-jupyter-notebook-panel--bounded-inline-specs visible))
+                         emacs-jupyter-notebook-panel--inline-image-specs))
+               (was-at-end (= (point) (point-max)))
+               (fallback nil)
+               (inhibit-read-only t))
+          (dolist (id ids)
+            (let ((entry (cl-find id visible :key (lambda (e) (plist-get e :id))))
+                  (bounds (emacs-jupyter-notebook-panel--entry-bounds id)))
+              (cond
+               ((and entry bounds (plist-get entry :stream-dirty-p)
+                     (emacs-jupyter-notebook-panel--render-stream-suffix entry bounds)))
+               ((and entry bounds)
+                (save-excursion
+                  (goto-char (car bounds))
+                  (delete-region (car bounds) (cdr bounds))
+                  (emacs-jupyter-notebook-panel--insert-entry entry inline)))
+               ((and (null entry) bounds)
+                (delete-region (car bounds) (cdr bounds)))
+               (entry
+                (setq fallback t)))))
+          (if fallback
+              (emacs-jupyter-notebook-panel--render panel)
+            (cl-incf emacs-jupyter-notebook-panel--render-count)
+            (when was-at-end
+              (goto-char (point-max)))))))))
 
 (defun emacs-jupyter-notebook-panel--render (panel)
   "Render PANEL contents according to current view.
 History view auto-scrolls to the bottom of the buffer so the newest
 entry is visible; latest-per-cell view goes to the top."
   (with-current-buffer panel
+    ;; This is retained as the explicit synchronous diagnostic/test hook.
+    ;; Ordinary timer-driven full renders go through `--start-sliced-render'.
+    (emacs-jupyter-notebook-panel--cancel-sliced-render)
     (let ((inhibit-read-only t)
           (entries (emacs-jupyter-notebook-panel--visible-entries)))
       (setq emacs-jupyter-notebook-panel--dirty-entry-ids nil)
@@ -1066,9 +1710,28 @@ entry is visible; latest-per-cell view goes to the top."
 
 (defun emacs-jupyter-notebook-panel--materialize-image (panel image)
   "Move IMAGE's inline data to a private file owned by PANEL.
-Specs that already refer to a file, or do not contain string data, are
-returned unchanged.  The file is mode 0600 and written without coding."
-  (let ((data (and (consp image) (plist-get (cdr image) :data))))
+Specs already materialized by this panel, or without data/file payloads, are
+returned unchanged.  Arbitrary file specs are rejected without consulting
+file handlers.  A new private file is mode 0600 and written without coding."
+  (let* ((props (and (consp image) (cdr image)))
+         (data (and props (plist-get props :data)))
+         (file (and props (plist-get props :file)))
+         (data-bytes (and (stringp data) (string-bytes data))))
+    (when (stringp file)
+      ;; Arbitrary file specs are not part of the helper-only transport.  In
+      ;; particular, never let a TRAMP-looking value reach a file handler from
+      ;; this public presentation API.  Only a spec previously materialized by
+      ;; this exact panel may be reused.
+      (unless (and (plist-get props :ejn-artifact-identity)
+                   (integerp (plist-get props :ejn-artifact-bytes))
+                   (with-current-buffer panel
+                     (eq (plist-get props :ejn-artifact-capability)
+                         emacs-jupyter-notebook-panel--image-artifact-capability)))
+        (error "direct image file specs are not permitted")))
+    (when (and data-bytes
+               (> data-bytes emacs-jupyter-notebook-panel--max-inline-image-data-bytes))
+      (error "image data exceeds the %d-byte limit"
+             emacs-jupyter-notebook-panel--max-inline-image-data-bytes))
     (if (not (stringp data))
         (if (plist-member (cdr image) :ejn-artifact-bytes)
             image
@@ -1142,77 +1805,121 @@ releases them together during clear/kill."
         (when cap (puthash key cap table))
         cap))))
 
+(defun emacs-jupyter-notebook-panel--admitted-artifact-current-p (metadata limit)
+  "Return non-nil when admitted METADATA still names its pinned local leaf.
+This bounded native-boundary check performs no hash or content read and
+disables file-name handlers.  At most the hard inline-image count reaches it
+per render, so retained history cannot amplify the filesystem work."
+  (let ((root (plist-get metadata :root))
+        (path (plist-get metadata :file))
+        (size (plist-get metadata :size))
+        (file-name-handler-alist nil))
+    (and (eq (plist-get metadata :ejn-admitted)
+             emacs-jupyter-notebook-panel--admitted-metadata-token)
+         (stringp root) (file-name-absolute-p root)
+         (stringp path) (file-name-absolute-p path)
+         (integerp size) (<= 0 size limit)
+         (not (file-symlink-p root))
+         (not (file-symlink-p path))
+         (let ((root-attrs (file-attributes root 'integer))
+               (attrs (file-attributes path 'integer)))
+           (and root-attrs attrs
+                (eq (file-attribute-type root-attrs) t)
+                (null (file-attribute-type attrs))
+                (equal (file-attribute-user-id root-attrs) (user-uid))
+                (equal (file-attribute-user-id attrs) (user-uid))
+                (= (file-attribute-link-number attrs) 1)
+                (= (file-attribute-size attrs) size)
+                (equal (file-attribute-file-identifier root-attrs)
+                       (plist-get metadata :root-identity))
+                (equal (file-attribute-file-identifier attrs)
+                       (plist-get metadata :identity))
+                (equal (file-name-directory (directory-file-name path))
+                       (file-name-as-directory
+                        (directory-file-name (expand-file-name root))))
+                (= (logand (file-modes root) #o7777) #o700)
+                (= (logand (file-modes path) #o7777) #o600))))))
+
 (defun emacs-jupyter-notebook-panel--published-artifact-metadata
-    (root path sha256 size root-identity limit &optional ppm width height capability)
+    (root path sha256 size root-identity limit
+          &optional ppm width height capability cached)
   "Validate one pinned publication and return metadata for later retirement.
 When PPM is non-nil, only its bounded canonical header and declared total
 length are checked before a native image spec is created.  The trusted local
 helper parent already validated the complete worker output and SHA-256 before
 publication.  Original compressed files deliberately skip content reads here;
-they are copied and revalidated outside the UI thread before external opening."
-  (unless (and (stringp root) (file-name-absolute-p root)
-               (stringp path) (file-name-absolute-p path)
-               (stringp sha256) (string-equal sha256 (downcase sha256))
-               (string-match-p "\\`[0-9a-f]\\{64\\}\\'" sha256)
-               (integerp size) (<= 0 size limit) root-identity)
-    (error "invalid published artifact metadata"))
-  (let* ((root-name (directory-file-name (expand-file-name root)))
-         (path-name (expand-file-name path))
-         (capability (or capability
-                         (emacs-jupyter-notebook-panel--helper-artifact-capability
-                          root-name root-identity)))
-         (root-attrs (and (not (file-symlink-p root-name))
-                          (file-attributes root-name 'integer)))
-         (attrs (and (not (file-symlink-p path-name))
-                     (file-attributes path-name 'integer)))
-         (identity (and attrs (file-attribute-file-identifier attrs))))
-    (unless (and capability root-attrs attrs identity
-                 (file-directory-p root-name)
-                 (eq (file-attribute-type root-attrs) t)
-                 (equal (file-attribute-user-id root-attrs) (user-uid))
-                 (= (logand (file-modes root-name) #o7777) #o700)
-                 (equal root-identity (file-attribute-file-identifier root-attrs))
-                 (equal (file-name-directory (directory-file-name path-name))
-                        (file-name-as-directory root-name))
-                 (file-regular-p path-name) (null (file-attribute-type attrs))
-                 (= (file-attribute-link-number attrs) 1)
-                 (equal (file-attribute-user-id attrs) (user-uid))
-                 (= (logand (file-modes path-name) #o7777) #o600)
-                 (= (file-attribute-size attrs) size))
-      (error "unsafe published artifact"))
-    (when ppm
-      (let* ((prefix
-              (let ((file-name-handler-alist nil)
-                    (coding-system-for-read 'no-conversion))
-                (with-temp-buffer
-                  (set-buffer-multibyte nil)
-                  (insert-file-contents-literally
-                   path-name nil 0
-                   (min size emacs-jupyter-notebook-panel--ppm-header-read-limit))
-                  (buffer-string))))
-             (metadata
-              (emacs-jupyter-notebook-panel--canonical-ppm-header-metadata
-               prefix size)))
-        (unless (and metadata
-                     (= (plist-get metadata :width) width)
-                     (= (plist-get metadata :height) height))
-          (error "unsafe PPM preview"))))
-    ;; Re-observe names after the optional bounded hash/read before ownership
-    ;; transfer.  This captures each publication's own device/inode.
-    (let ((post-root (and (not (file-symlink-p root-name))
-                          (file-attributes root-name 'integer)))
-          (post (and (not (file-symlink-p path-name))
-                     (file-attributes path-name 'integer))))
-      (unless (and post-root post
-                   (equal root-identity (file-attribute-file-identifier post-root))
-                   (equal identity (file-attribute-file-identifier post))
-                   (= (file-attribute-size post) size)
-                   (= (file-attribute-link-number post) 1)
-                   (= (logand (file-modes path-name) #o7777) #o600))
-        (error "published artifact changed during validation")))
-    (list :root root-name :root-identity root-identity :file path-name
-          :identity identity :sha256 sha256 :size size
-          :artifact-capability capability)))
+they are copied and revalidated outside the UI thread before external opening.
+When CACHED is an admitted metadata plist, return it without touching the
+filesystem; this is used only by repeated native preview admission checks."
+  (if (and cached (listp cached))
+      (if (emacs-jupyter-notebook-panel--admitted-artifact-current-p
+           cached limit)
+          cached
+        (error "published artifact changed after admission"))
+    (unless (and (stringp root) (file-name-absolute-p root)
+                 (stringp path) (file-name-absolute-p path)
+                 (stringp sha256) (string-equal sha256 (downcase sha256))
+                 (string-match-p "\\`[0-9a-f]\\{64\\}\\'" sha256)
+                 (integerp size) (<= 0 size limit) root-identity)
+      (error "invalid published artifact metadata"))
+    (let* ((root-name (directory-file-name (expand-file-name root)))
+           (path-name (expand-file-name path))
+           (capability (or capability
+                           (emacs-jupyter-notebook-panel--helper-artifact-capability
+                            root-name root-identity)))
+           (root-attrs (and (not (file-symlink-p root-name))
+                            (file-attributes root-name 'integer)))
+           (attrs (and (not (file-symlink-p path-name))
+                       (file-attributes path-name 'integer)))
+           (identity (and attrs (file-attribute-file-identifier attrs))))
+      (unless (and capability root-attrs attrs identity
+                   (file-directory-p root-name)
+                   (eq (file-attribute-type root-attrs) t)
+                   (equal (file-attribute-user-id root-attrs) (user-uid))
+                   (= (logand (file-modes root-name) #o7777) #o700)
+                   (equal root-identity (file-attribute-file-identifier root-attrs))
+                   (equal (file-name-directory (directory-file-name path-name))
+                          (file-name-as-directory root-name))
+                   (file-regular-p path-name) (null (file-attribute-type attrs))
+                   (= (file-attribute-link-number attrs) 1)
+                   (equal (file-attribute-user-id attrs) (user-uid))
+                   (= (logand (file-modes path-name) #o7777) #o600)
+                   (= (file-attribute-size attrs) size))
+        (error "unsafe published artifact"))
+      (when ppm
+        (let* ((prefix
+                (let ((file-name-handler-alist nil)
+                      (coding-system-for-read 'no-conversion))
+                  (with-temp-buffer
+                    (set-buffer-multibyte nil)
+                    (insert-file-contents-literally
+                     path-name nil 0
+                     (min size emacs-jupyter-notebook-panel--ppm-header-read-limit))
+                    (buffer-string))))
+               (metadata
+                (emacs-jupyter-notebook-panel--canonical-ppm-header-metadata
+                 prefix size)))
+          (unless (and metadata
+                       (= (plist-get metadata :width) width)
+                       (= (plist-get metadata :height) height))
+            (error "unsafe PPM preview"))))
+      ;; Re-observe names after the optional bounded hash/read before ownership
+      ;; transfer.  This captures each publication's own device/inode.
+      (let ((post-root (and (not (file-symlink-p root-name))
+                            (file-attributes root-name 'integer)))
+            (post (and (not (file-symlink-p path-name))
+                       (file-attributes path-name 'integer))))
+        (unless (and post-root post
+                     (equal root-identity (file-attribute-file-identifier post-root))
+                     (equal identity (file-attribute-file-identifier post))
+                     (= (file-attribute-size post) size)
+                     (= (file-attribute-link-number post) 1)
+                     (= (logand (file-modes path-name) #o7777) #o600))
+          (error "published artifact changed during validation")))
+      (list :root root-name :root-identity root-identity :file path-name
+            :identity identity :sha256 sha256 :size size
+            :artifact-capability capability
+            :ejn-admitted emacs-jupyter-notebook-panel--admitted-metadata-token))))
 
 (defun emacs-jupyter-notebook-panel--published-image-bundle-spec (image)
   "Validate nested IMAGE descriptor and construct its panel image spec.
@@ -1414,7 +2121,9 @@ pickle follows the image's existing cross-entry target."
                        (emacs-jupyter-notebook-panel--published-image-bundle-spec
                         image))))
                (old-entry (ejn-panel-entry-snapshot effective))
-               old-images old-pickle old-timer replace-pickle-p new-entry committed)
+               old-images old-image-replaced old-pickle old-timer
+               dropped-image dropped-pickle segment-omitted
+               replace-pickle-p new-entry committed)
           (when old-entry
             (setq old-pickle (plist-get old-entry :mpl-pickle)
                   old-timer (plist-get old-entry :pickle-open-timer))
@@ -1433,6 +2142,7 @@ pickle follows the image's existing cross-entry target."
                 (setq new
                       (emacs-jupyter-notebook-panel--entry-reset-output-accounting
                        new)))
+              (setq new (plist-put new :outputs outputs))
               (when image-spec
                 (if update-p
                     (let ((matching
@@ -1447,15 +2157,34 @@ pickle follows the image's existing cross-entry target."
                                  (reverse outputs)))))
                       (if matching
                           (progn
-                            (setq old-images (list (cdr matching)))
+                            (setq old-image-replaced (cdr matching)
+                                  old-images (list old-image-replaced))
                             (setcdr matching image-spec))
                         ;; clear_output(wait=True) deliberately turns the next
                         ;; update into the first new output segment.
-                        (setq outputs
-                              (append outputs (list (cons 'image image-spec))))))
-                  (setq outputs
-                        (append outputs (list (cons 'image image-spec))))))
+                        (if (emacs-jupyter-notebook-panel--entry-output-room-p
+                             new)
+                            (setq outputs
+                                  (append outputs
+                                          (list (cons 'image image-spec))))
+                          (setq dropped-image image-spec
+                                dropped-pickle pickle-meta
+                                image-spec nil
+                                pickle-meta nil
+                                segment-omitted t))))
+                  (if (emacs-jupyter-notebook-panel--entry-output-room-p new)
+                      (setq outputs
+                            (append outputs (list (cons 'image image-spec))))
+                    (setq dropped-image image-spec
+                          dropped-pickle pickle-meta
+                          image-spec nil
+                          pickle-meta nil
+                          segment-omitted t))))
               (setq new (plist-put new :outputs outputs))
+              (when segment-omitted
+                (setq new
+                      (emacs-jupyter-notebook-panel--entry-note-segment-omission
+                       new)))
               ;; A new image without a pickle clears the stale interactive
               ;; figure.  A pickle-only bundle leaves image output intact.
               (setq replace-pickle-p (or pending-clear pickle-meta image-spec))
@@ -1480,13 +2209,23 @@ pickle follows the image's existing cross-entry target."
                             (emacs-jupyter-notebook-panel--entry-text-bytes old-entry)))
                 (cl-incf emacs-jupyter-notebook-panel--retained-artifact-bytes
                          (- (emacs-jupyter-notebook-panel--entry-artifact-bytes new-entry)
-                            (emacs-jupyter-notebook-panel--entry-artifact-bytes old-entry))))
+                            (emacs-jupyter-notebook-panel--entry-artifact-bytes old-entry)))
+                (cl-incf emacs-jupyter-notebook-panel--retained-output-segments
+                         (- (length (plist-get new-entry :outputs))
+                            (length (plist-get old-entry :outputs)))))
               (emacs-jupyter-notebook-panel--set-entry
                panel (plist-get effective :id) new-entry)
               (setq committed t)
               (condition-case err
                   (emacs-jupyter-notebook-panel--schedule-render
-                   panel (plist-get effective :id) t)
+                   panel (plist-get effective :id)
+                   (cond
+                    ((not update-p) t)
+                    ((null image-spec) nil)
+                    ((null old-image-replaced) t)
+                    (t
+                     (emacs-jupyter-notebook-panel--image-update-needs-full-p
+                      panel new-entry old-image-replaced image-spec))))
                 (error
                  (message "emacs-jupyter-notebook: panel render scheduling failed: %s"
                           (error-message-string err)))))
@@ -1495,6 +2234,10 @@ pickle follows the image's existing cross-entry target."
               ;; validation or construction error above leaves these live.
               (dolist (old-image old-images)
                 (emacs-jupyter-notebook-panel--retire-image panel old-image))
+              (when dropped-image
+                (emacs-jupyter-notebook-panel--retire-image panel dropped-image))
+              (when dropped-pickle
+                (emacs-jupyter-notebook-panel--retire-pickle dropped-pickle))
               (when (and replace-pickle-p old-pickle)
                 (when (timerp old-timer)
                   (cancel-timer old-timer))
@@ -1630,18 +2373,12 @@ removed, so a failed batch remains conservatively owned and retriable."
   (or (plist-get entry :retained-text-bytes) 0))
 
 (defun emacs-jupyter-notebook-panel--image-artifact-bytes (image)
-  "Return retained artifact bytes for IMAGE, using its actual file size."
+  "Return retained artifact bytes for IMAGE without consulting its file name."
   (let* ((props (cdr-safe image))
-         (file (plist-get props :file))
+         (cached (plist-get props :ejn-artifact-bytes))
          (data (plist-get props :data)))
     (cond
-     ((and (stringp file) (file-exists-p file))
-      ;; Accounting must not expose a local cleanup race to an output callback.
-      (condition-case nil
-          (let ((size (file-attribute-size (file-attributes file))))
-            (if (and (numberp size) (>= size 0)) size 0))
-        (file-error 0)
-        (error 0)))
+     ((and (integerp cached) (>= cached 0)) cached)
      ((stringp data) (string-bytes data))
      (t 0))))
 
@@ -1676,6 +2413,11 @@ removed, so a failed batch remains conservatively owned and retriable."
                             sum (emacs-jupyter-notebook-panel--recompute-entry-artifact-bytes
                                  (cdr cell)))))
 
+(defun emacs-jupyter-notebook-panel--recompute-output-segments ()
+  "Return the recomputed output-segment count for test introspection."
+  (cl-loop for cell in emacs-jupyter-notebook-panel--entries
+           sum (length (plist-get (cdr cell) :outputs))))
+
 (defun emacs-jupyter-notebook-panel--total-text-bytes ()
   "Return the total retained text byte count in the current panel."
   emacs-jupyter-notebook-panel--retained-text-bytes)
@@ -1687,11 +2429,19 @@ removed, so a failed batch remains conservatively owned and retriable."
 (defun emacs-jupyter-notebook-panel--over-retention-budget-p ()
   "Return non-nil when the current panel exceeds any configured budget."
   (or (> (length emacs-jupyter-notebook-panel--entries)
-         emacs-jupyter-notebook-panel-max-history-entries)
+         (emacs-jupyter-notebook-panel--positive-clamped
+          emacs-jupyter-notebook-panel-max-history-entries
+          emacs-jupyter-notebook-panel--hard-history-entries))
       (> (emacs-jupyter-notebook-panel--total-text-bytes)
-         emacs-jupyter-notebook-panel-max-total-text-bytes)
+         (emacs-jupyter-notebook-panel--positive-clamped
+          emacs-jupyter-notebook-panel-max-total-text-bytes
+          emacs-jupyter-notebook-panel--hard-total-text-bytes))
       (> (emacs-jupyter-notebook-panel--total-artifact-bytes)
-         emacs-jupyter-notebook-panel-max-total-artifact-bytes)))
+         (emacs-jupyter-notebook-panel--positive-clamped
+          emacs-jupyter-notebook-panel-max-total-artifact-bytes
+          emacs-jupyter-notebook-panel--hard-total-artifact-bytes))
+      (> emacs-jupyter-notebook-panel--retained-output-segments
+         (emacs-jupyter-notebook-panel--output-segment-budget))))
 
 (defun emacs-jupyter-notebook-panel--oldest-evictable-cell ()
   "Return the oldest cell that is not the latest result for its cell key.
@@ -1719,6 +2469,8 @@ configured budgets remain hard limits."
              (emacs-jupyter-notebook-panel--entry-text-bytes entry))
     (cl-decf emacs-jupyter-notebook-panel--retained-artifact-bytes
              (emacs-jupyter-notebook-panel--entry-artifact-bytes entry))
+    (cl-decf emacs-jupyter-notebook-panel--retained-output-segments
+             (length (plist-get entry :outputs)))
     (emacs-jupyter-notebook-panel--retire-outputs panel
                                                    (plist-get entry :outputs))
     (setq entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer entry))
@@ -1819,7 +2571,8 @@ normal Emacs exit; it never consults source, registry, SSH, or kernel state."
             emacs-jupyter-notebook-panel--image-artifact-capability nil
             emacs-jupyter-notebook-panel--published-artifact-capabilities nil)
       (setq emacs-jupyter-notebook-panel--retained-text-bytes 0
-            emacs-jupyter-notebook-panel--retained-artifact-bytes 0))))
+            emacs-jupyter-notebook-panel--retained-artifact-bytes 0
+            emacs-jupyter-notebook-panel--retained-output-segments 0))))
 
 (defun ejn-panel-clear-all (panel)
   "Retire all PANEL artifacts and entries, invalidating their handles."
@@ -1828,7 +2581,8 @@ normal Emacs exit; it never consults source, registry, SSH, or kernel state."
       (emacs-jupyter-notebook-panel--retire-all-artifacts panel)
       (setq emacs-jupyter-notebook-panel--entries nil)
       (setq emacs-jupyter-notebook-panel--retained-text-bytes 0
-            emacs-jupyter-notebook-panel--retained-artifact-bytes 0)
+            emacs-jupyter-notebook-panel--retained-artifact-bytes 0
+            emacs-jupyter-notebook-panel--retained-output-segments 0)
       (setq emacs-jupyter-notebook-panel--history-evicted-p nil)
       (cl-incf emacs-jupyter-notebook-panel--generation)
       (emacs-jupyter-notebook-panel--invalidate-structure panel))))
@@ -1890,6 +2644,20 @@ Text properties (ANSI-coloured spans) are preserved."
        (split-string text "\n")
        "\n"))))
 
+(defun emacs-jupyter-notebook-panel--carriage-rewrites-current-line-p (text)
+  "Return non-nil when TEXT's first logical line contains a bare carriage."
+  (let ((index 0) found done)
+    (while (and (< index (length text)) (not done))
+      (pcase (aref text index)
+        (?\n (setq done t))
+        (?\r
+         (if (and (< (1+ index) (length text))
+                  (eq (aref text (1+ index)) ?\n))
+             (setq done t)
+           (setq found t done t))))
+      (setq index (1+ index)))
+    found))
+
 (defun ejn-panel-entry-text (handle-or-entry)
   "Return the concatenated text of all text segments, or \"\" when none.
 HANDLE-OR-ENTRY is an entry handle plist (with a `:panel' key) or a raw
@@ -1916,14 +2684,43 @@ entry plist."
   (setq entry (plist-put entry :output-text-bytes 0))
   (setq entry (plist-put entry :retained-text-bytes
                          (string-bytes (or (plist-get entry :code) ""))))
-  (plist-put entry :artifact-bytes 0))
+  (setq entry (plist-put entry :artifact-bytes 0))
+  (plist-put entry :output-segments-truncated nil))
+
+(defun emacs-jupyter-notebook-panel--entry-output-room-p (entry)
+  "Return non-nil when ENTRY can retain one more ordinary output segment.
+One final slot is reserved for the explicit omission marker."
+  (and (not (plist-get entry :output-segments-truncated))
+       (< (length (plist-get entry :outputs))
+          (1- emacs-jupyter-notebook-panel--hard-entry-output-segments))))
+
+(defun emacs-jupyter-notebook-panel--entry-note-segment-omission (entry)
+  "Append ENTRY's one bounded output-omission marker and return ENTRY."
+  (if (plist-get entry :output-segments-truncated)
+      entry
+    (let* ((text emacs-jupyter-notebook-panel--segment-omission-text)
+           (bytes (string-bytes text))
+           (outputs (plist-get entry :outputs)))
+      (setq entry
+            (plist-put entry :outputs
+                       (append outputs
+                               (list
+                                (cons 'text
+                                      (emacs-jupyter-notebook-panel--make-text-state
+                                       text))))))
+      (setq entry (plist-put entry :output-text-bytes
+                             (+ (plist-get entry :output-text-bytes) bytes)))
+      (setq entry (plist-put entry :retained-text-bytes
+                             (+ (string-bytes (or (plist-get entry :code) ""))
+                                (plist-get entry :output-text-bytes))))
+      (plist-put entry :output-segments-truncated t))))
 
 (defun emacs-jupyter-notebook-panel--entry-trim-text (entry)
   "Trim ENTRY's oldest text chunks to its per-entry byte budget."
   (let ((old-total (plist-get entry :output-text-bytes))
         (removed 0)
         (excess (- (plist-get entry :output-text-bytes)
-                   emacs-jupyter-notebook-result-max-bytes)))
+                   (emacs-jupyter-notebook-panel--entry-text-budget))))
     (when (> excess 0)
       (dolist (segment (plist-get entry :outputs))
         (when (and (> excess 0) (eq (car segment) 'text))
@@ -1992,45 +2789,80 @@ colours are preserved and uncoloured spans still get the fallback FACE."
                 (before (plist-get entry :output-text-bytes))
                 (after (plist-get entry :output-text-bytes))
                 (carriage-p (string-search "\r" display-text)))
-           (if (and last-seg (eq (car last-seg) 'text)
+           (if (and (not (plist-get entry :output-segments-truncated))
+                    last-seg (eq (car last-seg) 'text)
                     ;; A display-id segment is replaceable independently of
                     ;; ordinary stream output; never merge later streams into it.
                     (not (and (emacs-jupyter-notebook-panel--text-state-p (cdr last-seg))
                               (plist-get (cdr last-seg) :display-id))))
                (if carriage-p
-                   ;; Carriage returns rewrite an existing terminal line.  They
-                   ;; are uncommon; materialize once to preserve exact W14 semantics.
-                   (let ((resolved (emacs-jupyter-notebook--apply-carriage-returns
-                                    (concat (emacs-jupyter-notebook-panel--text-state-value
-                                             last-seg)
-                                            display-text))))
-                     (setq after (+ (- before
-                                       (emacs-jupyter-notebook-panel--text-segment-bytes
-                                        last-seg))
-                                    (string-bytes resolved)))
-                     (setcdr last-seg (emacs-jupyter-notebook-panel--make-text-state resolved))
+                   ;; Resolve only the bounded incoming frame.  Chunk metadata
+                   ;; identifies the current terminal line, so a progress
+                   ;; repaint never materializes megabytes of retained history.
+                   (let* ((segment-before
+                           (emacs-jupyter-notebook-panel--text-segment-bytes
+                            last-seg))
+                          (state (cdr last-seg))
+                          (state
+                           (if (emacs-jupyter-notebook-panel--text-state-p state)
+                               state
+                             (emacs-jupyter-notebook-panel--make-text-state state)))
+                          (resolved
+                           (emacs-jupyter-notebook--apply-carriage-returns
+                            display-text)))
+                     (when (emacs-jupyter-notebook-panel--carriage-rewrites-current-line-p
+                            display-text)
+                       (setq state
+                             (emacs-jupyter-notebook-panel--text-state-drop-current-line
+                              state)))
+                     (setq state
+                           (emacs-jupyter-notebook-panel--text-state-append
+                            state resolved))
+                     (setcdr last-seg state)
+                     (setq after (+ (- before segment-before)
+                                    (plist-get state :bytes)))
                      (setq force-full t))
-                 (let ((state (cdr last-seg)))
+                 (let ((state (cdr last-seg))
+                       (segment-before
+                        (emacs-jupyter-notebook-panel--text-segment-bytes
+                         last-seg)))
                    (unless (emacs-jupyter-notebook-panel--text-state-p state)
                      (setq state (emacs-jupyter-notebook-panel--make-text-state state)))
-                   (setcdr last-seg
-                           (emacs-jupyter-notebook-panel--text-state-append
-                            state display-text))
-                   (setq after (+ after (string-bytes display-text)))))
-             (let ((state (emacs-jupyter-notebook-panel--make-text-state
-                           (if carriage-p
-                               (emacs-jupyter-notebook--apply-carriage-returns display-text)
-                             display-text))))
-               (setq outputs (nconc outputs (list (cons 'text state))))
-               (setq after (+ after (string-bytes (if carriage-p
-                                                        (emacs-jupyter-notebook--apply-carriage-returns display-text)
-                                                      display-text))))))
+                   (setq state
+                         (emacs-jupyter-notebook-panel--text-state-append
+                          state display-text))
+                   (setcdr last-seg state)
+                   (setq after (+ (- before segment-before)
+                                  (plist-get state :bytes)))
+                   (when (plist-get state :pending-overflow)
+                     (setq force-full t))))
+             (if (emacs-jupyter-notebook-panel--entry-output-room-p entry)
+                 (let* ((resolved
+                         (if carriage-p
+                             (emacs-jupyter-notebook--apply-carriage-returns
+                              display-text)
+                           display-text))
+                        (state
+                         (emacs-jupyter-notebook-panel--make-text-state resolved)))
+                   (setq outputs (nconc outputs (list (cons 'text state))))
+                   (setq after (+ after (string-bytes resolved))))
+               (unless (plist-get entry :output-segments-truncated)
+                 (let ((marker emacs-jupyter-notebook-panel--segment-omission-text))
+                   (setq outputs
+                         (nconc outputs
+                                (list
+                                 (cons 'text
+                                       (emacs-jupyter-notebook-panel--make-text-state
+                                        marker)))))
+                   (setq after (+ after (string-bytes marker)))
+                   (setq entry (plist-put entry :output-segments-truncated t))
+                   (setq force-full t)))))
            (setq entry (plist-put entry :outputs outputs))
            (setq entry (plist-put entry :output-text-bytes after))
            (setq entry (plist-put entry :retained-text-bytes
                                   (+ (string-bytes (or (plist-get entry :code) "")) after)))
            (when (> (plist-get entry :output-text-bytes)
-                    emacs-jupyter-notebook-result-max-bytes)
+                    (emacs-jupyter-notebook-panel--entry-text-budget))
              (setq entry (emacs-jupyter-notebook-panel--entry-trim-text entry))
              (setq force-full t))
            (setq entry (plist-put entry :pending-clear nil))
@@ -2071,19 +2903,22 @@ When KIND is non-nil, only a segment whose car is KIND can match."
        handle
        (lambda (entry)
          (setq entry (emacs-jupyter-notebook-panel--entry-after-pending-clear panel entry))
-         (let ((outputs (plist-get entry :outputs)))
-           (setq entry (plist-put entry :outputs
-                                  (append outputs
-                                          (list (cons 'text
-                                                      (plist-put
-                                                       (emacs-jupyter-notebook-panel--make-text-state text)
-                                                       :display-id display-id))))))
-           (setq entry (plist-put entry :output-text-bytes
-                                  (+ (plist-get entry :output-text-bytes) (string-bytes text))))
-           (setq entry (plist-put entry :retained-text-bytes
-                                  (+ (string-bytes (or (plist-get entry :code) ""))
-                                     (plist-get entry :output-text-bytes))))
-           (plist-put entry :pending-clear nil)))
+         (if (emacs-jupyter-notebook-panel--entry-output-room-p entry)
+             (let ((outputs (plist-get entry :outputs)))
+               (setq entry (plist-put entry :outputs
+                                      (append outputs
+                                              (list (cons 'text
+                                                          (plist-put
+                                                           (emacs-jupyter-notebook-panel--make-text-state text)
+                                                           :display-id display-id))))))
+               (setq entry (plist-put entry :output-text-bytes
+                                      (+ (plist-get entry :output-text-bytes)
+                                         (string-bytes text))))
+               (setq entry (plist-put entry :retained-text-bytes
+                                      (+ (string-bytes (or (plist-get entry :code) ""))
+                                         (plist-get entry :output-text-bytes))))
+               (plist-put entry :pending-clear nil))
+           (emacs-jupyter-notebook-panel--entry-note-segment-omission entry)))
        t)
       (emacs-jupyter-notebook-panel--enforce-retention-budgets panel)
       t)))
@@ -2143,6 +2978,7 @@ replaced whatever figure the entry previously showed."
                                    (plist-get entry :output-text-bytes))))
          (setq entry (plist-put entry :artifact-bytes 0))
          (setq entry (plist-put entry :pending-clear nil))
+         (setq entry (plist-put entry :output-segments-truncated nil))
          entry)
        t)
       (emacs-jupyter-notebook-panel--enforce-retention-budgets panel))))
@@ -2162,15 +2998,20 @@ get their own segment."
            (lambda (entry)
              (setq entry (emacs-jupyter-notebook-panel--entry-after-pending-clear
                           panel entry))
-             (let ((outputs (plist-get entry :outputs)))
-               (setq entry (plist-put entry :outputs
-                                      (append outputs
-                                              (list (cons 'image stored)))))
-               (setq entry (plist-put entry :artifact-bytes
-                                      (+ (plist-get entry :artifact-bytes)
-                                         (or (plist-get (cdr stored) :ejn-artifact-bytes) 0))))
-               (setq entry (plist-put entry :pending-clear nil))
-               entry))
+             (if (emacs-jupyter-notebook-panel--entry-output-room-p entry)
+                 (let ((outputs (plist-get entry :outputs)))
+                   (setq entry (plist-put entry :outputs
+                                          (append outputs
+                                                  (list (cons 'image stored)))))
+                   (setq entry (plist-put entry :artifact-bytes
+                                          (+ (plist-get entry :artifact-bytes)
+                                             (or (plist-get (cdr stored)
+                                                            :ejn-artifact-bytes)
+                                                 0))))
+                   (setq entry (plist-put entry :pending-clear nil))
+                   entry)
+               (emacs-jupyter-notebook-panel--retire-image panel stored)
+               (emacs-jupyter-notebook-panel--entry-note-segment-omission entry)))
            t)
           (emacs-jupyter-notebook-panel--enforce-retention-budgets panel))))))
 
@@ -2186,7 +3027,21 @@ so text segments are left untouched and no new segment is created."
            (target (and display-id
                         (emacs-jupyter-notebook-panel--display-target
                          panel display-id 'image)))
-           (effective-handle (if target (car target) handle)))
+           (effective-handle (if target (car target) handle))
+           (old-entry (and effective-handle
+                           (ejn-panel-entry-snapshot effective-handle)))
+           (old-image
+            (and old-entry
+                 (cdr (if display-id
+                          (cl-find-if
+                           (lambda (segment)
+                             (and (eq (car segment) 'image)
+                                  (equal
+                                   (plist-get (cdr (cdr segment)) :ejn-display-id)
+                                   display-id)))
+                           (reverse (plist-get old-entry :outputs)))
+                        (cl-find 'image (reverse (plist-get old-entry :outputs))
+                                 :key #'car))))))
       (when (or (null display-id) target)
         (when (ejn-panel-entry-live-p effective-handle)
           (let ((stored (emacs-jupyter-notebook-panel--materialize-image
@@ -2211,22 +3066,35 @@ so text segments are left untouched and no new segment is created."
                             (or (plist-get (cdr (cdr last-image))
                                            :ejn-artifact-bytes)
                                 0))))
-                 (if last-image
-                     (progn
-                       (emacs-jupyter-notebook-panel--retire-image
-                        panel (cdr last-image))
-                       (setcdr last-image stored))
-                   (setq outputs (append outputs (list (cons 'image stored)))))
-                 (setq entry (plist-put entry :outputs outputs))
-                 (setq entry
-                       (plist-put
-                        entry :artifact-bytes
-                        (+ (- (plist-get entry :artifact-bytes)
-                              (or old-image-bytes 0))
-                           (or (plist-get (cdr stored) :ejn-artifact-bytes) 0))))
-                 (setq entry (plist-put entry :pending-clear nil))
-                 entry))
-             t)
+                 (cond
+                  (last-image
+                   (emacs-jupyter-notebook-panel--retire-image
+                    panel (cdr last-image))
+                   (setcdr last-image stored)
+                   (setq entry (plist-put entry :outputs outputs))
+                   (setq entry
+                         (plist-put
+                          entry :artifact-bytes
+                          (+ (- (plist-get entry :artifact-bytes)
+                                (or old-image-bytes 0))
+                             (or (plist-get (cdr stored) :ejn-artifact-bytes) 0))))
+                   (plist-put entry :pending-clear nil))
+                  ((emacs-jupyter-notebook-panel--entry-output-room-p entry)
+                   (setq outputs (append outputs (list (cons 'image stored))))
+                   (setq entry (plist-put entry :outputs outputs))
+                   (setq entry
+                         (plist-put
+                          entry :artifact-bytes
+                          (+ (plist-get entry :artifact-bytes)
+                             (or (plist-get (cdr stored) :ejn-artifact-bytes) 0))))
+                   (plist-put entry :pending-clear nil))
+                  (t
+                   (emacs-jupyter-notebook-panel--retire-image panel stored)
+                   (emacs-jupyter-notebook-panel--entry-note-segment-omission
+                    entry)))))
+             (lambda (_before after)
+               (emacs-jupyter-notebook-panel--image-update-needs-full-p
+                panel after old-image stored)))
             (emacs-jupyter-notebook-panel--enforce-retention-budgets panel)
             t))))))
 
@@ -2239,8 +3107,7 @@ so text segments are left untouched and no new segment is created."
        (setq entry (plist-put entry :status (or status 'ok)))
        (when execution-count
          (setq entry (plist-put entry :exec-count execution-count)))
-       entry))
-    (emacs-jupyter-notebook-panel-flush-now (plist-get handle :panel))))
+       entry))))
 
 (defun ejn-panel-set-entry-status (handle status)
   "Set live HANDLE to nonterminal STATUS without fabricating an execution count.
@@ -2395,7 +3262,6 @@ above it yields an `equal' key."
   ;; A pending content update may name an entry that is absent from one view
   ;; or leave other entries unrendered in the newly selected view.
   (emacs-jupyter-notebook-panel--invalidate-structure (current-buffer))
-  (emacs-jupyter-notebook-panel-flush-now (current-buffer))
   (message "EJN panel view: %s" emacs-jupyter-notebook-panel--view))
 
 (defun emacs-jupyter-notebook-panel-quit ()
@@ -2444,7 +3310,8 @@ only reliable way to rescale.  Two defects made the zoom keys look dead:
   reliably picked up.  The rebuilt spec (a fresh object, plus
   `image-flush' on the old one) always re-renders.
 The new spec is stored back on the ENTRY so the zoom level survives
-subsequent panel re-renders, and point is restored after the re-render.
+subsequent panel re-renders.  The selected display property is refreshed in
+place; the normal throttled renderer updates remaining image rows later.
 Also coerces a non-numeric `:scale' (Emacs 29+ reports the symbol
 `default' for unset) to 1.0 before multiplying."
   (let* ((id (emacs-jupyter-notebook-panel--entry-id-at-point))
@@ -2471,9 +3338,20 @@ Also coerces a non-numeric `:scale' (Emacs 29+ reports the symbol
         ;; Mutate the segment in place; the entry list structure is shared
         ;; with the stored entry, so the new spec persists across renders.
         (setcdr seg new-image)
-        (let ((pos (point)))
-          (emacs-jupyter-notebook-panel--render (current-buffer))
-          (goto-char (min pos (point-max))))))))
+        (let ((panel (current-buffer))
+              (pos (point))
+              (inhibit-read-only t))
+          ;; Do the visible selected image immediately, but never synchronously
+          ;; rebuild a whole capped panel merely to zoom one figure.  A sliced
+          ;; image may have several rows; the scheduled pass restores every
+          ;; row from the durable segment spec without blocking this command.
+          (when (get-text-property pos 'display)
+            (put-text-property
+             pos (next-single-property-change pos 'display nil (point-max))
+             'display
+             (or (emacs-jupyter-notebook-panel--native-preview-spec new-image)
+                 new-image)))
+          (emacs-jupyter-notebook-panel--schedule-render panel id nil))))))
 
 (defun emacs-jupyter-notebook-panel-image-zoom-in ()
   "Zoom in the image at point in the panel."
@@ -2675,8 +3553,17 @@ placeholders.  On an entry header, fall back to its first image segment."
 (declare-function w32-shell-execute "w32fns.c"
                   (operation document &optional parameters show-flag))
 
+(defconst emacs-jupyter-notebook-panel--external-opener-timeout 30
+  "Immutable maximum lifetime in seconds for one external opener child.
+Platform launchers such as `xdg-open' and `open' normally exit immediately.
+Keeping a direct configured viewer child indefinitely is a local process leak,
+so this hard watchdog always owns only that exact child process.")
+
 (defun emacs-jupyter-notebook-panel--spawn-external-opener (command file)
-  "Start COMMAND asynchronously with FILE appended to its argv."
+  "Start COMMAND asynchronously with FILE appended to its argv.
+The returned child has an identity-bound watchdog.  Either its sentinel or the
+watchdog disposes the process exactly once; a timer from an older invocation
+cannot affect a later viewer process or its independently retained snapshot."
   (let ((program (car command)))
     (unless (and program
                  (or (and (file-name-absolute-p program)
@@ -2685,15 +3572,64 @@ placeholders.  On an entry header, fall back to its first image segment."
       (user-error
        "No external image opener found; customize `%s'"
        'emacs-jupyter-notebook-external-image-viewer-command))
-    (make-process
-     :name (generate-new-buffer-name "ejn-image-viewer")
-     :buffer nil
-     :command (append command (list file))
-     :connection-type 'pipe
-     :noquery t
-     :sentinel (lambda (process _event)
-                 (unless (process-live-p process)
-                   (delete-process process))))))
+    (let (process watchdog settled)
+      (let ((token (list 'ejn-image-viewer)))
+        (cl-labels
+            ((settle (kill)
+               (when (and (processp process)
+                          (eq (process-get process
+                                           'emacs-jupyter-notebook-panel--external-opener-token)
+                              token)
+                          (not settled))
+                 ;; Mark settled before `delete-process': its sentinel may be
+                 ;; invoked synchronously, and must not perform a second
+                 ;; delete or cancel a watchdog belonging to another opener.
+                 (setq settled t)
+                 (when (timerp watchdog) (cancel-timer watchdog))
+                 (process-put process
+                              'emacs-jupyter-notebook-panel--external-opener-watchdog
+                              nil)
+                 (when (or kill (not (process-live-p process)))
+                   (delete-process process)))))
+          (setq process
+                (make-process
+                 :name (generate-new-buffer-name "ejn-image-viewer")
+                 :buffer nil
+                 :command (append command (list file))
+                 :connection-type 'pipe
+                 :noquery t
+                 :sentinel (lambda (current _event)
+                             (when (and (eq current process)
+                                        (not (process-live-p current)))
+                               (settle nil)))))
+          (process-put process
+                       'emacs-jupyter-notebook-panel--external-opener-token token)
+          (condition-case err
+              (setq watchdog
+                    (run-at-time
+                     emacs-jupyter-notebook-panel--external-opener-timeout nil
+                     (lambda () (settle t))))
+            ;; A failure to arm the watchdog must not leave this exact
+            ;; configured opener child running without a deadline.
+            (error
+             (settle t)
+             (signal (car err) (cdr err))))
+          (cond
+           ;; A very short-lived child may have reached its sentinel between
+           ;; token attachment and timer setup.  Do not leave a no-op timer
+           ;; retaining its closure until the hard deadline.
+           (settled
+            (cancel-timer watchdog))
+           (t
+            (process-put process
+                         'emacs-jupyter-notebook-panel--external-opener-watchdog
+                         watchdog)
+            ;; A sentinel cannot claim an exit before the token is attached.
+            ;; Recheck after both private properties exist and settle now if
+            ;; the child died in that small setup window.
+            (unless (process-live-p process)
+              (settle nil))))
+          process)))))
 
 (defun emacs-jupyter-notebook-panel--external-open-default (file)
   "Open FILE asynchronously using the configured or platform image opener."
@@ -2827,10 +3763,20 @@ durably copied into SNAPSHOT.  Return a no-argument cancellation function."
                  (unless (process-live-p current)
                    (finish (and (eq (process-status current) 'exit)
                                 (= (process-exit-status current) 0)))))))
-        (setq timer
-              (run-at-time
-               emacs-jupyter-notebook-panel--original-verify-timeout nil
-               (lambda () (finish nil))))
+        ;; The verifier is useful only while its hard deadline exists.  If
+        ;; timer construction fails after process creation, retire that exact
+        ;; child and settle the callback before propagating the setup error.
+        ;; A very short-lived verifier may also run its sentinel from inside
+        ;; `make-process'; do not retain a no-op timer in that case.
+        (unless settled
+          (condition-case err
+              (setq timer
+                    (run-at-time
+                     emacs-jupyter-notebook-panel--original-verify-timeout nil
+                     (lambda () (finish nil))))
+            (error
+             (finish nil)
+             (signal (car err) (cdr err)))))
         (lambda ()
           (unless settled
             (when (and (processp process) (process-live-p process))
@@ -2902,13 +3848,39 @@ It returns a no-argument function which cancels the pending verification.")
           emacs-jupyter-notebook-panel--max-published-original-bytes
           nil nil nil (plist-get snapshot :artifact-capability))))
     (plist-put snapshot :artifact artifact)
-    (push snapshot emacs-jupyter-notebook-panel--external-image-snapshots)
+    ;; Arm expiry before publishing SNAPSHOT into the retained set.  A timer
+    ;; setup error is then an ordinary failed handoff which the caller can
+    ;; retire through SNAPSHOT's already-recorded artifact capability; no
+    ;; immortal partially registered snapshot becomes globally reachable.
     (plist-put
      snapshot :timer
      (run-at-time
-      (max 1 emacs-jupyter-notebook-external-image-snapshot-ttl) nil
+      (emacs-jupyter-notebook-panel--external-image-snapshot-ttl) nil
       #'emacs-jupyter-notebook-panel--cleanup-external-image-snapshot snapshot))
+    (push snapshot emacs-jupyter-notebook-panel--external-image-snapshots)
     snapshot))
+
+(defun emacs-jupyter-notebook-panel--owned-materialized-image-file (image)
+  "Return IMAGE's exact panel-owned local file, or nil.
+This check disables file handlers and pins the capability, inode, size, owner,
+mode, link count, and direct-child spelling before an external process sees
+the path."
+  (let* ((props (and (consp image) (cdr image)))
+         (file (and props (plist-get props :file)))
+         (capability (and props (plist-get props :ejn-artifact-capability)))
+         (identity (and props (plist-get props :ejn-artifact-identity)))
+         (bytes (and props (plist-get props :ejn-artifact-bytes)))
+         (file-name-handler-alist nil))
+    (when (and (stringp file) identity
+               (integerp bytes) (>= bytes 0)
+               (eq capability
+                   emacs-jupyter-notebook-panel--image-artifact-capability)
+               (emacs-jupyter-notebook-artifacts-capability-valid-p capability))
+      (let ((attrs
+             (emacs-jupyter-notebook-artifacts--leaf-attributes
+              capability file identity)))
+        (when (and attrs (= (file-attribute-size attrs) bytes))
+          file)))))
 
 (defun emacs-jupyter-notebook-panel--cleanup-external-image-opens-on-exit ()
   "Cancel verifier jobs and remove retained external-viewer snapshots."
@@ -3013,19 +3985,19 @@ A second invocation while its verifier is pending cancels that request."
     (unless image
       (user-error "No image on this entry"))
     (if (not (plist-member props :ejn-publication-root))
-        ;; Legacy/local images are already ordinary local files and never carry
-        ;; helper publication metadata.  Keep that non-blocking opener path.
-        (let ((file (plist-get props :file)))
-          (unless (and (stringp file) (file-readable-p file))
-            (user-error "Image original is unavailable"))
+        (let ((file
+               (emacs-jupyter-notebook-panel--owned-materialized-image-file
+                image)))
+          (unless file (user-error "Image original is unavailable"))
           (funcall emacs-jupyter-notebook-panel-external-open-function file))
       (condition-case err
           (if-let ((cancel (plist-get props :ejn-original-open-cancel)))
               (progn
                 (funcall cancel)
                 (message "emacs-jupyter-notebook: cancelled pending image open"))
-            (let ((limit emacs-jupyter-notebook-external-image-max-snapshots))
-              (unless (and (integerp limit) (> limit 0))
+            (let ((limit
+                   (emacs-jupyter-notebook-panel--external-image-snapshot-budget)))
+              (unless (> limit 0)
                 (user-error "External image snapshots are disabled"))
               (when (>= (+ emacs-jupyter-notebook-panel--external-image-pending-count
                            (length emacs-jupyter-notebook-panel--external-image-snapshots))

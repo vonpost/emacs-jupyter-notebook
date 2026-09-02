@@ -25,7 +25,7 @@ class AuxiliaryIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     return result
 
                 try:
-                    connected = await request("connect", {"connection_file": str(fixture.connection_path), "artifact_dir": str(artifact_dir)})
+                    connected = await request("connect", {"connection_file": str(fixture.connection_path), "artifact_dir": str(artifact_dir), "image_max_pixels": 4_194_304})
                     self.assertIsNone(connected.error)
                     info = await request("kernel_info", {})
                     self.assertIsNone(info.error)
@@ -64,7 +64,7 @@ class AuxiliaryIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 try:
                     loop = asyncio.get_running_loop()
                     connected = loop.create_future()
-                    backend.start("connect", {"connection_file": str(fixture.connection_path), "artifact_dir": str(artifact_dir)}, lambda _e: None, connected.set_result)
+                    backend.start("connect", {"connection_file": str(fixture.connection_path), "artifact_dir": str(artifact_dir), "image_max_pixels": 4_194_304}, lambda _e: None, connected.set_result)
                     self.assertIsNone((await connected).error)
                     future = loop.create_future()
                     backend.start("inspect", {"code": "print", "cursor_pos": 5}, lambda _e: None, future.set_result)

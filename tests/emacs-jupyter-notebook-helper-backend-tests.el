@@ -51,6 +51,30 @@
 (defun ejn-ei2-test--run-timers ()
   (accept-process-output nil 0.02))
 
+(defun ejn-ei2-test--registry-replace-succeeds
+    (entry _expected-revision success _failure &rest _keys)
+  "Return a deferred successful CAS for lifecycle tests.
+
+Production callbacks are necessarily asynchronous because each transaction is
+owned by a child worker.  Keeping this mock deferred catches code which
+incorrectly assumes an inline persistence callback."
+  (let ((persisted (copy-tree entry)))
+    (setq persisted (plist-put persisted :registry-revision "ei2-next-revision"))
+    (run-at-time 0 nil (lambda () (funcall success persisted nil)))
+    'ejn-ei2-test-registry-operation))
+
+(defun ejn-ei2-test--registry-replace-fails
+    (_entry _expected-revision _success failure &rest _keys)
+  "Return a deferred durable failure for lifecycle tests."
+  (run-at-time
+   0 nil
+   (lambda ()
+     (funcall failure
+              '(:kind durability-uncertain :code "test-disk-full"
+                :message "test worker persistence failure")
+              nil)))
+  'ejn-ei2-test-registry-operation)
+
 (defun ejn-ei2-test--artifact-directory ()
   "Create a test-owned private helper artifact directory and retain its cap."
   (let* ((capability (emacs-jupyter-notebook-artifacts-create 'helper))
@@ -97,16 +121,15 @@ DISPOSALS receives local-only disposal reasons."
   (declare (indent 0) (debug t))
   `(let ((owner (generate-new-buffer " *ejn-ei2-owner*")))
      (unwind-protect
-         (let ((emacs-jupyter-notebook-backend 'helper))
-           (with-current-buffer owner
-             (let ((session (emacs-jupyter-notebook-backend-session-create nil owner)))
-               (unwind-protect
-                   (progn ,@body)
-                 (when-let* ((state (emacs-jupyter-notebook-backend-session-data
-                                     session)))
-                   (when (emacs-jupyter-notebook-helper-backend-state-p state)
-                     (emacs-jupyter-notebook-helper-backend--dispose
-                      state "EI2 test cleanup")))))))
+         (with-current-buffer owner
+           (let ((session (emacs-jupyter-notebook-backend-session-create nil owner)))
+             (unwind-protect
+                 (progn ,@body)
+               (when-let* ((state (emacs-jupyter-notebook-backend-session-data
+                                   session)))
+                 (when (emacs-jupyter-notebook-helper-backend-state-p state)
+                   (emacs-jupyter-notebook-helper-backend--dispose
+                    state "EI2 test cleanup"))))))
        (when (buffer-live-p owner) (kill-buffer owner)))))
 
 (defun ejn-ei2-test--direct-entry (&optional provisional)
@@ -123,7 +146,8 @@ DISPOSALS receives local-only disposal reasons."
           :remote-ports (list :shell_port 41000 :iopub_port 41001
                               :stdin_port 41002 :hb_port 41003
                               :control_port 41004)
-          :local-connection-file "/tmp/ejn-durable.json")))
+          :local-connection-file "/tmp/ejn-durable.json"
+          :registry-revision "ei2-current-revision")))
 
 (ert-deftest ejn-ei2-connect-orders-hello-attach-verify-and-defers-success ()
   "Synchronous helper callbacks still produce ordered deferred backend success."
@@ -379,7 +403,7 @@ DISPOSALS receives local-only disposal reasons."
   (ejn-ei2-test-with-fake-helper (requests callbacks disposals)
     (let ((owner (generate-new-buffer " *ejn-ei2-a-b*")))
       (unwind-protect
-          (let ((emacs-jupyter-notebook-backend 'helper))
+          (progn
             (with-current-buffer owner
               (let* ((a (emacs-jupyter-notebook-backend-session-create nil owner))
                      b a-verify)
@@ -411,26 +435,34 @@ DISPOSALS receives local-only disposal reasons."
 (ert-deftest ejn-ei2-core-start-helper-resolution-fails-before-admission ()
   "Helper resolution rejects a start before profile, registry, or SSH work."
   (let ((source (make-temp-file "ejn-ei2-source-"))
-        profile context registry ssh)
+        profile context returned-context ssh failure)
     (unwind-protect
         (with-temp-buffer
           (setq buffer-file-name source)
-          (let ((emacs-jupyter-notebook-backend 'helper))
+          (progn
             (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper-backend-ensure)
-                       (lambda () (error "helper missing")))
+                       (lambda (&rest _) (error "helper missing")))
                       ((symbol-function 'emacs-jupyter-notebook--read-host-profile)
                        (lambda (&rest _) (setq profile t)))
                       ((symbol-function 'emacs-jupyter-notebook--async-start-context)
                        (lambda (&rest _) (setq context t)))
-                      ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
-                       (lambda (&rest _) (setq registry t)))
                       ((symbol-function 'emacs-jupyter-notebook-ssh-start-bounded-process)
-                       (lambda (&rest _) (setq ssh t))))
-              (should-error (emacs-jupyter-notebook-start-remote-kernel "p"))
+                       (lambda (&rest _) (setq ssh t)))
+                      ((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+                       (lambda (success _failure &rest _keys)
+                         (run-at-time 0 nil (lambda () (funcall success nil nil)))
+                         'ejn-ei2-test-registry-operation)))
+              (setq returned-context
+                    (emacs-jupyter-notebook-start-remote-kernel
+                     "p" nil (lambda (_context reason) (setq failure reason))))
+              (let ((deadline (+ (float-time) 2)))
+                (while (and (not failure) (< (float-time) deadline))
+                  (accept-process-output nil 0.01)))
+              (should failure)
+              (should (eq (plist-get returned-context :phase) 'error))
               (should-not (buffer-modified-p))
               (should-not profile)
               (should-not context)
-              (should-not registry)
               (should-not ssh))))
       (when (file-exists-p source) (delete-file source)))))
 
@@ -440,8 +472,7 @@ DISPOSALS receives local-only disposal reasons."
     (let* ((entry (ejn-ei2-test--direct-entry))
            (original (copy-tree entry))
            (cleaned nil) context probe ssh)
-      (let ((emacs-jupyter-notebook-backend 'helper)
-            (emacs-jupyter-notebook--session-entry entry))
+      (let ((emacs-jupyter-notebook--session-entry entry))
         (cl-letf (((symbol-function 'emacs-jupyter-notebook--release-local-resources)
                    (lambda () (setq cleaned t)))
                   ((symbol-function 'emacs-jupyter-notebook-helper-backend-ensure)
@@ -463,15 +494,12 @@ DISPOSALS receives local-only disposal reasons."
   "Helper busy arbitration stays below its bounded verification request."
   (should (< emacs-jupyter-notebook--helper-connect-arbitration-maximum
              emacs-jupyter-notebook-helper-backend--verify-timeout))
-  (let ((emacs-jupyter-notebook-backend 'helper)
-        (emacs-jupyter-notebook-jupyter-connect-timeout 999))
+  (let ((emacs-jupyter-notebook-connect-arbitration-timeout 999))
     (should (= (emacs-jupyter-notebook--connect-arbitration-timeout) 45)))
-  (let ((emacs-jupyter-notebook-backend 'helper)
-        (emacs-jupyter-notebook-jupyter-connect-timeout 12))
+  (let ((emacs-jupyter-notebook-connect-arbitration-timeout 12))
     (should (= (emacs-jupyter-notebook--connect-arbitration-timeout) 12)))
   (dolist (invalid '(nil 0 -1 invalid))
-    (let ((emacs-jupyter-notebook-backend 'helper)
-          (emacs-jupyter-notebook-jupyter-connect-timeout invalid))
+    (let ((emacs-jupyter-notebook-connect-arbitration-timeout invalid))
       (should (= (emacs-jupyter-notebook--connect-arbitration-timeout) 45)))))
 
 (ert-deftest ejn-ei2-core-busy-pid-retains-session-after-bounded-verify-error ()
@@ -494,7 +522,8 @@ DISPOSALS receives local-only disposal reasons."
         (unwind-protect
             (cl-letf (((symbol-function 'emacs-jupyter-notebook--install-tunnel-sentinel)
                        #'ignore)
-                      ((symbol-function 'emacs-jupyter-notebook-registry-save-entry) #'ignore)
+                      ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+                       #'ejn-ei2-test--registry-replace-succeeds)
                       ((symbol-function 'emacs-jupyter-notebook--heartbeat-start) #'ignore)
                       ((symbol-function 'emacs-jupyter-notebook--inject-viewer-formatter) #'ignore)
                       ((symbol-function 'emacs-jupyter-notebook--inject-idle-watchdog) #'ignore)
@@ -574,12 +603,11 @@ DISPOSALS receives local-only disposal reasons."
            shutdown remote-cleanup disposed)
       (unwind-protect
           (let ((emacs-jupyter-notebook-registry-file registry-file))
-            ;; Model the launch admission contract: this provisional entry is
-            ;; already durable before the helper attachment can fail.
-            (emacs-jupyter-notebook-registry-save-entry entry)
+            ;; Model the admission contract: the context already carries the
+            ;; exact worker revision that authorizes final promotion.
             (setq emacs-jupyter-notebook--async-context context)
-            (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
-                       (lambda (&rest _) (error "disk full")))
+            (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+                       #'ejn-ei2-test--registry-replace-fails)
                       ((symbol-function 'emacs-jupyter-notebook-helper-request)
                        (lambda (_helper operation _params callback &rest _keys)
                          (when (equal operation "close")
@@ -601,8 +629,6 @@ DISPOSALS receives local-only disposal reasons."
               (should-not shutdown)
               (should-not remote-cleanup)
               (should (equal entry original))
-              (should (equal (emacs-jupyter-notebook-registry-load registry-file)
-                             (list original)))
               (should (equal (plist-get entry :remote-connection-file)
                              (plist-get original :remote-connection-file)))
               (should (equal (plist-get entry :local-connection-file)
@@ -642,8 +668,8 @@ DISPOSALS receives local-only disposal reasons."
       (unwind-protect
           (progn
             (setq emacs-jupyter-notebook--async-context context)
-            (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
-                       #'ignore)
+            (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+                       #'ejn-ei2-test--registry-replace-succeeds)
                       ((symbol-function 'emacs-jupyter-notebook--heartbeat-start)
                        #'ignore)
                       ((symbol-function 'emacs-jupyter-notebook--execution-start-setup)
@@ -679,8 +705,7 @@ DISPOSALS receives local-only disposal reasons."
 (ert-deftest ejn-ei2-core-success-callback-error-keeps-installed-client ()
   "Consumer failure after commit cannot tear down a healthy helper session."
   (with-temp-buffer
-    (let* ((emacs-jupyter-notebook-backend 'helper)
-           (buffer (current-buffer))
+    (let* ((buffer (current-buffer))
            (entry (ejn-ei2-test--direct-entry))
            (session (emacs-jupyter-notebook-backend-session-create nil buffer))
            (context (emacs-jupyter-notebook--async-new-context
@@ -696,8 +721,8 @@ DISPOSALS receives local-only disposal reasons."
       (emacs-jupyter-notebook-backend-session-mark-attached session)
       (setq emacs-jupyter-notebook--async-context context)
       (unwind-protect
-          (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
-                     #'ignore)
+          (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+                     #'ejn-ei2-test--registry-replace-succeeds)
                     ((symbol-function 'emacs-jupyter-notebook--heartbeat-start)
                      (lambda () (cl-incf heartbeat-started)))
                     ((symbol-function 'emacs-jupyter-notebook--inject-viewer-formatter)
@@ -709,6 +734,7 @@ DISPOSALS receives local-only disposal reasons."
                      '(:shell_port 1001 :iopub_port 1002 :stdin_port 1003
                        :hb_port 1004 :control_port 1005)
                      "/tmp/ei2-core.json" session))
+            (ejn-ei2-test--run-timers)
             (should (eq emacs-jupyter-notebook--client session))
             (should (emacs-jupyter-notebook-backend-session-installed-p session))
             (should (eq (plist-get context :phase) 'done))
@@ -734,7 +760,7 @@ DISPOSALS receives local-only disposal reasons."
               emacs-jupyter-notebook--session-entry entry)
         (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-control)
                    (lambda (&rest _) (setq shutdown t)))
-                  ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
+                  ((symbol-function 'emacs-jupyter-notebook-registry-remove-async)
                    (lambda (&rest _) (setq deregister t))))
           (emacs-jupyter-notebook--release-local-resources))
         (should-not emacs-jupyter-notebook--client)
@@ -875,6 +901,34 @@ DISPOSALS receives local-only disposal reasons."
       (should (< (emacs-jupyter-notebook-helper-backend--close-deadline)
                  (emacs-jupyter-notebook-backend--close-timeout))))))
 
+(ert-deftest ejn-ei2-close-deadline-setup-failure-retires-helper-and-artifacts ()
+  "A close ownership publication with no deadline disposes local state now."
+  (let ((emacs-jupyter-notebook-backend-close-timeout 0.02))
+    (ejn-ei2-test-with-fake-helper (requests callbacks disposals)
+      (ejn-ei2-test-with-session
+        (let (state artifact close-error)
+          (emacs-jupyter-notebook-backend-connect session "/tmp/c.json" #'ignore #'ignore)
+          (setq state (emacs-jupyter-notebook-backend-session-data session)
+                artifact (emacs-jupyter-notebook-helper-backend-state-artifact-dir state))
+          (funcall (car callbacks) nil (ejn-ei2-test--attached-response) nil)
+          (funcall (car callbacks) nil (ejn-ei2-test--kernel-info-response) nil)
+          (ejn-ei2-test--run-timers)
+          (let ((real-run-at-time (symbol-function 'run-at-time)))
+            (cl-letf (((symbol-function 'run-at-time)
+                       (lambda (delay repeat function &rest args)
+                         (if (= delay
+                                (emacs-jupyter-notebook-helper-backend--close-deadline))
+                             (error "injected helper close deadline allocation failure")
+                           (apply real-run-at-time delay repeat function args)))))
+              (emacs-jupyter-notebook-backend-close-local
+               session #'ignore (lambda (_id reason) (setq close-error reason)))))
+          (ejn-ei2-test--run-timers)
+          (should (string-match-p "cannot arm helper local close deadline" close-error))
+          (should (emacs-jupyter-notebook-helper-backend-state-retired state))
+          (should-not (file-exists-p artifact))
+          (should (= 1 (length disposals)))
+          (should-not (cl-find "close" requests :key #'car :test #'equal)))))))
+
 (ert-deftest ejn-ei2-close-rejects-malformed-success-result ()
   "An `ok' helper close reply without exact `{closed:true}' is failure."
   (ejn-ei2-test-with-fake-helper (requests callbacks disposals)
@@ -899,8 +953,7 @@ DISPOSALS receives local-only disposal reasons."
 (ert-deftest ejn-ei3-helper-execute-and-is-complete-use-v1-operations ()
   "EI3 admits user execute/is_complete and rejects unrelated helper operations."
   (with-temp-buffer
-    (let* ((emacs-jupyter-notebook-backend 'helper)
-           (session (emacs-jupyter-notebook-backend-session-create nil (current-buffer)))
+    (let* ((session (emacs-jupyter-notebook-backend-session-create nil (current-buffer)))
            (state (emacs-jupyter-notebook-helper-backend--make-state :helper 'fake))
            requests execute-error complete-result readiness-result control-error)
       (setf (emacs-jupyter-notebook-backend-session-data session) state)
@@ -967,8 +1020,7 @@ DISPOSALS receives local-only disposal reasons."
   "A string helper wire id is mapped before a reentrant event reaches the sink."
   (let (seen)
     (with-temp-buffer
-      (let* ((emacs-jupyter-notebook-backend 'helper)
-             (session (emacs-jupyter-notebook-backend-session-create
+      (let* ((session (emacs-jupyter-notebook-backend-session-create
                        (lambda (_session event) (setq seen event)) (current-buffer)))
              (state (emacs-jupyter-notebook-helper-backend--make-state :helper 'fake)))
         (setf (emacs-jupyter-notebook-backend-session-data session) state)
@@ -1020,8 +1072,7 @@ DISPOSALS receives local-only disposal reasons."
 (ert-deftest ejn-ei3-helper-correlation-burst-is-bounded-and-disposed ()
   "Unmapped raw-event bursts retain at most one descriptor per bounded id."
   (with-temp-buffer
-    (let* ((emacs-jupyter-notebook-backend 'helper)
-           (session (emacs-jupyter-notebook-backend-session-create nil (current-buffer)))
+    (let* ((session (emacs-jupyter-notebook-backend-session-create nil (current-buffer)))
            (state (emacs-jupyter-notebook-helper-backend--make-state)))
       (setf (emacs-jupyter-notebook-backend-session-data session) state)
       (setf (emacs-jupyter-notebook-backend-session-dispatch-depth session) 1)
@@ -1127,8 +1178,7 @@ DISPOSALS receives local-only disposal reasons."
   "Reply then idle from a synchronous helper fake stay FIFO and post-dispatch."
   (let (seen)
     (with-temp-buffer
-      (let* ((emacs-jupyter-notebook-backend 'helper)
-             (session (emacs-jupyter-notebook-backend-session-create
+      (let* ((session (emacs-jupyter-notebook-backend-session-create
                        (lambda (_session event)
                          (setq seen (append seen
                                             (list (plist-get (plist-get event :event) :type))))
@@ -1507,8 +1557,7 @@ DISPOSALS receives local-only disposal reasons."
 (ert-deftest ejn-ei5-helper-auxiliary-operations-use-bounded-v1-requests ()
   "Completion, inspect, completeness, and stdin use exact helper operations."
   (with-temp-buffer
-    (let* ((emacs-jupyter-notebook-backend 'helper)
-           (session (emacs-jupyter-notebook-backend-session-create nil (current-buffer)))
+    (let* ((session (emacs-jupyter-notebook-backend-session-create nil (current-buffer)))
            (state (emacs-jupyter-notebook-helper-backend--make-state :helper 'fake))
            requests complete inspect incomplete input)
       (setf (emacs-jupyter-notebook-backend-session-data session) state)
@@ -1567,8 +1616,7 @@ DISPOSALS receives local-only disposal reasons."
 (ert-deftest ejn-ei5-helper-heartbeat-failure-enters-existing-dead-path-once ()
   "An idle helper kernel-info failure takes the normal one-shot retry path."
   (with-temp-buffer
-    (let* ((emacs-jupyter-notebook-backend 'helper)
-           (session (emacs-jupyter-notebook-backend-session-create nil (current-buffer)))
+    (let* ((session (emacs-jupyter-notebook-backend-session-create nil (current-buffer)))
            (state (emacs-jupyter-notebook-helper-backend--make-state :helper 'fake))
            (emacs-jupyter-notebook--client session)
            (emacs-jupyter-notebook-mode t)
@@ -1597,8 +1645,7 @@ DISPOSALS receives local-only disposal reasons."
 (ert-deftest ejn-ei5-helper-heartbeat-is-single-flight-and-busy-safe ()
   "Helper heartbeats neither overlap nor count long execution silence."
   (with-temp-buffer
-    (let* ((emacs-jupyter-notebook-backend 'helper)
-           (session (emacs-jupyter-notebook-backend-session-create
+    (let* ((session (emacs-jupyter-notebook-backend-session-create
                      nil (current-buffer)))
            (state (emacs-jupyter-notebook-helper-backend--make-state
                    :helper 'fake))
@@ -1624,6 +1671,71 @@ DISPOSALS receives local-only disposal reasons."
         (should-not calls)
         (should (eq emacs-jupyter-notebook--heartbeat-inflight
                     'existing-probe))))))
+
+(ert-deftest ejn-ei5-heartbeat-timeout-timer-setup-failure-does-not-wedge-probes ()
+  "A failed per-probe timer is one miss, with no phantom single-flight token."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client 'heartbeat-client)
+          (emacs-jupyter-notebook--kernel-status 'idle)
+          (emacs-jupyter-notebook--tunnel-dead nil)
+          (emacs-jupyter-notebook--heartbeat-misses 0)
+          (emacs-jupyter-notebook-heartbeat-misses-allowed 3)
+          (timer-failures 0)
+          (probes 0)
+          timeout-timer)
+      (unwind-protect
+          (let ((real-run-with-timer (symbol-function 'run-with-timer)))
+            (cl-letf (((symbol-function 'run-with-timer)
+                       (lambda (&rest args)
+                         (if (= (cl-incf timer-failures) 1)
+                             (error "injected heartbeat timer failure")
+                           (apply real-run-with-timer args))))
+                      ((symbol-function 'emacs-jupyter-notebook-backend-aux)
+                       (lambda (&rest _args)
+                         (cl-incf probes)
+                         'heartbeat-request))
+                      ((symbol-function 'emacs-jupyter-notebook--log-append)
+                       #'ignore))
+              (emacs-jupyter-notebook--heartbeat-tick)
+              (should (= probes 0))
+              (should (= emacs-jupyter-notebook--heartbeat-misses 1))
+              (should-not emacs-jupyter-notebook--heartbeat-inflight)
+              (should-not emacs-jupyter-notebook--heartbeat-timeout-timer)
+              ;; A subsequent tick can create and own a new bounded probe.
+              (emacs-jupyter-notebook--heartbeat-tick)
+              (setq timeout-timer emacs-jupyter-notebook--heartbeat-timeout-timer)
+              (should (= probes 1))
+              (should emacs-jupyter-notebook--heartbeat-inflight)
+              (should (timerp timeout-timer))
+              (should-not emacs-jupyter-notebook--tunnel-dead)))
+        (when (timerp timeout-timer) (cancel-timer timeout-timer))))))
+
+(ert-deftest ejn-ei5-heartbeat-eager-timeout-never-sends-a-probe ()
+  "An eager heartbeat deadline retires its provisional token before send."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client 'heartbeat-client)
+          (emacs-jupyter-notebook--kernel-status 'idle)
+          (emacs-jupyter-notebook--tunnel-dead nil)
+          (emacs-jupyter-notebook--heartbeat-misses 0)
+          (emacs-jupyter-notebook-heartbeat-misses-allowed 3)
+          (probes 0)
+          cancelled timer)
+      (cl-letf (((symbol-function 'run-with-timer)
+                 (lambda (_seconds _repeat function &rest args)
+                   (apply function args)
+                   (setq timer (timer-create))))
+                ((symbol-function 'cancel-timer)
+                 (lambda (value) (setq cancelled value)))
+                ((symbol-function 'emacs-jupyter-notebook-backend-aux)
+                 (lambda (&rest _args) (cl-incf probes)))
+                ((symbol-function 'emacs-jupyter-notebook--log-append)
+                 #'ignore))
+        (emacs-jupyter-notebook--heartbeat-tick)
+        (should (= probes 0))
+        (should (= emacs-jupyter-notebook--heartbeat-misses 1))
+        (should-not emacs-jupyter-notebook--heartbeat-inflight)
+        (should-not emacs-jupyter-notebook--heartbeat-timeout-timer)
+        (should (eq cancelled timer))))))
 
 (ert-deftest ejn-ei5-stdin-prompts-defer-and-clear-passwords ()
   "Normal, password, and quit replies leave the filter turn without prompting."
@@ -1664,8 +1776,7 @@ DISPOSALS receives local-only disposal reasons."
 (ert-deftest ejn-ei5-helper-complete-inspect-real-replies-and-deadlines ()
   "The fake helper exercises successful, malformed, and bounded aux replies."
   (with-temp-buffer
-    (let* ((emacs-jupyter-notebook-backend 'helper)
-           (session (emacs-jupyter-notebook-backend-session-create nil
+    (let* ((session (emacs-jupyter-notebook-backend-session-create nil
                                                                     (current-buffer)))
            (state (emacs-jupyter-notebook-helper-backend--make-state :helper 'fake))
            requests pending complete inspect failures)
@@ -1739,8 +1850,7 @@ DISPOSALS receives local-only disposal reasons."
         (should (string-match-p "invalid result" failure))
         (should disposals))))
   (with-temp-buffer
-    (let* ((emacs-jupyter-notebook-backend 'helper)
-           (session (emacs-jupyter-notebook-backend-session-create
+    (let* ((session (emacs-jupyter-notebook-backend-session-create
                      nil (current-buffer)))
            (state (emacs-jupyter-notebook-helper-backend--make-state
                    :helper 'fake))
@@ -1764,8 +1874,7 @@ DISPOSALS receives local-only disposal reasons."
 (ert-deftest ejn-ei5-malformed-input-acknowledgement-is-a-failure ()
   "Only an exact accepted=true result acknowledges a stdin reply."
   (with-temp-buffer
-    (let* ((emacs-jupyter-notebook-backend 'helper)
-           (session (emacs-jupyter-notebook-backend-session-create
+    (let* ((session (emacs-jupyter-notebook-backend-session-create
                      nil (current-buffer)))
            (state (emacs-jupyter-notebook-helper-backend--make-state
                    :helper 'fake))
@@ -2008,9 +2117,8 @@ DISPOSALS receives local-only disposal reasons."
     (with-temp-buffer
       (python-mode)
       (insert "# %%\ninput()\n")
-      (let* ((session (let ((emacs-jupyter-notebook-backend 'helper))
-                        (emacs-jupyter-notebook-backend-session-create
-                         nil (current-buffer))))
+      (let* ((session (emacs-jupyter-notebook-backend-session-create
+                         nil (current-buffer)))
              (state (emacs-jupyter-notebook-helper-backend--make-state
                      :helper 'fake))
              (panel (ejn-panel-ensure (current-buffer)))
@@ -2209,8 +2317,7 @@ DISPOSALS receives local-only disposal reasons."
 
 (defun ejn-ei7-test--session (owner)
   "Return an installed helper SESSION with no remote resources."
-  (let ((emacs-jupyter-notebook-backend 'helper))
-    (let* ((session (emacs-jupyter-notebook-backend-session-create
+  (let* ((session (emacs-jupyter-notebook-backend-session-create
                      nil owner #'emacs-jupyter-notebook--backend-transport-failed))
            (state (emacs-jupyter-notebook-helper-backend--make-state
                    :helper 'ei7-fake
@@ -2223,7 +2330,7 @@ DISPOSALS receives local-only disposal reasons."
                session reason)))
       (emacs-jupyter-notebook-backend-session-mark-attached session)
       (emacs-jupyter-notebook-backend-session-mark-installed session)
-      session)))
+      session))
 
 (defun ejn-ei7-test--record (id state &optional backend-id timer)
   "Return an EI7 ledger record with stable correlation metadata."
@@ -2596,7 +2703,11 @@ DISPOSALS receives local-only disposal reasons."
                    (lambda (&rest _) (cl-incf controls)))
                   ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
                    (lambda (&rest _) (cl-incf remote-cleanups)))
-                  ((symbol-function 'emacs-jupyter-notebook--remove-registry-entry)
+                  ((symbol-function 'emacs-jupyter-notebook-registry-create-async)
+                   (lambda (&rest _) (cl-incf registry-removals)))
+                  ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+                   (lambda (&rest _) (cl-incf registry-removals)))
+                  ((symbol-function 'emacs-jupyter-notebook-registry-remove-async)
                    (lambda (&rest _) (cl-incf registry-removals)))
                   ((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
                    #'ignore)
@@ -2974,6 +3085,125 @@ DISPOSALS receives local-only disposal reasons."
         (should-not emacs-jupyter-notebook--execution-active-id)
         (should (= (hash-table-count emacs-jupyter-notebook--execution-ledger) 0))
         (should-not (gethash nil emacs-jupyter-notebook--execution-ledger))))))
+
+(ert-deftest ejn-ei7-timeout-grace-timer-setup-failure-terminally-recovers ()
+  "A cancelling execution cannot wedge when its post-interrupt timer fails."
+  (with-temp-buffer
+    (let* ((session (ejn-ei7-test--session (current-buffer)))
+           (state (emacs-jupyter-notebook-backend-session-data session))
+           (scheduled 0)
+           (interrupts 0)
+           (remote-controls 0))
+      (setq emacs-jupyter-notebook--client session
+            emacs-jupyter-notebook--execution-active-id 1
+            emacs-jupyter-notebook--execution-queue '(1 2)
+            emacs-jupyter-notebook--kernel-status 'idle)
+      (emacs-jupyter-notebook--execution-put
+       (ejn-ei7-test--record 1 'dispatched "wire-grace"))
+      (emacs-jupyter-notebook--execution-put
+       (ejn-ei7-test--record 2 'queued))
+      ;; The accepted head must retain its ambiguous outcome while the queued
+      ;; tail is cancelled by the exact existing transport-loss transition.
+      (puthash "wire-grace"
+               (list :ledger-id 1 :backend-request-id "wire-grace"
+                     :panel-generation 1)
+               (emacs-jupyter-notebook-helper-backend-state-request-map state))
+      (ejn-ei7-test-with-presentations (finished fringe text)
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook--interrupt-active-execution)
+                   (lambda (_client) (cl-incf interrupts)))
+                  ((symbol-function 'run-at-time)
+                   (lambda (&rest _args)
+                     (error "injected interrupt-grace timer failure")))
+                  ((symbol-function 'emacs-jupyter-notebook-backend-control)
+                   (lambda (&rest _args) (cl-incf remote-controls)))
+                  ((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
+                   #'ignore)
+                  ((symbol-function 'emacs-jupyter-notebook-backend-close-local)
+                   #'ignore)
+                  ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                   (lambda () (cl-incf scheduled)))
+                  ((symbol-function 'emacs-jupyter-notebook--log-append)
+                   #'ignore))
+          (let ((emacs-jupyter-notebook-evaluation-timeout 30))
+            (emacs-jupyter-notebook--evaluation-on-timeout 1))
+          (should (= interrupts 1))
+          (should (= scheduled 1))
+          (should (= remote-controls 0))
+          (should-not emacs-jupyter-notebook--client)
+          (should-not emacs-jupyter-notebook--execution-active-id)
+          (should-not emacs-jupyter-notebook--execution-queue)
+          (should (= (hash-table-count emacs-jupyter-notebook--execution-ledger) 0))
+          (should (member 'outcome-unknown finished))
+          (should (member 'cancelled finished))
+          (should (member 'outcome-unknown fringe))
+          (should (member 'cancelled fringe))
+          ;; Later timeout/event delivery for the retired identity is inert.
+          (emacs-jupyter-notebook--evaluation-on-timeout 1)
+          (should (= scheduled 1)))))))
+
+(ert-deftest ejn-ei7-dispatch-deadline-construction-failure-never-sends ()
+  "A user execution is terminally rejected before send without its deadline."
+  (with-temp-buffer
+    (let* ((session (ejn-ei7-test--session (current-buffer)))
+           (record (ejn-ei7-test--record 1 'checking))
+           (sent 0) (pumps 0))
+      (setq emacs-jupyter-notebook--client session
+            emacs-jupyter-notebook--execution-active-id 1
+            emacs-jupyter-notebook--execution-queue '(1 2))
+      (emacs-jupyter-notebook--execution-put record)
+      (emacs-jupyter-notebook--execution-put
+       (ejn-ei7-test--record 2 'queued))
+      (ejn-ei7-test-with-presentations (finished fringe text)
+        (cl-letf (((symbol-function 'run-at-time)
+                   (lambda (&rest _args)
+                     (error "injected evaluation deadline failure")))
+                  ((symbol-function 'emacs-jupyter-notebook-backend-execute)
+                   (lambda (&rest _args) (cl-incf sent)))
+                  ((symbol-function 'emacs-jupyter-notebook--execution-pump)
+                   (lambda () (cl-incf pumps))))
+          (emacs-jupyter-notebook--execution-dispatch record)
+          (should (= sent 0))
+          (should (= pumps 1))
+          (should-not (emacs-jupyter-notebook--execution-record 1))
+          (should (emacs-jupyter-notebook--execution-record 2))
+          (should-not emacs-jupyter-notebook--execution-active-id)
+          (should (equal emacs-jupyter-notebook--execution-queue '(2)))
+          (should (equal finished '(error)))
+          (should (equal fringe '(error)))
+          (should (equal text '("\ncannot schedule evaluation deadline"))))))))
+
+(ert-deftest ejn-ei7-dispatch-eager-deadline-callback-never-sends ()
+  "An eager deadline callback retires its pre-send record without a phantom."
+  (with-temp-buffer
+    (let* ((session (ejn-ei7-test--session (current-buffer)))
+           (record (ejn-ei7-test--record 1 'checking))
+           (sent 0) (pumps 0))
+      (setq emacs-jupyter-notebook--client session
+            emacs-jupyter-notebook--execution-active-id 1
+            emacs-jupyter-notebook--execution-queue '(1 2))
+      (emacs-jupyter-notebook--execution-put record)
+      (emacs-jupyter-notebook--execution-put
+       (ejn-ei7-test--record 2 'queued))
+      (ejn-ei7-test-with-presentations (finished fringe text)
+        (cl-letf (((symbol-function 'run-at-time)
+                   (lambda (_seconds _repeat function &rest args)
+                     (apply function args)
+                     (timer-create)))
+                  ((symbol-function 'emacs-jupyter-notebook-backend-execute)
+                   (lambda (&rest _args) (cl-incf sent)))
+                  ((symbol-function 'emacs-jupyter-notebook--execution-pump)
+                   (lambda () (cl-incf pumps))))
+          (emacs-jupyter-notebook--execution-dispatch record)
+          (should (= sent 0))
+          (should (= pumps 1))
+          (should-not (emacs-jupyter-notebook--execution-record 1))
+          (should (emacs-jupyter-notebook--execution-record 2))
+          (should-not emacs-jupyter-notebook--execution-active-id)
+          (should (equal emacs-jupyter-notebook--execution-queue '(2)))
+          (should (equal finished '(error)))
+          (should (equal fringe '(error)))
+          (should (equal text
+                         '("\nevaluation deadline elapsed before execution was sent"))))))))
 
 (ert-deftest ejn-ei7-reentrant-admitted-error-defers-until-wire-map-exists ()
   "A reentrant admitted error waits for mapping before settling transport."
@@ -3448,11 +3678,11 @@ DISPOSALS receives local-only disposal reasons."
                            (lambda (&rest _) (cl-incf remote-calls)))
                           ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
                            (lambda (&rest _) (cl-incf remote-calls)))
-                          ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
+                          ((symbol-function 'emacs-jupyter-notebook-registry-create-async)
                            (lambda (&rest _) (cl-incf registry-calls)))
-                          ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
+                          ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
                            (lambda (&rest _) (cl-incf registry-calls)))
-                          ((symbol-function 'emacs-jupyter-notebook--remove-registry-entry)
+                          ((symbol-function 'emacs-jupyter-notebook-registry-remove-async)
                            (lambda (&rest _) (cl-incf registry-calls))))
                   (button-activate button))))
             (should (= reconnects 1))
@@ -3539,8 +3769,7 @@ DISPOSALS receives local-only disposal reasons."
   (with-temp-buffer
     (let* ((source (current-buffer))
            (helper (ejn-ei8-test--fake-helper source 'ready))
-           (session (let ((emacs-jupyter-notebook-backend 'helper))
-                      (emacs-jupyter-notebook-backend-session-create nil source)))
+           (session (emacs-jupyter-notebook-backend-session-create nil source))
            (state (emacs-jupyter-notebook-helper-backend--make-state
                    :helper helper
                    :request-map (make-hash-table :test #'equal)
@@ -3568,8 +3797,7 @@ DISPOSALS receives local-only disposal reasons."
             (should (eq (plist-get (emacs-jupyter-notebook-helper-backend-snapshot session)
                                    :backend-state)
                         'closed))
-            (let ((empty (let ((emacs-jupyter-notebook-backend 'helper))
-                           (emacs-jupyter-notebook-backend-session-create nil source))))
+            (let ((empty (emacs-jupyter-notebook-backend-session-create nil source)))
               (should (eq (plist-get
                            (emacs-jupyter-notebook-helper-backend-snapshot empty)
                            :backend-state)
@@ -3858,14 +4086,48 @@ DISPOSALS receives local-only disposal reasons."
 ;;; EI10 — static no-hang architecture assertions
 
 (defun ejn-ei10--production-files ()
-  "Return non-legacy production Elisp files in the package root."
+  "Return production Elisp files in the package root."
   (let ((root (file-name-directory
                (directory-file-name ejn-ei2-test--directory))))
-    (cl-remove-if
-     (lambda (file)
-       (equal (file-name-nondirectory file)
-              "emacs-jupyter-notebook-jupyter.el"))
-     (directory-files root t "\\`emacs-jupyter-notebook.*\\.el\\'"))))
+    (directory-files root t "\\`emacs-jupyter-notebook.*\\.el\\'")))
+
+(defun ejn-ei10--jupyter-require-p (forms)
+  "Return non-nil when FORMS requires an Emacs Jupyter feature."
+  (cl-some
+   (lambda (form)
+     (when (and (consp form) (eq (car form) 'require))
+       (let ((feature (cadr form)))
+         (when (and (consp feature) (eq (car feature) 'quote))
+           (setq feature (cadr feature)))
+         (and (symbolp feature)
+              (or (eq feature 'jupyter)
+                  (string-prefix-p "jupyter-" (symbol-name feature)))))))
+   forms))
+
+(defun ejn-ei10--legacy-backend-selector-p (forms)
+  "Return non-nil when FORMS contains the removed backend selector.
+Module `require' and `provide' forms may mention the backend feature name;
+those are not selector references."
+  (let ((pending (list forms)) found)
+    (while (and pending (not found))
+      (let ((item (pop pending)))
+        (cond
+         ((symbolp item)
+          (setq found (memq item '(emacs-jupyter-notebook-backend legacy))))
+         ((consp item)
+          (unless (memq (car item) '(require provide))
+            (push (car item) pending)
+            (push (cdr item) pending))))))
+    found))
+
+(defun ejn-ei10--package-header-requires-jupyter-p (source)
+  "Return non-nil when SOURCE's package header requires Emacs Jupyter."
+  (with-temp-buffer
+    (insert source)
+    (goto-char (point-min))
+    (re-search-forward
+     "^;;[[:space:]]*Package-Requires:.*\\_<jupyter\\(?:-[[:alnum:]_-]+\\)?\\_>"
+     nil t)))
 
 (defun ejn-ei10--read-forms (source)
   "Read top-level forms from SOURCE with the Emacs Lisp reader.
@@ -3969,7 +4231,7 @@ In addition to `(jupyter-foo ...)', recognize function designators passed to
     found))
 
 (ert-deftest ejn-ei10-production-has-no-direct-jupyter-calls ()
-  "Direct `jupyter-*' calls remain confined to the legacy adapter."
+  "Production Elisp contains no direct `jupyter-*' calls."
   (let (offenders)
     (dolist (file (ejn-ei10--production-files))
       (let* ((raw (with-temp-buffer
@@ -3979,6 +4241,47 @@ In addition to `(jupyter-foo ...)', recognize function designators passed to
         (when (ejn-ei10--direct-jupyter-call-p forms)
           (push (file-name-nondirectory file) offenders))))
     (should-not offenders)))
+
+(ert-deftest ejn-ei10-production-has-no-legacy-jupyter-transport ()
+  "Production source and headers contain no removed Jupyter transport."
+  (let (legacy-references feature-requires selector-references)
+    (dolist (file (ejn-ei10--production-files))
+      (let* ((raw (with-temp-buffer
+                    (insert-file-contents file)
+                    (buffer-string)))
+             (forms (ejn-ei10--read-forms raw))
+             (name (file-name-nondirectory file)))
+        (when (or (string-match-p "emacs-jupyter-notebook-jupyter" raw)
+                  (ejn-ei10--package-header-requires-jupyter-p raw))
+          (push name legacy-references))
+        (when (ejn-ei10--jupyter-require-p forms)
+          (push name feature-requires))
+        (when (ejn-ei10--legacy-backend-selector-p forms)
+          (push name selector-references))))
+    (should-not legacy-references)
+    (should-not feature-requires)
+    (should-not selector-references)))
+
+(ert-deftest ejn-ei10-jupyter-require-scanner-detects-code-but-ignores-prose ()
+  "The feature gate catches a require form without prose false positives."
+  (should-not
+   (ejn-ei10--jupyter-require-p
+    (ejn-ei10--read-forms
+     "(defun prose () \"(require 'jupyter)\" nil)\n; (require 'jupyter)\n")))
+  (should
+   (ejn-ei10--jupyter-require-p
+    (ejn-ei10--read-forms "(require 'jupyter-client)\n"))))
+
+(ert-deftest ejn-ei10-legacy-selector-scanner-detects-code-but-ignores-prose ()
+  "The legacy selector gate catches code without prose false positives."
+  (should-not
+   (ejn-ei10--legacy-backend-selector-p
+    (ejn-ei10--read-forms
+     "(defun prose () \"legacy emacs-jupyter-notebook-backend\" nil)\n")))
+  (should
+   (ejn-ei10--legacy-backend-selector-p
+    (ejn-ei10--read-forms
+     "(setq emacs-jupyter-notebook-backend 'legacy)\n"))))
 
 (ert-deftest ejn-ei10-jupyter-scanner-detects-code-but-ignores-prose ()
   "The direct-call scanner catches a mutation without prose false positives."

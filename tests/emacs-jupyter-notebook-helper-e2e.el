@@ -21,6 +21,9 @@
 
 (defconst ejn-ag2--timeout 12.0)
 
+(defconst ejn-ag2--registry-timeout 10.0
+  "Finite deadline for one AG2 registry transaction.")
+
 (defun ejn-ag2--environment (name)
   "Return required AG2 environment variable NAME or signal a clear error."
   (let ((value (getenv name)))
@@ -34,6 +37,63 @@
     (while (and (not (funcall predicate)) (< (float-time) deadline))
       (accept-process-output nil 0.02))
     (funcall predicate)))
+
+(defun ejn-ag2--registry-call (file starter)
+  "Run registry STARTER against FILE with a bounded test-only wait.
+STARTER receives SUCCESS, FAILURE, and OWNER.  The production bridge remains
+asynchronous; this helper only coordinates the external AG2 assertions."
+  (let ((owner (emacs-jupyter-notebook-registry-owner-create))
+        (done nil) (values nil) (failure nil)
+        (deadline (+ (float-time) ejn-ag2--registry-timeout)))
+    (let ((emacs-jupyter-notebook-registry-file file))
+      (funcall starter
+               (lambda (&rest result) (setq values result done t))
+               (lambda (&rest result) (setq failure result done t))
+               owner))
+    (while (and (not done) (< (float-time) deadline))
+      (accept-process-output nil 0.02))
+    (unless done
+      (emacs-jupyter-notebook-registry-owner-cancel owner)
+      (error "AG2 registry transaction timed out"))
+    (emacs-jupyter-notebook-registry-owner-cancel owner)
+    (if failure
+        (error "AG2 registry transaction failed: %S" (car failure))
+      (car values))))
+
+(defun ejn-ag2--registry-read (file)
+  "Read FILE through the asynchronous registry bridge, bounded for AG2."
+  (ejn-ag2--registry-call
+   file
+   (lambda (success failure owner)
+     (emacs-jupyter-notebook-registry-read-async
+      success failure :owner owner :deadline ejn-ag2--registry-timeout))))
+
+(defun ejn-ag2--registry-current-entry (file entry)
+  "Return ENTRY's current revision-bearing row from FILE's worker registry.
+Create the isolated test row when absent, then read it back through the
+production bridge.  Attach promotion requires that exact opaque revision."
+  (let* ((key (plist-get entry :session-id))
+         (current (emacs-jupyter-notebook-registry-find
+                   key (ejn-ag2--registry-read file))))
+    (unless current
+      (setq current
+            (ejn-ag2--registry-call
+             file
+             (lambda (success failure owner)
+               (emacs-jupyter-notebook-registry-create-async
+                entry success failure
+                :owner owner :deadline ejn-ag2--registry-timeout))))
+      (unless (equal key (plist-get current :session-id))
+        (error "AG2 registry create returned a different session: %S" current))
+      ;; Read after create so every attach uses the worker's authoritative
+      ;; representation rather than a test-constructed approximation.
+      (setq current
+            (emacs-jupyter-notebook-registry-find
+             key (ejn-ag2--registry-read file))))
+    (unless (and current
+                 (stringp (plist-get current :registry-revision)))
+      (error "AG2 registry row lacks an exact revision: %S" current))
+    current))
 
 (defun ejn-ag2--await-phase (phase predicate &optional timeout)
   "Wait for PREDICATE during PHASE or fail with bounded transport facts."
@@ -188,7 +248,9 @@ a local pipe process; no SSH command is constructed or started."
   (let* ((state (or state (ejn-ag2--bridge-state)))
          (connection (emacs-jupyter-notebook-connection-read-file local-file))
          (ports (emacs-jupyter-notebook-connection-ports connection))
-         (entry (ejn-ag2--entry state local-file))
+         (entry (ejn-ag2--registry-current-entry
+                 emacs-jupyter-notebook-registry-file
+                 (ejn-ag2--entry state local-file)))
          (tunnel (ejn-ag2--make-tunnel))
          (context (emacs-jupyter-notebook--async-new-context
                    :phase 'connect :profile (list :profile "ag2" :host "127.0.0.1")
@@ -260,7 +322,7 @@ connection files, and buffer-local session entry for later reconnect."
   ;; Shutdown removes the entry but deliberately leaves an empty registry
   ;; file; ordinary local teardown must retain the live entry.
   (should (file-exists-p registry))
-  (let ((entries (emacs-jupyter-notebook-registry-load registry)))
+  (let ((entries (ejn-ag2--registry-read registry)))
     (if durable-expected
         (should (cl-some (lambda (entry)
                            (equal (plist-get entry :session-id) "ag2-e2e"))
@@ -308,7 +370,7 @@ connection files, and buffer-local session entry for later reconnect."
   (declare (indent 0) (debug t))
   `(let* ((root (make-temp-file "ejn-ag2-" t))
           (source-file (expand-file-name "e2e.py" root))
-          (registry (expand-file-name "registry.el" root))
+          (registry (expand-file-name "registry-v1.json" root))
           (local-file (expand-file-name "connection.json" root))
           (source nil)
           (durable-expected t)
@@ -317,7 +379,6 @@ connection files, and buffer-local session entry for later reconnect."
           (teardown-state nil)
           (test-artifact-capabilities nil)
           (test-artifact-roots nil)
-          (emacs-jupyter-notebook-backend 'helper)
           (emacs-jupyter-notebook-helper-command
            (list (ejn-ag2--environment "EJN_E2E_HELPER") "--protocol"))
           (emacs-jupyter-notebook-registry-file registry)
@@ -680,7 +741,14 @@ connection files, and buffer-local session entry for later reconnect."
                  (lambda (entry) (setq remote-cleanup entry))))
         (emacs-jupyter-notebook-shutdown-kernel)
         (ejn-ag2--await-phase
-         "public shutdown" (lambda () (null emacs-jupyter-notebook--client)))
+         "public shutdown"
+         (lambda ()
+           ;; Helper shutdown retires the client before the two exact
+           ;; registry transitions and final remote cleanup settle.
+           (and (null emacs-jupyter-notebook--client)
+                (eq (plist-get emacs-jupyter-notebook--async-context :phase)
+                    'done)
+                (null emacs-jupyter-notebook--session-entry))))
         (should remote-cleanup)
         (should-not (gethash "alive" (gethash "state" (ejn-ag2--bridge-request "status"))))
         (ejn-ag2--assert-source-pristine source baseline modified)

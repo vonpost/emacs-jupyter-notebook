@@ -115,7 +115,6 @@
           (local-file (expand-file-name "connection.json" root))
           (registry (expand-file-name "registry.el" root))
           (,source nil)
-          (emacs-jupyter-notebook-backend 'helper)
           (emacs-jupyter-notebook-helper-command
            (list (ejn-ag3--env "EJN_E2E_HELPER") "--protocol"))
           (emacs-jupyter-notebook-registry-file registry)

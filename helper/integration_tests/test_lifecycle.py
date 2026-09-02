@@ -29,7 +29,7 @@ class DirectLifecycleTests(unittest.IsolatedAsyncioTestCase):
         result = await self._completion(
             backend,
             "connect",
-            {"connection_file": str(fixture.connection_path), "artifact_dir": str(artifact_dir)},
+            {"connection_file": str(fixture.connection_path), "artifact_dir": str(artifact_dir), "image_max_pixels": 4_194_304},
         )
         self.assertIsNone(result.error)
         self.addAsyncCleanup(self._retire, backend)

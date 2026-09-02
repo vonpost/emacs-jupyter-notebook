@@ -4,7 +4,7 @@
 
 Build an Emacs extension for working with Jupyter kernels running on remote systems from local source files.
 
-The extension should let users edit ordinary local source files, evaluate code cells against a remote Jupyter kernel, display rich outputs inline in Emacs, and reconnect to kernels after Emacs restarts.
+The extension should let users edit ordinary local source files, evaluate code cells against a remote Jupyter kernel, display rich outputs in a dedicated Emacs panel, and reconnect to kernels after Emacs restarts.
 
 ## Hard Constraints
 
@@ -19,11 +19,14 @@ Remote interaction must happen through external processes such as `ssh`, `scp`, 
 
 ## Architecture
 
-Use `emacs-jupyter` for Jupyter protocol/client behavior, MIME rendering helpers, and kernel messaging where practical.
+Use the supervised local Python helper for all Jupyter protocol/client behavior.
+Emacs communicates with it over the bounded framed protocol and must never load
+or call `emacs-jupyter`.
 
 Use `code-cells` style cell markers for source buffers. Python v1 should support `# %%` cells.
 
-Use overlays or dedicated result buffers for outputs. Results must be attached to buffer positions without modifying the visited source file.
+Use the dedicated result panel for outputs. Results must be keyed to source
+positions without modifying the visited source file.
 
 Remote kernel management should work like this:
 
@@ -32,7 +35,7 @@ Remote kernel management should work like this:
 3. The remote side writes or reports a Jupyter connection file.
 4. Emacs retrieves connection metadata without TRAMP.
 5. Emacs starts local SSH port forwards for the Jupyter channels.
-6. `emacs-jupyter` connects to `127.0.0.1` using the rewritten local ports.
+6. The local helper connects to `127.0.0.1` using the rewritten local ports.
 
 ## Reconnect Model
 
@@ -65,7 +68,7 @@ Provide commands for:
 - interrupting kernel
 - restarting kernel
 - shutting down kernel
-- clearing result overlays
+- clearing the result panel
 
 The first implementation target is Python. Design the language mapping so more Jupyter kernels can be added later.
 
@@ -92,7 +95,7 @@ Add ERT tests for behavior that does not require a real remote host:
 - registry serialization/deserialization
 - connection plist port rewriting
 - SSH command construction
-- result overlay creation and cleanup
+- result-panel entry creation, rendering, retention, and cleanup
 - guarantee that evaluation and result rendering do not mutate source text
 
 For remote behavior, structure code so SSH/process execution can be mocked.
@@ -101,13 +104,13 @@ For remote behavior, structure code so SSH/process execution can be mocked.
 
 - Prefer delegating bounded research, test design, failure fixing, and review tasks to subagents.
 - Tell subagents whether they may edit files or only inspect the tree.
-- Keep subagent prompts focused on one concern, such as registry behavior, SSH command construction, or emacs-jupyter adapter integration.
+- Keep subagent prompts focused on one concern, such as registry behavior, SSH command construction, or helper-backend integration.
 - Avoid assigning parallel editing tasks to the same file. If unavoidable, inspect the combined result carefully before running tests.
 - Ask subagents to report verification commands run, files changed, and remaining risks.
 - Treat subagent results as input for manager review, not as automatically final. Re-read the changed code and check for syntax, style, and integration issues.
 - Prefer manager/critic behavior for broad changes: delegate bounded implementation or review, then integrate, verify, and decide.
 - Do not ask subagents to use or require a real remote host for normal unit tests.
-- Keep deterministic ERT tests independent of `emacs-jupyter`, Jupyter itself, SSH connectivity, and remote hosts.
+- Keep deterministic ERT tests independent of Jupyter itself, SSH connectivity, and remote hosts.
 - Use `mother` or `mother.lan` only for optional remote smoke tests when explicitly useful.
 - After byte-compilation checks, remove generated `.elc` files before status/diff review.
 - Re-run the canonical source-based local ERT command after deleting stale byte-code artifacts, because stale `.elc` files can hide source changes.
@@ -117,7 +120,7 @@ For remote behavior, structure code so SSH/process execution can be mocked.
 ## Learnings
 
 Read `LEARNINGS.md` before starting any workstream that touches the async
-pipeline, the Jupyter adapter, the panel, or the display layer. It captures
+pipeline, the helper adapter, the panel, or the display layer. It captures
 concrete lessons (with file:line and workstream-row references) from
 landing W1–W7, and answers common footguns before you have to hit them.
 
@@ -161,15 +164,14 @@ the load-bearing constraints every agent must respect.
 
 ## Roadmap
 
-The active work plan is tracked in `ROADMAP.md` as six workstreams (W1–W6)
-with a claim/done protocol so multiple agents can land changes in parallel
-without colliding. Read `ROADMAP.md` before starting any task. The bootstrap
-phase (initial async start, reconnect, SSH tunnels, SCP retrieval, registry
-persistence, connection-file rewriting, file-associated sessions, cell
-evaluation, overlay rendering) is complete; everything else lives in
-`ROADMAP.md`.
+The active work plan is tracked in `ROADMAP.md` and
+`HELPER_TRANSPORT_PLAN.md` with a claim/done protocol so multiple agents can
+land changes in parallel without colliding. Read both before starting any
+task. The bootstrap phase (initial async start, reconnect, SSH tunnels, SCP
+retrieval, registry persistence, connection-file rewriting, file-associated
+sessions, cell evaluation, and panel rendering) is complete.
 
-Jupyter runtime niceties (richer MIME rendering beyond text and PNG/JPEG,
+Jupyter runtime niceties (richer MIME rendering beyond text and image artifacts,
 runtime completion polish, inspect-at-point polish, code-completeness checks,
 stdin prompts polish, watch values via `user_expressions`) remain a future
 workstream after W1–W6 are done.

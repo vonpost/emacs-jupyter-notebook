@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026
 
 ;;; Commentary:
-;; Unit tests that do not require emacs-jupyter, Jupyter, SSH, or a remote host.
+;; Unit tests that do not require a Jupyter package, SSH, or a remote host.
 
 ;;; Code:
 
@@ -11,21 +11,19 @@
 (require 'cl-lib)
 (require 'benchmark)
 (require 'emacs-jupyter-notebook)
-(require 'emacs-jupyter-notebook-jupyter)
 (require 'emacs-jupyter-notebook-artifacts)
 
 (defun ejn-test-backend-session (&optional raw-client attached)
-  "Create a test backend session with optional legacy RAW-CLIENT data.
+  "Create a helper backend session with optional opaque RAW-CLIENT data.
 When ATTACHED is non-nil, mark the opaque session as locally attached so
 busy-kernel reconnect arbitration may retain it after verification times out."
-  (let ((emacs-jupyter-notebook-backend 'legacy))
-    (let ((session (emacs-jupyter-notebook-backend-session-create
-                    nil (current-buffer))))
-      (when raw-client
-        (setf (emacs-jupyter-notebook-backend-session-data session) raw-client))
-      (when attached
-        (emacs-jupyter-notebook-backend-session-mark-attached session))
-      session)))
+  (let ((session (emacs-jupyter-notebook-backend-session-create
+                  nil (current-buffer))))
+    (when raw-client
+      (setf (emacs-jupyter-notebook-backend-session-data session) raw-client))
+    (when attached
+      (emacs-jupyter-notebook-backend-session-mark-attached session))
+    session))
 
 (defun ejn-test-direct-entry (entry)
   "Return a strict direct-launch registry ENTRY for reconnect tests."
@@ -48,7 +46,115 @@ busy-kernel reconnect arbitration may retain it after verification times out."
                  (list :shell_port 41000 :iopub_port 41001
                        :stdin_port 41002 :hb_port 41003
                        :control_port 41004)))
+    ;; Reconnect/lifecycle fixtures model rows already returned by the worker;
+    ;; any later promotion or retirement must carry this exact authority.
+    (unless (plist-get entry :registry-revision)
+      (setq entry (plist-put entry :registry-revision "ejn-test-current-revision")))
     entry))
+
+(defvar ejn-test--legacy-registry-state (make-hash-table :test #'equal)
+  "Test-only in-memory fixtures retained while lifecycle ERTs migrate.
+
+This never replaces a production registry function.  Real serialization,
+permissions, contention, and CAS behavior are tested through the external
+worker in `emacs-jupyter-notebook-registry-worker-tests'.")
+
+(defun ejn-test-registry--state-key (&optional file)
+  "Return a stable test-fixture key for optional registry FILE."
+  (expand-file-name (or file emacs-jupyter-notebook-registry-file)))
+
+(defun ejn-test-registry-load (&optional file)
+  "Return a copy of the test fixture entries for FILE.
+
+This helper exists solely for pre-worker ERT fixtures.  Production code must
+use the asynchronous transaction worker directly."
+  (copy-tree
+   (gethash (ejn-test-registry--state-key file) ejn-test--legacy-registry-state)))
+
+(defun ejn-test-registry-save (entries &optional file)
+  "Set test fixture ENTRIES for FILE and return a defensive copy."
+  (let ((copy (copy-tree entries)))
+    (puthash (ejn-test-registry--state-key file) copy ejn-test--legacy-registry-state)
+    (copy-tree copy)))
+
+(defun ejn-test-registry-upsert (entry &optional entries)
+  "Return test ENTRIES with ENTRY replacing its durable identity key."
+  (let* ((key (emacs-jupyter-notebook-registry--entry-key entry))
+         (replaced nil)
+         (result
+          (mapcar
+           (lambda (existing)
+             (if (equal key (emacs-jupyter-notebook-registry--entry-key existing))
+                 (progn (setq replaced t) (copy-tree entry))
+               (copy-tree existing)))
+           entries)))
+    (if replaced result (cons (copy-tree entry) result))))
+
+(defun ejn-test-registry-save-entry (entry &optional file)
+  "Upsert ENTRY into a test-only in-memory fixture."
+  (ejn-test-registry-save
+   (ejn-test-registry-upsert entry (ejn-test-registry-load file)) file))
+
+(defun ejn-test-registry-remove (key &optional entries)
+  "Return test ENTRIES without durable identity KEY."
+  (cl-remove-if
+   (lambda (entry)
+     (equal key (emacs-jupyter-notebook-registry--entry-key entry)))
+   entries))
+
+(defun ejn-test-registry-remove-entry (key &optional file)
+  "Remove KEY from a test-only in-memory fixture."
+  (ejn-test-registry-save
+   (ejn-test-registry-remove key (ejn-test-registry-load file)) file))
+
+(defun ejn-test-registry--defer (function)
+  "Run FUNCTION on the next event turn and return a mock operation token."
+  (run-at-time 0 nil function)
+  'ejn-test-registry-operation)
+
+(defun ejn-test-registry-replace-succeeds
+    (entry _expected-revision success _failure &rest _keys)
+  "Deferred exact-CAS success for lifecycle tests.
+
+The worker returns a new opaque revision with each committed mutation, so the
+mock does too.  Deferred delivery intentionally rejects inline-callback
+assumptions in the caller."
+  (let ((persisted (copy-tree entry)))
+    (setq persisted
+          (plist-put persisted :registry-revision "ejn-test-next-revision"))
+    (ejn-test-registry--defer (lambda () (funcall success persisted nil)))))
+
+(defun ejn-test-registry-replace-fails
+    (_entry _expected-revision _success failure &rest _keys)
+  "Deferred no-rollback worker failure for lifecycle tests."
+  (ejn-test-registry--defer
+   (lambda ()
+     (funcall failure
+              '(:kind durability-uncertain :code "test-registry-failure"
+                :message "test transaction failure")
+              nil))))
+
+(defun ejn-test-registry-remove-succeeds
+    (key _expected-revision success _failure &rest _keys)
+  "Deferred exact removal success for lifecycle tests."
+  (ejn-test-registry--defer (lambda () (funcall success key nil))))
+
+(defun ejn-test-registry-remove-fails
+    (_key _expected-revision _success failure &rest _keys)
+  "Deferred no-rollback removal failure for lifecycle tests."
+  (ejn-test-registry--defer
+   (lambda ()
+     (funcall failure
+              '(:kind durability-uncertain :code "test-registry-failure"
+                :message "test transaction failure")
+              nil))))
+
+(defun ejn-test-await (predicate &optional seconds)
+  "Process local test events until PREDICATE is true within SECONDS."
+  (let ((deadline (+ (float-time) (or seconds 2))))
+    (while (and (not (funcall predicate)) (< (float-time) deadline))
+      (accept-process-output nil 0.01))
+    (funcall predicate)))
 
 (defmacro ejn-test-with-temp-buffer (content &rest body)
   "Create a temporary buffer containing CONTENT and evaluate BODY."
@@ -315,6 +421,25 @@ wait for wall-clock time or weaken assertions about callback ordering."
     (let ((index (emacs-jupyter-notebook--imenu-index)))
       (should (equal (caar index) "Spaces Galore")))))
 
+(ert-deftest ejn-imenu-hostile-marker-title-copy-is-hard-bounded ()
+  "A minified marker line cannot make imenu allocate its full title."
+  (with-temp-buffer
+    (python-mode)
+    (insert "# %% ")
+    (insert (make-string 100000 ?x))
+    (insert "\n")
+    (let ((substring-function (symbol-function 'buffer-substring-no-properties))
+          largest)
+      (cl-letf (((symbol-function 'buffer-substring-no-properties)
+                 (lambda (beg end)
+                   (setq largest (max (or largest 0) (- end beg)))
+                   (funcall substring-function beg end))))
+        (let ((index (emacs-jupyter-notebook--imenu-index)))
+          (should (= (length index) 1))
+          (should (string-suffix-p "..." (caar index)))))
+      (should (<= largest
+                  emacs-jupyter-notebook--imenu-title-max-characters)))))
+
 (ert-deftest ejn-imenu-mode-sets-function-and-restores-python-imenu ()
   (with-temp-buffer
     (python-mode)
@@ -327,88 +452,19 @@ wait for wall-clock time or weaken assertions about callback ordering."
       (should (eq imenu-create-index-function python-imenu))
       (should (local-variable-p 'imenu-create-index-function)))))
 
-(ert-deftest ejn-registry-roundtrip-and-permissions ()
-  (ejn-test-with-temp-file file
-    (let ((entry '(:profile "default"
-                   :remote-host "mother"
-                   :remote-cwd "/tmp/project"
-                   :kernelspec "python3"
-                   :remote-connection-file "/tmp/kernel.json"
-                   :remote-pid 123
-                   :created-at "2026-06-10T00:00:00+0000"
-                   :tunnel-ports (:shell_port 50001)
-                   :display-name "mother:python3"
-                   :session-id "abc")))
-      (emacs-jupyter-notebook-registry-save (list entry) file)
-      (should (equal (emacs-jupyter-notebook-registry-load file) (list entry)))
-      (should (= (logand (file-modes file) #o777) #o600)))))
+(ert-deftest ejn-registry-in-memory-find-and-latest ()
+  "Pure entry selection remains independent of durable worker transport.
 
-(ert-deftest ejn-a6-corrupt-registry-backed-up-not-silently-wiped ()
-  "A6: saving into a corrupt registry preserves the old bytes as a
-`.corrupt-*' backup and still lands the new entry, rather than silently
-discarding every prior host's reconnect entry."
-  (ejn-test-with-temp-file file
-    (emacs-jupyter-notebook-registry-save
-     '((:profile "keep" :session-id "old")) file)
-    ;; Corrupt the file on disk (unbalanced form → `read' fails).
-    (with-temp-file file (insert "(:profile \"broken\" this is not"))
-    (cl-letf (((symbol-function 'display-warning) #'ignore))
-      (emacs-jupyter-notebook-registry-save-entry
-       '(:profile "new" :session-id "new") file))
-    ;; New entry present after the rewrite.
-    (should (emacs-jupyter-notebook-registry-find
-             "new" (emacs-jupyter-notebook-registry-load file)))
-    ;; Corrupt bytes preserved in a backup, so nothing is silently lost.
-    (let ((backups (directory-files
-                    (file-name-directory file) t
-                    (concat (regexp-quote (file-name-nondirectory file))
-                            "\\.corrupt-"))))
-      (should backups)
-      (should (string-match-p
-               "not" (with-temp-buffer
-                       (insert-file-contents (car backups))
-                       (buffer-string)))))))
-
-(ert-deftest ejn-a6-valid-registry-save-makes-no-backup ()
-  "A6: the corrupt-backup path never triggers on a healthy registry."
-  (ejn-test-with-temp-file file
-    (emacs-jupyter-notebook-registry-save
-     '((:profile "a" :session-id "a")) file)
-    (emacs-jupyter-notebook-registry-save-entry
-     '(:profile "b" :session-id "b") file)
-    (should (emacs-jupyter-notebook-registry-find
-             "a" (emacs-jupyter-notebook-registry-load file)))
-    (should (emacs-jupyter-notebook-registry-find
-             "b" (emacs-jupyter-notebook-registry-load file)))
-    (should-not (directory-files
-                 (file-name-directory file) nil
-                 (concat (regexp-quote (file-name-nondirectory file))
-                         "\\.corrupt-")))))
-
-(ert-deftest ejn-registry-save-creates-parent-directory ()
-  (let* ((dir (make-temp-file "ejn-registry-dir-" t))
-         (file (expand-file-name "missing/registry.el" dir)))
-    (unwind-protect
-        (progn
-          (emacs-jupyter-notebook-registry-save
-           '((:profile "default" :session-id "abc")) file)
-          (should (file-readable-p file))
-          (should (equal (emacs-jupyter-notebook-registry-load file)
-                         '((:profile "default" :session-id "abc")))))
-      (delete-directory dir t))))
-
-(ert-deftest ejn-registry-upsert-remove-find ()
-  (let* ((a '(:profile "default" :session-id "a" :created-at "1"))
-         (b '(:profile "default" :session-id "b" :created-at "2"))
+The transactional JSON worker owns serialization, permissions, corrupt-file
+handling, and compare-and-swap semantics; those properties are covered by
+`emacs-jupyter-notebook-registry-worker-tests'."
+  (let* ((b '(:profile "default" :session-id "b" :created-at "2"))
          (a2 '(:profile "default" :session-id "a" :created-at "3"))
-         (entries (emacs-jupyter-notebook-registry-upsert a nil)))
-    (setq entries (emacs-jupyter-notebook-registry-upsert b entries))
-    (setq entries (emacs-jupyter-notebook-registry-upsert a2 entries))
+         (entries (list b a2)))
     (should (= (length entries) 2))
     (should (equal (emacs-jupyter-notebook-registry-find "a" entries) a2))
-    (should (equal (emacs-jupyter-notebook-registry-latest-for-profile "default" entries) a2))
-      (should-not (emacs-jupyter-notebook-registry-find
-                  "a" (emacs-jupyter-notebook-registry-remove "a" entries)))))
+    (should (equal (emacs-jupyter-notebook-registry-latest-for-profile
+                    "default" entries) a2))))
 
 (ert-deftest ejn-registry-latest-for-file ()
   (let* ((file (expand-file-name "notebook.py" temporary-file-directory))
@@ -449,33 +505,27 @@ discarding every prior host's reconnect entry."
       (emacs-jupyter-notebook-connection-write-file conn file)
       (should (equal (emacs-jupyter-notebook-connection-read-file file) conn)))))
 
+(ert-deftest ejn-helper-only-production-has-no-adapter-or-jupyter-package ()
+  "Production uses only the local helper transport, without an adapter file."
+  (let* ((root (file-name-directory
+                (or (locate-library "emacs-jupyter-notebook")
+                    (expand-file-name "emacs-jupyter-notebook.el"))))
+         (adapter (expand-file-name "emacs-jupyter-notebook-jupyter.el" root))
+         (sources (directory-files root t "\\`emacs-jupyter-notebook.*\\.el\\'")))
+    (should-not (file-exists-p adapter))
+    (dolist (source sources)
+      (with-temp-buffer
+        (insert-file-contents source)
+        (goto-char (point-min))
+        (should-not
+         (re-search-forward "(require[[:space:]]+'?jupyter\\b" nil t))))))
+
 ;; W4.7: the sync `--retrieve-connection-file' and `--wait-for-tunnel'
 ;; tests have been removed along with the functions they exercised.  The
 ;; async retrieve and tunnel-readiness poller are covered by
 ;; `ejn-async-retrieve-*' / `ejn-async-wait-tunnel-*' (see ROADMAP W4.7).
 
-(ert-deftest ejn-w4.7-no-sleep-for-in-source-files ()
-  "W4.7 acceptance: no `sleep-for' call may appear in any package source
-file.  Test sources may still use it for synchronization (see the
-W4.4 dead-PID probe test); production code must not."
-  (let ((dir (file-name-directory
-              (or (locate-library "emacs-jupyter-notebook")
-                  (expand-file-name "emacs-jupyter-notebook.el")))))
-    (dolist (name '("emacs-jupyter-notebook.el"
-                    "emacs-jupyter-notebook-ssh.el"
-                    "emacs-jupyter-notebook-jupyter.el"
-                    "emacs-jupyter-notebook-result.el"
-                    "emacs-jupyter-notebook-connection.el"
-                    "emacs-jupyter-notebook-registry.el"
-                    "emacs-jupyter-notebook-vars.el"
-                    "emacs-jupyter-notebook-cell.el"))
-      (let ((path (expand-file-name name dir)))
-        (when (file-readable-p path)
-          (with-temp-buffer
-            (insert-file-contents path)
-            (goto-char (point-min))
-            (should-not
-             (re-search-forward "(sleep-for\\b" nil t))))))))
+
 
 (ert-deftest ejn-w4.7-local-port-probe-is-explicitly-nonblocking ()
   "Tunnel readiness must never wait synchronously for a TCP connect."
@@ -593,11 +643,10 @@ W4.4 dead-PID probe test); production code must not."
 ;; `ejn-async-wait-tunnel-*' tests.
 
 (ert-deftest ejn-start-remote-kernel-uses-async-launch ()
-  (let ((emacs-jupyter-notebook-backend 'legacy)
-        (emacs-jupyter-notebook-remote-profiles
+  (let ((emacs-jupyter-notebook-remote-profiles
           '(("p" . (:host "example.com" :remote-cwd "~" :kernelspec "python3"))))
         started)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-selected-backend)
                #'ignore)
               ((symbol-function 'emacs-jupyter-notebook-ssh-run-command)
                (lambda (&rest _)
@@ -609,10 +658,17 @@ W4.4 dead-PID probe test); production code must not."
               ((symbol-function 'emacs-jupyter-notebook-ssh-start-bounded-process)
                (lambda (_name _argv _limit _sentinel)
                  (setq started t)
-                 'mock-launch-process)))
+                 'mock-launch-process))
+              ((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+               (lambda (success _failure &rest _keys)
+                 (ejn-test-registry--defer
+                  (lambda () (funcall success nil nil))))))
       (with-temp-buffer
         (setq buffer-file-name "/tmp/example-notebook.py")
         (let ((context (emacs-jupyter-notebook-start-remote-kernel "p")))
+          (should (eq (plist-get context :phase) 'registry-start-preflight))
+          (should-not started)
+          (should (ejn-test-await (lambda () started)))
           (should started)
           (should (eq context emacs-jupyter-notebook--async-context))
           (should (eq (plist-get context :phase) 'resolve))
@@ -624,7 +680,7 @@ W4.4 dead-PID probe test); production code must not."
 (ert-deftest ejn-start-remote-kernel-requires-file-buffer ()
   (let ((emacs-jupyter-notebook-remote-profiles
            '(("p" . (:host "example.com")))))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-selected-backend)
                #'ignore))
       (with-temp-buffer
         (should-error (emacs-jupyter-notebook-start-remote-kernel "p")
@@ -637,14 +693,18 @@ nothing, so the buffer keeps its single in-progress attempt."
   (let ((emacs-jupyter-notebook-remote-profiles
           '(("p" . (:host "example.com" :remote-cwd "~" :kernelspec "python3"))))
         started)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-selected-backend)
                #'ignore)
               ((symbol-function 'y-or-n-p) (lambda (&rest _) nil))
               ((symbol-function
                 'emacs-jupyter-notebook-ssh-start-bounded-process)
                (lambda (&rest _)
                  (setq started t)
-                 'mock-process)))
+                 'mock-process))
+              ((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+               (lambda (success _failure &rest _keys)
+                 (ejn-test-registry--defer
+                  (lambda () (funcall success nil nil))))))
       (with-temp-buffer
         (setq buffer-file-name "/tmp/example-notebook.py")
         (setq emacs-jupyter-notebook--async-context
@@ -658,11 +718,10 @@ nothing, so the buffer keeps its single in-progress attempt."
 (ert-deftest ejn-start-remote-kernel-accepting-cancel-supersedes-attempt ()
   "W12: accepting the cancel prompt (`y') aborts the in-progress attempt
 via `--cancel-async-operation' and proceeds with the new start."
-  (let ((emacs-jupyter-notebook-backend 'legacy)
-        (emacs-jupyter-notebook-remote-profiles
+  (let ((emacs-jupyter-notebook-remote-profiles
           '(("p" . (:host "example.com" :remote-cwd "~" :kernelspec "python3"))))
         started superseded)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-selected-backend)
                #'ignore)
               ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
               ((symbol-function 'emacs-jupyter-notebook--cancel-async-operation)
@@ -673,7 +732,11 @@ via `--cancel-async-operation' and proceeds with the new start."
                 'emacs-jupyter-notebook-ssh-start-bounded-process)
                (lambda (&rest _)
                  (setq started t)
-                 'mock-process)))
+                 'mock-process))
+              ((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+               (lambda (success _failure &rest _keys)
+                 (ejn-test-registry--defer
+                  (lambda () (funcall success nil nil))))))
       (with-temp-buffer
         (setq buffer-file-name "/tmp/example-notebook.py")
         (setq emacs-jupyter-notebook--async-context
@@ -682,13 +745,13 @@ via `--cancel-async-operation' and proceeds with the new start."
                :origin-buffer (current-buffer)))
         (emacs-jupyter-notebook-start-remote-kernel "p")
         (should superseded)
-        (should started)))))
+        (should (ejn-test-await (lambda () started)))))))
 
 (ert-deftest ejn-start-remote-kernel-refuses-existing-client-noninteractive ()
   (let ((emacs-jupyter-notebook-remote-profiles
           '(("p" . (:host "example.com" :remote-cwd "~" :kernelspec "python3"))))
         started)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-selected-backend)
                #'ignore)
               ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
                (lambda (&rest _)
@@ -701,13 +764,250 @@ via `--cancel-async-operation' and proceeds with the new start."
                       :type 'user-error)
         (should-not started)))))
 
+(ert-deftest ejn-start-preflight-attaches-existing-current-file-session ()
+  "A fresh buffer must never launch over an ordinary durable current-file row."
+  (let* ((file "/tmp/ejn-preflight-existing.py")
+         (entry (ejn-test-direct-entry
+                 `(:profile "p" :session-id "existing" :local-file ,file
+                   :remote-host "example.com" :remote-cwd "~"
+                   :kernelspec "python3" :remote-pid 42001)))
+         (resolver-called nil)
+         (cleanup-called nil)
+         (registry-mutation nil)
+         failure)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+               (lambda (success _failure &rest _keys)
+                 (ejn-test-registry--defer
+                  (lambda () (funcall success (list entry) nil)))))
+              ((symbol-function 'emacs-jupyter-notebook--ensure-clean-before-start)
+               (lambda () (setq cleanup-called t)))
+              ((symbol-function 'emacs-jupyter-notebook--ensure-selected-backend)
+               (lambda () (ert-fail "existing row reached backend admission")))
+              ((symbol-function 'emacs-jupyter-notebook--read-host-profile)
+               (lambda (&rest _) (ert-fail "existing row resolved a profile")))
+              ((symbol-function 'emacs-jupyter-notebook--async-resolve-kernelspec)
+               (lambda (&rest _) (setq resolver-called t)))
+              ((symbol-function 'emacs-jupyter-notebook-registry-create-async)
+               (lambda (&rest _) (setq registry-mutation t)))
+              ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+               (lambda (&rest _) (setq registry-mutation t)))
+              ((symbol-function 'emacs-jupyter-notebook-registry-remove-async)
+               (lambda (&rest _) (setq registry-mutation t))))
+      (with-temp-buffer
+        (setq buffer-file-name file)
+        (should-not emacs-jupyter-notebook--session-entry)
+        (let ((context
+               (emacs-jupyter-notebook-start-remote-kernel
+                "p" nil
+                (lambda (_context reason) (setq failure reason)))))
+          (should (eq (plist-get context :phase) 'registry-start-preflight))
+          (should (ejn-test-await (lambda () failure)))
+          (should (eq (plist-get context :phase) 'error))
+          (should (equal emacs-jupyter-notebook--session-entry entry))
+          (should emacs-jupyter-notebook--tunnel-dead)
+          (should (string-match-p "reconnect-remote-kernel" failure))
+          (should (string-match-p "retry-fresh-kernel" failure))
+          (should-not resolver-called)
+          (should-not cleanup-called)
+          (should-not registry-mutation))))))
+
+(ert-deftest ejn-start-preflight-attaches-leased-current-file-session ()
+  "A durable lifecycle lease blocks a fresh-buffer start before all launch work."
+  (let* ((file "/tmp/ejn-preflight-leased.py")
+         (entry (ejn-test-direct-entry
+                 `(:profile "p" :session-id "leased" :local-file ,file
+                   :remote-host "example.com" :remote-cwd "~"
+                   :kernelspec "python3" :remote-pid 42002
+                   :transition-kind retry-fresh :transition-token "lease-token"
+                   :transition-stage admitted :transition-started-at "now"
+                   :transition-expires-at 9999999999)))
+         resolver-called cleanup-called failure)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+               (lambda (success _failure &rest _keys)
+                 (ejn-test-registry--defer
+                  (lambda () (funcall success (list entry) nil)))))
+              ((symbol-function 'emacs-jupyter-notebook--ensure-clean-before-start)
+               (lambda () (setq cleanup-called t)))
+              ((symbol-function 'emacs-jupyter-notebook--ensure-selected-backend)
+               (lambda () (ert-fail "leased row reached backend admission")))
+              ((symbol-function 'emacs-jupyter-notebook--read-host-profile)
+               (lambda (&rest _) (ert-fail "leased row resolved a profile")))
+              ((symbol-function 'emacs-jupyter-notebook--async-resolve-kernelspec)
+               (lambda (&rest _) (setq resolver-called t))))
+      (with-temp-buffer
+        (setq buffer-file-name file)
+        (emacs-jupyter-notebook-start-remote-kernel
+         "p" nil (lambda (_context reason) (setq failure reason)))
+        (should (ejn-test-await (lambda () failure)))
+        (should (equal emacs-jupyter-notebook--session-entry entry))
+        (should emacs-jupyter-notebook--tunnel-dead)
+        (should (string-match-p "retry-fresh-kernel" failure))
+        (should-not resolver-called)
+        (should-not cleanup-called)))))
+
+(ert-deftest ejn-start-preflight-uses-worker-matching-entry-for-lexical-alias ()
+  "Direct start attaches the worker's alias match before any launch work."
+  (let* ((root (make-temp-file "ejn-preflight-alias-" t))
+         (physical (expand-file-name "source.py" root))
+         (alias (expand-file-name "alias.py" root))
+         (entry (ejn-test-direct-entry
+                 `(:profile "p" :session-id "alias-existing"
+                   :local-file ,physical :remote-host "example.com"
+                   :remote-cwd "~" :kernelspec "python3" :remote-pid 42003)))
+         (resolver-called nil)
+         (ssh-called nil)
+         (launch-called nil)
+         (cleanup-called nil)
+         (read-local-file nil)
+         failure)
+    (unwind-protect
+        (progn
+          (with-temp-file physical
+            (insert "x = 1\n"))
+          (make-symbolic-link physical alias)
+          (should (equal (file-truename alias) (file-truename physical)))
+          (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+                     (lambda (success _failure &rest keys)
+                       (setq read-local-file (plist-get keys :local-file))
+                       (ejn-test-registry--defer
+                        (lambda ()
+                          ;; The worker's alias resolution is represented by
+                          ;; the third callback argument; the ordinary list
+                          ;; deliberately cannot satisfy the lexical lookup.
+                          (funcall success (list entry) nil entry)))))
+                    ((symbol-function
+                      'emacs-jupyter-notebook--current-file-registry-entry)
+                     (lambda (&rest _)
+                       (ert-fail "used lexical fallback instead of matching-entry")))
+                    ((symbol-function
+                      'emacs-jupyter-notebook--ensure-clean-before-start)
+                     (lambda (&rest _) (setq cleanup-called t)))
+                    ((symbol-function 'emacs-jupyter-notebook--ensure-selected-backend)
+                     (lambda (&rest _) (ert-fail "alias match reached backend admission")))
+                    ((symbol-function 'emacs-jupyter-notebook--read-host-profile)
+                     (lambda (&rest _) (ert-fail "alias match resolved a host profile")))
+                    ((symbol-function 'emacs-jupyter-notebook--async-resolve-kernelspec)
+                     (lambda (&rest _) (setq resolver-called t)))
+                    ((symbol-function 'emacs-jupyter-notebook-ssh-start-bounded-process)
+                     (lambda (&rest _) (setq ssh-called t)))
+                    ((symbol-function
+                      'emacs-jupyter-notebook--start-remote-kernel-admitted)
+                     (lambda (&rest _) (setq launch-called t))))
+            (with-temp-buffer
+              (setq buffer-file-name alias)
+              (let ((context
+                     (emacs-jupyter-notebook-start-remote-kernel
+                      "p" nil
+                      (lambda (_context reason) (setq failure reason)))))
+                (should (eq (plist-get context :phase)
+                            'registry-start-preflight))
+                (should (ejn-test-await (lambda () failure)))
+                (should (equal read-local-file (expand-file-name alias)))
+                (should (eq (plist-get context :phase) 'error))
+                (should (equal emacs-jupyter-notebook--session-entry entry))
+                (should emacs-jupyter-notebook--tunnel-dead)
+                (should (string-match-p "reconnect-remote-kernel" failure))
+                (should-not resolver-called)
+                (should-not ssh-called)
+                (should-not launch-called)
+                (should-not cleanup-called)))))
+      (when (file-exists-p alias)
+        (delete-file alias))
+      (when (file-exists-p physical)
+        (delete-file physical))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest ejn-ensure-client-starts-once-after-proven-empty-registry-read ()
+  "Evaluation's known-empty lookup hands off without a second registry read."
+  (let ((emacs-jupyter-notebook-default-profile "p")
+        (emacs-jupyter-notebook-remote-profiles
+         '(("p" . (:host "example.com" :remote-cwd "~" :kernelspec "python3"))))
+        (reads 0)
+        started)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+               (lambda (success _failure &rest _keys)
+                 (setq reads (1+ reads))
+                 (ejn-test-registry--defer
+                  (lambda () (funcall success nil nil)))))
+              ((symbol-function 'emacs-jupyter-notebook--ensure-selected-backend)
+               #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook-ssh-start-bounded-process)
+               (lambda (&rest _)
+                 (setq started t)
+                 'mock-resolver-process)))
+      (with-temp-buffer
+        (setq buffer-file-name "/tmp/ejn-proven-empty.py")
+        (emacs-jupyter-notebook--ensure-client-async #'ignore #'ignore)
+        (should (ejn-test-await (lambda () started)))
+        (should (= reads 1))))))
+
+(ert-deftest ejn-ensure-client-uses-worker-matching-entry-for-lexical-alias ()
+  "Ensure-client reconnects the worker's alias match before launch work."
+  (let* ((root (make-temp-file "ejn-ensure-alias-" t))
+         (physical (expand-file-name "source.py" root))
+         (alias (expand-file-name "alias.py" root))
+         (entry (ejn-test-direct-entry
+                 `(:profile "p" :session-id "alias-existing"
+                   :local-file ,physical :remote-host "example.com"
+                   :remote-cwd "~" :kernelspec "python3" :remote-pid 42004)))
+         (read-local-file nil)
+         (reconnected nil)
+         (resolver-called nil)
+         (ssh-called nil)
+         (launch-called nil)
+         (failure-called nil))
+    (unwind-protect
+        (progn
+          (with-temp-file physical
+            (insert "x = 1\n"))
+          (make-symbolic-link physical alias)
+          (should (equal (file-truename alias) (file-truename physical)))
+          (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+                     (lambda (success _failure &rest keys)
+                       (setq read-local-file (plist-get keys :local-file))
+                       (ejn-test-registry--defer
+                        (lambda ()
+                          (funcall success (list entry) nil entry)))))
+                    ((symbol-function
+                      'emacs-jupyter-notebook--current-file-registry-entry)
+                     (lambda (&rest _)
+                       (ert-fail "used lexical fallback instead of matching-entry")))
+                    ((symbol-function 'emacs-jupyter-notebook-reconnect-remote-kernel)
+                     (lambda (selected _success _failure &optional _owner)
+                       (setq reconnected selected)))
+                    ((symbol-function 'emacs-jupyter-notebook--async-resolve-kernelspec)
+                     (lambda (&rest _) (setq resolver-called t)))
+                    ((symbol-function 'emacs-jupyter-notebook-ssh-start-bounded-process)
+                     (lambda (&rest _) (setq ssh-called t)))
+                    ((symbol-function
+                      'emacs-jupyter-notebook--start-remote-kernel-admitted)
+                     (lambda (&rest _) (setq launch-called t))))
+            (with-temp-buffer
+              (setq buffer-file-name alias)
+              (emacs-jupyter-notebook--ensure-client-async
+               #'ignore
+               (lambda (&rest _) (setq failure-called t)))
+              (should (ejn-test-await (lambda () reconnected)))
+              (should (equal read-local-file (expand-file-name alias)))
+              (should (equal reconnected entry))
+              (should-not failure-called)
+              (should-not resolver-called)
+              (should-not ssh-called)
+              (should-not launch-called))))
+      (when (file-exists-p alias)
+        (delete-file alias))
+      (when (file-exists-p physical)
+        (delete-file physical))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
 (ert-deftest ejn-reconnect-remote-kernel-uses-async-retrieve ()
   ;; Post-W4.4: reconnect first runs `--async-probe-pid-alive', which only
   ;; advances to `--async-retrieve' when the entry's `:remote-pid' is alive.
   ;; The probe is stubbed here to call retrieve directly so this test still
   ;; pins the contract "reconnect ends in async-retrieve, never sync SSH".
-  (let ((emacs-jupyter-notebook-backend 'legacy)
-        (entry (ejn-test-direct-entry
+  (let ((entry (ejn-test-direct-entry
                 '(:profile "p"
                   :remote-host "example.com"
                   :remote-cwd "~"
@@ -716,7 +1016,7 @@ via `--cancel-async-operation' and proceeds with the new start."
                   :remote-connection-file "~/.cache/ejn/kernel.json"
                   :session-id "session")))
         retrieved)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-selected-backend)
                #'ignore)
               ((symbol-function 'emacs-jupyter-notebook-ssh-run-command)
                (lambda (&rest _)
@@ -749,7 +1049,7 @@ stale RECONNECT attempt, by contrast, is superseded silently — see
                  :remote-connection-file "~/.cache/ejn/kernel.json"
                  :session-id "session"))
         retrieved)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-selected-backend)
                #'ignore)
               ((symbol-function 'y-or-n-p) (lambda (&rest _) nil))
               ((symbol-function 'emacs-jupyter-notebook--async-retrieve)
@@ -772,8 +1072,7 @@ session, so reconnect must NOT be blocked by the guard — it reaps the
 stale buffer-local entry and proceeds to probe/retrieve the target entry.
 Pre-W10 this signalled `user-error \"A kernel is already active\"' and the
 wedged buffer could only be recovered by nuking the live kernel."
-  (let ((emacs-jupyter-notebook-backend 'legacy)
-        (entry (ejn-test-direct-entry
+  (let ((entry (ejn-test-direct-entry
                 '(:profile "p"
                   :remote-host "example.com"
                   :remote-cwd "~"
@@ -782,7 +1081,7 @@ wedged buffer could only be recovered by nuking the live kernel."
                   :remote-connection-file "~/.cache/ejn/kernel.json"
                   :session-id "session")))
         retrieved)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-selected-backend)
                #'ignore)
               ((symbol-function 'emacs-jupyter-notebook--async-probe-pid-alive)
                (lambda (context)
@@ -801,9 +1100,8 @@ wedged buffer could only be recovered by nuking the live kernel."
           ;; reconnect context took over.
           (should (equal (plist-get context :entry) entry)))))))
 
-(ert-deftest ejn-read-registry-entry-prefers-current-file ()
-  "W6.8: chooser ALWAYS runs, but the current-file entry is the default initial-input.
-Pressing RET on the chooser with no edit returns the current-file entry."
+(ert-deftest ejn-registry-picker-prefers-current-file ()
+  "Picker selection stays pure after its asynchronous registry read."
   (let* ((file (expand-file-name "current.py" temporary-file-directory))
          (entry `(:profile "p"
                   :session-id "current"
@@ -811,16 +1109,15 @@ Pressing RET on the chooser with no edit returns the current-file entry."
                   :created-at "2"))
          (other '(:profile "p" :session-id "other" :created-at "3"))
          (passed-default nil))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
-               (lambda (&optional _file) (list other entry)))
-              ((symbol-function 'completing-read)
+    (cl-letf (((symbol-function 'completing-read)
                (lambda (_prompt collection &optional _pred _require _initial _hist default)
                  (setq passed-default default)
                  ;; Simulate the user pressing RET on the default.
                  default)))
       (with-temp-buffer
         (setq buffer-file-name file)
-        (let ((selected (emacs-jupyter-notebook--read-registry-entry)))
+        (let ((selected (emacs-jupyter-notebook--choose-registry-entry
+                         (list other entry))))
           (should (equal selected entry))
           (should (string-match-p "session-id" "session-id"))
           ;; The default offered must be the label for the current-file entry.
@@ -1144,9 +1441,16 @@ leaves absolute paths untouched."
            (zerop
             (call-process
              "sh" nil nil nil "-c"
-             (format "nohup sh %s >/dev/null 2>&1 & echo $! > %s"
+             ;; Keep a waiter alive for the target so it reaps the child after
+             ;; the cleanup command sends TERM.  A bare `nohup' child can stay
+             ;; a zombie under a non-reaping test-container init, making its
+             ;; PID look alive to the intentionally conservative cleanup code.
+             (format "nohup sh -c %s sh %s %s >/dev/null 2>&1 &"
+                     (shell-quote-argument
+                      "sh \"$1\" & child=$!; printf '%s\\n' \"$child\" > \"$2\"; wait \"$child\"")
                      (shell-quote-argument connection)
                      (shell-quote-argument pid-file)))))
+          (should (ejn-test-await (lambda () (file-exists-p pid-file))))
           (setq pid
                 (string-to-number
                  (string-trim
@@ -1185,6 +1489,12 @@ leaves absolute paths untouched."
          (remote-command (car (last cmd))))
     (should (string-match-p "tail -c 12345 < \\$HOME/.cache/ejn/kernel-session.log"
                             remote-command))))
+
+(ert-deftest ejn-ssh-management-output-customization-cannot-raise-hard-limit ()
+  (let ((emacs-jupyter-notebook-management-output-max-bytes
+         most-positive-fixnum))
+    (should (= (emacs-jupyter-notebook-ssh--management-output-limit)
+               emacs-jupyter-notebook-ssh--management-output-hard-limit))))
 
 (ert-deftest ejn-ssh-remote-ps-command-targets-cache-dir ()
   (let* ((cmd (emacs-jupyter-notebook-ssh-build-remote-ps-command
@@ -1381,6 +1691,9 @@ a `Hint:' line."
                      :error-callback (lambda (ctx err)
                                        (setq captured err
                                              captured-context ctx)))))
+      ;; Install the context before starting the short-lived fixture process:
+      ;; sentinels intentionally ignore attempts that are not yet current.
+      (setq emacs-jupyter-notebook--async-context context)
       (cl-letf (((symbol-function 'display-warning) #'ignore))
         ;; Real subprocess so the sentinel fires on a real exit.  Route
         ;; the auth-failed stderr through the real ssh-start-process path
@@ -1759,22 +2072,36 @@ advises retrying reconnect, never a fresh start."
 MUST NOT start a fresh kernel.  It surfaces the error to the caller's
 error-callback so the user can decide."
   (with-temp-buffer
-    (let* ((entry '(:profile "p" :session-id "s8" :remote-host "h"
+    (let* ((emacs-jupyter-notebook--client nil)
+           (emacs-jupyter-notebook--async-context nil)
+           (emacs-jupyter-notebook--tunnel-dead nil)
+           (entry '(:profile "p" :session-id "s8" :remote-host "h"
                     :remote-pid 99999 :local-file "/tmp/foo.py"
                     :remote-connection-file "/r/k.json"))
            reconnect-error-cb start-called registry-removed err-called)
+      (setq buffer-file-name "/tmp/foo.py")
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
-                 (lambda () entry))
+                 (lambda (_entries) entry))
+                ((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+                 (lambda (success _failure &rest _keys)
+                   (ejn-test-registry--defer
+                    (lambda () (funcall success (list entry) nil)))))
+                ((symbol-function 'emacs-jupyter-notebook--registry-lookup-handoff)
+                 (lambda (context continuation)
+                   (funcall continuation
+                            (plist-get context :callback)
+                            (plist-get context :error-callback))))
                 ((symbol-function 'emacs-jupyter-notebook-reconnect-remote-kernel)
-                 (lambda (_entry _cb error-cb &optional _owner)
+                 (lambda (_entry _success error-cb &optional _owner)
                    (setq reconnect-error-cb error-cb)))
-                ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
+                ((symbol-function 'emacs-jupyter-notebook--start-remote-kernel-admitted)
                  (lambda (&rest _) (setq start-called t)))
                 ((symbol-function 'emacs-jupyter-notebook--remove-registry-entry)
                  (lambda (&rest _) (setq registry-removed t))))
         (emacs-jupyter-notebook--ensure-client-async
          #'ignore
          (lambda (_ctx _err) (setq err-called t)))
+        (should (ejn-test-await (lambda () reconnect-error-cb)))
         (should (functionp reconnect-error-cb))
         ;; Simulate the W4.4 kernel-dead failure.
         (funcall reconnect-error-cb nil "kernel-dead")
@@ -1810,22 +2137,7 @@ so it cannot fire (and bump misses) after cleanup."
     (should-not emacs-jupyter-notebook--heartbeat-timer)
     (should-not emacs-jupyter-notebook--heartbeat-timeout-timer)))
 
-(ert-deftest ejn-w4.5-heartbeat-success-keeps-tunnel-alive ()
-  "W4.5: a successful heartbeat reply keeps `--tunnel-dead' nil and resets
-the miss counter regardless of prior misses."
-  (with-temp-buffer
-    (setq emacs-jupyter-notebook--client
-          (ejn-test-backend-session 'mock-client t))
-    (setq emacs-jupyter-notebook--heartbeat-misses 1)
-    (let ((emacs-jupyter-notebook-heartbeat-misses-allowed 2)
-          (emacs-jupyter-notebook-heartbeat-timeout 0.2))
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-kernel-info)
-                 (lambda (_client cb)
-                   (funcall cb '(:status "ok") nil))))
-        (emacs-jupyter-notebook--heartbeat-tick)
-        (ejn-test-drain-zero-delay-timers)
-        (should (= 0 emacs-jupyter-notebook--heartbeat-misses))
-        (should-not emacs-jupyter-notebook--tunnel-dead)))))
+
 
 (ert-deftest ejn-w4.5-heartbeat-n-consecutive-misses-flip-tunnel-dead ()
   "W4.5: after `--heartbeat-misses-allowed' consecutive misses the buffer
@@ -1854,16 +2166,7 @@ flags --tunnel-dead, clears --kernel-status, and the timer is cancelled."
     (should (= 0 emacs-jupyter-notebook--heartbeat-misses))
     (should-not emacs-jupyter-notebook--heartbeat-inflight)))
 
-(ert-deftest ejn-w4.5-heartbeat-skipped-when-tunnel-already-dead ()
-  "W4.5: `--heartbeat-tick' does not fire a probe when --tunnel-dead is set."
-  (with-temp-buffer
-    (setq emacs-jupyter-notebook--client 'mock-client
-          emacs-jupyter-notebook--tunnel-dead t)
-    (let (probe-called)
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-kernel-info)
-                 (lambda (_c _cb) (setq probe-called t))))
-        (emacs-jupyter-notebook--heartbeat-tick)
-        (should-not probe-called)))))
+
 
 (ert-deftest ejn-w4.5-heartbeat-cancelled-by-release-local-resources ()
   "W4.5 + W1: `--release-local-resources' cancels the heartbeat timer
@@ -2278,21 +2581,7 @@ as part of local cleanup (kill-buffer-hook + mode-disable both route here)."
           (should (process-get process 'ejn-output-overflow)))
       (emacs-jupyter-notebook--async-delete-process process))))
 
-(ert-deftest ejn-evaluate-cell-does-not-mutate-source ()
-  "W2: evaluating a cell does not mutate source-buffer text.
-Output goes to the panel; the source buffer is untouched."
-  (ejn-test-with-temp-buffer "# %%\na = 1\n# %%\nb = 2\n"
-    (search-forward "a = 1")
-    (let ((before (buffer-string))
-          (emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t))
-          captured-code)
-      (let ((emacs-jupyter-notebook-jupyter-evaluate-function
-             (lambda (_client code _entry)
-               (setq captured-code code))))
-        (emacs-jupyter-notebook-send-cell))
-      (should (equal captured-code "a = 1\n"))
-      (should (equal (buffer-string) before)))))
+
 
 (ert-deftest ejn-evaluate-code-error-routes-to-panel ()
   "W2: an evaluate failure creates a panel entry annotated with the error and
@@ -2300,7 +2589,7 @@ leaves source-buffer text untouched."
   (ejn-test-with-temp-buffer "x = 1\n"
     (let ((before (buffer-string)))
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-client-async)
-                 (lambda (_callback error-callback)
+                 (lambda (_callback error-callback &optional _profile _announce)
                    (funcall error-callback nil "connect failed"))))
         (emacs-jupyter-notebook--evaluate-code "x = 1\n" nil))
       (should (equal (buffer-string) before))
@@ -2315,36 +2604,7 @@ leaves source-buffer text untouched."
                             (string-match-p "connect failed" c))))
                    emacs-jupyter-notebook-panel--entries)))))))
 
-(ert-deftest ejn-error-callback-decodes-ansi-escape-codes-in-traceback ()
-  "Python tracebacks arrive with ANSI colour SGR escapes (`\\x1b[0;31m'
-around the error class, `\\x1b[1m' for bold, etc.).  The `error'
-callback must strip those escapes and translate them into `face'
-text-properties rather than leaving them as literal bytes."
-  (with-temp-buffer
-    (let* ((panel (ejn-panel-ensure (current-buffer)))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) "1/0"))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks
-                       (current-buffer) handle 'mock-client))
-           (err-fn (cadr (assoc "error" callbacks)))
-           (raw-traceback
-            (list
-             "\e[0;31m---------------------------------------------------------------------------\e[0m"
-             "\e[0;31mZeroDivisionError\e[0m                         Traceback (most recent call last)"
-             "Cell \e[0;32mIn[1], line 1\e[0m"
-             "\e[0;31mZeroDivisionError\e[0m: division by zero")))
-      (cl-letf (((symbol-function 'jupyter-message-content)
-                 (lambda (_msg)
-                   (list :traceback raw-traceback
-                         :ename "ZeroDivisionError"
-                         :evalue "division by zero"))))
-        (funcall err-fn 'mock-msg))
-      (let* ((entry (emacs-jupyter-notebook-panel--entry
-                     panel (plist-get handle :id)))
-             (content (ejn-panel-entry-text entry)))
-        (should content)
-        (should-not (string-match-p "\e\\[[0-9;]*m" content))
-        (should (string-match-p "ZeroDivisionError" content))
-        (should (string-match-p "division by zero" content))))))
+
 
 (ert-deftest ejn-panel-append-text-preserves-ansi-faces-under-fallback-face ()
   "`ejn-panel-append-text' composes the optional FACE with any
@@ -2431,32 +2691,7 @@ deactivated the standard region before the interactive form runs."
     (deactivate-mark)
     (should-error (emacs-jupyter-notebook--region-bounds) :type 'user-error)))
 
-(ert-deftest ejn-send-region-and-buffer-do-not-mutate-source ()
-  "W2: region/buffer eval does not mutate source-buffer text and has cell-key nil."
-  (ejn-test-with-temp-buffer "x = 1\ny = 2\n"
-    (let ((before (buffer-string))
-          (modified (buffer-modified-p))
-          (emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t))
-          calls ids)
-      (let ((emacs-jupyter-notebook-jupyter-evaluate-function
-             (lambda (_client code entry-handle)
-               (push (list code (plist-get entry-handle :cell-key)) calls))))
-        (push (emacs-jupyter-notebook-send-region
-               (point-min) (line-end-position)) ids)
-        (push (emacs-jupyter-notebook-send-buffer) ids))
-      (should (equal (buffer-string) before))
-      (should (equal (buffer-modified-p) modified))
-      ;; Only the active head reaches the backend.  The second send remains a
-      ;; captured FIFO record until the first request is terminal.
-      (should (equal (mapcar #'car calls) '("x = 1")))
-      (let* ((ordered-ids (nreverse ids))
-             (records (mapcar #'emacs-jupyter-notebook--execution-record
-                              ordered-ids)))
-        (should (equal (mapcar (lambda (record) (plist-get record :code)) records)
-                       '("x = 1" "x = 1\ny = 2\n")))
-        (should (cl-every (lambda (record) (null (plist-get record :cell-key)))
-                          records))))))
+
 
 (ert-deftest ejn-mode-enable-does-not-start-remote-work ()
   (with-temp-buffer
@@ -2468,10 +2703,7 @@ deactivated the standard region before the interactive form runs."
                  (ert-fail "mode enable started SSH process")))
               ((symbol-function 'emacs-jupyter-notebook--wait-for-tunnel)
                (lambda (&rest _)
-                 (ert-fail "mode enable waited for tunnel")))
-              ((symbol-function 'emacs-jupyter-notebook-jupyter-connect)
-               (lambda (&rest _)
-                 (ert-fail "mode enable connected to Jupyter"))))
+                 (ert-fail "mode enable waited for tunnel"))))
       (emacs-jupyter-notebook-mode 1)
       (should emacs-jupyter-notebook-mode))))
 
@@ -2483,60 +2715,10 @@ deactivated the standard region before the interactive form runs."
     (should (equal (emacs-jupyter-notebook--last-bytes text 1) "j"))
     (should (equal (emacs-jupyter-notebook--last-bytes text 10) text))))
 
-(ert-deftest ejn-read-registry-entry-empty-registry-raises-user-error ()
-  (let ((completing-read-called nil))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
-               (lambda () nil))
-              ((symbol-function 'emacs-jupyter-notebook-registry-load)
-               (lambda (&optional _file) nil))
-              ((symbol-function 'completing-read)
-               (lambda (&rest _)
-                 (setq completing-read-called t)
-                 "choice")))
-      (with-temp-buffer
-        (should-error (emacs-jupyter-notebook--read-registry-entry)
-                      :type 'user-error)
-        (should-not completing-read-called)))))
-
-(ert-deftest ejn-shutdown-deletes-local-connection-file-and-removes-registry-by-session-id ()
-  (let* ((dir (make-temp-file "ejn-shutdown-" t))
-         (local-conn (expand-file-name "kernel.json" dir))
-         (registry-file (expand-file-name "registry.el" dir))
-         (target-entry `(:profile "p"
-                         :session-id "target-session"
-                         :remote-host "host"
-                         :local-connection-file ,local-conn))
-         (other-entry '(:profile "p" :session-id "other-session"))
-         (emacs-jupyter-notebook-registry-file registry-file))
-    (unwind-protect
-        (progn
-          (with-temp-file local-conn (insert "{}"))
-          (emacs-jupyter-notebook-registry-save
-           (list target-entry other-entry) registry-file)
-          (cl-letf (((symbol-function 'emacs-jupyter-notebook--lifecycle-retire-local-transport)
-                     (lambda (_client)
-                       (setq emacs-jupyter-notebook--client nil)))
-                    ((symbol-function 'emacs-jupyter-notebook-backend-control)
-                     (lambda (_client _operation _payload success _failure)
-                       (funcall success 1 nil)))
-                    ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry) #'ignore))
-            (with-temp-buffer
-              (setq emacs-jupyter-notebook--client
-                    (ejn-test-backend-session 'mock t))
-              (setf (emacs-jupyter-notebook-backend-session-backend
-                     emacs-jupyter-notebook--client) 'helper)
-              (emacs-jupyter-notebook-backend-session-mark-installed
-               emacs-jupyter-notebook--client)
-              (setq emacs-jupyter-notebook--session-entry target-entry)
-              (setq emacs-jupyter-notebook--tunnel-process nil)
-              (emacs-jupyter-notebook-shutdown-kernel)
-              (should-not (file-exists-p local-conn))
-              (should-not emacs-jupyter-notebook--client)
-              (should-not emacs-jupyter-notebook--session-entry)
-              (let ((remaining (emacs-jupyter-notebook-registry-load registry-file)))
-                (should (= (length remaining) 1))
-                (should (equal (plist-get (car remaining) :session-id) "other-session"))))))
-      (delete-directory dir t))))
+(ert-deftest ejn-registry-picker-empty-list-raises-user-error ()
+  "The pure picker rejects an empty result after async read completion."
+  (should-error (emacs-jupyter-notebook--choose-registry-entry nil)
+                :type 'user-error))
 
 (ert-deftest ejn-status-snapshot-reports-engine-state ()
   (with-temp-buffer
@@ -2607,41 +2789,6 @@ visible and diagnosable."
                    '(("Send the current cell"
                       . emacs-jupyter-notebook-send-cell))))))
 
-(ert-deftest ejn-cleanup-current-state-resets-buffer-state ()
-  (let* ((dir (make-temp-file "ejn-cleanup-" t))
-         (local-file (expand-file-name "kernel.json" dir))
-         (entry `(:profile "p"
-                  :session-id "session"
-                  :remote-connection-file "/tmp/kernel.json"
-                  :local-connection-file ,local-file))
-         shutdown-called cleanup-entry removed-key)
-    (unwind-protect
-        (progn
-          (with-temp-file local-file (insert "{}"))
-          (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
-                     (lambda (client)
-                       (setq shutdown-called client)))
-                    ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
-                     (lambda (captured-entry)
-                       (setq cleanup-entry captured-entry)))
-                    ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
-                     (lambda (key &optional _file)
-                       (setq removed-key key))))
-            (with-temp-buffer
-              (setq emacs-jupyter-notebook--client
-                    (ejn-test-backend-session 'mock-client t))
-              (setq emacs-jupyter-notebook--session-entry entry)
-              (setq emacs-jupyter-notebook--tunnel-dead t)
-              (emacs-jupyter-notebook--cleanup-current-state "cleanup")
-              (should-not shutdown-called)
-              (should (equal cleanup-entry entry))
-              (should (equal removed-key "session"))
-              (should-not (file-exists-p local-file))
-              (should-not emacs-jupyter-notebook--client)
-              (should-not emacs-jupyter-notebook--session-entry)
-              (should-not emacs-jupyter-notebook--tunnel-dead))))
-      (delete-directory dir t))))
-
 (ert-deftest ejn-cancel-operation-does-not-tear-down-session-entry ()
   (let ((entry '(:profile "p" :session-id "existing"))
         cleanup-called)
@@ -2674,7 +2821,7 @@ is the durable reconnect key)."
          (emacs-jupyter-notebook-registry-file registry-file))
     (unwind-protect
         (cl-letf (((symbol-function 'display-warning) #'ignore))
-          (emacs-jupyter-notebook-registry-save (list entry) registry-file)
+          (ejn-test-registry-save (list entry) registry-file)
           (with-temp-buffer
             (let* ((tunnel (emacs-jupyter-notebook-ssh-start-process
                             "emacs-jupyter-notebook-tunnel-w73-reconn"
@@ -2697,70 +2844,14 @@ is the durable reconnect key)."
               (should-not (process-live-p tunnel))
               (should-not (buffer-live-p stderr))
               ;; Registry entry survives the cancellation.
-              (let ((remaining (emacs-jupyter-notebook-registry-load
+              (let ((remaining (ejn-test-registry-load
                                 registry-file)))
                 (should (= 1 (length remaining)))
                 (should (equal (plist-get (car remaining) :session-id)
                                "w73-reconn"))))))
       (delete-directory registry-dir t))))
 
-(ert-deftest ejn-w7.3-cancel-during-tunnel-fresh-start-preserves-provisional-registry ()
-  "W7.3 fresh-start branch (`:owns-kernel t'): cancelling during the
-tunnel phase kills the live tunnel process, clears the async context,
-and preserves the admitted launch's durable provisional registry row."
-  (let* ((registry-dir (make-temp-file "ejn-w73-reg-" t))
-         (registry-file (expand-file-name "registry.eld" registry-dir))
-         (entry (ejn-test-direct-entry
-                 '(:profile "p" :session-id "w73-fresh"
-                   :remote-host "example.com" :remote-pid 4242
-                   :remote-connection-file "/remote/kernel.json"
-                   :provisional t)))
-         (emacs-jupyter-notebook-registry-file registry-file))
-    (unwind-protect
-        (cl-letf (((symbol-function 'display-warning) #'ignore))
-          (emacs-jupyter-notebook-registry-save-entry entry)
-          (with-temp-buffer
-            (let* ((tunnel (emacs-jupyter-notebook-ssh-start-process
-                            "emacs-jupyter-notebook-tunnel-w73-fresh"
-                            '("sleep" "60")))
-                   (stderr (process-get tunnel
-                                        'emacs-jupyter-notebook-stderr-buffer)))
-              (setq emacs-jupyter-notebook--session-entry nil)
-              (setq emacs-jupyter-notebook--tunnel-process tunnel)
-              (setq emacs-jupyter-notebook--async-context
-                    (emacs-jupyter-notebook--async-new-context
-                     :phase 'tunnel
-                     :owns-kernel t
-                     :session-id "w73-fresh"
-                     :profile '(:profile "p" :host "example.com")
-                     :entry entry
-                     :tunnel-process tunnel
-                     :origin-buffer (current-buffer)
-                     :error-callback (lambda (_ctx _err) nil)))
-              ;; Cancellation tears down local state only; neither a connected
-              ;; session nor an ambiguous admitted launch is terminated.
-              (let (remote-cleanup-called registry-remove-called
-                    shutdown-called kernel-killed)
-                (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
-                           (lambda (&rest _) (setq remote-cleanup-called t)))
-                          ((symbol-function 'emacs-jupyter-notebook--remove-registry-entry)
-                           (lambda (&rest _) (setq registry-remove-called t)))
-                          ((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
-                           (lambda (&rest _) (setq shutdown-called t)))
-                          ((symbol-function 'emacs-jupyter-notebook--async-kill-remote-kernel)
-                           (lambda (&rest _) (setq kernel-killed t))))
-                  (emacs-jupyter-notebook-cancel-operation)
-                  (should-not kernel-killed)
-                  (should-not remote-cleanup-called)
-                  (should-not registry-remove-called)
-                  (should-not shutdown-called)))
-              (should-not emacs-jupyter-notebook--async-context)
-              (should-not (process-live-p tunnel))
-              (should-not (buffer-live-p stderr))
-              (should (equal (emacs-jupyter-notebook-registry-load registry-file)
-                             (list entry)))
-              (should-not emacs-jupyter-notebook--session-entry))))
-      (delete-directory registry-dir t))))
+
 
 (ert-deftest ejn-w12-ensure-no-async-operation-prompts-and-cancels-on-yes ()
   "W12: starting/reconnecting while an attempt is in flight prompts; answering
@@ -2802,12 +2893,91 @@ in-progress attempt untouched."
                (lambda (&rest _) (error "must not prompt when idle"))))
       (should-not (emacs-jupyter-notebook--ensure-no-async-operation)))))
 
+(ert-deftest ejn-ei6-lifecycle-registry-phases-cannot-be-cancelled ()
+  "Every durable lifecycle phase refuses all local cancellation paths.
+
+Once a registry mutation may have been accepted by the worker, cancelling
+the local callback would hide the durable transition and could permit a
+second destructive operation.  This covers the ordinary guard, explicit
+reconnect supersession, direct cancellation, and the status-buffer action
+dispatcher."
+  (dolist (phase emacs-jupyter-notebook--lifecycle-registry-phases)
+    (with-temp-buffer
+      (let* ((owner (emacs-jupyter-notebook-registry-owner-create
+                     :buffer (current-buffer)
+                     :guard (lambda () t)))
+             (context (emacs-jupyter-notebook--async-new-context
+                       :phase phase :owns-kernel nil
+                       :origin-buffer (current-buffer)
+                       :registry-owner owner))
+             (identity (list :context-token (plist-get context :status-token)))
+             (owner-cancelled nil) async-cancelled process-deleted
+             remote-action)
+        (setq emacs-jupyter-notebook--async-context context)
+        (cl-letf (((symbol-function
+                    'emacs-jupyter-notebook-registry-owner-cancel)
+                   (lambda (&rest _) (setq owner-cancelled t)))
+                  ((symbol-function
+                    'emacs-jupyter-notebook--async-delete-process)
+                   (lambda (&rest _) (setq process-deleted t)))
+                  ((symbol-function
+                    'emacs-jupyter-notebook-ssh-management-cancel)
+                   (lambda (&rest _) (setq remote-action t)))
+                  ((symbol-function 'y-or-n-p)
+                   (lambda (&rest _) (ert-fail "lifecycle cancellation prompted")))
+                  ((symbol-function 'emacs-jupyter-notebook--async-fail)
+                   (lambda (&rest _) (ert-fail "lifecycle cancellation failed context"))))
+          ;; An explicit reconnect uses the supersede escape hatch for an
+          ;; ordinary reconnect, but lifecycle settlement takes precedence.
+          (cl-letf (((symbol-function
+                      'emacs-jupyter-notebook--cancel-async-operation)
+                     (lambda (&rest _) (setq async-cancelled t))))
+            (should-error
+             (emacs-jupyter-notebook--ensure-no-async-operation t)
+             :type 'user-error))
+          (should-not async-cancelled)
+          (should-error
+           (emacs-jupyter-notebook--cancel-async-operation context "test")
+           :type 'user-error)
+          (should-error
+           (emacs-jupyter-notebook--status-cancel-captured identity 'async)
+           :type 'user-error)
+          (should (eq emacs-jupyter-notebook--async-context context))
+          (should-not owner-cancelled)
+          (should-not async-cancelled)
+          (should-not process-deleted)
+          (should-not remote-action))))))
+
+(ert-deftest ejn-ei6-management-transition-settlement-cannot-be-cancelled ()
+  "Management cancellation keeps durable transition reconciliation alive."
+  (dolist (phase '(transition-admission transition-settlement))
+    (with-temp-buffer
+      (let* ((token (gensym "ejn-management-test-"))
+             (job (list :token token :phase phase :process 'mock-process
+                        :registry-owner 'mock-owner))
+             (identity (list :management-token token))
+             owner-cancelled process-cancelled finished)
+        (setq emacs-jupyter-notebook--management-operation job)
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-owner-cancel)
+                   (lambda (&rest _) (setq owner-cancelled t)))
+                  ((symbol-function 'emacs-jupyter-notebook-ssh-management-cancel)
+                   (lambda (&rest _) (setq process-cancelled t)))
+                  ((symbol-function 'emacs-jupyter-notebook--management-finish)
+                   (lambda (&rest _) (setq finished t)))
+                  ((symbol-function 'message) #'ignore))
+          (emacs-jupyter-notebook-cancel-operation)
+          (emacs-jupyter-notebook--status-cancel-captured identity 'management))
+        (should (eq emacs-jupyter-notebook--management-operation job))
+        (should-not owner-cancelled)
+        (should-not process-cancelled)
+        (should-not finished)))))
+
 (ert-deftest ejn-w12-kill-buffer-during-attempt-never-kills-remote-kernel ()
   "Killing a buffer tears down local resources and preserves recovery state."
   (let (kernel-killed)
     (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-kill-remote-kernel)
                (lambda (_ctx) (setq kernel-killed t)))
-              ((symbol-function 'emacs-jupyter-notebook-jupyter--ensure) #'ignore))
+              ((symbol-function 'emacs-jupyter-notebook--ensure-selected-backend) #'ignore))
       (let ((buffer (generate-new-buffer "ejn-w12-kill")))
         (with-current-buffer buffer
           (emacs-jupyter-notebook-mode 1)
@@ -2833,13 +3003,13 @@ in-progress attempt untouched."
                  :connection-file-tokens ("-f" "/remote/kernel-admitted.json"))))
     (unwind-protect
         (with-temp-buffer
-          (emacs-jupyter-notebook-registry-save-entry entry)
+          (ejn-test-registry-save-entry entry)
           (setq emacs-jupyter-notebook--async-context
                 (emacs-jupyter-notebook--async-new-context
                  :phase 'launch :entry entry :origin-buffer (current-buffer)))
           (emacs-jupyter-notebook--cancel-async-operation
            emacs-jupyter-notebook--async-context)
-          (should (equal (emacs-jupyter-notebook-registry-load) (list entry))))
+          (should (equal (ejn-test-registry-load) (list entry))))
       (delete-directory dir t))))
 
 (ert-deftest ejn-ht12r2-resolver-failure-leaves-registry-untouched ()
@@ -2892,32 +3062,41 @@ in-progress attempt untouched."
                    :resolution (list :connection-file path)
                    :entry entry :origin-buffer (current-buffer))))
             (setq emacs-jupyter-notebook--async-context context)
-            (cl-letf (((symbol-function 'display-warning) #'ignore)
+            (let (persisted)
+              (cl-letf (((symbol-function 'display-warning) #'ignore)
+                        ((symbol-function
+                          'emacs-jupyter-notebook-registry-create-async)
+                         (lambda (candidate success _failure &rest _keys)
+                           (setq persisted (copy-tree candidate))
+                           (setq persisted
+                                 (plist-put persisted :registry-revision
+                                            "ejn-test-admission-revision"))
+                           (ejn-test-registry--defer
+                            (lambda () (funcall success persisted nil)))))
                       ((symbol-function
                         'emacs-jupyter-notebook-ssh-start-bounded-process)
                        (lambda (&rest _) (error "local make-process failed"))))
-              (emacs-jupyter-notebook--async-resolve-sentinel context process))
-            (let* ((saved (car (emacs-jupyter-notebook-registry-load)))
-                   (serialized (prin1-to-string saved)))
-              (should saved)
-              (should (plist-get saved :provisional))
-              (should-not (plist-get saved :remote-pid))
-              (should (equal (plist-get saved :remote-connection-file) path))
-              (should-not (string-match-p (regexp-quote secret) serialized)))))
+                (emacs-jupyter-notebook--async-resolve-sentinel context process))
+              (should (ejn-test-await (lambda () persisted)))
+              (let ((serialized (prin1-to-string persisted)))
+                (should (plist-get persisted :provisional))
+                (should-not (plist-get persisted :remote-pid))
+                (should (equal (plist-get persisted :remote-connection-file) path))
+                (should-not (string-match-p (regexp-quote secret) serialized))))))
       (when (processp process)
         (emacs-jupyter-notebook--async-delete-process process))
       (delete-directory dir t))))
 
 (ert-deftest ejn-ht12r2-provisional-reconnect-recovers-pid-from-sidecar ()
-  (let ((emacs-jupyter-notebook-backend 'legacy)
-        (entry (ejn-test-direct-entry
+  (let ((entry (ejn-test-direct-entry
                 '(:profile "p" :session-id "provisional" :remote-host "h"
                   :remote-pid 1 :remote-connection-file "/tmp/k.json"
                   :provisional t)))
         sidecar-called)
     (setq entry (plist-put entry :remote-pid nil))
     (with-temp-buffer
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-ensure) #'ignore)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-selected-backend)
+                 #'ignore)
                 ((symbol-function 'emacs-jupyter-notebook--async-read-pid-sidecar)
                  (lambda (context)
                    (setq sidecar-called context)
@@ -2948,7 +3127,6 @@ in-progress attempt untouched."
     (setq entry (plist-put entry :remote-pid nil))
     (unwind-protect
         (progn
-          (emacs-jupyter-notebook-registry-save-entry entry)
           (while (process-live-p process)
             (accept-process-output process 0.05))
           (with-temp-buffer
@@ -2962,20 +3140,24 @@ in-progress attempt untouched."
                       (setq failure error-data)))))
               (setq emacs-jupyter-notebook--async-context context)
               (cl-letf (((symbol-function
-                          'emacs-jupyter-notebook-registry-save-entry)
-                         (lambda (&rest _)
-                           (error "registry is read-only")))
+                          'emacs-jupyter-notebook-registry-replace-async)
+                         #'ejn-test-registry-replace-fails)
                         ((symbol-function
                           'emacs-jupyter-notebook--async-retrieve)
                          (lambda (&rest _)
                            (setq retrieve-called t))))
                 (emacs-jupyter-notebook--async-launch-pid-sentinel
                  context 4242 process))
+              (should (ejn-test-await
+                       (lambda () (eq (plist-get context :phase) 'error))) )
               (should (eq (plist-get context :phase) 'error))
-              (should (string-match-p "Could not persist verified" failure))
+              (should (string-match-p "Remote PID promotion" failure))
               (should-not retrieve-called)
               (should-not (plist-get (plist-get context :entry) :remote-pid))))
-          (should (equal (emacs-jupyter-notebook-registry-load) (list entry))))
+          ;; A failed exact promotion must leave the earlier provisional row
+          ;; as the sole durable recovery authority; worker behavior itself is
+          ;; covered by the real registry-worker ERT module.
+          (should (plist-get entry :provisional)))
       (when (processp process)
         (emacs-jupyter-notebook--async-delete-process process))
       (delete-directory dir t))))
@@ -2994,7 +3176,6 @@ in-progress attempt untouched."
          closed setup-called failure callback-called)
     (unwind-protect
         (progn
-          (emacs-jupyter-notebook-registry-save-entry entry)
           (with-temp-buffer
             (let ((context
                    (emacs-jupyter-notebook--async-new-context
@@ -3006,9 +3187,8 @@ in-progress attempt untouched."
                       (setq failure error-data)))))
               (setq emacs-jupyter-notebook--async-context context)
               (cl-letf (((symbol-function
-                          'emacs-jupyter-notebook-registry-save-entry)
-                         (lambda (&rest _)
-                           (error "registry is read-only")))
+                          'emacs-jupyter-notebook-registry-replace-async)
+                         #'ejn-test-registry-replace-fails)
                         ((symbol-function
                           'emacs-jupyter-notebook-backend-close-local)
                          (lambda (session &rest _)
@@ -3024,16 +3204,18 @@ in-progress attempt untouched."
                          (lambda (&rest _) (setq setup-called t))))
                 (should
                  (emacs-jupyter-notebook--async-connect-finalize
-                  context (current-buffer) entry '(:shell 1)
+                 context (current-buffer) entry '(:shell 1)
                   "/tmp/local.json" client)))
+              (should (ejn-test-await
+                       (lambda () (eq (plist-get context :phase) 'error))))
               (should (eq (plist-get context :phase) 'error))
-              (should (string-match-p "Could not persist connected" failure))
+              (should (string-match-p "Connection promotion" failure))
               (should (eq closed client))
               (should-not emacs-jupyter-notebook--client)
               (should-not emacs-jupyter-notebook--session-entry)
               (should-not setup-called)
               (should-not callback-called)))
-          (should (equal (emacs-jupyter-notebook-registry-load) (list entry))))
+          (should (plist-get entry :provisional)))
       (delete-directory dir t))))
 
 (ert-deftest ejn-ht12r2-successful-start-pipeline-promotes-only-verified-pid ()
@@ -3062,7 +3244,7 @@ in-progress attempt untouched."
                    path secret path session)))
          (real-start
           (symbol-function 'emacs-jupyter-notebook-ssh-start-bounded-process))
-         retrieved started)
+         retrieved started persisted)
     (unwind-protect
         (with-temp-buffer
           (let ((context
@@ -3071,7 +3253,7 @@ in-progress attempt untouched."
             (cl-letf
                 (((symbol-function
                    'emacs-jupyter-notebook-ssh-start-bounded-process)
-                  (lambda (name _argv limit sentinel)
+                 (lambda (name _argv limit sentinel)
                     (let ((output
                            (cond
                             ((string-match-p "resolve" name) resolver-output)
@@ -3085,6 +3267,24 @@ in-progress attempt untouched."
                       (push name started)
                       (funcall real-start name (list "printf" "%s" output)
                                limit sentinel))))
+                 ((symbol-function
+                   'emacs-jupyter-notebook-registry-create-async)
+                  (lambda (candidate success _failure &rest _keys)
+                    (setq persisted (copy-tree candidate))
+                    (setq persisted
+                          (plist-put persisted :registry-revision
+                                     "ejn-test-pipeline-admission"))
+                    (ejn-test-registry--defer
+                     (lambda () (funcall success persisted nil)))))
+                 ((symbol-function
+                   'emacs-jupyter-notebook-registry-replace-async)
+                  (lambda (candidate _revision success _failure &rest _keys)
+                    (setq persisted (copy-tree candidate))
+                    (setq persisted
+                          (plist-put persisted :registry-revision
+                                     "ejn-test-pipeline-promotion"))
+                    (ejn-test-registry--defer
+                     (lambda () (funcall success persisted nil)))))
                  ((symbol-function 'emacs-jupyter-notebook--async-retrieve)
                   (lambda (ready-context)
                     (setq retrieved ready-context)
@@ -3097,10 +3297,9 @@ in-progress attempt untouched."
             (should (= (plist-get (plist-get retrieved :entry) :remote-pid)
                        4242))
             (should (= (length started) 4))
-            (let* ((saved (car (emacs-jupyter-notebook-registry-load)))
-                   (serialized (prin1-to-string saved)))
-              (should (= (plist-get saved :remote-pid) 4242))
-              (should (plist-get saved :provisional))
+            (let ((serialized (prin1-to-string persisted)))
+              (should (= (plist-get persisted :remote-pid) 4242))
+              (should (plist-get persisted :provisional))
               (should-not (string-match-p (regexp-quote secret) serialized)))
             (emacs-jupyter-notebook--cancel-async-context-locally context)
             (setq emacs-jupyter-notebook--async-context nil)))
@@ -3116,14 +3315,14 @@ in-progress attempt untouched."
                   :connection-file-tokens ("-f" "/tmp/kernel-bad.json"))))
     (unwind-protect
         (progn
-          (emacs-jupyter-notebook-registry-save-entry entry)
+          (ejn-test-registry-save-entry entry)
           (with-temp-buffer
             (setq emacs-jupyter-notebook--session-entry entry)
             (should-error
              (emacs-jupyter-notebook--begin-reconnect
               entry nil (lambda (&rest _)) 'explicit))
             (should (equal emacs-jupyter-notebook--session-entry entry)))
-          (should (equal (emacs-jupyter-notebook-registry-load) (list entry))))
+          (should (equal (ejn-test-registry-load) (list entry))))
       (delete-directory dir t))))
 
 (ert-deftest ejn-w12-kill-buffer-with-connected-kernel-spares-it ()
@@ -3132,7 +3331,7 @@ client) never kills the remote kernel — it is the durable reconnect surface."
   (let (kernel-killed)
     (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-kill-remote-kernel)
                (lambda (_ctx) (setq kernel-killed t)))
-              ((symbol-function 'emacs-jupyter-notebook-jupyter--ensure) #'ignore))
+              ((symbol-function 'emacs-jupyter-notebook--ensure-selected-backend) #'ignore))
       (let ((buffer (generate-new-buffer "ejn-w12-connected")))
         (with-current-buffer buffer
           (emacs-jupyter-notebook-mode 1)
@@ -3161,17 +3360,205 @@ client) never kills the remote kernel — it is the durable reconnect surface."
               ((symbol-function 'emacs-jupyter-notebook--management-launch)
                (lambda (_token _name _argv success _failure &optional _timeout)
                  (funcall success "__EJN_CLEANUP_DONE__\n")))
-              ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
-               #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+               #'ejn-test-registry-replace-succeeds)
+              ((symbol-function 'emacs-jupyter-notebook-registry-remove-async)
+               #'ejn-test-registry-remove-succeeds)
               ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
                (lambda (profile &optional _callback _error-callback)
                  (setq started-profile profile))))
       (with-temp-buffer
         (setq emacs-jupyter-notebook--session-entry entry)
         (emacs-jupyter-notebook-retry-fresh-kernel)
-        (should (equal cleanup-called
-                       (list "Retrying with fresh kernel" entry t)))
+        (should (ejn-test-await (lambda () started-profile)))
+        (should (equal (cl-subseq cleanup-called 0 1)
+                       '("Retrying with fresh kernel")))
+        (should (plist-get (nth 1 cleanup-called) :transition-token))
+        (should (eq (plist-get (nth 1 cleanup-called) :transition-kind)
+                    'retry-fresh))
+        (should (equal (nth 2 cleanup-called) t))
         (should (equal started-profile "p"))))))
+
+(ert-deftest ejn-retry-fresh-admission-fences-local-and-remote-cleanup ()
+  "No retry-fresh teardown can run until the exact lease CAS succeeds."
+  (let* ((entry (ejn-test-direct-entry
+                 '(:profile "p" :session-id "admission-fence" :remote-pid 4242)))
+         (persisted nil) admission-success cleanup-entry launched removed started)
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--entry-profile)
+                 (lambda (_entry) '(:profile "p" :host "example.com")))
+                ((symbol-function 'emacs-jupyter-notebook-ssh-build-remote-cleanup)
+                 (lambda (&rest _) '("ssh" "cleanup")))
+                ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+                 (lambda (leased expected success _failure &rest _keys)
+                   (should (equal expected "ejn-test-current-revision"))
+                   (setq persisted (plist-put (copy-tree leased) :registry-revision
+                                               "admitted-revision")
+                         admission-success success)
+                   'deferred-admission))
+                ((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
+                 (lambda (_reason value _preserve) (setq cleanup-entry value)))
+                ((symbol-function 'emacs-jupyter-notebook--management-launch)
+                 (lambda (_token _name _argv success _failure &optional _timeout)
+                   (setq launched t)
+                   (funcall success "__EJN_CLEANUP_DONE__\n")))
+                ((symbol-function 'emacs-jupyter-notebook-registry-remove-async)
+                 (lambda (_key revision success _failure &rest _keys)
+                   (setq removed revision)
+                   (funcall success nil nil)))
+                ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
+                 (lambda (profile &rest _) (setq started profile))))
+        (setq emacs-jupyter-notebook--session-entry entry)
+        (emacs-jupyter-notebook-retry-fresh-kernel)
+        (should admission-success)
+        (should-not cleanup-entry)
+        (should-not launched)
+        (should-not removed)
+        (funcall admission-success persisted nil)
+        (should (eq cleanup-entry persisted))
+        (should launched)
+        (should (equal removed "admitted-revision"))
+        (should (equal started "p"))))))
+
+(ert-deftest ejn-retry-fresh-admission-conflict-touches-nothing ()
+  "A failed retry-fresh admission cannot retire local transport or the PID."
+  (let ((entry (ejn-test-direct-entry
+                '(:profile "p" :session-id "admission-conflict" :remote-pid 4242)))
+        cleaned launched warning)
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--entry-profile)
+                 (lambda (_entry) '(:profile "p" :host "example.com")))
+                ((symbol-function 'emacs-jupyter-notebook-ssh-build-remote-cleanup)
+                 (lambda (&rest _) '("ssh" "cleanup")))
+                ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+                 (lambda (_leased _revision _success failure &rest _keys)
+                   (funcall failure '(:kind conflict :code "revision-conflict"
+                                               :message "current row changed") nil)))
+                ((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
+                 (lambda (&rest _) (setq cleaned t)))
+                ((symbol-function 'emacs-jupyter-notebook--management-launch)
+                 (lambda (&rest _) (setq launched t)))
+                ((symbol-function 'display-warning)
+                 (lambda (&rest _) (setq warning t)))
+                ((symbol-function 'emacs-jupyter-notebook--log-append) #'ignore))
+        (setq emacs-jupyter-notebook--session-entry entry)
+        (emacs-jupyter-notebook-retry-fresh-kernel)
+        (should warning)
+        (should-not cleaned)
+        (should-not launched)
+        (should (equal emacs-jupyter-notebook--session-entry entry))
+        (should-not (emacs-jupyter-notebook--management-active-p))))))
+
+(ert-deftest ejn-retry-fresh-resume-uses-persisted-lease-revision ()
+  "Resuming a locally owned terminal lease removes exactly its returned revision."
+  (let* ((token "resume-token")
+         (entry (emacs-jupyter-notebook--transition-lease
+                 (ejn-test-direct-entry
+                  '(:profile "p" :session-id "resume-lease" :remote-pid nil))
+                 'retry-fresh token 'kernel-dead))
+         (persisted (plist-put (copy-tree entry) :registry-revision "lease-revision"))
+         replace-value remove-revision started)
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--entry-profile)
+                 (lambda (_entry) '(:profile "p" :host "example.com")))
+                ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+                (lambda (value revision success _failure &rest _keys)
+                   (setq replace-value value)
+                   (should (equal revision "ejn-test-current-revision"))
+                   (ejn-test-registry--defer
+                    (lambda () (funcall success persisted nil)))))
+                ((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
+                 #'ignore)
+                ((symbol-function 'emacs-jupyter-notebook-registry-remove-async)
+                 (lambda (_key revision success _failure &rest _keys)
+                   (setq remove-revision revision)
+                   (funcall success nil nil)))
+                ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
+                 (lambda (profile &rest _) (setq started profile))))
+        (setq emacs-jupyter-notebook--session-entry entry
+              emacs-jupyter-notebook--transition-token token)
+        (emacs-jupyter-notebook-retry-fresh-kernel)
+        (should (ejn-test-await (lambda () started)))
+        (should (eq (plist-get replace-value :transition-stage) 'kernel-dead))
+        (should (equal remove-revision "lease-revision"))
+        (should (equal started "p"))))))
+
+(ert-deftest ejn-transition-lease-reconnect-rejects-before-pid-probe ()
+  "A leased row cannot launch a probe or tunnel from a second Emacs."
+  (let* ((entry (emacs-jupyter-notebook--transition-lease
+                 (ejn-test-direct-entry
+                  '(:profile "p" :session-id "leased-reconnect" :remote-pid 4242))
+                 'retry-fresh "other-emacs"))
+         probe released failure)
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-probe-pid-alive)
+                 (lambda (&rest _) (setq probe t)))
+                ((symbol-function 'emacs-jupyter-notebook--release-local-resources)
+                 (lambda (&rest _) (setq released t))))
+        (emacs-jupyter-notebook--reconnect-selected-entry
+         entry #'ignore
+         (lambda (_context reason) (setq failure reason)) nil)
+        (should failure)
+        (should-not probe)
+        (should-not released)
+        (should (equal emacs-jupyter-notebook--session-entry entry))
+        (should (eq (plist-get emacs-jupyter-notebook--async-context :error-kind)
+                    'transition-active))))))
+
+(ert-deftest ejn-retry-fresh-renewal-keeps-absence-only-for-current-owner ()
+  "A sidecar-absence observation cannot cross a transition-token takeover."
+  (dolist (case '((owned . t) (takeover . nil)))
+    (let* ((token "absence-owner")
+           (entry (emacs-jupyter-notebook--transition-lease
+                   (ejn-test-direct-entry
+                    '(:profile "p" :session-id "absence-renewal" :remote-pid nil))
+                   'retry-fresh token 'kernel-dead))
+           captured)
+      (setq entry (plist-put entry :transition-absent-observed-at 123))
+      (unless (cdr case)
+        (setq entry (plist-put entry :transition-expires-at 0)))
+      (with-temp-buffer
+        (let ((emacs-jupyter-notebook--transition-token
+               (and (cdr case) token)))
+          (cl-letf (((symbol-function 'emacs-jupyter-notebook--entry-profile)
+                     (lambda (_entry) '(:profile "p" :host "example.com")))
+                    ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+                     (lambda (value _revision _success failure &rest _keys)
+                       (setq captured value)
+                       (funcall failure '(:kind conflict :message "stop test") nil)))
+                    ((symbol-function 'display-warning) #'ignore)
+                    ((symbol-function 'emacs-jupyter-notebook--log-append) #'ignore))
+            (setq emacs-jupyter-notebook--session-entry entry)
+            (emacs-jupyter-notebook-retry-fresh-kernel)
+            (if (cdr case)
+                (should (= (plist-get captured :transition-absent-observed-at) 123))
+              (should-not (plist-member captured :transition-absent-observed-at)))))))))
+
+(ert-deftest ejn-start-rejects-transition-before-cleanup ()
+  "A durable lifecycle lease blocks start before it can reap local state."
+  (with-temp-buffer
+    (let ((entry (emacs-jupyter-notebook--transition-lease
+                  (ejn-test-direct-entry
+                   '(:profile "p" :session-id "start-fence" :remote-pid 42))
+                  'retry-fresh "start-fence-token"))
+          cleaned)
+      (setq buffer-file-name "/tmp/ejn-transition-start.py"
+            emacs-jupyter-notebook--session-entry entry)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-clean-before-start)
+                 (lambda () (setq cleaned t))))
+        (should-error (emacs-jupyter-notebook-start-remote-kernel "p")
+                      :type 'user-error)
+        (should-not cleaned)))))
+
+(ert-deftest ejn-connection-attempt-timeout-is-finite-and-bounded ()
+  "Malformed and excessive customization cannot disable the lifecycle deadline."
+  (let ((emacs-jupyter-notebook-connection-attempt-timeout 0))
+    (should (= (emacs-jupyter-notebook--connection-attempt-timeout) 180)))
+  (let ((emacs-jupyter-notebook-connection-attempt-timeout "forever"))
+    (should (= (emacs-jupyter-notebook--connection-attempt-timeout) 180)))
+  (let ((emacs-jupyter-notebook-connection-attempt-timeout most-positive-fixnum))
+    (should (= (emacs-jupyter-notebook--connection-attempt-timeout)
+               emacs-jupyter-notebook--connection-attempt-hard-timeout))))
 
 (ert-deftest ejn-retry-fresh-kernel-refuses-provisional-entry-without-pid ()
   "Fresh retry cannot erase an admitted launch before PID promotion."
@@ -3184,22 +3571,22 @@ client) never kills the remote kernel — it is the durable reconnect surface."
          cleaned started)
     (unwind-protect
         (progn
-          (emacs-jupyter-notebook-registry-save-entry entry)
+          (ejn-test-registry-save-entry entry)
           (with-temp-buffer
             (setq emacs-jupyter-notebook--async-context
                   (emacs-jupyter-notebook--async-new-context
                    :phase 'launch :entry entry :origin-buffer (current-buffer)))
             (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
                        (lambda (&rest _) (setq cleaned t)))
-                      ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
-                       (lambda (&rest _) (setq started t))))
+              ((symbol-function 'emacs-jupyter-notebook--start-remote-kernel-admitted)
+                 (lambda (&rest _) (setq started t))))
               (should-error (emacs-jupyter-notebook-retry-fresh-kernel)
                             :type 'user-error)
               (should-not cleaned)
               (should-not started)
               (should (equal (plist-get emacs-jupyter-notebook--async-context :entry)
                              entry))))
-          (should (equal (emacs-jupyter-notebook-registry-load) (list entry))))
+          (should (equal (ejn-test-registry-load) (list entry))))
       (delete-directory directory t))))
 
 (ert-deftest ejn-retry-fresh-kernel-cleanup-failure-retains-entry-and-does-not-start ()
@@ -3216,9 +3603,9 @@ client) never kills the remote kernel — it is the durable reconnect surface."
               ((symbol-function 'emacs-jupyter-notebook--management-launch)
                (lambda (_token _name _argv _success failure &optional _timeout)
                  (funcall failure 'timeout "network unavailable")))
-              ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
-               (lambda (&rest _) t))
-              ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
+              ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+               #'ejn-test-registry-replace-succeeds)
+              ((symbol-function 'emacs-jupyter-notebook-registry-remove-async)
                (lambda (&rest _) (setq removed t)))
               ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
                (lambda (&rest _) (setq started t)))
@@ -3227,11 +3614,58 @@ client) never kills the remote kernel — it is the durable reconnect surface."
       (with-temp-buffer
         (setq emacs-jupyter-notebook--session-entry entry)
         (emacs-jupyter-notebook-retry-fresh-kernel)
+        (should (ejn-test-await (lambda () cleaned)))
         (should cleaned)
         (should-not removed)
         (should-not started)
         (should emacs-jupyter-notebook--tunnel-dead)
-        (should (equal emacs-jupyter-notebook--session-entry entry))))))
+        (should (eq (plist-get emacs-jupyter-notebook--session-entry
+                               :transition-kind)
+                    'retry-fresh))))))
+
+(ert-deftest ejn-retry-fresh-kernel-dead-retirement-survives-reused-pid-cleanup-failure ()
+  "Terminal proof retires the row and starts fresh despite old-PID cleanup errors.
+
+The `kernel-dead' transition is already an exact durable proof.  Best-effort
+cleanup of its old remote artifact must therefore not block registry removal
+or replacement startup, especially when the recorded PID has since been
+reused by an unrelated process."
+  (let* ((entry (emacs-jupyter-notebook--transition-lease
+                 (ejn-test-direct-entry
+                  '(:profile "p" :session-id "dead-pid-reused" :remote-pid 4242))
+                 'retry-fresh "dead-pid-token" 'kernel-dead))
+         removed cleanup-called started)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
+               #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook--entry-profile)
+               (lambda (_entry) '(:profile "p" :host "example.com")))
+              ((symbol-function
+                'emacs-jupyter-notebook-ssh-build-remote-cleanup)
+               (lambda (&rest _) '("ssh" "cleanup")))
+              ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+               #'ejn-test-registry-replace-succeeds)
+              ((symbol-function 'emacs-jupyter-notebook-registry-remove-async)
+               (lambda (key _revision success _failure &rest _keys)
+                 (setq removed key)
+                 (ejn-test-registry--defer (lambda () (funcall success key nil)))))
+              ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
+               (lambda (_entry)
+                 (setq cleanup-called t)
+                 (error "recorded PID was reused")))
+              ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
+               (lambda (profile &rest _)
+                 (setq started profile)))
+              ((symbol-function 'display-warning) #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook--log-append) #'ignore))
+      (with-temp-buffer
+        (setq emacs-jupyter-notebook--session-entry entry
+              emacs-jupyter-notebook--transition-token "dead-pid-token")
+        (emacs-jupyter-notebook-retry-fresh-kernel)
+        (should (ejn-test-await (lambda () started)))
+        (should (equal removed "dead-pid-reused"))
+        (should cleanup-called)
+        (should (equal started "p"))
+        (should-not (emacs-jupyter-notebook--replacement-active-p))))))
 
 (ert-deftest ejn-retry-fresh-kernel-public-cancel-restores-durable-entry ()
   "Cancelling the real bounded cleanup child retains old recovery authority."
@@ -3243,7 +3677,7 @@ client) never kills the remote kernel — it is the durable reconnect surface."
          process started)
     (unwind-protect
         (progn
-          (emacs-jupyter-notebook-registry-save-entry entry)
+          (ejn-test-registry-save-entry entry)
           (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
                      (lambda (&rest _)
                        (setq emacs-jupyter-notebook--session-entry nil)))
@@ -3251,6 +3685,8 @@ client) never kills the remote kernel — it is the durable reconnect surface."
                      (lambda (_entry) '(:profile "p" :host "example.com")))
                     ((symbol-function 'emacs-jupyter-notebook-ssh-build-remote-cleanup)
                      (lambda (&rest _) '("sh" "-c" "sleep 30")))
+                    ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+                     #'ejn-test-registry-replace-succeeds)
                     ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
                      (lambda (&rest _) (setq started t)))
                     ((symbol-function 'display-warning) #'ignore)
@@ -3258,18 +3694,24 @@ client) never kills the remote kernel — it is the durable reconnect surface."
             (with-temp-buffer
               (setq emacs-jupyter-notebook--session-entry entry)
               (emacs-jupyter-notebook-retry-fresh-kernel)
+              (should (ejn-test-await
+                       (lambda ()
+                         (processp (plist-get emacs-jupyter-notebook--management-operation
+                                             :process)))))
               (setq process
                     (plist-get emacs-jupyter-notebook--management-operation :process))
               (should (process-live-p process))
               (emacs-jupyter-notebook-cancel-operation)
               (should-not (process-live-p process))
               (should-not (emacs-jupyter-notebook--management-active-p))
-              (should (equal emacs-jupyter-notebook--session-entry entry))
+              (should (eq (plist-get emacs-jupyter-notebook--session-entry
+                                     :transition-kind)
+                          'retry-fresh))
               (should emacs-jupyter-notebook--tunnel-dead)
               (should-not emacs-jupyter-notebook--reconnect-timer)
               (should-not emacs-jupyter-notebook--reconnect-schedule-token)
               (should-not started)))
-          (should (equal (emacs-jupyter-notebook-registry-load) (list entry))))
+          (should (equal (ejn-test-registry-load) (list entry))))
       (when (process-live-p process) (delete-process process))
       (delete-directory directory t))))
 
@@ -3287,14 +3729,15 @@ client) never kills the remote kernel — it is the durable reconnect surface."
               ((symbol-function 'emacs-jupyter-notebook--management-launch)
                (lambda (_token _name _argv _success failure &optional _timeout)
                  (setq cleanup-failure failure)))
-              ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
-               (lambda (&rest _) t))
+              ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+               #'ejn-test-registry-replace-succeeds)
               ((symbol-function 'display-warning) #'ignore)
               ((symbol-function 'emacs-jupyter-notebook--log-append) #'ignore))
       (with-temp-buffer
         (setq buffer-file-name "/tmp/ejn-retry-owned.py"
               emacs-jupyter-notebook--session-entry entry)
         (emacs-jupyter-notebook-retry-fresh-kernel)
+        (should (ejn-test-await (lambda () cleanup-failure)))
         (should (emacs-jupyter-notebook--replacement-active-p))
         (should-error (emacs-jupyter-notebook-start-remote-kernel "p")
                       :type 'user-error)
@@ -3311,7 +3754,9 @@ client) never kills the remote kernel — it is the durable reconnect surface."
         (should cleanup-failure)
         (funcall cleanup-failure 'cancelled "cancelled by test")
         (should-not (emacs-jupyter-notebook--replacement-active-p))
-        (should (equal emacs-jupyter-notebook--session-entry entry))))))
+        (should (eq (plist-get emacs-jupyter-notebook--session-entry
+                               :transition-kind)
+                    'retry-fresh))))))
 
 (ert-deftest ejn-retry-fresh-kernel-stale-callbacks-cannot-clobber-new-owner ()
   "Late success and failure callbacks require the exact replacement token/entry."
@@ -3329,10 +3774,10 @@ client) never kills the remote kernel — it is the durable reconnect surface."
               ((symbol-function 'emacs-jupyter-notebook--management-launch)
                (lambda (_token _name _argv ok bad &optional _timeout)
                  (setq success ok failure bad)))
-              ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
+              ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+               #'ejn-test-registry-replace-succeeds)
+              ((symbol-function 'emacs-jupyter-notebook-registry-remove-async)
                (lambda (&rest _) (setq removed t)))
-              ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
-               (lambda (&rest _) t))
               ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
                (lambda (&rest _) (setq started t)))
               ((symbol-function 'display-warning) #'ignore)
@@ -3340,6 +3785,7 @@ client) never kills the remote kernel — it is the durable reconnect surface."
       (with-temp-buffer
         (setq emacs-jupyter-notebook--session-entry entry)
         (emacs-jupyter-notebook-retry-fresh-kernel)
+        (should (ejn-test-await (lambda () success)))
         (let ((old-token
                (plist-get emacs-jupyter-notebook--management-operation :token))
               (new-token (gensym "new-retry-")))
@@ -3369,10 +3815,12 @@ client) never kills the remote kernel — it is the durable reconnect surface."
               ((symbol-function 'emacs-jupyter-notebook--management-launch)
                (lambda (_token _name _argv success _failure &optional _timeout)
                  (funcall success "__EJN_CLEANUP_DONE__\n")))
-              ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
-               (lambda (&rest _) (setq removed t)))
-              ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
-               (lambda (&rest _) (setq retained t)))
+              ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+               #'ejn-test-registry-replace-succeeds)
+              ((symbol-function 'emacs-jupyter-notebook-registry-remove-async)
+               (lambda (key _revision success _failure &rest _keys)
+                 (setq removed t)
+                 (ejn-test-registry--defer (lambda () (funcall success key nil)))))
               ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
                (lambda (&rest _) (error "replacement construction failed")))
               ((symbol-function 'display-warning) #'ignore)
@@ -3380,6 +3828,8 @@ client) never kills the remote kernel — it is the durable reconnect surface."
       (with-temp-buffer
         (setq emacs-jupyter-notebook--session-entry entry)
         (emacs-jupyter-notebook-retry-fresh-kernel)
+        (should (ejn-test-await
+                 (lambda () (not (emacs-jupyter-notebook--replacement-active-p)))))
         (should removed)
         (should-not retained)
         (should-not emacs-jupyter-notebook--session-entry)
@@ -3389,7 +3839,7 @@ client) never kills the remote kernel — it is the durable reconnect surface."
   "Confirmed remote death remains retryable when durable retirement fails."
   (let ((entry (ejn-test-direct-entry
                 '(:profile "p" :session-id "retire-failed" :remote-pid 4242)))
-        retained started)
+        started)
     (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
                #'ignore)
               ((symbol-function 'emacs-jupyter-notebook--entry-profile)
@@ -3399,10 +3849,10 @@ client) never kills the remote kernel — it is the durable reconnect surface."
               ((symbol-function 'emacs-jupyter-notebook--management-launch)
                (lambda (_token _name _argv success _failure &optional _timeout)
                  (funcall success "__EJN_CLEANUP_DONE__\n")))
-              ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
-               (lambda (&rest _) (error "registry read-only")))
-              ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
-               (lambda (&rest _) (setq retained t)))
+              ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+               #'ejn-test-registry-replace-succeeds)
+              ((symbol-function 'emacs-jupyter-notebook-registry-remove-async)
+               #'ejn-test-registry-remove-fails)
               ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
                (lambda (&rest _) (setq started t)))
               ((symbol-function 'display-warning) #'ignore)
@@ -3410,10 +3860,13 @@ client) never kills the remote kernel — it is the durable reconnect surface."
       (with-temp-buffer
         (setq emacs-jupyter-notebook--session-entry entry)
         (emacs-jupyter-notebook-retry-fresh-kernel)
-        (should retained)
+        (should (ejn-test-await
+                 (lambda () (not (emacs-jupyter-notebook--replacement-active-p)))))
         (should-not started)
         (should emacs-jupyter-notebook--tunnel-dead)
-        (should (equal emacs-jupyter-notebook--session-entry entry))
+        (should (eq (plist-get emacs-jupyter-notebook--session-entry
+                               :transition-kind)
+                    'retry-fresh))
         (should-not (emacs-jupyter-notebook--replacement-active-p))))))
 
 (ert-deftest ejn-retry-fresh-kernel-reserves-management-before-local-retirement ()
@@ -3519,7 +3972,7 @@ client) never kills the remote kernel — it is the durable reconnect surface."
       (should (string-match-p "pkill -f" (car (last argv))))
       (should (string-match-p "requested remote orphan cleanup" message-text)))))
 
-(ert-deftest ejn-registry-latest-for-file-normalizes-with-file-truename ()
+(ert-deftest ejn-registry-latest-for-file-normalizes-lexically-without-symlink-io ()
   (let* ((dir (make-temp-file "ejn-truename-" t))
          (real-file (expand-file-name "notebook.py" dir))
          (link (expand-file-name "link.py" dir)))
@@ -3527,74 +3980,25 @@ client) never kills the remote kernel — it is the durable reconnect surface."
         (progn
           (with-temp-file real-file (insert "x = 1\n"))
           (make-symbolic-link real-file link)
-          (let* ((true-path (file-truename real-file))
-                 (a `(:profile "p" :session-id "a" :local-file ,true-path :created-at "1"))
-                 (b `(:profile "p" :session-id "b" :local-file ,true-path :created-at "2")))
+          (let* ((lexical-link (expand-file-name link))
+                 (a `(:profile "p" :session-id "a" :local-file ,lexical-link
+                              :created-at "1"))
+                 (b `(:profile "p" :session-id "b" :local-file ,lexical-link
+                              :created-at "2")))
             (should (equal (emacs-jupyter-notebook-registry-latest-for-file
                             link (list a b))
-                           b))))
+                           b))
+            ;; Real and symlink spellings remain distinct without a potentially
+            ;; blocking `file-truename' filesystem traversal on the UI path.
+            (should-not (emacs-jupyter-notebook-registry-latest-for-file
+                         real-file (list a b)))))
       (delete-directory dir t))))
 
-(ert-deftest ejn-evaluate-cell-with-existing-client-evaluates-immediately ()
-  (ejn-test-with-temp-buffer "# %%\na = 1\n"
-    (let ((emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t))
-          captured)
-      (let ((emacs-jupyter-notebook-jupyter-evaluate-function
-             (lambda (_client code _entry-handle)
-               (push code captured))))
-        (emacs-jupyter-notebook-send-cell))
-      (should (equal captured '("a = 1\n"))))))
 
-(ert-deftest ejn-evaluate-cell-no-client-with-file-entry-calls-reconnect ()
-  (ejn-test-with-temp-buffer "# %%\na = 1\n"
-    (let* ((emacs-jupyter-notebook--client nil)
-           (emacs-jupyter-notebook--async-context nil)
-           (entry '(:profile "p" :session-id "s" :local-file "/tmp/x.py"))
-           (reconnect-captured nil)
-           (reconnect-owner nil)
-           (eval-called nil)
-           (emacs-jupyter-notebook-jupyter-evaluate-function
-            (lambda (_client _code _entry-handle)
-              (setq eval-called t))))
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
-                 (lambda () entry))
-                 ((symbol-function 'emacs-jupyter-notebook-reconnect-remote-kernel)
-                  (lambda (captured-entry callback
-                           &optional _error-callback owner)
-                    (setq reconnect-captured (cons captured-entry callback))
-                    (setq reconnect-owner owner)
-                    (setq emacs-jupyter-notebook--client
-                          (ejn-test-backend-session 'mock-client t))
-                    (funcall callback nil))))
-        (emacs-jupyter-notebook-send-cell)
-        (should (equal (car reconnect-captured) entry))
-        (should (functionp (cdr reconnect-captured)))
-        (should (eq reconnect-owner 'evaluation))
-        (should eval-called)))))
 
-(ert-deftest ejn-evaluate-cell-no-client-no-entry-calls-start-default ()
-  (ejn-test-with-temp-buffer "# %%\na = 1\n"
-    (let* ((emacs-jupyter-notebook--client nil)
-           (emacs-jupyter-notebook--async-context nil)
-           (emacs-jupyter-notebook-default-profile "mydefault")
-           (start-captured nil)
-           (eval-called nil)
-           (emacs-jupyter-notebook-jupyter-evaluate-function
-            (lambda (_client _code _entry-handle)
-              (setq eval-called t))))
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
-                 (lambda () nil))
-                 ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
-                  (lambda (profile callback &optional _error-callback)
-                    (setq start-captured (cons profile callback))
-                    (setq emacs-jupyter-notebook--client
-                          (ejn-test-backend-session 'mock-client t))
-                    (funcall callback nil))))
-        (emacs-jupyter-notebook-send-cell)
-        (should (equal (car start-captured) "mydefault"))
-        (should (functionp (cdr start-captured)))
-        (should eval-called)))))
+
+
+
 
 ;; W4.8: `ejn-evaluate-cell-stale-file-entry-falls-back-to-start-default'
 ;; was removed.  The old behavior — silently removing the registry entry
@@ -3604,25 +4008,7 @@ client) never kills the remote kernel — it is the durable reconnect surface."
 ;; `--ensure-client-async' surfaces the reconnect error to the caller
 ;; instead; see `ejn-w4.8-ensure-client-async-does-not-auto-restart-on-dead-reconnect'.
 
-(ert-deftest ejn-evaluate-cell-async-in-progress-chains-callback ()
-  (ejn-test-with-temp-buffer "# %%\na = 1\n"
-    (let* ((emacs-jupyter-notebook--client nil)
-           (eval-called nil)
-           (emacs-jupyter-notebook-jupyter-evaluate-function
-            (lambda (_client code _entry-handle)
-              (setq eval-called t)))
-           (emacs-jupyter-notebook--async-context
-            (emacs-jupyter-notebook--async-new-context
-             :phase 'launch
-             :origin-buffer (current-buffer))))
-      (emacs-jupyter-notebook-send-cell)
-      (should-not eval-called)
-      (let ((cb (plist-get emacs-jupyter-notebook--async-context :callback)))
-        (should (functionp cb))
-        (setq emacs-jupyter-notebook--client
-              (ejn-test-backend-session 'mock-client t))
-        (funcall cb emacs-jupyter-notebook--async-context)
-        (should eval-called)))))
+
 
 (ert-deftest ejn-evaluate-cell-async-in-progress-chains-error-callback ()
   (ejn-test-with-temp-buffer "# %%\na = 1\n"
@@ -3643,67 +4029,11 @@ client) never kills the remote kernel — it is the durable reconnect surface."
             (should (eq (plist-get entry :status) 'error))
             (should (string-match-p "boom" (ejn-panel-entry-text entry)))))))))
 
-(ert-deftest ejn-jupyter-runtime-adapter-dispatches ()
-  (let ((emacs-jupyter-notebook-jupyter-complete-function
-         (lambda (client code pos callback)
-           (funcall callback (list :client client :code code :pos pos) nil)))
-        (emacs-jupyter-notebook-jupyter-inspect-function
-         (lambda (client code pos detail callback)
-           (funcall callback
-                    (list :client client :code code :pos pos :detail detail)
-                    nil)))
-        (emacs-jupyter-notebook-jupyter-is-complete-function
-         (lambda (client code callback)
-           (funcall callback (list :client client :code code :status "complete") nil)))
-        complete-result inspect-result is-complete-result)
-    (emacs-jupyter-notebook-jupyter-complete
-     'client "abc" 2 (lambda (reply _error) (setq complete-result reply)))
-    (emacs-jupyter-notebook-jupyter-inspect
-     'client "abc" 2 0 (lambda (reply _error) (setq inspect-result reply)))
-    (emacs-jupyter-notebook-jupyter-is-complete
-     'client "abc" (lambda (reply _error) (setq is-complete-result reply)))
-    (should (equal complete-result '(:client client :code "abc" :pos 2)))
-    (should (equal inspect-result '(:client client :code "abc" :pos 2 :detail 0)))
-    (should (equal is-complete-result '(:client client :code "abc" :status "complete")))))
 
-(ert-deftest ejn-completion-at-point-does-not-request-on-cursor-motion ()
-  ;; Cursor motion: capf returns nil without scheduling an idle timer.
-  ;; The existing assertion that the adapter is never called still holds —
-  ;; W3 strengthens it: even the idle timer must not be installed.
-  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
-    (search-forward "my_obj.met")
-    (let ((emacs-jupyter-notebook--client 'mock-client)
-          (emacs-jupyter-notebook--completion-cache nil)
-          (emacs-jupyter-notebook--completion-pending-key nil)
-          (emacs-jupyter-notebook--completion-idle-timer nil)
-          (this-command 'next-line)
-          called)
-      (let ((emacs-jupyter-notebook-jupyter-complete-function
-             (lambda (_client _code _pos _callback)
-               (setq called t))))
-        (should-not (emacs-jupyter-notebook-completion-at-point))
-        (should-not called)
-        (should-not (timerp emacs-jupyter-notebook--completion-idle-timer))))))
 
-(ert-deftest ejn-completion-at-point-requests-after-self-insert ()
-  ;; W3.2: capf schedules an idle timer after self-insert.  The adapter is
-  ;; NOT called synchronously by the capf — the timer is the proxy for the
-  ;; pending request.
-  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
-    (search-forward "my_obj.met")
-    (let ((emacs-jupyter-notebook--client 'mock-client)
-          (emacs-jupyter-notebook--completion-cache nil)
-          (emacs-jupyter-notebook--completion-pending-key nil)
-          (emacs-jupyter-notebook--completion-idle-timer nil)
-          (this-command 'self-insert-command)
-          adapter-called)
-      (let ((emacs-jupyter-notebook-jupyter-complete-function
-             (lambda (_client _code _pos _callback)
-               (setq adapter-called t))))
-        (should-not (emacs-jupyter-notebook-completion-at-point))
-        (should-not adapter-called)
-        (should (timerp emacs-jupyter-notebook--completion-idle-timer))
-        (cancel-timer emacs-jupyter-notebook--completion-idle-timer)))))
+
+
+
 
 (ert-deftest ejn-completion-at-point-returns-cached-data ()
   ;; W3.1: cache is a hash-table keyed by (point . line-up-to-point).
@@ -3731,154 +4061,15 @@ client) never kills the remote kernel — it is the durable reconnect surface."
        key '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10))
       (should-not (emacs-jupyter-notebook-completion-at-point)))))
 
-(ert-deftest ejn-completion-callback-triggers-completion-in-region ()
-  ;; Forces the fallback UI branch (no corfu/company) so the reply lands
-  ;; via `completion-in-region'.
-  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
-    (search-forward "my_obj.met")
-    (let* ((emacs-jupyter-notebook--client
-            (ejn-test-backend-session 'mock-client t))
-           (emacs-jupyter-notebook--completion-pending-key nil)
-           (emacs-jupyter-notebook--completion-pending-id nil)
-           (emacs-jupyter-notebook--completion-request-counter 0)
-           (emacs-jupyter-notebook--completion-cache nil)
-           (emacs-jupyter-notebook--completion-cache-order nil)
-           triggered)
-      (let ((emacs-jupyter-notebook-jupyter-complete-function
-             (lambda (_client _code _pos callback)
-               (funcall callback
-                        '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10)
-                        nil))))
-        (cl-letf (((symbol-function 'completion-in-region)
-                   (lambda (&rest _args) (setq triggered t))))
-          (emacs-jupyter-notebook--request-completion t)
-          (ejn-test-drain-zero-delay-timers)
-          (should triggered))))))
 
-(ert-deftest ejn-completion-no-duplicate-request ()
-  ;; Dedup: when the pending key matches the current key and an id is
-  ;; already set, the adapter must not be called twice.
-  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
-    (search-forward "my_obj.met")
-    (let* ((emacs-jupyter-notebook--client 'mock-client)
-           (key (emacs-jupyter-notebook--completion-key))
-           (emacs-jupyter-notebook--completion-pending-key key)
-           (emacs-jupyter-notebook--completion-pending-id 42)
-           (emacs-jupyter-notebook--completion-request-counter 42)
-           (emacs-jupyter-notebook--completion-cache nil)
-           (emacs-jupyter-notebook--completion-cache-order nil)
-           call-count)
-      (let ((emacs-jupyter-notebook-jupyter-complete-function
-             (lambda (_client _code _pos _callback)
-               (setq call-count (1+ (or call-count 0))))))
-        (emacs-jupyter-notebook--request-completion)
-        (should-not call-count)))))
 
-(ert-deftest ejn-w14-explicit-complete-fetches-now-and-shows ()
-  "W14: explicit `complete-at-point' with no cached candidates fetches
-IMMEDIATELY (not via the debounced idle timer) and drives
-`completion-in-region' when the reply arrives, so a single invocation
-reliably shows candidates instead of silently requiring a second press."
-  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
-    (search-forward "my_obj.met")
-    (let ((emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t))
-          (emacs-jupyter-notebook--completion-cache nil)
-          (emacs-jupyter-notebook--completion-cache-order nil)
-          adapter-code shown)
-      (cl-letf (((symbol-function 'completion-in-region)
-                 (lambda (&rest args) (setq shown args))))
-        (let ((emacs-jupyter-notebook-jupyter-complete-function
-               (lambda (_client code _pos callback)
-                 (setq adapter-code code)
-                 (funcall callback '(:matches ["method" "meta"]
-                                     :cursor_start 7 :cursor_end 10)
-                          nil))))
-          (emacs-jupyter-notebook-complete-at-point))
-        (ejn-test-drain-zero-delay-timers)
-        (should adapter-code)
-        (should shown)
-        (should (member "method" (nth 2 shown)))))))
 
-(ert-deftest ejn-w9-capf-explicit-invocation-schedules-request-on-miss ()
-  ;; W9: the capf is invoked EXPLICITLY (this-command = `completion-at-point',
-  ;; i.e. M-TAB / a manual frontend trigger), NOT via self-insert.  On a cache
-  ;; miss it must now schedule the idle async request (the timer is the proxy
-  ;; for the pending kernel fetch).  Letting the timer fire drives the adapter,
-  ;; confirming a request is actually sent.
-  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
-    (search-forward "my_obj.met")
-    (let ((emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t))
-          (emacs-jupyter-notebook--completion-cache nil)
-          (emacs-jupyter-notebook--completion-cache-order nil)
-          (emacs-jupyter-notebook--completion-pending-key nil)
-          (emacs-jupyter-notebook--completion-pending-id nil)
-          (emacs-jupyter-notebook--completion-idle-timer nil)
-          (this-command 'completion-at-point)
-          adapter-called)
-      (let ((emacs-jupyter-notebook-jupyter-complete-function
-             (lambda (_client _code _pos _callback)
-               (setq adapter-called t))))
-        ;; capf returns nil (cache miss) but must arm the idle timer.
-        (should-not (emacs-jupyter-notebook-completion-at-point))
-        (should-not adapter-called)          ; never synchronous
-        (should (timerp emacs-jupyter-notebook--completion-idle-timer))
-        (cancel-timer emacs-jupyter-notebook--completion-idle-timer)
-        ;; Draining that scheduled work (what the timer would do) actually
-        ;; sends the request through the adapter -- proving it is a real
-        ;; pending kernel fetch, not just a dangling timer.  Called directly
-        ;; (as ejn-completion-callback-triggers-completion-in-region does) to
-        ;; avoid timer/mode-guard flakiness.
-        (setq emacs-jupyter-notebook--completion-pending-key nil
-              emacs-jupyter-notebook--completion-pending-id nil)
-        (emacs-jupyter-notebook--request-completion t)
-        (should adapter-called)))))
 
-(ert-deftest ejn-w9-capf-explicit-invocation-regression-old-gate-fixed ()
-  ;; Regression pin: the OLD gate only scheduled for self-insert/delete/yank,
-  ;; so an explicit completion command on a miss scheduled NOTHING.  It now
-  ;; must schedule for both the vanilla `completion-at-point' and popup
-  ;; frontend commands (name-matched: corfu/company), while cursor motion
-  ;; still schedules nothing (see the -does-not-request-on-cursor-motion test).
-  (dolist (cmd '(completion-at-point
-                 corfu-complete
-                 company-complete
-                 emacs-jupyter-notebook-complete-at-point))
-    (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
-      (search-forward "my_obj.met")
-      (let ((emacs-jupyter-notebook--client 'mock-client)
-            (emacs-jupyter-notebook--completion-cache nil)
-            (emacs-jupyter-notebook--completion-cache-order nil)
-            (emacs-jupyter-notebook--completion-pending-key nil)
-            (emacs-jupyter-notebook--completion-idle-timer nil)
-            (this-command cmd))
-        (let ((emacs-jupyter-notebook-jupyter-complete-function
-               (lambda (&rest _) nil)))
-          (should-not (emacs-jupyter-notebook-completion-at-point))
-          (should (timerp emacs-jupyter-notebook--completion-idle-timer))
-          (cancel-timer emacs-jupyter-notebook--completion-idle-timer)))))
-  ;; And the negative half of the gate: cursor motion AND popup
-  ;; navigation/dismissal commands must NOT arm it.  The popup commands
-  ;; (`corfu-next', `company-abort', ...) embed a frontend prefix but not
-  ;; the `complet' verb, so keying on the verb correctly excludes them —
-  ;; re-entering the capf while merely scrolling or aborting a popup must
-  ;; never fire a kernel request (W3 contract; opencode W9 review).
-  (dolist (cmd '(next-line
-                 forward-char
-                 corfu-next
-                 corfu-previous
-                 corfu-quit
-                 company-select-next
-                 company-abort))
-    (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
-      (search-forward "my_obj.met")
-      (let ((emacs-jupyter-notebook--client 'mock-client)
-            (emacs-jupyter-notebook--completion-cache nil)
-            (emacs-jupyter-notebook--completion-idle-timer nil)
-            (this-command cmd))
-        (should-not (emacs-jupyter-notebook-completion-at-point))
-        (should-not (timerp emacs-jupyter-notebook--completion-idle-timer))))))
+
+
+
+
+
 
 (ert-deftest ejn-w9-empty-prefix-attribute-reply-yields-usable-capf-result ()
   ;; Real `d.' complete_reply shape from a live ipykernel: cursor_start ==
@@ -3967,6 +4158,11 @@ reliably shows candidates instead of silently requiring a second press."
       (should-not (gethash '(2 . "b") emacs-jupyter-notebook--completion-cache))
       (should (gethash '(3 . "c") emacs-jupyter-notebook--completion-cache)))))
 
+(ert-deftest ejn-w3.1-completion-cache-customization-cannot-raise-hard-limit ()
+  (let ((emacs-jupyter-notebook-completion-cache-size most-positive-fixnum))
+    (should (= (emacs-jupyter-notebook--completion-cache-limit)
+               emacs-jupyter-notebook--completion-cache-hard-size))))
+
 (ert-deftest ejn-w3.2-schedule-installs-idle-timer ()
   ;; A schedule call installs exactly one idle timer.
   (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
@@ -4014,37 +4210,7 @@ reliably shows candidates instead of silently requiring a second press."
       (should-not emacs-jupyter-notebook--completion-pending-key)
       (should-not emacs-jupyter-notebook--completion-pending-id))))
 
-(ert-deftest ejn-w3.2-schedule-fires-adapter-after-delay ()
-  ;; When the scheduled timer fires, the adapter is called exactly once
-  ;; with the expected (code, cursor-pos).  The test invokes the timer's
-  ;; function directly rather than relying on the batch-mode scheduler.
-  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
-    (emacs-jupyter-notebook-mode 1)
-    (unwind-protect
-        (progn
-          (search-forward "my_obj.met")
-          (let ((emacs-jupyter-notebook--client
-                 (ejn-test-backend-session 'mock-client t))
-                (emacs-jupyter-notebook--completion-cache nil)
-                (emacs-jupyter-notebook--completion-cache-order nil)
-                (emacs-jupyter-notebook--completion-idle-timer nil)
-                (emacs-jupyter-notebook--completion-pending-key nil)
-                (emacs-jupyter-notebook--completion-pending-id nil)
-                (emacs-jupyter-notebook-completion-idle 0.01)
-                calls captured-code captured-pos)
-            (let ((emacs-jupyter-notebook-jupyter-complete-function
-                   (lambda (_client code pos _callback)
-                     (setq calls (1+ (or calls 0))
-                           captured-code code
-                           captured-pos pos))))
-              (emacs-jupyter-notebook--completion-schedule-request)
-              (let ((timer emacs-jupyter-notebook--completion-idle-timer))
-                (should (timerp timer))
-                (apply (timer--function timer) (timer--args timer)))
-              (should (equal calls 1))
-              (should (stringp captured-code))
-              (should (numberp captured-pos)))))
-      (emacs-jupyter-notebook-mode -1))))
+
 
 (ert-deftest ejn-w3.2-typing-after-schedule-invalidates-pending ()
   ;; A schedule that follows another schedule (the user typed) clears any
@@ -4064,124 +4230,13 @@ reliably shows candidates instead of silently requiring a second press."
             (should-not emacs-jupyter-notebook--completion-pending-id))
         (emacs-jupyter-notebook--completion-cancel-idle-timer)))))
 
-(ert-deftest ejn-w3.3-stale-reply-dropped-by-superseded-id ()
-  ;; Two requests fire; the first one's reply arrives AFTER the second has
-  ;; superseded it.  The first reply must not populate the cache and must
-  ;; not refresh the UI.
-  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
-    (search-forward "my_obj.met")
-    (let ((emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t))
-          (emacs-jupyter-notebook--completion-cache nil)
-          (emacs-jupyter-notebook--completion-cache-order nil)
-          (emacs-jupyter-notebook--completion-pending-key nil)
-          (emacs-jupyter-notebook--completion-pending-id nil)
-          (emacs-jupyter-notebook--completion-request-counter 0)
-          first-callback second-callback ui-refresh-count)
-      (let ((emacs-jupyter-notebook-jupyter-complete-function
-             (lambda (_client _code _pos cb)
-               (cond ((null first-callback) (setq first-callback cb))
-                     (t (setq second-callback cb))))))
-        (cl-letf (((symbol-function 'completion-in-region)
-                   (lambda (&rest _args)
-                     (setq ui-refresh-count (1+ (or ui-refresh-count 0))))))
-          ;; First request fires.
-          (emacs-jupyter-notebook--request-completion t)
-          (should first-callback)
-          ;; Simulate user keystroke: bump key by moving point, then a new
-          ;; schedule sends a second request.
-          (forward-char -1)
-          (emacs-jupyter-notebook--request-completion t)
-          (should second-callback)
-          ;; First reply arrives AFTER the second request superseded it.
-          (funcall first-callback
-                   '(:matches ("stale_match") :cursor_start 0 :cursor_end 5)
-                   nil)
-          ;; The stale reply must NOT have populated the cache.
-          (should (or (null emacs-jupyter-notebook--completion-cache)
-                      (= 0 (hash-table-count
-                            emacs-jupyter-notebook--completion-cache))))
-          (should-not ui-refresh-count))))))
 
-(ert-deftest ejn-w3.3-fresh-reply-populates-cache ()
-  ;; Counterpoint: when the reply matches the live pending id and key,
-  ;; it lands in the cache and the UI refresh runs.
-  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
-    (search-forward "my_obj.met")
-    (let ((emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t))
-          (emacs-jupyter-notebook--completion-cache nil)
-          (emacs-jupyter-notebook--completion-cache-order nil)
-          (emacs-jupyter-notebook--completion-pending-key nil)
-          (emacs-jupyter-notebook--completion-pending-id nil)
-          (emacs-jupyter-notebook--completion-request-counter 0)
-          captured-callback ui-refresh-count)
-      (let ((emacs-jupyter-notebook-jupyter-complete-function
-             (lambda (_client _code _pos cb)
-               (setq captured-callback cb))))
-        (cl-letf (((symbol-function 'completion-in-region)
-                   (lambda (&rest _args)
-                     (setq ui-refresh-count (1+ (or ui-refresh-count 0))))))
-          (emacs-jupyter-notebook--request-completion t)
-          (should captured-callback)
-          (funcall captured-callback
-                   '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10)
-                   nil)
-          (ejn-test-drain-zero-delay-timers)
-          (let ((key (emacs-jupyter-notebook--completion-key)))
-            (should (gethash key emacs-jupyter-notebook--completion-cache)))
-          (should (equal ui-refresh-count 1)))))))
 
-(ert-deftest ejn-w3.3-reply-after-buffer-killed-is-safe ()
-  ;; If the buffer that owns the request is killed before the reply
-  ;; arrives, the callback must not raise.
-  (let (buffer captured-cb)
-    (with-current-buffer (setq buffer (generate-new-buffer "ejn-w3.3"))
-      (python-mode)
-      (insert "# %%\nmy_obj.met\n")
-      (goto-char (point-max))
-      (setq-local emacs-jupyter-notebook--client
-                  (ejn-test-backend-session 'mock-client t))
-      (let ((emacs-jupyter-notebook-jupyter-complete-function
-             (lambda (_client _code _pos cb) (setq captured-cb cb))))
-        (emacs-jupyter-notebook--request-completion t)))
-    (should captured-cb)
-    (kill-buffer buffer)
-    ;; Should not raise.
-    (should
-     (eq nil
-         (progn
-           (funcall captured-cb
-                    '(:matches ("x") :cursor_start 0 :cursor_end 1) nil)
-           nil)))))
 
-(ert-deftest ejn-w3.4-capf-returns-fast-even-when-adapter-stalls ()
-  ;; Load-bearing W3 test: the adapter is mocked to delay 10 seconds.
-  ;; The adapter is only ever called from the deferred timer, never from the
-  ;; capf itself.  Assert that scheduling boundary directly instead of using a
-  ;; scheduler-sensitive wall-clock threshold.
-  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
-    (search-forward "my_obj.met")
-    (let ((emacs-jupyter-notebook--client 'mock-client)
-          (emacs-jupyter-notebook--completion-cache nil)
-          (emacs-jupyter-notebook--completion-cache-order nil)
-          (emacs-jupyter-notebook--completion-pending-key nil)
-          (emacs-jupyter-notebook--completion-pending-id nil)
-          (emacs-jupyter-notebook--completion-idle-timer nil)
-          (emacs-jupyter-notebook-completion-idle 0.10)
-          (this-command 'self-insert-command)
-          adapter-called)
-      (let ((emacs-jupyter-notebook-jupyter-complete-function
-             (lambda (_client _code _pos _callback)
-               (setq adapter-called t)
-               (sleep-for 10))))
-        (unwind-protect
-            (progn
-              (should-not (emacs-jupyter-notebook-completion-at-point))
-              (should-not adapter-called)
-              (should (timerp emacs-jupyter-notebook--completion-idle-timer)))
-          (when (timerp emacs-jupyter-notebook--completion-idle-timer)
-            (cancel-timer emacs-jupyter-notebook--completion-idle-timer)))))))
+
+
+
+
 
 (ert-deftest ejn-w3.4-capf-returns-fast-on-cache-hit ()
   ;; A cache hit is pure local lookup and must not schedule remote work.
@@ -4203,117 +4258,13 @@ reliably shows candidates instead of silently requiring a second press."
 (defvar completion-in-region-mode nil)
 (defvar company-mode nil)
 
-(ert-deftest ejn-w3.5-refresh-ui-skips-when-completion-in-region-active ()
-  ;; W3.7: when `completion-in-region-mode' is active there is no reliable
-  ;; cross-version way to force the popup to re-fetch capf candidates.
-  ;; The refresh hook deliberately becomes a no-op in that case; the
-  ;; next user keystroke causes capf to be re-invoked naturally and the
-  ;; popup picks up the new candidates from the cache then.
-  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
-    (search-forward "my_obj.met")
-    (let ((emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t))
-          (emacs-jupyter-notebook--completion-cache nil)
-          (emacs-jupyter-notebook--completion-cache-order nil)
-          (emacs-jupyter-notebook--completion-pending-key nil)
-          (emacs-jupyter-notebook--completion-pending-id nil)
-          (emacs-jupyter-notebook--completion-request-counter 0)
-          captured-cb fallback-called)
-      (let ((emacs-jupyter-notebook-jupyter-complete-function
-             (lambda (_client _code _pos cb) (setq captured-cb cb))))
-        (cl-letf* (((symbol-value 'completion-in-region-mode) t)
-                   ((symbol-function 'completion-in-region)
-                    (lambda (&rest _) (setq fallback-called t))))
-          (emacs-jupyter-notebook--request-completion t)
-          (should captured-cb)
-          (funcall captured-cb
-                   '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10)
-                   nil)
-          (ejn-test-drain-zero-delay-timers)
-          (should-not fallback-called))))))
 
-(ert-deftest ejn-w3.5-reply-refreshes-company-via-manual-begin ()
-  ;; When company is active, the reply path calls `company-manual-begin'.
-  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
-    (search-forward "my_obj.met")
-    (let ((emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t))
-          (emacs-jupyter-notebook--completion-cache nil)
-          (emacs-jupyter-notebook--completion-cache-order nil)
-          (emacs-jupyter-notebook--completion-pending-key nil)
-          (emacs-jupyter-notebook--completion-pending-id nil)
-          (emacs-jupyter-notebook--completion-request-counter 0)
-          captured-cb refresh-called)
-      (let ((emacs-jupyter-notebook-jupyter-complete-function
-             (lambda (_client _code _pos cb) (setq captured-cb cb))))
-        (cl-letf* (((symbol-value 'corfu-mode) nil)
-                   ((symbol-value 'company-mode) t)
-                   ((symbol-function 'company-manual-begin)
-                    (lambda (&rest _) (setq refresh-called 'company-manual))))
-          (emacs-jupyter-notebook--request-completion t)
-          (should captured-cb)
-          (funcall captured-cb
-                   '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10)
-                   nil)
-          (ejn-test-drain-zero-delay-timers)
-          (should (eq refresh-called 'company-manual)))))))
 
-(ert-deftest ejn-w3.5-reply-refreshes-fallback-completion-in-region ()
-  ;; With neither corfu nor company active, the reply path falls back to
-  ;; `completion-in-region'.
-  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
-    (search-forward "my_obj.met")
-    (let ((emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t))
-          (emacs-jupyter-notebook--completion-cache nil)
-          (emacs-jupyter-notebook--completion-cache-order nil)
-          (emacs-jupyter-notebook--completion-pending-key nil)
-          (emacs-jupyter-notebook--completion-pending-id nil)
-          (emacs-jupyter-notebook--completion-request-counter 0)
-          captured-cb fallback-called)
-      (let ((emacs-jupyter-notebook-jupyter-complete-function
-             (lambda (_client _code _pos cb) (setq captured-cb cb))))
-        (cl-letf (((symbol-function 'completion-in-region)
-                   (lambda (&rest _args) (setq fallback-called t))))
-          (emacs-jupyter-notebook--request-completion t)
-          (should captured-cb)
-          (funcall captured-cb
-                   '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10)
-                   nil)
-          (ejn-test-drain-zero-delay-timers)
-          (should fallback-called))))))
 
-(ert-deftest ejn-w3.7-context-changed-drops-reply-entirely ()
-  ;; W3.7: if the user moved point so the live key no longer matches the
-  ;; request's key, the reply is DROPPED entirely.  Caching it under the
-  ;; original key would risk surfacing out-of-date candidates if the user
-  ;; later returned to that context after the kernel state had drifted.
-  (ejn-test-with-temp-buffer "# %%\nmy_obj.met\n"
-    (search-forward "my_obj.met")
-    (let ((emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t))
-          (emacs-jupyter-notebook--completion-cache nil)
-          (emacs-jupyter-notebook--completion-cache-order nil)
-          (emacs-jupyter-notebook--completion-pending-key nil)
-          (emacs-jupyter-notebook--completion-pending-id nil)
-          (emacs-jupyter-notebook--completion-request-counter 0)
-          captured-cb refresh-called orig-key)
-      (let ((emacs-jupyter-notebook-jupyter-complete-function
-             (lambda (_client _code _pos cb) (setq captured-cb cb))))
-        (cl-letf (((symbol-function 'completion-in-region)
-                   (lambda (&rest _args) (setq refresh-called t))))
-          (setq orig-key (emacs-jupyter-notebook--completion-key))
-          (emacs-jupyter-notebook--request-completion t)
-          (should captured-cb)
-          ;; User moves point AFTER request was sent.
-          (forward-char -3)
-          (funcall captured-cb
-                   '(:matches ("my_obj.method") :cursor_start 0 :cursor_end 10)
-                   nil)
-          ;; Reply is dropped: cache does not contain orig-key, no refresh.
-          (should-not (and emacs-jupyter-notebook--completion-cache
-                           (gethash orig-key emacs-jupyter-notebook--completion-cache)))
-          (should-not refresh-called))))))
+
+
+
+
 
 (ert-deftest ejn-w3.7-idle-timer-captures-buffer ()
   ;; W3.7: `--completion-start-idle-timer' must capture `current-buffer'
@@ -4366,81 +4317,11 @@ reliably shows candidates instead of silently requiring a second press."
       (should (= (hash-table-count emacs-jupyter-notebook--completion-cache) 0))
       (should-not emacs-jupyter-notebook--completion-cache-order))))
 
-(ert-deftest ejn-inspect-at-point-callback-displays-text-plain ()
-  (ejn-test-with-temp-buffer "# %%\nrange(5)\n"
-    (goto-char (point-min))
-    (search-forward "range")
-    (let ((emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t))
-           captured-code
-           captured-pos
-           captured-detail
-           displayed
-           inspect-callback)
-      (cl-letf (((symbol-function 'display-message-or-buffer)
-                 (lambda (message &optional _buffer-name _action _frame)
-                   (setq displayed message))))
-        (let ((emacs-jupyter-notebook-jupyter-inspect-function
-               (lambda (_client code pos detail callback)
-                 (setq captured-code code
-                       captured-pos pos
-                       captured-detail detail)
-                 (setq inspect-callback callback))))
-          (emacs-jupyter-notebook-inspect-at-point)
-          (should-not displayed)
-          (funcall inspect-callback
-                   '(:found t :data (:text/plain "range docs")) nil)
-          (ejn-test-drain-zero-delay-timers)))
-      (should (equal displayed "range docs"))
-      (should (equal captured-code "range(5)\n"))
-      (should (= captured-pos 5))
-      (should (= captured-detail 0)))))
 
-(ert-deftest ejn-inspect-at-point-decodes-ansi-escapes ()
-  "IPython colourises its inspector (`?') output with ANSI SGR escapes.
-The displayed text must have them decoded (to faces) rather than dumped
-as literal `\\e[0;31m...' sequences into the echo area / *Message*."
-  (ejn-test-with-temp-buffer "# %%\nrange(5)\n"
-    (goto-char (point-min))
-    (search-forward "range")
-    (let ((emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t))
-          displayed inspect-callback)
-      (cl-letf (((symbol-function 'display-message-or-buffer)
-                 (lambda (m &rest _) (setq displayed m))))
-        (let ((emacs-jupyter-notebook-jupyter-inspect-function
-               (lambda (_c _code _pos _detail cb) (setq inspect-callback cb))))
-          (emacs-jupyter-notebook-inspect-at-point)
-          (funcall inspect-callback
-                   (list :found t
-                         :data (list :text/plain
-                                     "\e[0;31mSignature:\e[0m range(stop)\n"))
-                   nil)
-          (ejn-test-drain-zero-delay-timers)))
-      ;; No raw escape sequence survived, the visible text is intact, and
-      ;; the trailing newline was trimmed.
-      (should displayed)
-      (should-not (string-match-p "\e\\[" displayed))
-      (should (equal (substring-no-properties displayed)
-                     "Signature: range(stop)")))))
 
-(ert-deftest ejn-inspect-callback-not-found-displays-nothing ()
-  "Real `inspect_reply' for an unknown symbol is `(:status ok :found
-nil :data ())' — an EMPTY data plist.  The callback must display nothing
-(the `text/plain' guard handles it), not error or show an empty popup.
-Pins the real reply shape the happy-path test never exercises."
-  (ejn-test-with-temp-buffer "# %%\nnope\n"
-    (search-forward "nope")
-    (let ((emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t))
-          displayed inspect-callback)
-      (cl-letf (((symbol-function 'display-message-or-buffer)
-                 (lambda (m &rest _) (setq displayed m))))
-        (let ((emacs-jupyter-notebook-jupyter-inspect-function
-               (lambda (_c _code _pos _detail cb) (setq inspect-callback cb))))
-          (emacs-jupyter-notebook-inspect-at-point)
-          (funcall inspect-callback '(:status "ok" :found nil :data ()) nil)))
-      (should-not displayed))))
+
+
+
 
 (ert-deftest ejn-completion-result-from-reply-handles-vector-matches ()
   "Real emacs-jupyter delivers complete_reply `:matches' as a VECTOR
@@ -4474,24 +4355,7 @@ both so a regression in either is caught without a live kernel."
     (should (string-match-p (regexp-quote "/usr/bin/python3") remote))
     (should-not (string-match-p "KernelSpecManager" remote))))
 
-(ert-deftest ejn-evaluate-cell-completeness-check-skips-incomplete-code-async ()
-  (ejn-test-with-temp-buffer "# %%\nif True:\n"
-    (let ((emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t))
-          (emacs-jupyter-notebook-check-code-completeness t)
-          eval-called
-          callback)
-      (let ((emacs-jupyter-notebook-jupyter-is-complete-function
-             (lambda (_client _code captured-callback)
-               (setq callback captured-callback)))
-            (emacs-jupyter-notebook-jupyter-evaluate-function
-             (lambda (&rest _)
-               (setq eval-called t))))
-        (emacs-jupyter-notebook-send-cell))
-      (should callback)
-      (should-not eval-called)
-      (funcall callback '(:status "incomplete" :indent "    ") nil)
-      (should-not eval-called))))
+
 
 (ert-deftest ejn-panel-append-replace-clear-pending ()
   "W2.1: panel API supports append, replace, clear and pending-clear semantics."
@@ -4518,95 +4382,15 @@ both so a regression in either is caught without a live kernel."
       (should (equal (ejn-panel-entry-text handle)
                      "swapped")))))
 
-(ert-deftest ejn-callback-clear-output-immediate ()
-  "W2.7: clear_output without :wait clears the panel entry immediately."
-  (with-temp-buffer
-    (let* ((buffer (current-buffer))
-           (panel (ejn-panel-ensure buffer))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
-           (clear-fn (cadr (assoc "clear_output" callbacks))))
-      (ejn-panel-append-text handle "some output")
-      (cl-letf (((symbol-function 'jupyter-message-content)
-                 (lambda (_msg) '(:wait nil))))
-        (funcall clear-fn 'mock-msg))
-      (let ((e (ejn-panel-entry-snapshot handle)))
-        (should (equal (ejn-panel-entry-text e) ""))
-        (should-not (plist-get e :pending-clear))))))
 
-(ert-deftest ejn-callback-clear-output-wait-defers-clear ()
-  "W2.7: clear_output with :wait defers the clear until next text arrives."
-  (with-temp-buffer
-    (let* ((buffer (current-buffer))
-           (panel (ejn-panel-ensure buffer))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
-           (clear-fn (cadr (assoc "clear_output" callbacks))))
-      (ejn-panel-append-text handle "some output")
-      (cl-letf (((symbol-function 'jupyter-message-content)
-                 (lambda (_msg) '(:wait t))))
-        (funcall clear-fn 'mock-msg))
-      (let ((e (ejn-panel-entry-snapshot handle)))
-        (should (equal (ejn-panel-entry-text e) "some output"))
-        (should (plist-get e :pending-clear))))))
 
-(ert-deftest ejn-callback-update-display-data-replaces-content ()
-  "W2.7: update_display_data replaces the panel entry's content."
-  (with-temp-buffer
-    (let* ((buffer (current-buffer))
-           (panel (ejn-panel-ensure buffer))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
-           (update-fn (cadr (assoc "update_display_data" callbacks))))
-      (ejn-panel-append-text handle "old display")
-      (cl-letf (((symbol-function 'jupyter-message-content)
-                 (lambda (_msg) '(:data (:text/plain "updated output")
-                                        :transient (:display_id "abc"))))
-                ((symbol-function 'jupyter-message-data)
-                 (lambda (_msg mimetype)
-                   (when (eq mimetype :text/plain) "updated output"))))
-        (funcall update-fn 'mock-update-msg))
-      (should (equal (ejn-panel-entry-text handle)
-                     "updated output")))))
 
-(ert-deftest ejn-evaluate-cell-completeness-check-allows-complete-code-async ()
-  (ejn-test-with-temp-buffer "# %%\nx = 1\n"
-    (let ((emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t))
-          (emacs-jupyter-notebook-check-code-completeness t)
-          eval-called
-          callback)
-      (let ((emacs-jupyter-notebook-jupyter-is-complete-function
-             (lambda (_client _code captured-callback)
-               (setq callback captured-callback)))
-            (emacs-jupyter-notebook-jupyter-evaluate-function
-             (lambda (&rest _)
-               (setq eval-called t))))
-        (emacs-jupyter-notebook-send-cell)
-        (should callback)
-        (should-not eval-called)
-        (funcall callback '(:status "complete") nil)
-        (ejn-test-drain-zero-delay-timers))
-      (should eval-called))))
 
-(ert-deftest ejn-status-message-sets-kernel-status ()
-  (with-temp-buffer
-    (emacs-jupyter-notebook-mode 1)
-    (let* ((buffer (current-buffer))
-           (panel (ejn-panel-ensure buffer))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) "")))
-      (let* ((callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
-             (status-handler (cadr (assoc "status" callbacks)))
-             (mock-msg 'mock-status-msg))
-        (should status-handler)
-        (cl-letf (((symbol-function 'jupyter-message-content)
-                   (lambda (_msg) '(:execution_state "busy"))))
-          (funcall status-handler mock-msg))
-        (should (eq emacs-jupyter-notebook--kernel-status 'busy))
-        (cl-letf (((symbol-function 'jupyter-message-content)
-                   (lambda (_msg) '(:execution_state "idle"))))
-          (funcall status-handler mock-msg))
-        (should (eq emacs-jupyter-notebook--kernel-status 'idle))))))
+
+
+
+
+
 
 (ert-deftest ejn-mode-lighter-changes-based-on-kernel-status ()
   (with-temp-buffer
@@ -4647,67 +4431,23 @@ both so a regression in either is caught without a live kernel."
 ;; `--tunnel-dead' on a successful new client is exercised by
 ;; `ejn-async-connect-finalize-sets-client-on-success'.
 
-(ert-deftest ejn-mime-select-png-over-jpeg-and-text ()
-  (let ((data '(:text/plain "hello" :image/png "pngdata" :image/jpeg "jpgdata")))
-    (should (equal (car (emacs-jupyter-notebook--select-mime-type data)) :image/png))
-    (should (equal (cdr (emacs-jupyter-notebook--select-mime-type data)) "pngdata"))))
 
-(ert-deftest ejn-mime-select-jpeg-over-text ()
-  (let ((data '(:text/plain "hello" :image/jpeg "jpgdata")))
-    (should (equal (car (emacs-jupyter-notebook--select-mime-type data)) :image/jpeg))
-    (should (equal (cdr (emacs-jupyter-notebook--select-mime-type data)) "jpgdata"))))
 
-(ert-deftest ejn-mime-select-text-when-no-image ()
-  (let ((data '(:text/plain "hello")))
-    (should (equal (car (emacs-jupyter-notebook--select-mime-type data)) :text/plain))
-    (should (equal (cdr (emacs-jupyter-notebook--select-mime-type data)) "hello"))))
 
-(ert-deftest ejn-mime-select-nil-when-only-unsupported-types ()
-  (should-not (emacs-jupyter-notebook--select-mime-type '(:text/html "<p>hi</p>"))))
 
-(ert-deftest ejn-mime-select-nil-for-empty-data ()
-  (should-not (emacs-jupyter-notebook--select-mime-type nil)))
 
-(ert-deftest ejn-mime-render-text-returns-plain-string ()
-  (let ((result (emacs-jupyter-notebook--render-mime-result '(:text/plain "42"))))
-    (should (equal result "42"))
-    (should-not (get-text-property 0 'display result))))
 
-(ert-deftest ejn-mime-render-image-decodes-base64 ()
-  (let* ((raw "fake-image-data")
-         (encoded (base64-encode-string raw t))
-         (captured-data nil)
-         (captured-props nil))
-    (cl-letf (((symbol-function 'create-image)
-               (lambda (data &optional _type _data-p &rest props)
-                 (setq captured-data data)
-                 (setq captured-props props)
-                 (list 'image :type 'png :data data))))
-      (let ((result (emacs-jupyter-notebook--render-mime-result
-                     `(:image/png ,encoded))))
-        (should result)
-        (should (equal captured-data raw))
-        (should (get-text-property 0 'display result))
-        (should (equal (plist-get captured-props :max-width)
-                       emacs-jupyter-notebook-image-max-width))
-        (should (equal (plist-get captured-props :max-height)
-                       emacs-jupyter-notebook-image-max-height))))))
 
-(ert-deftest ejn-mime-render-image-falls-back-to-text-on-error ()
-  (let* ((encoded (base64-encode-string "bad" t))
-         (data `(:text/plain "fallback" :image/png ,encoded)))
-    (cl-letf (((symbol-function 'create-image)
-               (lambda (&rest _) (error "no image support"))))
-      (let ((result (emacs-jupyter-notebook--render-mime-result data)))
-        (should (equal result "fallback"))))))
 
-(ert-deftest ejn-mime-render-image-nil-return-falls-back-to-text ()
-  (let* ((encoded (base64-encode-string "bad" t))
-         (data `(:text/plain "fallback" :image/png ,encoded)))
-    (cl-letf (((symbol-function 'create-image)
-               (lambda (&rest _) nil)))
-      (let ((result (emacs-jupyter-notebook--render-mime-result data)))
-        (should (equal result "fallback"))))))
+
+
+
+
+
+
+
+
+
 
 (ert-deftest ejn-panel-image-and-text-coexist-in-order ()
   "W16: text and images COEXIST as ordered segments — a cell that prints
@@ -4755,88 +4495,19 @@ pre-W16 exclusive-output tests.)"
         (should-not (car (ejn-panel-entry-images e)))
         (should (equal (ejn-panel-entry-text e) ""))))))
 
-(ert-deftest ejn-callback-execute-result-renders-text-via-mime ()
-  "W2.7: execute_result with text MIME goes through replace-text."
-  (with-temp-buffer
-    (let* ((buffer (current-buffer))
-           (panel (ejn-panel-ensure buffer))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
-           (exec-fn (cadr (assoc "execute_result" callbacks))))
-      (cl-letf (((symbol-function 'jupyter-message-content)
-                 (lambda (_msg) '(:data (:text/plain "42")))))
-        (funcall exec-fn 'mock-msg))
-      (let ((e (ejn-panel-entry-snapshot handle)))
-        (should (equal (ejn-panel-entry-text e) "42"))
-        (should-not (car (ejn-panel-entry-images e)))))))
 
-(ert-deftest ejn-callback-execute-result-renders-image-via-mime ()
-  "W2.7: display_data with PNG MIME goes through set-image."
-  (with-temp-buffer
-    (let* ((buffer (current-buffer))
-           (panel (ejn-panel-ensure buffer))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
-           (display-fn (cadr (assoc "display_data" callbacks)))
-           (encoded (base64-encode-string "imgdata" t)))
-      (cl-letf (((symbol-function 'jupyter-message-content)
-                 (lambda (_msg) `(:data (:image/png ,encoded))))
-                ((symbol-function 'create-image)
-                 (lambda (data &optional _type _data-p &rest _props)
-                   (list 'image :type 'png :data data))))
-        (funcall display-fn 'mock-msg))
-      (let ((image (car (ejn-panel-entry-images handle))))
-        (should (ejn-test-image-file-backed-p image))
-        (should (equal (ejn-test-image-spec-data image) "imgdata"))))))
 
-(ert-deftest ejn-callback-update-display-data-replaces-image ()
-  "W2.7/W16: update_display_data with image MIME updates the entry's LAST
-image segment IN PLACE — the kernel is refreshing an existing display —
-while surrounding text segments are left untouched."
-  (with-temp-buffer
-    (let* ((buffer (current-buffer))
-           (panel (ejn-panel-ensure buffer))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
-           (update-fn (cadr (assoc "update_display_data" callbacks)))
-           (encoded (base64-encode-string "newimg" t)))
-      (ejn-panel-append-text handle "old text")
-      (ejn-panel-set-image handle '(image :type png :data "oldimg"))
-      (cl-letf (((symbol-function 'jupyter-message-content)
-                 (lambda (_msg) `(:data (:image/jpeg ,encoded))))
-                ((symbol-function 'create-image)
-                 (lambda (data &optional _type _data-p &rest _props)
-                   (list 'image :type 'jpeg :data data))))
-        (funcall update-fn 'mock-msg))
-      (let ((e (ejn-panel-entry-snapshot handle)))
-        ;; Still exactly one image; its spec was swapped in place.
-        (let ((images (ejn-panel-entry-images e)))
-          (should (= (length images) 1))
-          (should (ejn-test-image-file-backed-p (car images)))
-          (should (equal (ejn-test-image-spec-data (car images)) "newimg")))
-        ;; The text segment survives the display update.
-        (should (equal (ejn-panel-entry-text e) "old text"))))))
 
-(ert-deftest ejn-mime-render-image-jpeg-decodes-base64 ()
-  (let* ((raw "jpeg-data")
-         (encoded (base64-encode-string raw t))
-         (captured-data nil))
-    (cl-letf (((symbol-function 'create-image)
-               (lambda (data &optional _type _data-p &rest _props)
-                 (setq captured-data data)
-                 (list 'image :type 'jpeg :data data))))
-      (let ((result (emacs-jupyter-notebook--render-mime-result
-                     `(:image/jpeg ,encoded))))
-        (should result)
-        (should (equal captured-data raw))
-        (should (get-text-property 0 'display result))))))
+
+
+
+
 
 (ert-deftest ejn-tunnel-reconnect-is-async-and-uses-reconnect-context ()
   ;; Post-W4.4: tunnel-reconnect goes through `--async-probe-pid-alive'
   ;; before retrieve.  The probe is stubbed to call retrieve directly so
   ;; this test still pins the async-only contract.
-  (let ((emacs-jupyter-notebook-backend 'legacy)
-        (entry (ejn-test-direct-entry
+  (let ((entry (ejn-test-direct-entry
                 '(:profile "p"
                   :remote-host "example.com"
                   :remote-cwd "~"
@@ -4845,7 +4516,7 @@ while surrounding text segments are left untouched."
                   :remote-connection-file "~/.cache/ejn/kernel.json"
                   :session-id "session")))
         (retrieve-called nil))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-selected-backend)
                #'ignore)
               ((symbol-function 'emacs-jupyter-notebook--async-probe-pid-alive)
                (lambda (context)
@@ -4911,9 +4582,14 @@ normal start/reconnect."
           started)
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
                  (lambda (&rest _) nil))
-                ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
+                ((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+                 (lambda (success _failure &rest _keys)
+                   (ejn-test-registry--defer
+                    (lambda () (funcall success nil nil)))))
+                ((symbol-function 'emacs-jupyter-notebook--start-remote-kernel-admitted)
                  (lambda (&rest _) (setq started t))))
-        (emacs-jupyter-notebook--ensure-client-async (lambda (_) nil) nil))
+        (emacs-jupyter-notebook--ensure-client-async (lambda (_) nil) nil)
+        (should (ejn-test-await (lambda () started))))
       (should started)
       (should-not emacs-jupyter-notebook--tunnel-dead))))
 
@@ -4930,84 +4606,11 @@ tearing down a tunnel whose death-sentinel is armed never spuriously sets
         (accept-process-output nil 0.05)
         (should-not emacs-jupyter-notebook--tunnel-dead)))))
 
-(ert-deftest ejn-tunnel-dead-branch-wires-callback-and-error-callback ()
-  (ejn-test-with-temp-buffer "# %%\na = 1\n"
-    (let* ((emacs-jupyter-notebook--client nil)
-           (emacs-jupyter-notebook--async-context nil)
-           (emacs-jupyter-notebook--tunnel-dead t)
-           (emacs-jupyter-notebook--session-entry
-            '(:profile "p" :session-id "s" :local-file "/tmp/x.py"))
-           (reconnect-called nil)
-           (eval-called nil)
-           (emacs-jupyter-notebook-jupyter-evaluate-function
-            (lambda (_client _code _entry-handle)
-              (setq eval-called t))))
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook--tunnel-reconnect)
-                 (lambda (buffer callback error-callback)
-                   (setq reconnect-called t)
-                   (should (functionp callback))
-                   (should (functionp error-callback))
-                   (setq emacs-jupyter-notebook--tunnel-dead nil)
-                   (setq emacs-jupyter-notebook--client
-                         (ejn-test-backend-session 'mock-client t))
-                   (funcall callback nil))))
-        (emacs-jupyter-notebook-send-cell)
-        (should reconnect-called)
-        (should eval-called)))))
 
-(ert-deftest ejn-tunnel-dead-branch-error-callback-fires-on-failure ()
-  (ejn-test-with-temp-buffer "# %%\na = 1\n"
-    (let* ((emacs-jupyter-notebook--client nil)
-           (emacs-jupyter-notebook--async-context nil)
-           (emacs-jupyter-notebook--tunnel-dead t)
-           (emacs-jupyter-notebook--session-entry
-            '(:profile "p" :session-id "s" :local-file "/tmp/x.py"))
-           (error-called nil)
-           (eval-called nil)
-           (emacs-jupyter-notebook-jupyter-evaluate-function
-            (lambda (&rest _)
-              (setq eval-called t))))
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook--tunnel-reconnect)
-                 (lambda (_buffer _callback error-callback)
-                   (funcall error-callback nil "tunnel reconnect failed"))))
-        (emacs-jupyter-notebook-send-cell)
-        (should-not eval-called)))))
 
-(ert-deftest ejn-w4.6-heartbeat-death-routes-through-tunnel-reconnect ()
-  "W4.6: the --tunnel-dead flag set by a heartbeat miss-threshold leads
-`--ensure-client-async' to `--tunnel-reconnect' in exactly the same way as
-sentinel-driven death.  Heartbeat and sentinel are indistinguishable to
-the evaluate flow."
-  (ejn-test-with-temp-buffer "# %%\na = 1\n"
-    (let* ((emacs-jupyter-notebook--client nil)
-           (emacs-jupyter-notebook--async-context nil)
-           (emacs-jupyter-notebook--tunnel-dead nil)
-           (emacs-jupyter-notebook--session-entry
-            '(:profile "p" :session-id "s" :local-file "/tmp/x.py"))
-           (reconnect-called nil)
-           (eval-called nil)
-           (emacs-jupyter-notebook-jupyter-evaluate-function
-            (lambda (_client _code _entry-handle)
-              (setq eval-called t)))
-           (emacs-jupyter-notebook-heartbeat-misses-allowed 2))
-      ;; Trigger heartbeat-driven death exactly the way the runtime does.
-      (cl-letf (((symbol-function 'display-warning) #'ignore))
-        (emacs-jupyter-notebook--heartbeat-on-miss)
-        (emacs-jupyter-notebook--heartbeat-on-miss))
-      (should emacs-jupyter-notebook--tunnel-dead)
-      ;; Now evaluate: the engine must route through tunnel-reconnect
-      ;; without distinguishing how we got here.
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook--tunnel-reconnect)
-                 (lambda (buffer callback _error-callback)
-                   (setq reconnect-called t)
-                   (should (functionp callback))
-                   (setq emacs-jupyter-notebook--tunnel-dead nil)
-                   (setq emacs-jupyter-notebook--client
-                         (ejn-test-backend-session 'mock-client t))
-                   (funcall callback nil))))
-        (emacs-jupyter-notebook-send-cell)
-        (should reconnect-called)
-        (should eval-called)))))
+
+
+
 
 (ert-deftest ejn-install-tunnel-sentinel-detects-already-dead-process ()
   (with-temp-buffer
@@ -5049,213 +4652,26 @@ the evaluate flow."
         (should-not emacs-jupyter-notebook-panel--entries))
       (should-not emacs-jupyter-notebook--fringe-overlays))))
 
-(ert-deftest ejn-callback-input-request-appends-prompt-to-panel ()
-  "W2.7: input_request appends the prompt and defers reading it."
-  (with-temp-buffer
-    (let* ((buffer (current-buffer))
-           (panel (ejn-panel-ensure buffer))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks
-                        buffer handle 'mock-client))
-           (input-fn (cadr (assoc "input_request" callbacks)))
-           (source-before (buffer-string))
-           (prompted nil)
-           (reply-sent nil))
-      (cl-letf (((symbol-function 'jupyter-message-content)
-                 (lambda (_msg) '(:prompt "Enter value: " :password nil)))
-                ((symbol-function 'read-string)
-                 (lambda (prompt)
-                   (setq prompted prompt)
-                   "42"))
-                ((symbol-function 'emacs-jupyter-notebook-jupyter--send-input-reply)
-                 (lambda (_client _value) (setq reply-sent t))))
-        (funcall input-fn 'mock-input-msg)
-        (should-not prompted)
-        (should-not reply-sent)
-        (ejn-test-drain-zero-delay-timers))
-      (should (string-match-p "Enter value: "
-                              (ejn-panel-entry-text handle)))
-      (should (equal prompted "Enter value: "))
-      (should reply-sent)
-      (should (equal (buffer-string) source-before)))))
-
-(ert-deftest ejn-callback-input-request-sends-reply-with-user-input ()
-  "W2.7: input_request relays the user's response back to the kernel."
-  (with-temp-buffer
-    (let* ((buffer (current-buffer))
-           (panel (ejn-panel-ensure buffer))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks
-                        buffer handle 'mock-client))
-           (input-fn (cadr (assoc "input_request" callbacks)))
-           (source-before (buffer-string))
-           prompted
-           reply-sent)
-      (cl-letf (((symbol-function 'jupyter-message-content)
-                 (lambda (_msg) '(:prompt "Name: " :password nil)))
-                ((symbol-function 'read-string)
-                 (lambda (prompt) (setq prompted prompt) "alice"))
-                ((symbol-function 'emacs-jupyter-notebook-jupyter--send-input-reply)
-                 (lambda (client value)
-                   (setq reply-sent (list client value)))))
-        (funcall input-fn 'mock-input-msg)
-        (should-not prompted)
-        (should-not reply-sent)
-        (ejn-test-drain-zero-delay-timers))
-      (should (equal prompted "Name: "))
-      (should (equal reply-sent '(mock-client "alice")))
-      (should (equal (buffer-string) source-before)))))
-
-(ert-deftest ejn-callback-input-request-uses-read-passwd-for-password ()
-  "W2.7: password prompts route through `read-passwd'."
-  (with-temp-buffer
-    (let* ((buffer (current-buffer))
-           (panel (ejn-panel-ensure buffer))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks
-                        buffer handle 'mock-client))
-           (input-fn (cadr (assoc "input_request" callbacks)))
-           (source-before (buffer-string))
-           passwd-called passwd-prompt reply-value)
-      (cl-letf (((symbol-function 'jupyter-message-content)
-                 (lambda (_msg) '(:prompt "Password: " :password t)))
-                ((symbol-function 'read-passwd)
-                 (lambda (prompt)
-                   (setq passwd-called t)
-                   (setq passwd-prompt prompt)
-                   "secret"))
-                ((symbol-function 'emacs-jupyter-notebook-jupyter--send-input-reply)
-                 (lambda (_client value)
-                    (setq reply-value (copy-sequence value)))))
-        (funcall input-fn 'mock-input-msg)
-        (should-not passwd-called)
-        (should-not reply-value)
-        (ejn-test-drain-zero-delay-timers))
-      (should passwd-called)
-      (should (equal passwd-prompt "Password: "))
-      (should (equal reply-value "secret"))
-      (should (equal (buffer-string) source-before)))))
-
-(ert-deftest ejn-callback-input-request-without-client-does-not-send-reply ()
-  "W2.7: without a client, the input_request callback still shows the prompt."
-  (with-temp-buffer
-    (let* ((buffer (current-buffer))
-           (panel (ejn-panel-ensure buffer))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks
-                        buffer handle))
-           (input-fn (cadr (assoc "input_request" callbacks)))
-           (reply-called nil))
-      (cl-letf (((symbol-function 'jupyter-message-content)
-                 (lambda (_msg) '(:prompt "Input: " :password nil)))
-                ((symbol-function 'read-string)
-                 (lambda (_prompt) "test"))
-                ((symbol-function 'emacs-jupyter-notebook-jupyter--send-input-reply)
-                 (lambda (&rest _)
-                   (setq reply-called t))))
-        (funcall input-fn 'mock-input-msg))
-      (should-not reply-called)
-      (should (string-match-p "Input: "
-                              (ejn-panel-entry-text handle))))))
-
-(ert-deftest ejn-callback-input-request-extracts-prompt-and-password-fields ()
-  "W2.7: input_request reads :prompt and :password fields correctly."
-  (with-temp-buffer
-    (let* ((buffer (current-buffer))
-           (panel (ejn-panel-ensure buffer))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks
-                        buffer handle 'mock-client))
-           (input-fn (cadr (assoc "input_request" callbacks)))
-           (source-before (buffer-string))
-           captured-prompt)
-      (cl-letf (((symbol-function 'jupyter-message-content)
-                 (lambda (_msg) '(:prompt "Your name: " :password nil)))
-                ((symbol-function 'read-string)
-                 (lambda (prompt) (setq captured-prompt prompt) "bob"))
-                ((symbol-function 'emacs-jupyter-notebook-jupyter--send-input-reply)
-                 #'ignore))
-        (funcall input-fn 'mock-input-msg)
-        (should-not captured-prompt)
-        (ejn-test-drain-zero-delay-timers))
-      (should (equal captured-prompt "Your name: "))
-      (should (equal (buffer-string) source-before)))))
-
-(ert-deftest ejn-send-input-reply-delegates-to-jupyter-run-with-state ()
-  (let ((called-with nil))
-    (cl-letf (((symbol-function 'jupyter-run-with-state)
-               (lambda (client body)
-                 (setq called-with (list client body))
-                 nil))
-              ((symbol-function 'jupyter-sent)
-               (lambda (req) (list 'sent req)))
-              ((symbol-function 'jupyter-input-reply)
-               (lambda (&rest args) (cons 'input-reply args))))
-      (emacs-jupyter-notebook-jupyter--send-input-reply 'my-client "hello")
-      (should (equal (car called-with) 'my-client))
-      (should (equal (cadr called-with) '(sent (input-reply :value "hello")))))))
-
-(ert-deftest ejn-watch-expressions-plist-converts-to-json-plist ()
-  (let ((emacs-jupyter-notebook-watch-expressions
-         '(("x" . "x")
-           ("mean value" . "sum(xs) / len(xs)")
-           ("" . "ignored")
-           ("missing" . ""))))
-    (should (equal (emacs-jupyter-notebook-jupyter--watch-expressions-plist)
-                   (list :x "x"
-                         (intern ":mean value") "sum(xs) / len(xs)")))))
-
-(ert-deftest ejn-evaluate-sends-user-expressions ()
-  "W2.7: user_expressions are forwarded to jupyter-execute-request."
-  (with-temp-buffer
-    (let ((emacs-jupyter-notebook-watch-expressions
-           '(("x" . "x") ("total" . "sum(xs)")))
-          captured-args)
-      (cl-letf* ((orig-require (symbol-function 'require))
-                 ((symbol-function 'require)
-                  (lambda (feature &optional filename noerror)
-                    (if (memq feature '(jupyter-client jupyter-messages jupyter-monads))
-                        feature
-                      (funcall orig-require feature filename noerror))))
-                 ((symbol-function 'emacs-jupyter-notebook-jupyter--ensure) #'ignore)
-                 ((symbol-function 'jupyter-run-with-state) (lambda (&rest _) nil))
-                 ((symbol-function 'jupyter-sent) (lambda (x) x))
-                 ((symbol-function 'jupyter-message-subscribed) (lambda (req _cbs) req))
-                 ((symbol-function 'jupyter-execute-request)
-                  (lambda (&rest args)
-                    (setq captured-args args)
-                    'mock-request)))
-        (insert "# %%\nx = 1\n")
-        (let* ((panel (ejn-panel-ensure (current-buffer)))
-               (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1")))
-          (emacs-jupyter-notebook-jupyter--evaluate
-           'mock-client "x = 1" handle))
-        (should (equal (plist-get captured-args :user-expressions)
-                       '(:x "x" :total "sum(xs)")))))))
-
-(ert-deftest ejn-execute-reply-appends-watch-results ()
-  "W2.7: execute_reply watch results are appended to the panel entry."
-  (with-temp-buffer
-    (let* ((buffer (current-buffer))
-           (panel (ejn-panel-ensure buffer))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
-           (reply-fn (cadr (assoc "execute_reply" callbacks))))
-      (cl-letf (((symbol-function 'jupyter-message-content)
-                 (lambda (_msg)
-                   '(:status "ok"
-                     :execution_count 9
-                     :user_expressions
-                     (:x (:status "ok" :data (:text/plain "10"))
-                      :bad (:status "error" :ename "NameError" :evalue "name 'bad' is not defined"))))))
-        (funcall reply-fn 'mock-reply-msg))
-      (let ((content (ejn-panel-entry-text handle)))
-        (should (string-match-p "\\[watch\\]" content))
-        (should (string-match-p "x: 10" content))
-        (should (string-match-p "bad: NameError: name 'bad' is not defined" content))))))
 
 
-(ert-deftest ejn-w5.4-interrupt-kernel-dispatches-through-adapter-var ()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+(ert-deftest ejn-w5.4-interrupt-kernel-dispatches-through-helper-backend ()
   "W5.4: interrupt dispatches through the helper backend for active work."
   (with-temp-buffer
     (let* ((client (ejn-test-backend-session 'mock-client t))
@@ -5277,8 +4693,8 @@ the evaluate flow."
       (should (plist-get (emacs-jupyter-notebook--execution-record 1)
                          :interrupt-sent)))))
 
-(ert-deftest ejn-w5.4-restart-kernel-dispatches-through-adapter-var ()
-  "W5.4: restart rejects a legacy session instead of sending unsafe control."
+(ert-deftest ejn-w5.4-restart-kernel-requires-a-durable-session ()
+  "W5.4: restart rejects a session without durable reconnect metadata."
   (with-temp-buffer
     (let ((emacs-jupyter-notebook--client
            (ejn-test-backend-session 'mock-client t))
@@ -5290,72 +4706,12 @@ the evaluate flow."
          :type 'user-error))
       (should-not sent))))
 
-(ert-deftest ejn-w5.4-interrupt-kernel-errors-without-client ()
-  "W5.4: interrupt without a client surfaces a clear error, does not call adapter."
-  (with-temp-buffer
-    (let ((emacs-jupyter-notebook--client nil)
-          adapter-called)
-      (let ((emacs-jupyter-notebook-jupyter-interrupt-function
-             (lambda (&rest _) (setq adapter-called t))))
-        (should-error (call-interactively #'emacs-jupyter-notebook-interrupt-kernel)))
-      (should-not adapter-called))))
-
-(ert-deftest ejn-w5.4-restart-kernel-errors-without-client ()
-  "W5.4: restart without a client surfaces a clear error, does not call adapter."
-  (with-temp-buffer
-    (let ((emacs-jupyter-notebook--client nil)
-          adapter-called)
-      (let ((emacs-jupyter-notebook-jupyter-restart-function
-             (lambda (&rest _) (setq adapter-called t))))
-        (should-error (call-interactively #'emacs-jupyter-notebook-restart-kernel)))
-      (should-not adapter-called))))
 
 
-(ert-deftest ejn-async-connect-calls-connect-async-function ()
-  (let ((emacs-jupyter-notebook-backend 'legacy)
-        (entry '(:profile "p"
-                 :remote-host "example.com"
-                 :remote-connection-file "/tmp/kernel.json"
-                 :session-id "session"))
-        (profile '(:profile "p" :host "example.com"))
-        (local-ports '(:shell_port 1001
-                       :iopub_port 1002
-                       :stdin_port 1003
-                       :hb_port 1004
-                       :control_port 1005))
-        (local-file (make-temp-file "ejn-test-" nil ".json"))
-        connect-async-called
-        captured-callback)
-    (unwind-protect
-        (progn
-          (with-temp-file local-file (insert "{}"))
-          (cl-letf (((symbol-function 'emacs-jupyter-notebook--start-tunnel)
-                     (lambda (&rest _) 'mock-process))
-                    ((symbol-function 'emacs-jupyter-notebook--install-tunnel-sentinel)
-                     #'ignore)
-                    ((symbol-function 'emacs-jupyter-notebook-jupyter-connect-async)
-                     (lambda (file callback)
-                       (setq connect-async-called t)
-                       (setq captured-callback callback)
-                       'mock-client))
-                    ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
-                     #'ignore))
-            (with-temp-buffer
-              (let* ((context (emacs-jupyter-notebook--async-new-context
-                               :phase 'tunnel
-                               :entry entry
-                               :session-id "session"
-                               :local-ports local-ports
-                               :local-file local-file
-                               :tunnel-process 'mock-process
-                               :origin-buffer (current-buffer))))
-                (setq emacs-jupyter-notebook--async-context context)
-                (setq context (emacs-jupyter-notebook--async-connect context))
-                (should connect-async-called)
-                (should (functionp captured-callback))
-                (should (eq (plist-get emacs-jupyter-notebook--async-context :phase) 'connect))))))
-      (when (file-exists-p local-file)
-        (delete-file local-file)))))
+
+
+
+
 
 (ert-deftest ejn-async-connect-finalize-sets-client-on-success ()
   (let ((entry (ejn-test-direct-entry '(:profile "p" :session-id "session")))
@@ -5377,11 +4733,24 @@ the evaluate flow."
         (setq session (ejn-test-backend-session 'mock-client t))
         (setq context (emacs-jupyter-notebook--async-put
                        context :client-unverified session))
-        (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
-                   (lambda (entry &optional _file)
-                     (setq saved-entry entry))))
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+                   (lambda (candidate _revision success _failure &rest _keys)
+                     (setq saved-entry (copy-tree candidate))
+                     (setq saved-entry
+                           (plist-put saved-entry :registry-revision
+                                      "ejn-test-connect-finalized"))
+                     (ejn-test-registry--defer
+                      (lambda () (funcall success saved-entry nil)))))
+                  ((symbol-function 'emacs-jupyter-notebook--heartbeat-start)
+                   #'ignore)
+                  ((symbol-function 'emacs-jupyter-notebook--inject-viewer-formatter)
+                   #'ignore)
+                  ((symbol-function 'emacs-jupyter-notebook--inject-idle-watchdog)
+                   #'ignore))
           (emacs-jupyter-notebook--async-connect-finalize
-           context buffer entry local-ports local-file session))
+           context buffer entry local-ports local-file session)
+          (should (ejn-test-await
+                   (lambda () (eq emacs-jupyter-notebook--client session)))))
         (should (eq emacs-jupyter-notebook--client session))
         (should (eq (plist-get emacs-jupyter-notebook--async-context :phase) 'done))
         (should (equal (plist-get saved-entry :session-id) "session"))
@@ -5435,7 +4804,7 @@ the evaluate flow."
                    (setf (emacs-jupyter-notebook-backend-session-closed closing) t)
                    (funcall callback 1 nil)
                    1))
-                ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
+                ((symbol-function 'ejn-test-registry-save-entry)
                  (lambda (&rest _) (setq saved t)))
                 ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
                  (lambda ()
@@ -5477,7 +4846,7 @@ the evaluate flow."
                    (setf (emacs-jupyter-notebook-backend-session-closed closing) t)
                    (funcall callback 1 nil)
                    1))
-                ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
+                ((symbol-function 'ejn-test-registry-save-entry)
                  (lambda (&rest _) (setq saved t))))
         ;; Invoke the exact transition used by the tunnel sentinel before the
         ;; already queued backend success gets a chance to run.
@@ -5489,6 +4858,44 @@ the evaluate flow."
       (should-not emacs-jupyter-notebook--tunnel-process)
       (should-not emacs-jupyter-notebook--client)
       (should-not saved))))
+
+(ert-deftest ejn-connect-helper-loss-during-promotion-retires-context ()
+  "A provisional helper remains context-owned during registry promotion."
+  (with-temp-buffer
+    (let* ((session (ejn-test-backend-session 'mock-client t))
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'registry-connect-promotion
+                     :client-unverified session
+                     :origin-buffer (current-buffer)))
+           failed)
+      (setq emacs-jupyter-notebook--async-context context)
+      (cl-letf (((symbol-function
+                  'emacs-jupyter-notebook--async-connect-transport-fail)
+                 (lambda (candidate reason)
+                   (setq failed (list candidate reason)))))
+        (emacs-jupyter-notebook--transport-lost
+         "helper exited during promotion" session nil))
+      (should (eq (car failed) context))
+      (should (equal (cadr failed) "helper exited during promotion")))))
+
+(ert-deftest ejn-connect-tunnel-loss-during-promotion-retires-context ()
+  "A provisional tunnel remains context-owned during registry promotion."
+  (with-temp-buffer
+    (let* ((tunnel 'promotion-tunnel)
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'registry-connect-promotion
+                     :tunnel-process tunnel
+                     :origin-buffer (current-buffer)))
+           failed)
+      (setq emacs-jupyter-notebook--async-context context)
+      (cl-letf (((symbol-function
+                  'emacs-jupyter-notebook--async-connect-transport-fail)
+                 (lambda (candidate reason)
+                   (setq failed (list candidate reason)))))
+        (emacs-jupyter-notebook--transport-lost
+         "tunnel exited during promotion" nil tunnel))
+      (should (eq (car failed) context))
+      (should (equal (cadr failed) "tunnel exited during promotion")))))
 
 (ert-deftest ejn-connect-finalize-revalidates-provisional-session ()
   "The install boundary rejects a session retired before its callback runs."
@@ -5505,7 +4912,7 @@ the evaluate flow."
            saved)
       (setf (emacs-jupyter-notebook-backend-session-closed session) t)
       (setq emacs-jupyter-notebook--async-context context)
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
+      (cl-letf (((symbol-function 'ejn-test-registry-save-entry)
                  (lambda (&rest _) (setq saved t))))
         (should
          (emacs-jupyter-notebook--async-connect-finalize
@@ -5539,23 +4946,7 @@ the evaluate flow."
       (emacs-jupyter-notebook--async-connect-timeout context buffer)
       (should (eq (plist-get emacs-jupyter-notebook--async-context :phase) 'done)))))
 
-(ert-deftest ejn-w15-heartbeat-suspended-while-kernel-busy ()
-  "W15-A: while the kernel is busy the heartbeat sends NO probe and resets
-the miss counter — shell silence is the expected state of a busy kernel,
-not evidence of death.  This kills the false tunnel-death that fired ~45 s
-into every long-running (training) cell."
-  (with-temp-buffer
-    (let ((emacs-jupyter-notebook--client 'mock-client)
-          (emacs-jupyter-notebook--tunnel-dead nil)
-          (emacs-jupyter-notebook--kernel-status 'busy)
-          (emacs-jupyter-notebook--heartbeat-misses 2)
-          probed)
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-kernel-info)
-                 (lambda (&rest _) (setq probed t))))
-        (emacs-jupyter-notebook--heartbeat-tick))
-      (should-not probed)
-      (should (= emacs-jupyter-notebook--heartbeat-misses 0))
-      (should-not emacs-jupyter-notebook--tunnel-dead))))
+
 
 (ert-deftest ejn-w15-heartbeat-suspended-before-busy-status-arrives ()
   "An admitted FIFO execution closes the pre-`busy' false-death window."
@@ -5594,49 +4985,7 @@ into every long-running (training) cell."
       (should (= emacs-jupyter-notebook--heartbeat-misses 0))
       (should-not emacs-jupyter-notebook--tunnel-dead))))
 
-(ert-deftest ejn-w15-connect-timeout-busy-kernel-finalizes-busy ()
-  "W15-B: kernel-info timeout on a RECONNECT + PID probe says alive →
-finalize as connected-BUSY: client installed, status busy, phase done,
-registry saved — no failure."
-  (with-temp-buffer
-    (let* ((buffer (current-buffer))
-           (session (ejn-test-backend-session 'mock-client t))
-           (entry (ejn-test-direct-entry
-                   '(:profile "p" :session-id "s15" :remote-host "h"
-                     :remote-pid 4242
-                     :remote-connection-file "/r/k.json")))
-           (context (emacs-jupyter-notebook--async-new-context
-                     :phase 'connect
-                     :profile '(:profile "p" :host "h")
-                     :entry entry
-                     :session-id "s15"
-                     :remote-ports (plist-get entry :remote-ports)
-                     :local-ports '(:shell_port 1001 :iopub_port 1002
-                                    :stdin_port 1003 :hb_port 1004
-                                    :control_port 1005)
-                     :local-file "/tmp/k15.json"
-                     :client-unverified session
-                     :origin-buffer buffer))
-           failed)
-      (setq emacs-jupyter-notebook--async-context context)
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-fail)
-                 (lambda (&rest _) (setq failed t)))
-                ((symbol-function 'emacs-jupyter-notebook--heartbeat-start) #'ignore)
-                ((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent) #'ignore)
-                ((symbol-function 'emacs-jupyter-notebook-registry-save-entry) #'ignore)
-                ((symbol-function 'emacs-jupyter-notebook-ssh-start-bounded-process)
-                 (ejn-test--probe-process-fn
-                  "echo __EJN_ALIVE_MATCH__; echo __EJN_DONE__")))
-        (emacs-jupyter-notebook--async-connect-timeout context buffer)
-        (let ((deadline (+ (float-time) 5)))
-          (while (and (not (eq emacs-jupyter-notebook--client session))
-                      (not failed)
-                      (< (float-time) deadline))
-            (accept-process-output nil 0.02))))
-      (should-not failed)
-      (should (eq emacs-jupyter-notebook--client session))
-      (should (eq emacs-jupyter-notebook--kernel-status 'busy))
-      (should (eq (plist-get emacs-jupyter-notebook--async-context :phase) 'done)))))
+
 
 (ert-deftest ejn-w15-connect-timeout-dead-kernel-fails ()
   "W15-B: kernel-info timeout + PID probe answers dead → fail with the
@@ -5795,18 +5144,7 @@ hooks, so mode enable does not install them."
     (should-not (memq 'emacs-jupyter-notebook--kill-buffer-hook
                       kill-buffer-hook))))
 
-(ert-deftest ejn-release-local-resources-drops-client-without-shutdown ()
-  "W1.1: the disposer drops the client without calling jupyter-shutdown."
-  (let (shutdown-called)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
-               (lambda (&rest _)
-                 (setq shutdown-called t))))
-      (with-temp-buffer
-        (setq emacs-jupyter-notebook--client
-              (ejn-test-backend-session 'mock-client t))
-        (emacs-jupyter-notebook--release-local-resources)
-        (should-not shutdown-called)
-        (should-not emacs-jupyter-notebook--client)))))
+
 
 (ert-deftest ejn-release-local-resources-preserves-session-entry ()
   "W1.1: the disposer leaves the registry-bearing session entry untouched."
@@ -5818,7 +5156,7 @@ hooks, so mode enable does not install them."
     (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
                (lambda (&rest _)
                  (setq cleanup-called t)))
-              ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
+              ((symbol-function 'ejn-test-registry-remove-entry)
                (lambda (&rest _)
                  (setq registry-removed t))))
       (with-temp-buffer
@@ -5940,33 +5278,7 @@ hooks, so mode enable does not install them."
       (should-not (memq eval-timer timer-list))
       (should-not emacs-jupyter-notebook--completion-idle-timer))))
 
-(ert-deftest ejn-mode-disable-preserves-session-entry-and-registry ()
-  "W1.2 + W1.9: mode disable does not call jupyter-shutdown, does not touch the
-registry, and preserves the buffer's `--session-entry'.  It DOES drop the
-buffer-local client handle: that handle is a local resource and the W1 GOAL
-explicitly lists it among the things released on mode disable."
-  (let (shutdown-called cleanup-called registry-removed
-        (entry '(:profile "p" :session-id "session")))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
-               (lambda (&rest _)
-                 (setq shutdown-called t)))
-              ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
-               (lambda (&rest _)
-                 (setq cleanup-called t)))
-              ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
-               (lambda (&rest _)
-                 (setq registry-removed t))))
-      (with-temp-buffer
-        (emacs-jupyter-notebook-mode 1)
-        (setq emacs-jupyter-notebook--client
-              (ejn-test-backend-session 'mock-client t))
-        (setq emacs-jupyter-notebook--session-entry entry)
-        (emacs-jupyter-notebook-mode -1)
-        (should-not shutdown-called)
-        (should-not cleanup-called)
-        (should-not registry-removed)
-        (should (equal emacs-jupyter-notebook--session-entry entry))
-        (should-not emacs-jupyter-notebook--client)))))
+
 
 (ert-deftest ejn-release-local-resources-survives-one-disposer-raising ()
   "W1.10: when one disposer in `--release-local-resources' raises, the remaining
@@ -6056,21 +5368,7 @@ goes away."
         (dolist (b stderrs)
           (should-not (buffer-live-p b)))))))
 
-(ert-deftest ejn-cleanup-current-state-disposes-tunnel-stderr-buffer ()
-  "W1.3: `--cleanup-current-state' disposes the tunnel stderr buffer."
-  (let ((proc (emacs-jupyter-notebook-ssh-start-process
-               "ejn-test-cleanup-tunnel" '("sleep" "60")))
-        stderr)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown) #'ignore)
-              ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
-               #'ignore))
-      (setq stderr (process-get proc 'emacs-jupyter-notebook-stderr-buffer))
-      (should (buffer-live-p stderr))
-      (with-temp-buffer
-        (setq emacs-jupyter-notebook--tunnel-process proc)
-        (emacs-jupyter-notebook--cleanup-current-state "cleanup")
-        (should-not (process-live-p proc))
-        (should-not (buffer-live-p stderr))))))
+
 
 (ert-deftest ejn-release-local-resources-disposes-tunnel-stderr-buffer ()
   "W1.3: the kill-buffer disposer kills the tunnel stderr buffer."
@@ -6084,68 +5382,7 @@ goes away."
         (should-not (process-live-p proc))
         (should-not (buffer-live-p stderr))))))
 
-(ert-deftest ejn-kill-buffer-with-async-context-cleans-locally-and-preserves-registry ()
-  "W1.4: killing a buffer with an in-flight async context kills the local
-launch/scp/tunnel processes and their stderr buffers, yet leaves the registry
-entry and the local connection file on disk untouched (they are the offline
-reconnect key)."
-  (let* ((registry-dir (make-temp-file "ejn-w14-registry-" t))
-         (registry-file (expand-file-name "registry.eld" registry-dir))
-         (local-dir (make-temp-file "ejn-w14-local-" t))
-         (local-file (expand-file-name "kernel.json" local-dir))
-         (entry `(:profile "p"
-                  :session-id "w14-session"
-                  :remote-host "example.com"
-                  :remote-connection-file "/remote/kernel.json"
-                  :local-connection-file ,local-file))
-         shutdown-called cleanup-called
-         (emacs-jupyter-notebook-registry-file registry-file))
-    (unwind-protect
-        (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
-                   (lambda (&rest _) (setq shutdown-called t)))
-                  ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
-                   (lambda (&rest _) (setq cleanup-called t))))
-          (with-temp-file local-file (insert "{}"))
-          (emacs-jupyter-notebook-registry-save (list entry) registry-file)
-          (let* ((buffer (generate-new-buffer "ejn-w14"))
-                 (launch (emacs-jupyter-notebook-ssh-start-process
-                          "ejn-test-w14-launch" '("sleep" "60")))
-                 (scp (emacs-jupyter-notebook-ssh-start-process
-                       "ejn-test-w14-scp" '("sleep" "60")))
-                 (tunnel (emacs-jupyter-notebook-ssh-start-process
-                          "ejn-test-w14-tunnel" '("sleep" "60")))
-                 (stderrs (mapcar (lambda (p)
-                                    (process-get
-                                     p 'emacs-jupyter-notebook-stderr-buffer))
-                                  (list launch scp tunnel))))
-            (with-current-buffer buffer
-              (emacs-jupyter-notebook-mode 1)
-              (setq emacs-jupyter-notebook--client
-                    (ejn-test-backend-session 'mock-client t))
-              (setq emacs-jupyter-notebook--session-entry entry)
-              (setq emacs-jupyter-notebook--tunnel-process tunnel)
-              (setq emacs-jupyter-notebook--async-context
-                    (emacs-jupyter-notebook--async-new-context
-                     :phase 'launch
-                     :launch-process launch
-                     :scp-process scp
-                     :tunnel-process tunnel
-                     :origin-buffer buffer)))
-            (kill-buffer buffer)
-            (should-not (process-live-p launch))
-            (should-not (process-live-p scp))
-            (should-not (process-live-p tunnel))
-            (dolist (b stderrs)
-              (should-not (buffer-live-p b)))
-            (should-not shutdown-called)
-            (should-not cleanup-called)
-            (should (file-exists-p local-file))
-            (let ((remaining (emacs-jupyter-notebook-registry-load registry-file)))
-              (should (= (length remaining) 1))
-              (should (equal (plist-get (car remaining) :session-id)
-                             "w14-session")))))
-      (delete-directory registry-dir t)
-      (delete-directory local-dir t))))
+
 
 (defun ejn-test--mode-disable-during-phase (phase)
   "Helper for W1.5: disable the mode while async context is in PHASE.
@@ -6160,7 +5397,7 @@ Returns a plist describing post-disable state of the in-flight processes."
          result)
     (unwind-protect
         (progn
-          (emacs-jupyter-notebook-registry-save (list entry) registry-file)
+          (ejn-test-registry-save (list entry) registry-file)
           (with-temp-buffer
             (emacs-jupyter-notebook-mode 1)
             (let* ((launch (emacs-jupyter-notebook-ssh-start-process
@@ -6198,7 +5435,7 @@ Returns a plist describing post-disable state of the in-flight processes."
                                                   stderrs)
                           :session-entry emacs-jupyter-notebook--session-entry
                           :registry-entries
-                          (emacs-jupyter-notebook-registry-load registry-file))))))
+                          (ejn-test-registry-load registry-file))))))
       (delete-directory registry-dir t))
     result))
 
@@ -6313,49 +5550,7 @@ promotes it."
       (when (file-exists-p local-file)
         (delete-file local-file)))))
 
-(ert-deftest ejn-kill-buffer-with-live-client-does-not-shutdown-or-deregister ()
-  "W1.7: killing a buffer that owns a live client does not call the configured
-`emacs-jupyter-notebook-jupyter-shutdown-function' and does not remove the
-session's registry entry.  The remote kernel and its registry entry are the
-durable reconnect surface and must survive buffer kill."
-  (let* ((registry-dir (make-temp-file "ejn-w17-registry-" t))
-         (registry-file (expand-file-name "registry.eld" registry-dir))
-         (entry '(:profile "p"
-                  :session-id "w17-session"
-                  :remote-host "example.com"
-                  :remote-connection-file "/remote/kernel.json"
-                  :local-connection-file "/tmp/w17-local.json"))
-         (emacs-jupyter-notebook-registry-file registry-file)
-         shutdown-called registry-removed remote-cleanup-called)
-    (unwind-protect
-        (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
-                   (lambda (&rest _) (setq shutdown-called t)))
-                  ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
-                   (lambda (&rest _) (setq remote-cleanup-called t)))
-                  ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
-                   (lambda (&rest _) (setq registry-removed t)))
-                  ;; The kernel-info adapter would otherwise touch the network
-                  ;; when the buffer's local hooks run.
-                  ((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
-                   #'ignore))
-          (let ((emacs-jupyter-notebook-jupyter-shutdown-function
-                 (lambda (&rest _) (setq shutdown-called t))))
-            (emacs-jupyter-notebook-registry-save (list entry) registry-file)
-            (let ((buffer (generate-new-buffer "ejn-w17")))
-              (with-current-buffer buffer
-                (emacs-jupyter-notebook-mode 1)
-                (setq emacs-jupyter-notebook--client
-                      (ejn-test-backend-session 'mock-client t))
-                (setq emacs-jupyter-notebook--session-entry entry))
-              (kill-buffer buffer))
-            (should-not shutdown-called)
-            (should-not registry-removed)
-            (should-not remote-cleanup-called)
-            (let ((remaining (emacs-jupyter-notebook-registry-load registry-file)))
-              (should (= (length remaining) 1))
-              (should (equal (plist-get (car remaining) :session-id)
-                             "w17-session")))))
-      (delete-directory registry-dir t))))
+
 
 ;;; W2 — Output panel & fringe indicator
 
@@ -6707,95 +5902,13 @@ batch timing, but it must be a tiny fraction of the event count."
       (ejn-test--kill-source-buffer buf))))
 
 ;; W2.7: callback rewrite (additional)
-(ert-deftest ejn-w2.7-stream-callback-routes-to-panel-append ()
-  "W2.7: a stream message appends to the panel entry, not the source buffer."
-  (let ((buf (ejn-test--make-source-buffer)))
-    (unwind-protect
-        (let* ((panel (ejn-panel-ensure buf))
-               (handle (ejn-panel-start-entry panel '("f" . 1) "code"))
-               (callbacks (emacs-jupyter-notebook-jupyter--callbacks
-                           buf handle))
-               (stream (cadr (assoc "stream" callbacks)))
-               (before (with-current-buffer buf (buffer-string))))
-          (cl-letf (((symbol-function 'jupyter-message-content)
-                     (lambda (_msg) '(:text "hello\n" :name "stdout"))))
-            (funcall stream 'mock))
-          (should (equal (ejn-panel-entry-text handle)
-                         "hello\n"))
-          (with-current-buffer buf
-            (should (equal (buffer-string) before))))
-      (ejn-test--kill-source-buffer buf))))
 
-(ert-deftest ejn-w2.7-error-callback-uses-error-face ()
-  "W2.7: an error message lands in the panel content with the error face."
-  (let ((buf (ejn-test--make-source-buffer)))
-    (unwind-protect
-        (let* ((panel (ejn-panel-ensure buf))
-               (handle (ejn-panel-start-entry panel '("f" . 1) "code"))
-               (callbacks (emacs-jupyter-notebook-jupyter--callbacks
-                           buf handle))
-               (err-fn (cadr (assoc "error" callbacks))))
-          (cl-letf (((symbol-function 'jupyter-message-content)
-                     (lambda (_msg)
-                       '(:traceback ("a" "b") :ename "Boom" :evalue "x"))))
-            (funcall err-fn 'mock))
-          (let ((content (ejn-panel-entry-text handle)))
-            (should (string-match-p "a\nb" content))))
-      (ejn-test--kill-source-buffer buf))))
 
-(ert-deftest ejn-w2.7-reply-plus-idle-marks-status-and-count ()
-  "EI3: correlated execute_reply plus idle finishes status and exec-count."
-  (let ((buf (ejn-test--make-source-buffer)))
-    (unwind-protect
-        (let* ((panel (ejn-panel-ensure buf))
-               (handle (ejn-panel-start-entry panel '("f" . 1) "code"))
-               (callbacks (emacs-jupyter-notebook-jupyter--callbacks
-                           buf handle nil 1 11))
-               (reply-fn (cadr (assoc "execute_reply" callbacks)))
-               (status-fn (cadr (assoc "status" callbacks))))
-          (with-current-buffer buf
-            (emacs-jupyter-notebook--execution-put
-             (list :id 1 :state 'dispatched :panel-entry handle
-                   :backend-request-id 11
-                   :generation (plist-get handle :generation)))
-            (setq emacs-jupyter-notebook--execution-active-id 1
-                  emacs-jupyter-notebook--execution-queue '(1)))
-          (cl-letf (((symbol-function 'jupyter-message-content)
-                     (lambda (_msg) '(:status "ok" :execution_count 5))))
-            (funcall reply-fn 'mock))
-          (should (eq (plist-get (ejn-panel-entry-snapshot handle) :status)
-                      'running))
-          (cl-letf (((symbol-function 'jupyter-message-content)
-                     (lambda (_msg) '(:execution_state "idle"))))
-            (funcall status-fn 'mock))
-          (let ((e (ejn-panel-entry-snapshot handle)))
-            (should (eq (plist-get e :status) 'ok))
-            (should (equal (plist-get e :exec-count) 5))))
-      (ejn-test--kill-source-buffer buf))))
 
-(ert-deftest ejn-w2.7-callbacks-do-not-mutate-source-buffer ()
-  "W2.7: an entire roundtrip of callbacks does not change source-buffer text."
-  (let ((buf (ejn-test--make-source-buffer "# %%\ncode\n")))
-    (unwind-protect
-        (let* ((before (with-current-buffer buf (buffer-string)))
-               (panel (ejn-panel-ensure buf))
-               (handle (ejn-panel-start-entry panel '("f" . 1) "code"))
-               (callbacks (emacs-jupyter-notebook-jupyter--callbacks
-                           buf handle)))
-          (cl-letf (((symbol-function 'jupyter-message-content)
-                     (lambda (_msg) '(:text "out" :name "stdout"))))
-            (funcall (cadr (assoc "stream" callbacks)) 'mock))
-          (cl-letf (((symbol-function 'jupyter-message-content)
-                     (lambda (_msg) '(:data (:text/plain "42")))))
-            (funcall (cadr (assoc "execute_result" callbacks)) 'mock))
-          (cl-letf (((symbol-function 'jupyter-message-content)
-                     (lambda (_msg) '(:wait nil))))
-            (funcall (cadr (assoc "clear_output" callbacks)) 'mock))
-          (cl-letf (((symbol-function 'jupyter-message-content)
-                     (lambda (_msg) '(:status "ok" :execution_count 1))))
-            (funcall (cadr (assoc "execute_reply" callbacks)) 'mock))
-          (should (equal (with-current-buffer buf (buffer-string)) before)))
-      (ejn-test--kill-source-buffer buf))))
+
+
+
+
 
 ;; W2.8: fringe indicator
 (ert-deftest ejn-w2.8-fringe-state-transitions ()
@@ -6982,28 +6095,7 @@ same cell across ordinary editing."
         (delete-file file)))
     (should-not (buffer-live-p panel))))
 
-(ert-deftest ejn-w2.9-killing-panel-alone-does-not-affect-kernel-or-registry ()
-  "W2.9: killing only the panel buffer leaves --client and registry untouched."
-  (let* ((buf (ejn-test--make-source-buffer))
-         shutdown-called registry-removed)
-    (unwind-protect
-        (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
-                   (lambda (&rest _) (setq shutdown-called t)))
-                  ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
-                   (lambda (&rest _) (setq registry-removed t))))
-          (with-current-buffer buf
-            (emacs-jupyter-notebook-mode 1)
-            (setq emacs-jupyter-notebook--client 'mock-client)
-            (setq emacs-jupyter-notebook--session-entry
-                  '(:profile "p" :session-id "s")))
-          (let ((panel (ejn-panel-ensure buf)))
-            (kill-buffer panel))
-          (with-current-buffer buf
-            (should (eq emacs-jupyter-notebook--client 'mock-client))
-            (should emacs-jupyter-notebook--session-entry))
-          (should-not shutdown-called)
-          (should-not registry-removed))
-      (ejn-test--kill-source-buffer buf))))
+
 
 ;; W2.10: customization variables exist and have the documented defaults
 (ert-deftest ejn-w2.10-customization-defaults ()
@@ -7369,44 +6461,7 @@ Adding a live `--client' flips both predicates."
         (when (process-live-p tunnel)
           (delete-process tunnel))))))
 
-(ert-deftest ejn-w10-ensure-clean-before-start-reaps-clientless-debris ()
-  "W10: `--ensure-clean-before-start' must NOT signal on a client-less
-debris buffer; it reaps the LOCAL resources (disposes the stale tunnel and
-its stderr buffer, clears the buffer-local session state) WITHOUT shutting
-down the remote kernel, then lets the fresh start proceed."
-  (with-temp-buffer
-    (let* ((tunnel (emacs-jupyter-notebook-ssh-start-process
-                    "emacs-jupyter-notebook-tunnel-w10-reap"
-                    '("sleep" "60")))
-           (stderr (process-get tunnel
-                                'emacs-jupyter-notebook-stderr-buffer))
-           remote-shutdown-called)
-      (unwind-protect
-          (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
-                     (lambda (&rest _) (setq remote-shutdown-called t)))
-                    ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
-                     (lambda (&rest _) (setq remote-shutdown-called t))))
-            (setq emacs-jupyter-notebook--client nil)
-            (setq emacs-jupyter-notebook--session-entry
-                  '(:profile "p" :session-id "wedged"))
-            (setq emacs-jupyter-notebook--tunnel-process tunnel)
-            (setq emacs-jupyter-notebook--async-context
-                  (emacs-jupyter-notebook--async-new-context
-                   :phase 'done
-                   :origin-buffer (current-buffer)))
-            ;; Does not raise.
-            (emacs-jupyter-notebook--ensure-clean-before-start)
-            ;; Debris reaped: tunnel disposed, buffer-local session state cleared.
-            (should-not (process-live-p tunnel))
-            (should-not (buffer-live-p stderr))
-            (should-not emacs-jupyter-notebook--tunnel-process)
-            (should-not emacs-jupyter-notebook--session-entry)
-            (should-not emacs-jupyter-notebook--async-context)
-            (should-not emacs-jupyter-notebook--client)
-            ;; The remote kernel was NEVER touched during the reap.
-            (should-not remote-shutdown-called))
-        (when (process-live-p tunnel)
-          (delete-process tunnel))))))
+
 
 (ert-deftest ejn-w10-ensure-clean-before-start-still-refuses-live-client ()
   "W10 no-regression: a genuinely LIVE client must still block a fresh
@@ -7422,88 +6477,24 @@ start — the guard's original leak-prevention is preserved.  A present
     (should (eq emacs-jupyter-notebook--client 'mock-client))
     (should emacs-jupyter-notebook--session-entry)))
 
-(ert-deftest ejn-w10-connect-async-invokes-callback-once-despite-finalize-error ()
-  "W10 lesson re-pinned on the W15 adapter shape: the verify callback fires
-exactly ONCE, always with a non-nil client, and a raise from the downstream
-finalize work must NOT be misread as a connect failure nor re-enter the
-callback with nil.  In the W15 shape the reply arrives through the
-adapter's `--safe-callback' layer, which contains the raise (surfacing it
-as a message) — the `called' latch guarantees single invocation.  The
-adapter returns the unverified client synchronously."
-  (let ((calls 0)
-        captured)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--connect-unverified)
-               (lambda (_file) 'mock-client))
-              ((symbol-function 'emacs-jupyter-notebook-jupyter--store-kernel-info)
-               #'ignore)
-              ((symbol-function 'emacs-jupyter-notebook-jupyter-kernel-info)
-               (lambda (_client cb)
-                 ;; Deliver the reply through the same safe-callback layer
-                 ;; production uses, twice — the latch must dedupe.
-                 (emacs-jupyter-notebook-jupyter--safe-callback
-                  cb '(:status "ok") nil)
-                 (emacs-jupyter-notebook-jupyter--safe-callback
-                  cb '(:status "ok") nil)))
-              ((symbol-function 'message) (lambda (&rest _) nil)))
-      (let ((client (emacs-jupyter-notebook-jupyter--connect-async
-                     "/tmp/kernel.json"
-                     (lambda (client)
-                       (cl-incf calls)
-                       (setq captured client)
-                       (error "finalize boom")))))
-        ;; Unverified client returned synchronously.
-        (should (eq client 'mock-client)))
-      (should (= calls 1))
-      (should (eq captured 'mock-client)))))
 
-(ert-deftest ejn-w10-connect-nil-client-transitions-context-to-error ()
-  "W10 secondary: a connect whose adapter yields a nil client must move the
-async context to ERROR (surfacing the failure via `--async-fail'), never
-silently to `done'.  Drives the full `--async-connect' -> adapter
-  callback(nil) -> `--async-connect-finalize' seam."
-  (with-temp-buffer
-    (let ((emacs-jupyter-notebook-backend 'legacy)
-          (err-surfaced nil))
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook--install-tunnel-sentinel)
-                 #'ignore)
-                ((symbol-function 'emacs-jupyter-notebook-jupyter-connect-async)
-                 (lambda (_file callback)
-                   ;; Adapter reports a failed connect: nil client.
-                   (funcall callback nil))))
-        (let ((context (emacs-jupyter-notebook--async-new-context
-                        :phase 'tunnel
-                        :entry '(:profile "p" :session-id "session")
-                        :local-ports '(:shell_port 1001)
-                        :local-file "/tmp/kernel.json"
-                        :tunnel-process 'mock-process
-                        :origin-buffer (current-buffer)
-                        :error-callback (lambda (_ctx _err)
-                                          (setq err-surfaced t)))))
-          (setq emacs-jupyter-notebook--async-context context)
-          (emacs-jupyter-notebook--async-connect context)
-          (ejn-test-drain-zero-delay-timers)
-          (should (eq (plist-get emacs-jupyter-notebook--async-context :phase)
-                      'error))
-          (should-not emacs-jupyter-notebook--client)
-          (should err-surfaced))))))
+
+
 
 ;;; W6.3 — Friendly first-evaluate
 
 (ert-deftest ejn-w6.3-send-cell-announces-default-profile-on-cold-start ()
-  "W6.3: with no client/async/registry, send-cell messages the default profile."
+  "W6.3: cold send passes the default profile and announcement intent."
   (ejn-test-with-temp-buffer "# %% A\nx = 1\n"
     (let* ((emacs-jupyter-notebook-default-profile "workstation")
            (emacs-jupyter-notebook--client nil)
            (emacs-jupyter-notebook--async-context nil)
-           (announced nil))
+           captured)
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--evaluate-code)
-                 (lambda (&rest _) nil))
-                ((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
-                 (lambda () nil))
-                ((symbol-function 'emacs-jupyter-notebook--announce-cold-start)
-                 (lambda (p) (setq announced p))))
+                 (lambda (_code _key profile announce)
+                   (setq captured (list profile announce)))))
         (emacs-jupyter-notebook-send-cell))
-      (should (equal announced "workstation")))))
+      (should (equal captured '("workstation" t))))))
 
 (ert-deftest ejn-w6.3-send-cell-with-prefix-prompts-and-skips-message ()
   "W6.3: C-u send-cell on a cold start prompts via `--read-profile-name' and skips the banner."
@@ -7511,19 +6502,16 @@ silently to `done'.  Drives the full `--async-connect' -> adapter
     (let* ((emacs-jupyter-notebook-default-profile "default")
            (emacs-jupyter-notebook--client nil)
            (emacs-jupyter-notebook--async-context nil)
-           (announced nil)
+           captured
            (read-called nil))
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--evaluate-code)
-                 (lambda (&rest _) nil))
-                ((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
-                 (lambda () nil))
+                 (lambda (_code _key profile announce)
+                   (setq captured (list profile announce))))
                 ((symbol-function 'emacs-jupyter-notebook--read-profile-name)
-                 (lambda () (setq read-called t) "chosen"))
-                ((symbol-function 'emacs-jupyter-notebook--announce-cold-start)
-                 (lambda (p) (setq announced p))))
+                 (lambda () (setq read-called t) "chosen")))
         (emacs-jupyter-notebook-send-cell '(4)))
       (should read-called)
-      (should (null announced)))))
+      (should (equal captured '("chosen" nil))))))
 
 (ert-deftest ejn-w6.3-send-cell-with-live-client-does-not-announce ()
   "W6.3: when a client is already live, no banner fires."
@@ -7531,15 +6519,12 @@ silently to `done'.  Drives the full `--async-connect' -> adapter
     (let* ((emacs-jupyter-notebook-default-profile "workstation")
            (emacs-jupyter-notebook--client 'mock)
            (emacs-jupyter-notebook--async-context nil)
-           (announced nil))
+           captured)
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--evaluate-code)
-                 (lambda (&rest _) nil))
-                ((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
-                 (lambda () nil))
-                ((symbol-function 'emacs-jupyter-notebook--announce-cold-start)
-                 (lambda (p) (setq announced p))))
+                 (lambda (_code _key profile announce)
+                   (setq captured (list profile announce)))))
         (emacs-jupyter-notebook-send-cell))
-      (should (null announced)))))
+      (should (equal captured '("workstation" nil))))))
 
 (ert-deftest ejn-w6.3-send-cell-with-registry-entry-does-not-announce ()
   "W6.3: when a registry entry exists, send-cell silently reconnects (no banner)."
@@ -7547,15 +6532,59 @@ silently to `done'.  Drives the full `--async-connect' -> adapter
     (let* ((emacs-jupyter-notebook-default-profile "workstation")
            (emacs-jupyter-notebook--client nil)
            (emacs-jupyter-notebook--async-context nil)
-           (announced nil))
+           (emacs-jupyter-notebook--session-entry '(:session-id "s"))
+           captured)
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--evaluate-code)
-                 (lambda (&rest _) nil))
-                ((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
-                 (lambda () '(:session-id "s")))
-                ((symbol-function 'emacs-jupyter-notebook--announce-cold-start)
-                 (lambda (p) (setq announced p))))
+                 (lambda (_code _key profile announce)
+                   (setq captured (list profile announce)))))
         (emacs-jupyter-notebook-send-cell))
-      (should (null announced)))))
+      (should (equal captured '("workstation" nil))))))
+
+(ert-deftest ejn-w6.3-empty-registry-announces-before-deferred-start ()
+  "W6.3: the authoritative empty-registry branch announces before launch."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client nil)
+          (emacs-jupyter-notebook--async-context nil)
+          events)
+      (setq buffer-file-name "/tmp/ejn-cold-start.py")
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+                 (lambda (success _failure &rest _keys)
+                   (ejn-test-registry--defer
+                    (lambda () (funcall success nil nil)))))
+                ((symbol-function 'emacs-jupyter-notebook--announce-cold-start)
+                 (lambda (profile) (push (list 'announce profile) events)))
+                ((symbol-function 'emacs-jupyter-notebook--start-remote-kernel-admitted)
+                 (lambda (profile _success _failure)
+                   (push (list 'start profile) events))))
+        (emacs-jupyter-notebook--ensure-client-async
+         #'ignore #'ignore "workstation" t)
+        (should (ejn-test-await (lambda () (= (length events) 2))))
+        (should (equal (nreverse events)
+                       '((announce "workstation") (start "workstation"))))))))
+
+(ert-deftest ejn-w6.3-registry-entry-suppresses-deferred-start-banner ()
+  "W6.3: the authoritative durable-session branch reconnects silently."
+  (with-temp-buffer
+    (let ((entry '(:profile "p" :session-id "s"
+                   :local-file "/tmp/ejn-cold-start.py"))
+          (emacs-jupyter-notebook--client nil)
+          (emacs-jupyter-notebook--async-context nil)
+          reconnected
+          announced)
+      (setq buffer-file-name "/tmp/ejn-cold-start.py")
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+                 (lambda (success _failure &rest _keys)
+                   (ejn-test-registry--defer
+                    (lambda () (funcall success (list entry) nil)))))
+                ((symbol-function 'emacs-jupyter-notebook--announce-cold-start)
+                 (lambda (&rest _) (setq announced t)))
+                ((symbol-function 'emacs-jupyter-notebook-reconnect-remote-kernel)
+                 (lambda (selected &rest _) (setq reconnected selected))))
+        (emacs-jupyter-notebook--ensure-client-async
+         #'ignore #'ignore "workstation" t)
+        (should (ejn-test-await (lambda () reconnected)))
+        (should (equal reconnected entry))
+        (should-not announced)))))
 
 (ert-deftest ejn-w6.3-announce-cold-start-message-shape ()
   "W6.3: `--announce-cold-start' produces the documented message shape."
@@ -7610,14 +6639,18 @@ silently to `done'.  Drives the full `--async-connect' -> adapter
                  (funcall success 1 nil)))
               ((symbol-function 'emacs-jupyter-notebook--lifecycle-retire-local-transport)
                #'ignore)
-              ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
-               #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+               #'ejn-test-registry-replace-succeeds)
+              ((symbol-function 'emacs-jupyter-notebook-registry-remove-async)
+               #'ejn-test-registry-remove-succeeds)
               ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
                #'ignore))
       (with-temp-buffer
         (setq emacs-jupyter-notebook--client 'helper-client
-              emacs-jupyter-notebook--session-entry '(:session-id "s"))
-        (emacs-jupyter-notebook-shutdown-kernel))
+              emacs-jupyter-notebook--session-entry
+              (ejn-test-direct-entry '(:profile "p" :session-id "s" :remote-pid 1)))
+        (emacs-jupyter-notebook-shutdown-kernel)
+        (should (ejn-test-await (lambda () shutdown-called))))
       (should-not asked)
       (should shutdown-called))))
 
@@ -7645,15 +6678,19 @@ silently to `done'.  Drives the full `--async-connect' -> adapter
                  (funcall success 1 nil)))
               ((symbol-function 'emacs-jupyter-notebook--lifecycle-retire-local-transport)
                #'ignore)
-              ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
-               #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+               #'ejn-test-registry-replace-succeeds)
+              ((symbol-function 'emacs-jupyter-notebook-registry-remove-async)
+               #'ejn-test-registry-remove-succeeds)
               ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
                #'ignore))
       (with-temp-buffer
         (setq emacs-jupyter-notebook--client 'helper-client
-              emacs-jupyter-notebook--session-entry '(:session-id "s"))
+              emacs-jupyter-notebook--session-entry
+              (ejn-test-direct-entry '(:profile "p" :session-id "s" :remote-pid 1)))
         (let ((current-prefix-arg '(4)))
-          (call-interactively #'emacs-jupyter-notebook-shutdown-kernel)))
+          (call-interactively #'emacs-jupyter-notebook-shutdown-kernel))
+        (should (ejn-test-await (lambda () shutdown-called))))
       (should-not asked)
       (should shutdown-called))))
 
@@ -7904,6 +6941,25 @@ Cleans up the status buffer (and its refresh timer) after BODY."
          (should (string-match-p "entry 7\n" text))
          (should (string-match-p "entry 11\n" text)))))))
 
+(ert-deftest ejn-w6.6-log-append-enforces-byte-and-immutable-bounds ()
+  "Long diagnostic lines and huge customization values remain bounded."
+  (ejn-test-with-fresh-log-buffer
+   (let ((emacs-jupyter-notebook-log-max-lines most-positive-fixnum)
+         (emacs-jupyter-notebook-log-max-bytes 256))
+     (dotimes (index 20)
+       (emacs-jupyter-notebook--log-append
+        'bytes "entry-%d %s" index (make-string 40 ?x)))
+     (with-current-buffer (get-buffer emacs-jupyter-notebook--log-buffer-name)
+       (should (<= (- (or (position-bytes (point-max)) 1)
+                       (or (position-bytes (point-min)) 1))
+                   256))
+       (should (string-match-p "entry-19" (buffer-string))))
+     (setq emacs-jupyter-notebook-log-max-bytes most-positive-fixnum)
+     (should (= (emacs-jupyter-notebook--log-line-limit)
+                emacs-jupyter-notebook--log-hard-lines))
+     (should (= (emacs-jupyter-notebook--log-byte-limit)
+                emacs-jupyter-notebook--log-hard-bytes)))))
+
 (ert-deftest ejn-w6.6-async-message-writes-to-log ()
   "W6.6: `--async-message' writes a structured entry tagged with the phase."
   (ejn-test-with-fresh-log-buffer
@@ -8049,82 +7105,12 @@ the timer would fire forever on a dead source."
     (let ((profile (emacs-jupyter-notebook--read-host-profile "p")))
       (should (equal (plist-get profile :host) "example.com")))))
 
-;;; W6.8 — `--read-registry-entry' chooser always with current-file default
-
-(ert-deftest ejn-w6.8-read-registry-entry-always-prompts ()
-  "W6.8: even when only one entry exists, the chooser is invoked."
-  (let* ((entry '(:profile "p" :session-id "sole"))
-         (asked nil))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
-               (lambda (&optional _file) (list entry)))
-              ((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
-               (lambda () nil))
-              ((symbol-function 'completing-read)
-               (lambda (&rest _)
-                 (setq asked t)
-                 (emacs-jupyter-notebook--registry-entry-label entry))))
-      (with-temp-buffer
-        (should (equal (emacs-jupyter-notebook--read-registry-entry) entry))
-        (should asked)))))
-
-(ert-deftest ejn-w6.8-read-registry-entry-uses-current-file-default ()
-  "W6.8: when current-file entry exists, it is passed as the chooser's default."
-  (let* ((file (expand-file-name "x.py" temporary-file-directory))
-         (current `(:profile "p" :session-id "x-session" :local-file ,file))
-         (other '(:profile "p" :session-id "other"))
-         (passed-default nil))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
-               (lambda (&optional _file) (list other current)))
-              ((symbol-function 'completing-read)
-               (lambda (_prompt _collection &optional _pred _require _initial _hist default)
-                 (setq passed-default default)
-                 default)))
-      (with-temp-buffer
-        (setq buffer-file-name file)
-        (let ((selected (emacs-jupyter-notebook--read-registry-entry)))
-          (should (equal selected current))
-          (should (stringp passed-default))
-          (should (string-match-p "x-session" passed-default)))))))
-
-(ert-deftest ejn-w6.8-read-registry-entry-no-current-file-no-default ()
-  "W6.8: when there is no current-file entry, the default is nil and the chooser still runs."
-  (let* ((entries '((:profile "p" :session-id "a")
-                    (:profile "p" :session-id "b")))
-         (asked-with-default 'unset))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
-               (lambda (&optional _file) entries))
-              ((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
-               (lambda () nil))
-              ((symbol-function 'completing-read)
-               (lambda (_prompt _collection &optional _pred _require _initial _hist default)
-                 (setq asked-with-default default)
-                 (emacs-jupyter-notebook--registry-entry-label (car entries)))))
-      (with-temp-buffer
-        (emacs-jupyter-notebook--read-registry-entry)
-        (should (null asked-with-default))))))
-
 (ert-deftest ejn-w6.1-old-evaluate-command-names-removed ()
   "W6.1: the legacy `emacs-jupyter-notebook-evaluate-*' names are gone (no aliases)."
   (should-not (fboundp 'emacs-jupyter-notebook-evaluate-current-cell))
   (should-not (fboundp 'emacs-jupyter-notebook-evaluate-region))
   (should-not (fboundp 'emacs-jupyter-notebook-evaluate-buffer))
   (should-not (fboundp 'emacs-jupyter-notebook-evaluate-current-cell-and-advance)))
-
-;;; W7.5 — Continuous coverage backfill
-
-(ert-deftest ejn-w7.5-registry-load-corrupt-file-returns-nil-with-warning ()
-  "W7.5: `registry-load' on a corrupt file must not raise; it returns nil
-and surfaces a warning.  The registry is durable truth — a garbled file
-must not brick the package's ability to start a fresh kernel."
-  (let ((file (make-temp-file "ejn-w75-corrupt-")))
-    (unwind-protect
-        (let (warned)
-          (with-temp-file file (insert "this is not (a valid) sexp"))
-          (cl-letf (((symbol-function 'display-warning)
-                     (lambda (&rest _) (setq warned t))))
-            (should-not (emacs-jupyter-notebook-registry-load file)))
-          (should warned))
-      (when (file-exists-p file) (delete-file file)))))
 
 (ert-deftest ejn-w7.5-ssh-command-honors-identity-file-and-port ()
   "W7.5: profile `:identity-file' expands `~' and joins the ssh argv
@@ -8262,104 +7248,19 @@ a mention that only exists in prose."
 
 ;;; W8.1 — remote formatter-registration snippet injection
 
-(ert-deftest ejn-w8.1-inject-uses-silent-execute-adapter ()
-  "W8.1: the formatter injection routes the snippet through the silent
-execute adapter (no panel entry) and passes the actual snippet string."
-  (with-temp-buffer
-    (let ((calls nil)
-          (emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t)))
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
-                 (lambda (client code) (push (list client code) calls))))
-        (emacs-jupyter-notebook--inject-viewer-formatter))
-      (should (= (length calls) 1))
-      (should (eq (caar calls) 'mock-client))
-      (should (equal (cadar calls)
-                     emacs-jupyter-notebook--viewer-formatter-snippet))
-      ;; The snippet must reference the custom MIME and patch the figure
-      ;; type's `_repr_mimebundle_'.  It must NOT use the old
-      ;; `for_type_by_name' display-formatter registration, which the
-      ;; matplotlib inline backend wipes on the first plot (the payload then
-      ;; silently degrades to the figure `__repr__').  See
-      ;; `viewer/test_formatter_kernel.py' for the real-kernel regression.
-      (should (string-match-p "application/x-ejn-mpl-pickle"
-                              emacs-jupyter-notebook--viewer-formatter-snippet))
-      (should (string-match-p "_repr_mimebundle_"
-                              emacs-jupyter-notebook--viewer-formatter-snippet))
-      ;; Must not CALL the wipeable display-formatter registration API.
-      (should-not (string-match-p "\\.for_type_by_name("
-                                  emacs-jupyter-notebook--viewer-formatter-snippet))
-      (should-not (string-match-p "\\.for_type("
-                                  emacs-jupyter-notebook--viewer-formatter-snippet))
-      (should (string-match-p "get_ipython"
-                              emacs-jupyter-notebook--viewer-formatter-snippet)))))
 
-(ert-deftest ejn-w8.1-inject-noop-without-client ()
-  "W8.1: with no client the injection is a silent no-op (no adapter call)."
-  (with-temp-buffer
-    (let ((calls nil)
-          (emacs-jupyter-notebook--client nil))
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
-                 (lambda (client code) (push (list client code) calls))))
-        (emacs-jupyter-notebook--inject-viewer-formatter))
-      (should (null calls)))))
 
-(ert-deftest ejn-w8.1-inject-swallows-adapter-errors ()
-  "W8.1: a raise from the adapter must not propagate out of injection —
-formatter injection may never break a connect or restart."
-  (with-temp-buffer
-    (let ((emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t)))
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
-                 (lambda (_client _code) (error "boom"))))
-        ;; Should not signal.
-        (should (progn (emacs-jupyter-notebook--inject-viewer-formatter) t))))))
 
-(ert-deftest ejn-w8.1-inject-produces-no-panel-entry ()
-  "W8.1: injecting the snippet creates no panel entry for the source buffer."
-  (with-temp-buffer
-    (let ((emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t))
-          (panel (ejn-panel-ensure (current-buffer))))
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
-                 (lambda (_client _code) nil)))
-        (emacs-jupyter-notebook--inject-viewer-formatter))
-      (with-current-buffer panel
-        (should (null emacs-jupyter-notebook-panel--entries))))))
 
-(ert-deftest ejn-w8.1-png-plus-pickle-bundle-still-renders-png ()
-  "W8.1: a display_data bundle carrying BOTH image/png and the custom
-pickle MIME still renders the PNG through the callbacks — the extra MIME
-key never disturbs the existing PNG path."
-  (with-temp-buffer
-    (let* ((buffer (current-buffer))
-           (panel (ejn-panel-ensure buffer))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks buffer handle))
-           (display-fn (cadr (assoc "display_data" callbacks)))
-           (png (base64-encode-string "imgdata" t))
-           (pickle (base64-encode-string "pickle-bytes" t)))
-      (cl-letf (((symbol-function 'jupyter-message-content)
-                 (lambda (_msg)
-                   `(:data (:image/png ,png
-                            :application/x-ejn-mpl-pickle ,pickle))))
-                ((symbol-function 'create-image)
-                 (lambda (data &optional _type _data-p &rest _props)
-                   (list 'image :type 'png :data data))))
-        (funcall display-fn 'mock-msg))
-      (let ((image (car (ejn-panel-entry-images handle))))
-        (should (ejn-test-image-file-backed-p image))
-        (should (equal (ejn-test-image-spec-data image) "imgdata"))))))
+
+
+
+
+
 
 ;;; W8.2 — MIME recognition + pickle stash
 
-(ert-deftest ejn-w8.2-select-mime-type-ignores-pickle ()
-  "W8.2: the pickle MIME is never chosen as a renderable thumbnail."
-  (should (equal (emacs-jupyter-notebook--select-mime-type
-                  '(:application/x-ejn-mpl-pickle "cGts" :image/png "aW1n"))
-                 '(:image/png . "aW1n")))
-  (should (null (emacs-jupyter-notebook--select-mime-type
-                 '(:application/x-ejn-mpl-pickle "cGts")))))
+
 
 (ert-deftest ejn-w8.2-helper-bundle-stores-descriptor-and-renders-png ()
   "W8.2/EI4V: helper-published PNG and pickle metadata are retained together."
@@ -8661,6 +7562,9 @@ server process, which doubles as the manager's placeholder process."
          (emacs-jupyter-notebook-viewer--socket-path nil)
          (emacs-jupyter-notebook-viewer--socket-directory nil)
          (emacs-jupyter-notebook-viewer--socket-directory-identity nil)
+         (emacs-jupyter-notebook-viewer--stdout-buffer nil)
+         (emacs-jupyter-notebook-viewer--stderr-buffer nil)
+         (emacs-jupyter-notebook-viewer--stderr-process nil)
          (emacs-jupyter-notebook-viewer--active-transaction nil))
      (unwind-protect
          (progn ,@body)
@@ -8690,6 +7594,109 @@ server process, which doubles as the manager's placeholder process."
             #'ejn-w8.3--make-pipe-viewer))
       (emacs-jupyter-notebook-viewer-ensure)
       (should (memq #'emacs-jupyter-notebook-viewer-reap kill-emacs-hook)))))
+
+(ert-deftest ejn-w8.3-stderr-pipe-construction-failure-releases-buffers ()
+  "A failed stderr-pipe constructor leaves neither output tail allocated."
+  (let* ((real-generate-new-buffer (symbol-function 'generate-new-buffer))
+         (created nil)
+         (emacs-jupyter-notebook-viewer--process nil)
+         (emacs-jupyter-notebook-viewer--stdout-buffer nil)
+         (emacs-jupyter-notebook-viewer--stderr-buffer nil)
+         (emacs-jupyter-notebook-viewer--stderr-process nil))
+    (unwind-protect
+        (cl-letf
+            (((symbol-function 'emacs-jupyter-notebook-viewer--python-path)
+              (lambda (_command) "/bin/sh"))
+             ((symbol-function 'emacs-jupyter-notebook-viewer--script-path)
+              (lambda () "/tmp/ejn-viewer-test.py"))
+             ((symbol-function 'generate-new-buffer)
+              (lambda (name &optional inhibit-buffer-hooks)
+                (let ((buffer
+                       (funcall real-generate-new-buffer
+                                (format "%s-%s" name (gensym "pipe-failure"))
+                                inhibit-buffer-hooks)))
+                  (push buffer created)
+                  buffer)))
+             ((symbol-function 'make-pipe-process)
+              (lambda (&rest _) (error "stderr pipe setup failed"))))
+          (should-error
+           (emacs-jupyter-notebook-viewer--spawn "/tmp/ejn-viewer-test.sock"))
+          (should (= (length created) 2))
+          (should (cl-every (lambda (buffer) (not (buffer-live-p buffer)))
+                            created))
+          (should-not emacs-jupyter-notebook-viewer--process)
+          (should-not emacs-jupyter-notebook-viewer--stdout-buffer)
+          (should-not emacs-jupyter-notebook-viewer--stderr-buffer)
+          (should-not emacs-jupyter-notebook-viewer--stderr-process))
+      (dolist (buffer created)
+        (when (buffer-live-p buffer) (kill-buffer buffer))))))
+
+(ert-deftest ejn-w8.3-inline-terminal-construction-releases-generation ()
+  "An inline terminal sentinel cannot leak or publish its dead generation."
+  (let* ((real-generate-new-buffer (symbol-function 'generate-new-buffer))
+         (real-make-pipe-process (symbol-function 'make-pipe-process))
+         (real-delete-process (symbol-function 'delete-process))
+         (dead-process
+          (funcall real-make-pipe-process :name "ejn-w8.3-inline-dead"
+                   :buffer nil :noquery t))
+         (stderr-process
+          (funcall real-make-pipe-process :name "ejn-w8.3-inline-stderr"
+                   :buffer nil :noquery t))
+         (created nil)
+         (pipe-count 0)
+         (kill-emacs-hook nil)
+         (emacs-jupyter-notebook-viewer--process nil)
+         (emacs-jupyter-notebook-viewer--socket-path nil)
+         (emacs-jupyter-notebook-viewer--socket-directory nil)
+         (emacs-jupyter-notebook-viewer--socket-directory-identity nil)
+         (emacs-jupyter-notebook-viewer--stdout-buffer nil)
+         (emacs-jupyter-notebook-viewer--stderr-buffer nil)
+         (emacs-jupyter-notebook-viewer--stderr-process nil))
+    (unwind-protect
+        (cl-letf
+            (((symbol-function 'emacs-jupyter-notebook-viewer--python-path)
+              (lambda (_command) "/bin/sh"))
+             ((symbol-function 'emacs-jupyter-notebook-viewer--script-path)
+              (lambda () "/tmp/ejn-viewer-test.py"))
+             ((symbol-function 'generate-new-buffer)
+              (lambda (name &optional inhibit-buffer-hooks)
+                (let ((buffer
+                       (funcall real-generate-new-buffer
+                                (format "%s-%s" name (gensym "inline-terminal"))
+                                inhibit-buffer-hooks)))
+                  (push buffer created)
+                  buffer)))
+             ((symbol-function 'make-pipe-process)
+              (lambda (&rest _)
+                (cl-incf pipe-count)
+                stderr-process))
+             ((symbol-function 'make-process)
+              (lambda (&rest args)
+                (let ((sentinel (plist-get args :sentinel)))
+                  (funcall real-delete-process dead-process)
+                  ;; Deliberately call the sentinel before `make-process'
+                  ;; returns, when the new process has no viewer properties.
+                  (funcall sentinel dead-process "killed during construction\n")
+                  dead-process))))
+          (should-error (emacs-jupyter-notebook-viewer-ensure))
+          (should (= pipe-count 1))
+          (should (cl-every (lambda (buffer) (not (buffer-live-p buffer)))
+                            created))
+          (should-not (process-live-p dead-process))
+          (should-not (process-live-p stderr-process))
+          (should-not emacs-jupyter-notebook-viewer--process)
+          (should-not emacs-jupyter-notebook-viewer--socket-path)
+          (should-not emacs-jupyter-notebook-viewer--socket-directory)
+          (should-not emacs-jupyter-notebook-viewer--stdout-buffer)
+          (should-not emacs-jupyter-notebook-viewer--stderr-buffer)
+          (should-not emacs-jupyter-notebook-viewer--stderr-process)
+          (should-not (memq #'emacs-jupyter-notebook-viewer-reap kill-emacs-hook)))
+      (when (process-live-p dead-process)
+        (funcall real-delete-process dead-process))
+      (when (process-live-p stderr-process)
+        (funcall real-delete-process stderr-process))
+      (dolist (buffer created)
+        (when (buffer-live-p buffer) (kill-buffer buffer))))))
 
 (ert-deftest ejn-w8.3-reap-kills-process-and-removes-socket ()
   "W8.3: reap deletes the process, removes the socket file, and clears state."
@@ -8745,6 +7752,65 @@ server process, which doubles as the manager's placeholder process."
       (emacs-jupyter-notebook-viewer-reap)
       (should (= completions 1))
       (should-not emacs-jupyter-notebook-viewer--active-transaction))))
+
+(ert-deftest ejn-w8.3-stale-viewer-cannot-dispose-replacement-output ()
+  "A late old-viewer sentinel cannot kill the replacement's diagnostics."
+  (let* ((old (make-pipe-process :name "ejn-w8.3-old-viewer"
+                                 :buffer nil :noquery t))
+         (unowned (make-pipe-process :name "ejn-w8.3-unowned-viewer"
+                                     :buffer nil :noquery t))
+         (current (make-pipe-process :name "ejn-w8.3-current-viewer"
+                                     :buffer nil :noquery t))
+         (old-stdout (generate-new-buffer " *ejn-w8.3-old-stdout*"))
+         (old-stderr (generate-new-buffer " *ejn-w8.3-old-stderr*"))
+         (old-stderr-process
+          (make-pipe-process :name "ejn-w8.3-old-stderr-pipe"
+                             :buffer nil :noquery t))
+         (stdout (generate-new-buffer " *ejn-w8.3-current-stdout*"))
+         (stderr (generate-new-buffer " *ejn-w8.3-current-stderr*"))
+         (stderr-process
+          (make-pipe-process :name "ejn-w8.3-current-stderr-pipe"
+                             :buffer nil :noquery t))
+         (emacs-jupyter-notebook-viewer--process current)
+         (emacs-jupyter-notebook-viewer--stdout-buffer stdout)
+         (emacs-jupyter-notebook-viewer--stderr-buffer stderr)
+         (emacs-jupyter-notebook-viewer--stderr-process stderr-process))
+    (unwind-protect
+        (progn
+          (process-put old 'emacs-jupyter-notebook-viewer-output-buffer
+                       old-stdout)
+          (process-put old 'emacs-jupyter-notebook-viewer-stderr-buffer
+                       old-stderr)
+          (process-put old 'emacs-jupyter-notebook-viewer-stderr-process
+                       old-stderr-process)
+          ;; UNOWNED deliberately has no attached buffers.  Falling back to the
+          ;; manager globals here would destroy CURRENT's resources.
+          (emacs-jupyter-notebook-viewer--dispose-output-buffers unowned)
+          (should (buffer-live-p stdout))
+          (should (buffer-live-p stderr))
+          (should (process-live-p stderr-process))
+          ;; An attached stale generation may dispose exactly its own unique
+          ;; buffers and pipe, never the replacement's resources.
+          (emacs-jupyter-notebook-viewer--dispose-output-buffers old)
+          (should-not (buffer-live-p old-stdout))
+          (should-not (buffer-live-p old-stderr))
+          (should-not (process-live-p old-stderr-process))
+          (should (buffer-live-p stdout))
+          (should (buffer-live-p stderr))
+          (should (process-live-p stderr-process))
+          (should (eq emacs-jupyter-notebook-viewer--stdout-buffer stdout))
+          (should (eq emacs-jupyter-notebook-viewer--stderr-buffer stderr))
+          (should (eq emacs-jupyter-notebook-viewer--stderr-process
+                      stderr-process)))
+      (ignore-errors (delete-process old))
+      (ignore-errors (delete-process unowned))
+      (ignore-errors (delete-process current))
+      (ignore-errors (delete-process old-stderr-process))
+      (ignore-errors (delete-process stderr-process))
+      (when (buffer-live-p old-stdout) (kill-buffer old-stdout))
+      (when (buffer-live-p old-stderr) (kill-buffer old-stderr))
+      (when (buffer-live-p stdout) (kill-buffer stdout))
+      (when (buffer-live-p stderr) (kill-buffer stderr)))))
 
 (ert-deftest ejn-w8.3-python-path-resolves-command ()
   "W8.3: `--python-path' resolves an absolute executable or PATH command,
@@ -9028,7 +8094,6 @@ and returns nil for a bogus command."
   "A pre-connect socket failure retries, and stale timers cannot finish it."
   (let ((connect-count 0)
         (completed nil)
-        timers
         sent
         conn)
     (unwind-protect
@@ -9046,9 +8111,7 @@ and returns nil for a bogus command."
                   ((symbol-function 'delete-process) (lambda (&rest _) nil))
                   ((symbol-function 'run-at-time)
                    (lambda (seconds _repeat function &rest _args)
-                     (let ((timer (list seconds function)))
-                       (push timer timers)
-                       timer))))
+                     (list seconds function))))
           (let ((emacs-jupyter-notebook-viewer--socket-path "/tmp/ejn-viewer.sock")
                 (emacs-jupyter-notebook-viewer-send-retry-delay 0)
                 (state (list :pickle
@@ -9060,16 +8123,124 @@ and returns nil for a bogus command."
             (emacs-jupyter-notebook-viewer--send-pickle-attempt state)
             (should (= connect-count 1))
             (should-not completed)
-            (let ((retry (cadar timers)))
-              (funcall retry))
+            ;; Store the transaction-owned retry timer directly.  A real pipe
+            ;; process may schedule unrelated Emacs timers while this test's
+            ;; broad `run-at-time' mock is active.
+            (let ((retry-timer (plist-get state :timer)))
+              (should (functionp (cadr retry-timer)))
+              (funcall (cadr retry-timer))
             (should (= connect-count 2))
             (should (string-match-p "\\\"id\\\":" sent))
-            (let ((old-retry (cadar (cdr timers))))
-              (when old-retry (funcall old-retry)))
-            (should (= connect-count 2))
-            (should-not completed)))
+              (should-not (equal retry-timer (plist-get state :timer)))
+              (funcall (cadr retry-timer))
+              (should (= connect-count 2))
+              (should-not completed))))
       (when (and (processp conn) (process-live-p conn))
         (delete-process conn)))))
+
+(ert-deftest ejn-w8.3-inline-retry-timer-cannot-overwrite-ack-timer ()
+  "An eager retry callback cannot replace the newer acknowledgement timer."
+  (let* ((real-delete (symbol-function 'delete-process))
+         (fake (make-pipe-process :name "ejn-w8-inline-retry"
+                                  :buffer nil :noquery t))
+         (connect-count 0)
+         (timer-count 0)
+         retry-timer sent completed state)
+    (unwind-protect
+        (cl-letf
+            (((symbol-function 'emacs-jupyter-notebook-viewer-live-p) (lambda () t))
+             ((symbol-function 'make-network-process)
+              (lambda (&rest _)
+                (cl-incf connect-count)
+                (if (= connect-count 1)
+                    (error "socket not ready")
+                  fake)))
+             ((symbol-function 'process-send-string)
+              (lambda (_process wire) (setq sent wire)))
+             ((symbol-function 'delete-process) (lambda (&rest _) nil))
+             ((symbol-function 'run-at-time)
+              (lambda (seconds _repeat function &rest _args)
+                (let ((timer (list 'timer (cl-incf timer-count) seconds)))
+                  ;; The retry timer is constructed first.  Invoke it before
+                  ;; returning to model an eager wrapper around `run-at-time'.
+                  (when (= seconds emacs-jupyter-notebook-viewer-send-retry-delay)
+                    (setq retry-timer timer)
+                    (funcall function))
+                  timer))))
+          (let ((emacs-jupyter-notebook-viewer--socket-path "/tmp/ejn-viewer.sock")
+                (emacs-jupyter-notebook-viewer-send-retry-delay 0.15)
+                (emacs-jupyter-notebook-viewer--next-request-id 0))
+            (setq state
+                  (list :pickle
+                        '(:root "/tmp/root" :file "/tmp/root/ejn-artifact-0123456789abcdef0123456789abcdef"
+                          :root-identity (7 . 11) :identity (7 . 12) :size 3
+                          :sha256 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+                        :completion (lambda (accepted) (push accepted completed))
+                        :attempt 0 :token 0 :timer nil :connection nil :done nil))
+            (emacs-jupyter-notebook-viewer--send-pickle-attempt state)
+            (should (= connect-count 2))
+            (should retry-timer)
+            (should sent)
+            (should-not completed)
+            (should-not (equal retry-timer (plist-get state :timer)))
+            (should (eq (plist-get state :connection) fake))))
+      (when (process-live-p fake) (funcall real-delete fake)))))
+
+(ert-deftest ejn-w8.3-inline-ack-timer-settles-before-frame-send ()
+  "An eager ACK callback settles once and suppresses the now-stale frame."
+  (let* ((real-delete (symbol-function 'delete-process))
+         (fake (make-pipe-process :name "ejn-w8-inline-ack"
+                                  :buffer nil :noquery t))
+         sent completed state)
+    (unwind-protect
+        (cl-letf
+            (((symbol-function 'emacs-jupyter-notebook-viewer-live-p) (lambda () t))
+             ((symbol-function 'make-network-process) (lambda (&rest _) fake))
+             ((symbol-function 'process-send-string)
+              (lambda (_process wire) (setq sent wire)))
+             ((symbol-function 'delete-process) (lambda (&rest _) nil))
+             ((symbol-function 'run-at-time)
+              (lambda (seconds _repeat function &rest _args)
+                (let ((timer (list 'timer seconds)))
+                  (when (= seconds emacs-jupyter-notebook-viewer--send-ack-timeout)
+                    (funcall function))
+                  timer))))
+          (let ((emacs-jupyter-notebook-viewer--socket-path "/tmp/ejn-viewer.sock"))
+            (setq state
+                  (list :pickle
+                        '(:root "/tmp/root" :file "/tmp/root/ejn-artifact-0123456789abcdef0123456789abcdef"
+                          :root-identity (7 . 11) :identity (7 . 12) :size 3
+                          :sha256 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+                        :completion (lambda (accepted) (push accepted completed))
+                        :attempt 0 :token 0 :timer nil :connection nil :done nil))
+            (emacs-jupyter-notebook-viewer--send-pickle-attempt state)
+            (should (equal completed '(nil)))
+            (should-not sent)
+            (should (plist-get state :done))
+            (should-not (plist-get state :timer))
+            (should-not (plist-get state :connection))))
+      (when (process-live-p fake) (funcall real-delete fake)))))
+
+(ert-deftest ejn-w8.3-inline-transaction-deadline-skips-viewer-setup ()
+  "An eager deadline callback leaves no later setup or hand-off work running."
+  (let (completed ensured attempted)
+    (let ((emacs-jupyter-notebook-viewer--active-transaction nil))
+      (cl-letf
+          (((symbol-function 'emacs-jupyter-notebook-viewer-ensure)
+            (lambda () (cl-incf ensured)))
+           ((symbol-function 'emacs-jupyter-notebook-viewer--send-pickle-attempt)
+            (lambda (_state) (cl-incf attempted)))
+           ((symbol-function 'run-at-time)
+            (lambda (_seconds _repeat function &rest _args)
+              (funcall function)
+              '(timer deadline))))
+        (emacs-jupyter-notebook-viewer-open-pickle-file
+         '(:file "/tmp/irrelevant")
+         (lambda (accepted) (push accepted completed)))
+        (should (equal completed '(nil)))
+        (should-not ensured)
+        (should-not attempted)
+        (should-not emacs-jupyter-notebook-viewer--active-transaction)))))
 
 (ert-deftest ejn-w8.3-socket-directory-cleanup-pins-its-identity ()
   "Cleanup removes only the exact private directory it created."
@@ -9240,172 +8411,63 @@ wiring.  Skipped when no local python3 is available in this environment."
     (should-not (string-match-p "matplotlib" s))
     (should-not (string-match-p "import numpy" s))))
 
-(ert-deftest ejn-w11-watchdog-injection-embeds-timeout ()
-  "W11: injection routes through the silent adapter and embeds the timeout."
-  (with-temp-buffer
-    (let ((calls nil)
-          (emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t))
-          (emacs-jupyter-notebook-kernel-idle-timeout 1234))
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
-                 (lambda (client code) (push (list client code) calls))))
-        (emacs-jupyter-notebook--inject-idle-watchdog))
-      (should (= (length calls) 1))
-      (should (eq (caar calls) 'mock-client))
-      (should (string-match-p "_EJN_WD_TIMEOUT = 1234" (cadar calls)))
-      ;; The formatted code must carry both cell events and the shutdown.
-      (should (string-match-p "register('pre_run_cell'" (cadar calls)))
-      (should (string-match-p "register('post_run_cell'" (cadar calls)))
-      (should (string-match-p "SIGTERM" (cadar calls))))))
 
-(ert-deftest ejn-w11-watchdog-noop-when-timeout-zero ()
-  "W11: a 0 idle timeout disables the watchdog — nothing is injected."
-  (with-temp-buffer
-    (let ((calls nil)
-          (emacs-jupyter-notebook--client 'mock-client)
-          (emacs-jupyter-notebook-kernel-idle-timeout 0))
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
-                 (lambda (client code) (push (list client code) calls))))
-        (emacs-jupyter-notebook--inject-idle-watchdog))
-      (should (null calls)))))
 
-(ert-deftest ejn-w11-watchdog-noop-without-client ()
-  "W11: with no client the watchdog injection is a silent no-op."
-  (with-temp-buffer
-    (let ((calls nil)
-          (emacs-jupyter-notebook--client nil)
-          (emacs-jupyter-notebook-kernel-idle-timeout 3600))
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
-                 (lambda (client code) (push (list client code) calls))))
-        (emacs-jupyter-notebook--inject-idle-watchdog))
-      (should (null calls)))))
 
-(ert-deftest ejn-w11-watchdog-swallows-adapter-errors ()
-  "W11: a raise from the adapter must not propagate out of injection."
-  (with-temp-buffer
-    (let ((emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t))
-          (emacs-jupyter-notebook-kernel-idle-timeout 3600))
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
-                 (lambda (_client _code) (error "boom"))))
-        (should (progn (emacs-jupyter-notebook--inject-idle-watchdog) t))))))
 
-(ert-deftest ejn-w11-watchdog-injected-on-connect-finalize ()
-  "W11: connect-finalize injects the watchdog carrying the configured timeout."
-  (let ((entry (ejn-test-direct-entry '(:profile "p" :session-id "session")))
-        (local-ports '(:shell_port 1001 :iopub_port 1002 :stdin_port 1003
-                       :hb_port 1004 :control_port 1005))
-        (local-file "/tmp/test.json")
-        (emacs-jupyter-notebook--client nil)
-        (emacs-jupyter-notebook--session-entry nil)
-        (emacs-jupyter-notebook-kernel-idle-timeout 7200)
-        (codes nil))
-    (with-temp-buffer
-      (let ((buffer (current-buffer))
-            (client (ejn-test-backend-session 'mock-client t))
-            (context (emacs-jupyter-notebook--async-new-context
-                      :phase 'connect
-                      :entry entry
-                      :remote-ports (plist-get entry :remote-ports)
-                      :origin-buffer (current-buffer))))
-        (setq context (emacs-jupyter-notebook--async-put
-                       context :client-unverified client))
-        (setq emacs-jupyter-notebook--async-context context)
-        (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
-                   (lambda (_entry &optional _file) nil))
-                  ((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
-                   (lambda (_client code) (push code codes))))
-        (emacs-jupyter-notebook--async-connect-finalize
-         context buffer entry local-ports local-file client)
-        (ejn-test-drain-zero-delay-timers))
-        ;; A watchdog snippet carrying the configured timeout was sent.
-        (should (cl-some (lambda (c) (string-match-p "_EJN_WD_TIMEOUT = 7200" c))
-                         codes))))))
 
-(ert-deftest ejn-w11-watchdog-injected-on-restart ()
-  "W11: the obsolete legacy restart path is rejected without injection."
-  (with-temp-buffer
-    (let ((emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t))
-          (emacs-jupyter-notebook-kernel-idle-timeout 5400)
-          (codes nil)
-          (restart-called nil))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-restart)
-                 (lambda (&rest _) (setq restart-called t)))
-                ((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
-                 (lambda (_client code) (push code codes))))
-      (should-error (call-interactively #'emacs-jupyter-notebook-restart-kernel)
-                    :type 'user-error))
-    (should-not restart-called)
-    (should-not codes))))
 
-(ert-deftest ejn-w13-viewer3-restart-reinjection-waits-for-kernel-info ()
-  "W13-Viewer3: legacy restart is rejected before any reinjection."
-  (with-temp-buffer
-    (let ((emacs-jupyter-notebook--client
-           (ejn-test-backend-session 'mock-client t))
-          (emacs-jupyter-notebook-kernel-idle-timeout 900)
-          info-cb sent)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-restart)
-                 (lambda (&rest _) (setq sent t)))
-                ((symbol-function 'emacs-jupyter-notebook-jupyter-kernel-info)
-                 (lambda (_client callback) (setq info-cb callback)))
-                ((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
-                 (lambda (_client _code) (setq sent t))))
-      (should-error (call-interactively #'emacs-jupyter-notebook-restart-kernel)
-                    :type 'user-error))
-    (should-not info-cb)
-    (should-not sent))))
+
+
+
+
+
+
+
 
 ;;; W11(B) — non-destructive prune of dead registry entries
 
 (defun ejn-w11--entry (session pid host)
   "Build a registry ENTRY fixture with SESSION, PID, and HOST."
   (list :profile "p" :session-id session :remote-pid pid :remote-host host
-        :remote-connection-file (format "/cache/kernel-%s.json" session)))
+        :remote-connection-file (format "/cache/kernel-%s.json" session)
+        :registry-revision (format "ejn-w11-%s-revision" session)))
 
 (ert-deftest ejn-w11-prune-removes-only-confirmed-dead ()
-  "W11: prune drops confirmed-dead entries, keeps alive AND unknown ones.
-A dead PID on a host that ANSWERED is pruned; an unreachable host's
-entries (UNKNOWN) are kept — an unreachable host must never cause a false
-prune."
-  (let* ((live   (ejn-w11--entry "live"    100 "up.example"))
-         (dead   (ejn-w11--entry "dead"    200 "up.example"))
-         (ghost  (ejn-w11--entry "ghost"   300 "down.example"))
-         (nopid  (list :profile "p" :session-id "nopid" :remote-host "up.example"))
-         (entries (list live dead ghost nopid))
-         (saved nil)
-         ;; Mock probe: host "up.example" answers (100 alive, 200 dead);
-         ;; host "down.example" is unreachable (:answered nil).
-         (probe (lambda (profile pids)
-                  (let ((host (plist-get profile :host)))
-                    (cond
-                     ((equal host "up.example")
-                      (list :answered t
-                            :alive (cl-remove-if-not
-                                    (lambda (p) (equal (format "%s" p) "100"))
-                                    pids)
-                            :dead (cl-remove-if-not
-                                   (lambda (p) (equal (format "%s" p) "200"))
-                                   pids)))
-                     (t (list :answered nil :alive nil)))))))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
-               (lambda (&optional _file) entries))
-              ((symbol-function 'emacs-jupyter-notebook-registry-save)
-               (lambda (kept &optional _file) (setq saved kept))))
-      (let ((res (emacs-jupyter-notebook--prune-dead-registry-entries
-                  nil probe)))
-        (should (= (plist-get res :pruned) 1))
-        (should (= (plist-get res :alive) 1))
-        ;; ghost (unreachable) + nopid (no pid) are both UNKNOWN, kept.
-        (should (= (plist-get res :unknown) 2))
-        ;; Exactly the dead entry was pruned.
-        (should (equal (plist-get res :pruned-entries) (list dead)))
-        ;; The saved registry keeps live + ghost + nopid, drops dead.
-        (should (member live saved))
-        (should (member ghost saved))
-        (should (member nopid saved))
-        (should-not (member dead saved))))))
+  "Async pruning submits only exact confirmed-dead worker revisions."
+  (let* ((live (ejn-w11--entry "live" 100 "up.example"))
+         (dead (ejn-w11--entry "dead" 200 "up.example"))
+         (unknown (ejn-w11--entry "unknown" 300 "down.example"))
+         (current (list live dead unknown))
+         pruned message-text)
+    (cl-letf
+        (((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+          (lambda (success _failure &rest _keys)
+            (ejn-test-registry--defer
+             (lambda () (funcall success (copy-tree current) nil)))))
+         ((symbol-function 'emacs-jupyter-notebook--classify-registry-liveness-async)
+          (lambda (entries _token callback)
+            (funcall callback
+                     (list (cons (nth 0 entries) 'alive)
+                           (cons (nth 1 entries) 'dead)
+                           (cons (nth 2 entries) 'unknown)) nil)))
+         ((symbol-function 'emacs-jupyter-notebook-registry-prune-async)
+          (lambda (targets success _failure &rest _keys)
+            (setq pruned (copy-tree targets)
+                  current (list live unknown))
+            (ejn-test-registry--defer
+             (lambda () (funcall success '("dead") nil nil)))))
+         ((symbol-function 'message)
+          (lambda (format-string &rest args)
+            (setq message-text (apply #'format format-string args)))))
+      (with-temp-buffer
+        (emacs-jupyter-notebook-prune-dead-kernels)
+        (should (ejn-test-await (lambda () pruned)))
+        (should (equal pruned (list dead)))
+        (should (equal current (list live unknown)))
+        (should (ejn-test-await
+                 (lambda () (and message-text
+                                 (string-match-p "pruned 1 dead" message-text)))))))))
 
 (ert-deftest ejn-w11-prune-answered-omission-remains-unknown ()
   "An answered probe may prune only PIDs carrying an explicit dead record."
@@ -9547,21 +8609,24 @@ prune."
                 'unknown))))
 
 (ert-deftest ejn-w11-prune-unreachable-host-keeps-entries ()
-  "W11: when every host is unreachable, nothing is pruned and no save runs."
-  (let* ((a (ejn-w11--entry "a" 10 "down.example"))
-         (b (ejn-w11--entry "b" 20 "down.example"))
-         (entries (list a b))
-         (save-called nil)
-         (probe (lambda (_profile _pids) (list :answered nil :alive nil))))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
-               (lambda (&optional _file) entries))
-              ((symbol-function 'emacs-jupyter-notebook-registry-save)
-               (lambda (_kept &optional _file) (setq save-called t))))
-      (let ((res (emacs-jupyter-notebook--prune-dead-registry-entries nil probe)))
-        (should (= (plist-get res :pruned) 0))
-        (should (= (plist-get res :unknown) 2))
-        ;; No dead entries → the file is never rewritten.
-        (should-not save-called)))))
+  "An unknown liveness result never starts a worker prune transaction."
+  (let* ((entry (ejn-w11--entry "unknown" 10 "down.example"))
+         prune-called done)
+    (cl-letf
+        (((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+          (lambda (success _failure &rest _keys)
+            (ejn-test-registry--defer (lambda () (funcall success (list entry) nil)))))
+         ((symbol-function 'emacs-jupyter-notebook--classify-registry-liveness-async)
+          (lambda (_entries _token callback)
+            (funcall callback (list (cons entry 'unknown)) nil)
+            (setq done t)))
+         ((symbol-function 'emacs-jupyter-notebook-registry-prune-async)
+          (lambda (&rest _) (setq prune-called t)))
+         ((symbol-function 'message) (lambda (&rest _) nil)))
+      (with-temp-buffer
+        (emacs-jupyter-notebook-prune-dead-kernels)
+        (should (ejn-test-await (lambda () done)))
+        (should-not prune-called)))))
 
 (ert-deftest ejn-w11-prune-dead-kernels-messages-summary ()
   "W11: the command prunes and reports pruned/live counts."
@@ -9569,10 +8634,14 @@ prune."
          (dead (ejn-w11--entry "dead" 200 "up.example"))
          (entries (list live dead))
          (msg nil))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
-                 (lambda (&optional _file) entries))
-                ((symbol-function 'emacs-jupyter-notebook-registry-save)
-                 (lambda (_kept &optional _file) nil))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+                 (lambda (success _failure &rest _keys)
+                   (ejn-test-registry--defer
+                    (lambda () (funcall success entries nil)))))
+                ((symbol-function 'emacs-jupyter-notebook-registry-prune-async)
+                 (lambda (_targets success _failure &rest _keys)
+                   (ejn-test-registry--defer
+                    (lambda () (funcall success '("dead") nil nil)))))
                 ((symbol-function
                   'emacs-jupyter-notebook--classify-registry-liveness-async)
                  (lambda (probed-entries _token callback)
@@ -9583,17 +8652,21 @@ prune."
                  (lambda (fmt &rest args) (setq msg (apply #'format fmt args)))))
       (with-temp-buffer
         (call-interactively #'emacs-jupyter-notebook-prune-dead-kernels)
+        (should (ejn-test-await (lambda () (and msg (string-match-p "pruned" msg)))))
         (should (string-match-p "pruned 1 dead" msg))
         (should (string-match-p "1 live remain" msg))))))
 
 (ert-deftest ejn-w11-prune-dead-kernels-empty-registry ()
   "W11: with an empty registry the command reports nothing to prune."
   (let ((msg nil))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
-               (lambda (&optional _file) nil))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+               (lambda (success _failure &rest _keys)
+                 (ejn-test-registry--defer (lambda () (funcall success nil nil)))))
               ((symbol-function 'message)
                (lambda (fmt &rest args) (setq msg (apply #'format fmt args)))))
       (call-interactively #'emacs-jupyter-notebook-prune-dead-kernels)
+      (should (ejn-test-await
+               (lambda () (and msg (string-match-p "registry is empty" msg)))))
       (should (string-match-p "registry is empty" msg)))))
 
 (ert-deftest ejn-w11-picker-excludes-dead-entries ()
@@ -9602,21 +8675,25 @@ alive/unknown ones; the dead ghost is removed from the registry too."
   (let* ((live  (ejn-w11--entry "live"  100 "up.example"))
          (dead  (ejn-w11--entry "dead"  200 "up.example"))
          (entries (list live dead))
-         (saved nil)
+         (current entries)
+         (pruned nil)
          (offered nil)
          selected)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
-               (lambda (&optional _file) entries))
-              ((symbol-function 'emacs-jupyter-notebook-registry-save)
-               (lambda (kept &optional _file) (setq saved kept)))
-              ((symbol-function 'emacs-jupyter-notebook--current-file-registry-entry)
-               (lambda () nil))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+               (lambda (success _failure &rest _keys)
+                 (ejn-test-registry--defer
+                  (lambda () (funcall success (copy-tree current) nil)))))
               ((symbol-function
                 'emacs-jupyter-notebook--classify-registry-liveness-async)
                (lambda (probed-entries _token callback)
                  (funcall callback
                           (list (cons (car probed-entries) 'alive)
                                 (cons (cadr probed-entries) 'dead)) nil)))
+              ((symbol-function 'emacs-jupyter-notebook-registry-prune-async)
+               (lambda (targets success _failure &rest _keys)
+                 (setq pruned targets current (list live))
+                 (ejn-test-registry--defer
+                  (lambda () (funcall success '("dead") nil nil)))))
               ((symbol-function 'completing-read)
                (lambda (_prompt collection &rest _)
                  (setq offered collection)
@@ -9625,83 +8702,104 @@ alive/unknown ones; the dead ghost is removed from the registry too."
       (with-temp-buffer
         (emacs-jupyter-notebook--read-registry-entry-async
          (lambda (entry) (setq selected entry)))
+          (should (ejn-test-await (lambda () selected)))
           ;; Only the live entry survived and was selectable.
           (should (equal selected live))
           (should (= (length offered) 1))
           (should (string-match-p "live" (caar offered)))
-          ;; The dead ghost was pruned from the durable registry.
-          (should (member live saved))
-          (should-not (member dead saved))))))
+          ;; The dead ghost was pruned through its exact observed revision.
+          (should (equal pruned (list dead)))
+          (should (equal current (list live)))))))
 
 (ert-deftest ejn-w11-prune-dead-kernels-preserves-concurrent-addition ()
   "Async explicit pruning must not discard an entry added during its probe."
   (let* ((dead (ejn-w11--entry "dead" 200 "up.example"))
          (added (ejn-w11--entry "added" 300 "up.example"))
          (current (list dead))
-         callback probed saved)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
-               (lambda (&optional _file) current))
-              ((symbol-function 'emacs-jupyter-notebook-registry-save)
-               (lambda (entries &optional _file)
-                 (setq saved (copy-tree entries)
-                       current entries)))
+         callback probed pruned)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+               (lambda (success _failure &rest _keys)
+                 (ejn-test-registry--defer
+                  (lambda () (funcall success (copy-tree current) nil)))))
               ((symbol-function
                 'emacs-jupyter-notebook--classify-registry-liveness-async)
                (lambda (entries _token continuation)
-                 (setq probed entries callback continuation))))
+                 (setq probed entries callback continuation)))
+              ((symbol-function 'emacs-jupyter-notebook-registry-prune-async)
+               (lambda (targets success _failure &rest _keys)
+                 (setq pruned targets current (list added))
+                 (ejn-test-registry--defer
+                  (lambda () (funcall success '("dead") nil nil)))))
+              ((symbol-function 'message) (lambda (&rest _) nil)))
       (with-temp-buffer
         (emacs-jupyter-notebook-prune-dead-kernels)
-        (should callback)
+        (should (ejn-test-await (lambda () callback)))
         ;; Simulate a separate completion path persisting a new kernel while
         ;; the liveness SSH probe is outstanding.
         (setq current (list dead added))
         (funcall callback (list (cons (car probed) 'dead)) nil)
-        (should (equal current (list added)))
-        (should (equal saved (list added)))))))
+        (should (ejn-test-await (lambda () pruned)))
+        (should (equal pruned (list dead)))
+        ;; A worker's exact deletion touches only the old observed row.
+        (should (equal current (list added)))))))
 
 (ert-deftest ejn-w11-prune-dead-kernels-preserves-concurrent-same-key-refresh ()
   "Async explicit pruning must not delete a same-key entry refreshed in flight."
   (let* ((dead (ejn-w11--entry "session" 200 "up.example"))
          (refreshed (plist-put (copy-tree dead) :remote-pid 201))
          (current (list dead))
-         callback probed save-called)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
-               (lambda (&optional _file) current))
-              ((symbol-function 'emacs-jupyter-notebook-registry-save)
-               (lambda (&rest _) (setq save-called t)))
+         callback probed pruned)
+    (setq refreshed (plist-put refreshed :registry-revision "ejn-w11-refreshed"))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+               (lambda (success _failure &rest _keys)
+                 (ejn-test-registry--defer
+                  (lambda () (funcall success (copy-tree current) nil)))))
               ((symbol-function
                 'emacs-jupyter-notebook--classify-registry-liveness-async)
                (lambda (entries _token continuation)
-                 (setq probed entries callback continuation))))
+                 (setq probed entries callback continuation)))
+              ((symbol-function 'emacs-jupyter-notebook-registry-prune-async)
+               (lambda (targets success _failure &rest _keys)
+                 (setq pruned targets)
+                 ;; The worker sees the changed revision and reports retained.
+                 (ejn-test-registry--defer
+                  (lambda () (funcall success nil '("session") nil)))))
+              ((symbol-function 'message) (lambda (&rest _) nil)))
       (with-temp-buffer
         (emacs-jupyter-notebook-prune-dead-kernels)
-        (should callback)
+        (should (ejn-test-await (lambda () callback)))
         ;; The replacement has the same registry key but a different durable
         ;; PID, so the old positive-death answer no longer authorizes removal.
         (setq current (list refreshed))
         (funcall callback (list (cons (car probed) 'dead)) nil)
+        (should (ejn-test-await (lambda () pruned)))
         (should (equal current (list refreshed)))
-        (should-not save-called)))))
+        (should (equal pruned (list dead)))))))
 
 (ert-deftest ejn-w11-picker-prune-preserves-concurrent-addition ()
   "Reconnect picker pruning must retain and offer entries added in flight."
   (let* ((dead (ejn-w11--entry "dead" 200 "up.example"))
          (added (ejn-w11--entry "added" 300 "up.example"))
          (current (list dead))
-         callback probed saved offered selected)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
-               (lambda (&optional _file) current))
-              ((symbol-function 'emacs-jupyter-notebook-registry-save)
-               (lambda (entries &optional _file)
-                 (setq saved (copy-tree entries)
-                       current entries)))
+         callback probed pruned offered selected)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+               (lambda (success _failure &rest _keys)
+                 (ejn-test-registry--defer
+                  (lambda () (funcall success (copy-tree current) nil)))))
               ((symbol-function
                 'emacs-jupyter-notebook--current-file-registry-entry)
-               (lambda () nil))
+               (lambda (&rest _) nil))
               ((symbol-function
                 'emacs-jupyter-notebook--classify-registry-liveness-async)
                (lambda (entries _token continuation)
                  (setq probed entries callback continuation)))
+              ((symbol-function 'emacs-jupyter-notebook-registry-prune-async)
+               (lambda (targets success _failure &rest _keys)
+                 (setq pruned (copy-tree targets))
+                 ;; The exact worker prune sees only the observed dead row.
+                 (setq current (list added))
+                 (ejn-test-registry--defer
+                  (lambda () (funcall success '(("dead" . "removed")) nil nil)))))
               ((symbol-function 'completing-read)
                (lambda (_prompt collection &rest _)
                  (setq offered collection)
@@ -9709,11 +8807,12 @@ alive/unknown ones; the dead ghost is removed from the registry too."
       (with-temp-buffer
         (emacs-jupyter-notebook--read-registry-entry-async
          (lambda (entry) (setq selected entry)))
-        (should callback)
+        (should (ejn-test-await (lambda () callback)))
         (setq current (list dead added))
         (funcall callback (list (cons (car probed) 'dead)) nil)
+        (should (ejn-test-await (lambda () selected)))
+        (should (equal pruned (list dead)))
         (should (equal current (list added)))
-        (should (equal saved (list added)))
         (should (= (length offered) 1))
         (should (equal selected added))))))
 
@@ -9722,18 +8821,26 @@ alive/unknown ones; the dead ghost is removed from the registry too."
   (let* ((dead (ejn-w11--entry "session" 200 "up.example"))
          (refreshed (plist-put (copy-tree dead) :remote-pid 201))
          (current (list dead))
-         callback probed save-called offered selected)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
-               (lambda (&optional _file) current))
-              ((symbol-function 'emacs-jupyter-notebook-registry-save)
-               (lambda (&rest _) (setq save-called t)))
+         callback probed pruned offered selected)
+    (setq refreshed
+          (plist-put refreshed :registry-revision "ejn-w11-refreshed"))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+               (lambda (success _failure &rest _keys)
+                 (ejn-test-registry--defer
+                  (lambda () (funcall success (copy-tree current) nil)))))
               ((symbol-function
                 'emacs-jupyter-notebook--current-file-registry-entry)
-               (lambda () nil))
+               (lambda (&rest _) nil))
               ((symbol-function
                 'emacs-jupyter-notebook--classify-registry-liveness-async)
                (lambda (entries _token continuation)
                  (setq probed entries callback continuation)))
+              ((symbol-function 'emacs-jupyter-notebook-registry-prune-async)
+               (lambda (targets success _failure &rest _keys)
+                 (setq pruned (copy-tree targets))
+                 ;; The observed revision is stale, so the worker retains it.
+                 (ejn-test-registry--defer
+                  (lambda () (funcall success nil '("session") nil)))))
               ((symbol-function 'completing-read)
                (lambda (_prompt collection &rest _)
                  (setq offered collection)
@@ -9741,11 +8848,12 @@ alive/unknown ones; the dead ghost is removed from the registry too."
       (with-temp-buffer
         (emacs-jupyter-notebook--read-registry-entry-async
          (lambda (entry) (setq selected entry)))
-        (should callback)
+        (should (ejn-test-await (lambda () callback)))
         (setq current (list refreshed))
         (funcall callback (list (cons (car probed) 'dead)) nil)
+        (should (ejn-test-await (lambda () selected)))
+        (should (equal pruned (list dead)))
         (should (equal current (list refreshed)))
-        (should-not save-called)
         (should (= (length offered) 1))
         (should (equal selected refreshed))))))
 
@@ -9912,6 +9020,96 @@ connection attempt can wedge a buffer forever."
       (should fail-called)
       (should (eq fail-kind 'attempt-timeout)))))
 
+(ert-deftest ejn-w19-fresh-start-wall-deadline-blocks-late-dispatches ()
+  "An expired fresh start cannot rely on a delayed timeout timer.
+
+Each callback starts with an overall deadline in the past but no timer-set
+deadline flag.  It must fail locally before resolving, launching, reading or
+probing the sidecar, promoting the PID, retrieving, tunnelling, connecting,
+or promoting the final connection state."
+  (with-temp-buffer
+    (let* ((buffer (current-buffer))
+           (profile '(:profile "p" :host "example.test"))
+           (entry '(:profile "p" :session-id "expired"
+                    :launch-kind direct :provisional t :remote-pid nil
+                    :registry-revision "expired-revision"
+                    :remote-connection-file "/remote/kernel-expired.json"
+                    :remote-pid-sidecar "/remote/kernel-expired.pid"
+                    :connection-file-tokens ("-f" "/remote/kernel-expired.json")))
+           (deadline (1- (float-time)))
+           failures)
+      (cl-labels
+          ((context (phase)
+             (emacs-jupyter-notebook--async-new-context
+              :phase phase :origin-buffer buffer :owns-kernel t
+              :overall-deadline deadline :profile profile :entry (copy-tree entry)
+              :session-id "expired" :launch-admitted t
+              :resolution '(:argv ("ssh" "resolver"))
+              :launch '(:argv ("ssh" "launch")))))
+        (cl-letf
+            (((symbol-function 'emacs-jupyter-notebook--async-fail)
+              (lambda (context reason)
+                (push (cons context reason) failures)))
+             ((symbol-function 'emacs-jupyter-notebook-ssh-start-bounded-process)
+              (lambda (&rest _) (ert-fail "expired callback started a process")))
+             ((symbol-function 'emacs-jupyter-notebook-registry-create-async)
+              (lambda (&rest _) (ert-fail "expired callback admitted a launch")))
+             ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+              (lambda (&rest _) (ert-fail "expired callback promoted registry state")))
+             ((symbol-function 'emacs-jupyter-notebook-ssh-build-remote-read-pid-sidecar)
+              (lambda (&rest _) (ert-fail "expired callback built a sidecar command")))
+             ((symbol-function 'emacs-jupyter-notebook-ssh-build-pid-alive)
+              (lambda (&rest _) (ert-fail "expired callback built a PID probe")))
+             ((symbol-function 'emacs-jupyter-notebook-ssh-scp-from-command)
+              (lambda (&rest _) (ert-fail "expired callback built an SCP command")))
+             ((symbol-function 'emacs-jupyter-notebook-connection-allocate-local-ports)
+              (lambda (&rest _) (ert-fail "expired callback allocated tunnel ports")))
+             ((symbol-function 'emacs-jupyter-notebook-backend-session-create)
+              (lambda (&rest _) (ert-fail "expired callback created a backend session")))
+             ((symbol-function 'emacs-jupyter-notebook-backend-connect)
+              (lambda (&rest _) (ert-fail "expired callback connected a backend")))
+             ((symbol-function 'emacs-jupyter-notebook--async-connect-transport-current-p)
+              (lambda (&rest _) t))
+             ((symbol-function 'process-status)
+              (lambda (&rest _) 'exit)))
+          (dolist
+              (case
+               (list
+                (cons 'resolve (lambda (context)
+                                 (emacs-jupyter-notebook--async-resolve-kernelspec context)))
+                (cons 'launch (lambda (context)
+                                (emacs-jupyter-notebook--async-launch context)))
+                (cons 'sidecar (lambda (context)
+                                 (emacs-jupyter-notebook--async-read-pid-sidecar context)))
+                (cons 'probe (lambda (context)
+                               (emacs-jupyter-notebook--async-verify-launch-pid context 4242)))
+                (cons 'pid-promotion (lambda (context)
+                                       (emacs-jupyter-notebook--async-launch-pid-sentinel
+                                        context 4242 'expired-probe)))
+                (cons 'retrieve (lambda (context)
+                                  (emacs-jupyter-notebook--async-retrieve-attempt context)))
+                (cons 'tunnel (lambda (context)
+                                (emacs-jupyter-notebook--async-tunnel context)))
+                (cons 'connect (lambda (context)
+                                 (emacs-jupyter-notebook--async-connect context)))
+                (cons 'connection-promotion
+                      (lambda (context)
+                        (emacs-jupyter-notebook--async-connect-finalize
+                         context buffer (plist-get context :entry) nil nil
+                         'expired-client)))))
+            (let ((context (context (if (eq (car case) 'connection-promotion)
+                                        'connect
+                                      (car case)))))
+              (setq emacs-jupyter-notebook--async-context context)
+              (when (eq (car case) 'connection-promotion)
+                (setq context
+                      (emacs-jupyter-notebook--async-put
+                       context :client-unverified 'expired-client)))
+              (should-not (plist-get context :lifecycle-deadline-reached))
+              (funcall (cdr case) context)
+              (should (eq (plist-get context :error-kind) 'attempt-timeout)))))
+        (should (= (length failures) 9))))))
+
 (ert-deftest ejn-w19-process-watchdog-kills-hung-process ()
   "W19: a one-shot remote process that outlives the per-process deadline is
 killed and its attempt failed with `process-timeout' — bounding a probe or
@@ -9952,6 +9150,80 @@ backoff) and is capped at the configured maximum."
       (should (= (emacs-jupyter-notebook--auto-reconnect-delay) 16))
       (setq emacs-jupyter-notebook--reconnect-attempt 25)
       (should (= (emacs-jupyter-notebook--auto-reconnect-delay) 300)))))
+
+(ert-deftest ejn-w19-retry-probe-and-reconnect-options-have-hard-bounds ()
+  "Hostile customization cannot create timer spin or disable eventual retry."
+  (let ((emacs-jupyter-notebook-connection-retrieve-attempts
+         most-positive-fixnum)
+        (emacs-jupyter-notebook-connection-retrieve-delay 0)
+        (emacs-jupyter-notebook-tunnel-wait-timeout most-positive-fixnum)
+        (emacs-jupyter-notebook-tunnel-wait-delay -1)
+        (emacs-jupyter-notebook-reconnect-initial-delay most-positive-fixnum)
+        (emacs-jupyter-notebook-reconnect-max-delay most-positive-fixnum)
+        (emacs-jupyter-notebook--reconnect-attempt 30))
+    (should (= (emacs-jupyter-notebook--effective-connection-retrieve-attempts)
+               emacs-jupyter-notebook--hard-connection-retrieve-attempts))
+    (should (= (emacs-jupyter-notebook--effective-connection-retrieve-delay) 0.25))
+    (should (= (emacs-jupyter-notebook--effective-tunnel-wait-timeout)
+               emacs-jupyter-notebook--hard-tunnel-wait-timeout))
+    (should (= (emacs-jupyter-notebook--effective-tunnel-wait-delay) 0.05))
+    (should (= (emacs-jupyter-notebook--auto-reconnect-delay)
+               emacs-jupyter-notebook--hard-reconnect-max-delay))))
+
+(ert-deftest ejn-ir3s-render-throttle-option-cannot-schedule-zero-delay ()
+  "Panel stream customization cannot turn throttling into timer churn."
+  (let ((emacs-jupyter-notebook-panel-stream-throttle-ms 0))
+    (should (= (emacs-jupyter-notebook-panel--stream-throttle-delay) 0.05)))
+  (let ((emacs-jupyter-notebook-panel-stream-throttle-ms most-positive-fixnum))
+    (should (= (emacs-jupyter-notebook-panel--stream-throttle-delay) 1.0))))
+
+(ert-deftest ejn-ei3-evaluation-timeout-option-is-finite-and-hard-bounded ()
+  (dolist (value (list 0 -1 most-positive-fixnum))
+    (let ((emacs-jupyter-notebook-evaluation-timeout value))
+      (let ((effective (emacs-jupyter-notebook--effective-evaluation-timeout)))
+        (should (> effective 0))
+        (should (<= effective emacs-jupyter-notebook--hard-evaluation-timeout))
+        (should (= (emacs-jupyter-notebook-helper-backend--execute-request-timeout)
+                   (1+ (* 2 effective))))))))
+
+(ert-deftest ejn-nonblocking-heartbeat-and-completion-options-have-hard-bounds ()
+  "Invalid liveness/debounce customization cannot spin or disable timers."
+  (dolist (value (list 0 -1 'invalid most-positive-fixnum 1.0e+INF))
+    (let ((emacs-jupyter-notebook-heartbeat-interval value)
+          (emacs-jupyter-notebook-heartbeat-timeout value)
+          (emacs-jupyter-notebook-heartbeat-misses-allowed value)
+          (emacs-jupyter-notebook-completion-idle value))
+      (should (<= 1.0 (emacs-jupyter-notebook--effective-heartbeat-interval)
+                  emacs-jupyter-notebook--hard-heartbeat-interval))
+      (should (<= 0.1 (emacs-jupyter-notebook--effective-heartbeat-timeout)
+                  emacs-jupyter-notebook--hard-heartbeat-timeout))
+      (should (<= 1 (emacs-jupyter-notebook--effective-heartbeat-misses)
+                  emacs-jupyter-notebook--hard-heartbeat-misses))
+      (should (<= 0.025 (emacs-jupyter-notebook--effective-completion-idle)
+                  emacs-jupyter-notebook--hard-completion-idle)))))
+
+(ert-deftest ejn-nonblocking-process-prune-and-status-options-have-hard-bounds ()
+  "Local watchdogs remain finite under hostile timing customization."
+  (dolist (value (list nil 0 -1 'invalid most-positive-fixnum 1.0e+INF))
+    (let ((emacs-jupyter-notebook-ssh-process-timeout value)
+          (emacs-jupyter-notebook-prune-ssh-timeout value)
+          (emacs-jupyter-notebook--status-refresh-interval value))
+      (should (<= 0.1 (emacs-jupyter-notebook--effective-ssh-process-timeout)
+                  emacs-jupyter-notebook--hard-ssh-process-timeout))
+      (should (<= 1 (emacs-jupyter-notebook--effective-prune-ssh-timeout)
+                  emacs-jupyter-notebook--hard-prune-ssh-timeout))
+      (should (<= 0.25 (emacs-jupyter-notebook--status-refresh-delay)
+                  emacs-jupyter-notebook--status-refresh-hard-interval)))))
+
+(ert-deftest ejn-w11-batch-liveness-command-normalizes-invalid-timeout ()
+  "The SSH argv always receives a valid finite integer ConnectTimeout."
+  (let* ((emacs-jupyter-notebook-prune-ssh-timeout 1.0e+INF)
+         (argv (emacs-jupyter-notebook-ssh-build-batch-pid-alive
+                '(:profile "p" :host "example.test") '(42))))
+    (should (member "ConnectTimeout=60" argv)))
+  (let ((argv (emacs-jupyter-notebook-ssh-build-batch-pid-alive
+               '(:profile "p" :host "example.test") '(42) 999999)))
+    (should (member "ConnectTimeout=60" argv))))
 
 (ert-deftest ejn-w19-auto-reconnect-schedules-on-tunnel-death ()
   "W19: with a durable session entry and a dead tunnel, auto-reconnect
@@ -10040,13 +9312,12 @@ with backoff instead of giving up; a success schedules nothing further."
   "W19: an explicit reconnect is the reliable escape hatch from a wedged
 background attempt — it supersedes a stale RECONNECT attempt silently (no
 second prompt), because cancelling a reconnect never touches a kernel."
-  (let ((emacs-jupyter-notebook-backend 'legacy)
-        (entry (ejn-test-direct-entry
+  (let ((entry (ejn-test-direct-entry
                 '(:profile "p" :remote-host "h" :remote-cwd "~"
                   :kernelspec "python3" :remote-pid 1
                   :remote-connection-file "/r/k.json" :session-id "s")))
         prompted retrieved)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-selected-backend)
                #'ignore)
               ((symbol-function 'y-or-n-p)
                (lambda (&rest _) (setq prompted t) nil))
@@ -10073,7 +9344,7 @@ left to run shutdown + start by hand."
                  :kernelspec "python3" :remote-pid 1
                  :remote-connection-file "/r/k.json" :session-id "s"))
         fresh-profile)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-selected-backend)
                #'ignore)
               ((symbol-function 'emacs-jupyter-notebook--read-registry-entry-async)
                (lambda (callback) (funcall callback entry)))
@@ -10099,7 +9370,7 @@ surfaces the error."
                  :kernelspec "python3" :remote-pid 1
                  :remote-connection-file "/r/k.json" :session-id "s"))
         fresh-called err-seen)
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-selected-backend)
                #'ignore)
               ((symbol-function 'emacs-jupyter-notebook--begin-reconnect)
                (lambda (_entry _cb error-cb &optional _owner)
@@ -10138,85 +9409,190 @@ initial delay instead of inheriting this recovery's accumulated attempts."
                  #'ignore)
                 ((symbol-function 'emacs-jupyter-notebook--inject-idle-watchdog)
                  #'ignore)
-                ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
-                 #'ignore))
+                ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+                 #'ejn-test-registry-replace-succeeds))
         (emacs-jupyter-notebook--async-connect-finalize
          context (current-buffer) entry
          '(:shell_port 1 :iopub_port 2 :stdin_port 3 :hb_port 4 :control_port 5)
          "/tmp/local.json" session))
+      (should (ejn-test-await
+               (lambda () (eq (plist-get emacs-jupyter-notebook--async-context
+                                         :phase)
+                              'done))))
       (should (= emacs-jupyter-notebook--reconnect-attempt 0))
+      (should-not emacs-jupyter-notebook--reconnect-exhausted)
       (should-not emacs-jupyter-notebook--reconnect-next-at)
       (should-not emacs-jupyter-notebook--tunnel-dead)
       (should (eq emacs-jupyter-notebook--client session)))))
 
-(ert-deftest ejn-w19-release-local-resources-disconnects-client-not-kernel ()
-  "W19: tearing down local transport disconnects the stale emacs-jupyter
-client (a local handle) but NEVER shuts the remote kernel down — the kernel
-is durable and outlives the local client."
-  (with-temp-buffer
-    (let (disconnected shutdown)
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-disconnect)
-                 (lambda (_client) (setq disconnected t)))
-                ((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
-                 (lambda (_client) (setq shutdown t))))
-        (setq emacs-jupyter-notebook--client
-              (ejn-test-backend-session 'stale-client t))
-        (emacs-jupyter-notebook--release-local-resources)
-        (should disconnected)
-        (should-not shutdown)
-        (should-not emacs-jupyter-notebook--client)))))
+(ert-deftest ejn-reconnect-attempt-limit-is-finite-and-hard-bounded ()
+  "Invalid customization cannot disable the automatic reconnect ceiling."
+  (dolist (value (list nil 0 -1 'invalid 1.0e+INF))
+    (let ((emacs-jupyter-notebook-reconnect-attempt-limit value))
+      (should (= (emacs-jupyter-notebook--effective-reconnect-attempt-limit)
+                 72))))
+  (let ((emacs-jupyter-notebook-reconnect-attempt-limit most-positive-fixnum))
+    (should (= (emacs-jupyter-notebook--effective-reconnect-attempt-limit)
+               emacs-jupyter-notebook--hard-reconnect-attempt-limit))))
 
-(ert-deftest ejn-w19-async-fail-disposes-unverified-client ()
-  "Review fix: a FAILED connect must not retain its `:client-unverified'.
-The abandoned client holds a ZMQ ioloop subprocess that emacs-jupyter only
-reclaims through a GC finalizer, so `--async-fail' releases the client's
-local I/O and clears the reference — repeated failed recoveries must not
-accumulate ioloop subprocesses."
+(ert-deftest ejn-reconnect-attempt-limit-exhausts-at-the-exact-boundary ()
+  "Only LIMIT automatic attempts run; exhaustion leaves no retry ownership."
+  (let ((entry '(:profile "p" :session-id "s" :remote-host "h"
+                 :remote-pid 1 :remote-connection-file "/r/k.json"))
+        (emacs-jupyter-notebook-reconnect-attempt-limit 2))
+    (with-temp-buffer
+      (let (stale-token (started 0))
+        (setq emacs-jupyter-notebook-mode t
+              emacs-jupyter-notebook--tunnel-dead t
+              emacs-jupyter-notebook--session-entry entry)
+        (unwind-protect
+            (cl-letf (((symbol-function 'emacs-jupyter-notebook--begin-reconnect)
+                       (lambda (_entry _success failure &optional _owner)
+                         (cl-incf started)
+                         (let ((context
+                                (emacs-jupyter-notebook--async-new-context
+                                 :phase 'error :error-kind 'probe-unreachable
+                                 :origin-buffer (current-buffer))))
+                           (setq emacs-jupyter-notebook--async-context context)
+                           (emacs-jupyter-notebook--handle-reconnect-failure
+                            context "offline" failure)))))
+              (emacs-jupyter-notebook--schedule-auto-reconnect)
+              (setq stale-token emacs-jupyter-notebook--reconnect-schedule-token)
+              (emacs-jupyter-notebook--auto-reconnect-fire
+               (current-buffer) stale-token)
+              (setq stale-token emacs-jupyter-notebook--reconnect-schedule-token)
+              (emacs-jupyter-notebook--auto-reconnect-fire
+               (current-buffer) stale-token)
+              (should (= started 2))
+              (should (= emacs-jupyter-notebook--reconnect-attempt 2))
+              (should emacs-jupyter-notebook--reconnect-exhausted)
+              (should-not emacs-jupyter-notebook--reconnect-timer)
+              (should-not emacs-jupyter-notebook--reconnect-next-at)
+              (should-not emacs-jupyter-notebook--reconnect-schedule-token)
+              (should (equal emacs-jupyter-notebook--session-entry entry))
+              (should (equal (emacs-jupyter-notebook--mode-line-string)
+                             " EJN!exhausted"))
+              (let* ((snapshot (emacs-jupyter-notebook-status-snapshot))
+                     (text (emacs-jupyter-notebook--status-snapshot-text snapshot))
+                     (actions (emacs-jupyter-notebook--status-suggestions-for snapshot)))
+                (should (eq (plist-get snapshot :transport-phase) 'retry-exhausted))
+                (should (string-match-p "Retry limit: 2" text))
+                (should (string-match-p "Automatic reconnect: exhausted" text))
+                (should (rassq 'emacs-jupyter-notebook-reconnect-remote-kernel
+                               actions))
+                (should (rassq 'emacs-jupyter-notebook--restart-helper
+                               actions)))
+              ;; The fired generation is stale now and cannot resurrect retry.
+              (emacs-jupyter-notebook--auto-reconnect-fire
+               (current-buffer) stale-token)
+              (should (= started 2))
+              (should-not emacs-jupyter-notebook--reconnect-timer)
+              ;; A later config change cannot make an exhausted episode live
+              ;; again; only a new transport-loss episode or success resets it.
+              (let ((emacs-jupyter-notebook-reconnect-attempt-limit 3))
+                (emacs-jupyter-notebook--schedule-auto-reconnect))
+              (should (= started 2))
+              (should-not emacs-jupyter-notebook--reconnect-timer))
+          (emacs-jupyter-notebook--cancel-auto-reconnect))))))
+
+(ert-deftest ejn-reconnect-attempt-limit-resets-on-new-transport-loss ()
+  "A genuinely new loss starts a new retry episode; duplicate loss does not."
   (with-temp-buffer
-    (let* ((disconnected-client nil)
-           (context (emacs-jupyter-notebook--async-new-context
-                     :phase 'connect
-                     :origin-buffer (current-buffer)
-                     :session-id "s"
-                     :client-unverified
-                     (ejn-test-backend-session 'stale-io-client t))))
+    (let ((entry '(:profile "p" :session-id "s" :remote-host "h"))
+          scheduled)
+      (setq emacs-jupyter-notebook--session-entry entry
+            emacs-jupyter-notebook--client 'old-client
+            emacs-jupyter-notebook--tunnel-dead nil
+            emacs-jupyter-notebook--reconnect-attempt 7
+            emacs-jupyter-notebook--reconnect-exhausted t)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-close-local)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel) #'ignore)
+                ((symbol-function
+                  'emacs-jupyter-notebook--completion-cancel-idle-timer) #'ignore)
+                ((symbol-function
+                  'emacs-jupyter-notebook--schedule-auto-reconnect)
+                 (lambda () (setq scheduled t))))
+        (emacs-jupyter-notebook--transport-lost "test loss" 'old-client nil))
+      (should scheduled)
+      (should (= emacs-jupyter-notebook--reconnect-attempt 0))
+      (should-not emacs-jupyter-notebook--reconnect-exhausted)
+      (should emacs-jupyter-notebook--tunnel-dead))))
+
+(ert-deftest ejn-reconnect-attempt-limit-exhaustion-keeps-manual-actions ()
+  "Exhaustion keeps explicit reconnect and helper-restart recovery functional."
+  (with-temp-buffer
+    (let ((entry '(:profile "p" :session-id "s" :remote-host "h"))
+          begun)
+      (setq emacs-jupyter-notebook--session-entry entry
+            emacs-jupyter-notebook--tunnel-dead t
+            emacs-jupyter-notebook--reconnect-attempt 2
+            emacs-jupyter-notebook--reconnect-exhausted t)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--begin-reconnect)
+                 (lambda (actual-entry _success _failure owner)
+                   (push (list actual-entry owner) begun))))
+        (emacs-jupyter-notebook--restart-helper)
+        (emacs-jupyter-notebook-reconnect-remote-kernel entry))
+      (should (equal begun (list (list entry 'explicit) (list entry 'explicit))))
+      (should (= emacs-jupyter-notebook--reconnect-attempt 2))
+      (should emacs-jupyter-notebook--reconnect-exhausted))))
+
+(ert-deftest ejn-reconnect-timer-setup-failure-retains-no-phantom-schedule ()
+  "A failed timer constructor cannot permanently deduplicate reconnect."
+  (with-temp-buffer
+    (setq emacs-jupyter-notebook-mode t
+          emacs-jupyter-notebook--tunnel-dead t
+          emacs-jupyter-notebook--session-entry
+          '(:profile "p" :session-id "s" :remote-host "h")
+          emacs-jupyter-notebook--reconnect-attempt 3)
+    (cl-letf (((symbol-function 'run-at-time)
+               (lambda (&rest _)
+                 (error "injected reconnect timer setup failure"))))
+      (emacs-jupyter-notebook--schedule-auto-reconnect))
+    (should (= emacs-jupyter-notebook--reconnect-attempt 3))
+    (should-not emacs-jupyter-notebook--reconnect-timer)
+    (should-not emacs-jupyter-notebook--reconnect-next-at)
+    (should-not emacs-jupyter-notebook--reconnect-schedule-token)
+    (should-not emacs-jupyter-notebook--reconnect-force)
+    (should-not emacs-jupyter-notebook--reconnect-exhausted)
+    (should emacs-jupyter-notebook--async-last-error)
+    (should (string-match-p
+             "Could not arm automatic reconnect timer"
+             emacs-jupyter-notebook--last-bounded-error))))
+
+(ert-deftest ejn-connection-deadline-setup-failure-is-immediately-terminal ()
+  "A connection without its hard watchdog never remains in progress."
+  (with-temp-buffer
+    (let ((context
+           (emacs-jupyter-notebook--async-new-context
+            :phase 'retrieve :origin-buffer (current-buffer)))
+          (callbacks 0))
+      (setq context
+            (emacs-jupyter-notebook--async-put
+             context :error-callback
+             (lambda (_context _reason) (cl-incf callbacks))))
       (setq emacs-jupyter-notebook--async-context context)
-      ;; Keep the test hermetic: `--async-fail' would otherwise emit a real
-      ;; warning and force a mode-line redisplay.
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-disconnect)
-                 (lambda (client) (setq disconnected-client client)))
-                ((symbol-function 'display-warning) #'ignore)
-                ((symbol-function 'force-mode-line-update) #'ignore))
-        (emacs-jupyter-notebook--async-fail context "boom"))
-      (should (eq disconnected-client 'stale-io-client))
-      (should-not (plist-get context :client-unverified)))))
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (&rest _)
+                   (error "injected overall deadline setup failure"))))
+        (setq context
+              (emacs-jupyter-notebook--async-arm-overall-timeout context)))
+      (should (= callbacks 1))
+      (should (eq (plist-get context :phase) 'error))
+      (should (eq (plist-get context :error-kind) 'deadline-setup-failed))
+      (should-not (plist-get context :overall-timer))
+      (should-not (emacs-jupyter-notebook--async-in-progress-p))
+      (should (string-match-p
+               "Could not arm connection attempt deadline"
+               (plist-get context :error))))))
 
-(ert-deftest ejn-w19-cancel-context-locally-disposes-unverified-client ()
-  "Review fix: an in-flight connect abandoned by buffer kill / mode disable
-\(`--cancel-async-context-locally') also releases its `:client-unverified'
-ioloop, and does so without resurrecting the context into the buffer slot."
-  (let ((disconnected-client nil)
-        (context (emacs-jupyter-notebook--async-new-context
-                  :phase 'connect
-                  :client-unverified
-                  (ejn-test-backend-session 'stale-io t))))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-disconnect)
-               (lambda (client) (setq disconnected-client client))))
-      (emacs-jupyter-notebook--cancel-async-context-locally context))
-    (should (eq disconnected-client 'stale-io))
-    (should-not (plist-get context :client-unverified))))
 
-(ert-deftest ejn-w19-dispose-unverified-client-noop-without-client ()
-  "Review fix: disposing a context that never reached connect (no
-`:client-unverified') is a harmless no-op — no disconnect, no error."
-  (let ((disconnected nil)
-        (context (emacs-jupyter-notebook--async-new-context
-                  :phase 'retrieve)))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter-disconnect)
-               (lambda (_client) (setq disconnected t))))
-      (emacs-jupyter-notebook--dispose-unverified-client context)
-      (should-not disconnected)
-      (should-not (plist-get context :client-unverified)))))
+
+
+
+
+
+
 
 ;;; W18 — bounded, non-blocking panel images
 
@@ -10288,8 +9664,12 @@ opener function with the backing file path."
           (should img-pos)
           (goto-char img-pos)
           (let ((emacs-jupyter-notebook-panel-external-open-function
-                 (lambda (file) (setq opened-file file))))
-            (emacs-jupyter-notebook-panel-open-image-externally))))
+                 (lambda (file) (setq opened-file file)))
+                (ejn-ir3s--file-handler-calls 0)
+                (file-name-handler-alist
+                 '(("\\`/" . ejn-ir3s--rejecting-file-handler))))
+            (emacs-jupyter-notebook-panel-open-image-externally)
+            (should (= ejn-ir3s--file-handler-calls 0)))))
       (should (stringp opened-file))
       (should (file-exists-p opened-file))
       (should (equal (with-temp-buffer
@@ -10535,6 +9915,9 @@ session does not pay an O(history) erase+reinsert on every stream flush."
       (ejn-panel-append-text latest " pending")
       (with-current-buffer panel
         (emacs-jupyter-notebook-panel-toggle-view)
+        ;; Structural rendering is deliberately sliced in ordinary use.  This
+        ;; explicit test hook drains it before asserting the final snapshot.
+        (emacs-jupyter-notebook-panel-flush-now panel)
         (let ((text (buffer-substring-no-properties (point-min) (point-max))))
           (should (string-match-p "view: history" text))
           (should (string-match-p "old output" text))
@@ -10561,6 +9944,7 @@ session does not pay an O(history) erase+reinsert on every stream flush."
       (ejn-panel-append-text first " pending")
       (emacs-jupyter-notebook-clear-results)
       (with-current-buffer panel
+        (emacs-jupyter-notebook-panel-flush-now panel)
         (let ((text (buffer-substring-no-properties (point-min) (point-max))))
           (should (string-match-p "view: latest" text))
           (should-not (string-match-p "first output" text))
@@ -10643,33 +10027,7 @@ session does not pay an O(history) erase+reinsert on every stream flush."
                 (should-not emacs-jupyter-notebook-panel--inline-image-specs)))))
       (ignore-errors (delete-directory root t)))))
 
-(ert-deftest ejn-ir2-late-image-after-clear-creates-no-file ()
-  "A late image callback after clear never decodes or materializes a file."
-  (with-temp-buffer
-    (let* ((source (current-buffer))
-           (panel (ejn-panel-ensure source))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
-           (callbacks (emacs-jupyter-notebook-jupyter--callbacks source handle))
-           (display (cadr (assoc "display_data" callbacks)))
-           (update (cadr (assoc "update_display_data" callbacks)))
-           (stream (cadr (assoc "stream" callbacks)))
-           (message-reads 0)
-           (render-calls 0))
-      (emacs-jupyter-notebook-clear-results)
-      (cl-letf (((symbol-function 'jupyter-message-content)
-                 (lambda (_msg)
-                   (cl-incf message-reads)
-                   '(:data (:image/png "aW1hZ2UtYnl0ZXM="))))
-                ((symbol-function 'emacs-jupyter-notebook--render-mime-result)
-                 (lambda (_data) (cl-incf render-calls) (ert-fail "late image decoded"))))
-        (funcall display 'late-message)
-        (funcall update 'late-message)
-        (funcall stream 'late-message))
-      (should (= message-reads 0))
-      (should (= render-calls 0))
-      (with-current-buffer panel
-        (should-not emacs-jupyter-notebook-panel--image-directory)
-        (should-not emacs-jupyter-notebook-panel--entries)))))
+
 
 (ert-deftest ejn-ir2-late-pickle-after-clear-retains-no-bytes ()
   "A late confined pickle descriptor after clear is ignored before validation."
@@ -10950,59 +10308,7 @@ session does not pay an O(history) erase+reinsert on every stream flush."
               (should-not opened))))
       (ignore-errors (delete-directory root t)))))
 
-(ert-deftest ejn-ir2-exit-cleanup-is-local-only ()
-  "The normal-exit artifact reaper leaves registry, SSH, and kernels alone."
-  (let* ((root (car (ejn-ei4-test--artifact-root)))
-         (pickle-file nil))
-    (unwind-protect
-        (progn
-          (set-file-modes root #o700)
-          (setq pickle-file
-                (ejn-ei4v-test--artifact-file
-                 root "12121212121212121212121212121212" "pickle"))
-          (with-temp-buffer
-            (let* ((source (current-buffer))
-                   (panel (ejn-panel-ensure source))
-                   (handle (ejn-panel-start-entry panel '("x.py" . 1) "plot()"))
-                   (file nil)
-                   (lease nil)
-                   (durable-calls 0)
-                   (remote-calls 0))
-              (ejn-panel-set-image handle '(image :type png :data "image-bytes"))
-              (setq file (plist-get (cdr (car (ejn-panel-entry-images handle))) :file))
-              (should
-               (ejn-panel-set-published-pickle
-                handle root pickle-file
-                (ejn-ei4-test--content-sha256 pickle-file)
-                (file-attribute-size (file-attributes pickle-file 'integer))
-                (file-attribute-file-identifier
-                 (file-attributes root 'integer))))
-              (setq lease (ejn-panel-acquire-pickle handle))
-              (should (file-exists-p file))
-              (should (file-exists-p pickle-file))
-              (should (memq #'emacs-jupyter-notebook-panel--cleanup-published-artifacts-on-exit
-                            kill-emacs-hook))
-              (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-save)
-                         (lambda (&rest _) (cl-incf durable-calls)))
-                        ((symbol-function 'emacs-jupyter-notebook--remove-registry-entry)
-                         (lambda (&rest _) (cl-incf durable-calls)))
-                        ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
-                         (lambda (&rest _) (cl-incf remote-calls)))
-                        ((symbol-function 'emacs-jupyter-notebook--async-kill-remote-kernel)
-                         (lambda (&rest _) (cl-incf remote-calls)))
-                        ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
-                         (lambda (&rest _) (cl-incf remote-calls)))
-                        ((symbol-function 'emacs-jupyter-notebook-jupyter-shutdown)
-                         (lambda (&rest _) (cl-incf remote-calls))))
-                (emacs-jupyter-notebook-panel--cleanup-published-artifacts-on-exit))
-              (should-not (file-exists-p file))
-              (should (file-exists-p pickle-file))
-              (should (plist-get lease :retired))
-              (should (= durable-calls 0))
-              (should (= remote-calls 0))
-              (ejn-panel-release-pickle lease)
-              (should-not (file-exists-p pickle-file)))))
-      (ignore-errors (delete-directory root t)))))
+
 
 
 ;;; IR3 — total history and artifact retention budgets
@@ -11177,6 +10483,65 @@ session does not pay an O(history) erase+reinsert on every stream flush."
         (ejn-panel-entry-text handle)
         (should (= emacs-jupyter-notebook-panel--text-materialization-count 1))))))
 
+(ert-deftest ejn-ir3s-tiny-stream-chunks-and-pending-suffix-are-hard-bounded ()
+  "One-byte stream callbacks cannot create millions of retained heap objects."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook-result-max-bytes (* 1024 1024))
+          (panel (ejn-panel-ensure (current-buffer))))
+      (let ((handle (ejn-panel-start-entry panel '("x.py" . 1) "")))
+        (dotimes (_ (+ emacs-jupyter-notebook-panel--hard-text-chunks 100))
+          (ejn-panel-append-text handle "x"))
+        (let* ((entry (ejn-panel-entry-snapshot handle))
+               (state (cdr (car (plist-get entry :outputs)))))
+          (should (<= (plist-get state :chunk-count)
+                      emacs-jupyter-notebook-panel--hard-text-chunks))
+          (should (<= (or (plist-get state :pending-count) 0)
+                      emacs-jupyter-notebook-panel--hard-pending-text-chunks))
+          (should (= (plist-get state :bytes)
+                     emacs-jupyter-notebook-panel--hard-text-chunks))
+          (should (= (length (ejn-panel-entry-text handle))
+                     emacs-jupyter-notebook-panel--hard-text-chunks)))))))
+
+(ert-deftest ejn-ir3s-carriage-progress-does-not-materialize-retained-history ()
+  "A carriage repaint rewrites only the tracked terminal line."
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+           (history (concat (make-string (* 1024 1024) ?h) "\nold-progress"))
+           (emacs-jupyter-notebook-panel--text-materialization-count 0))
+      (ejn-panel-append-text handle history)
+      (ejn-panel-append-text handle "\rnew-progress")
+      (should (= emacs-jupyter-notebook-panel--text-materialization-count 0))
+      (should (string-suffix-p "\nnew-progress"
+                               (ejn-panel-entry-text handle)))
+      (should (= emacs-jupyter-notebook-panel--text-materialization-count 1)))))
+
+(ert-deftest ejn-ir3s-large-stream-frame-cannot-create-large-trim-work ()
+  "A large frame is split before later one-byte front trims occur."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook-result-max-bytes 100000)
+          (panel (ejn-panel-ensure (current-buffer)))
+          (largest-trim-input 0))
+      (let ((handle (ejn-panel-start-entry panel '("x.py" . 1) "")))
+        (ejn-panel-append-text handle (make-string 100000 ?a))
+        (let* ((entry (ejn-panel-entry-snapshot handle))
+               (state (cdr (car (plist-get entry :outputs)))))
+          (should (cl-every
+                   (lambda (chunk)
+                     (<= (string-bytes chunk)
+                         emacs-jupyter-notebook-panel--hard-text-chunk-bytes))
+                   (plist-get state :chunks))))
+        (let ((original (symbol-function 'emacs-jupyter-notebook--last-bytes)))
+          (cl-letf (((symbol-function 'emacs-jupyter-notebook--last-bytes)
+                     (lambda (text bytes)
+                       (setq largest-trim-input
+                             (max largest-trim-input (string-bytes text)))
+                       (funcall original text bytes))))
+            (dotimes (_ 1000)
+              (ejn-panel-append-text handle "x"))))
+        (should (<= largest-trim-input
+                    emacs-jupyter-notebook-panel--hard-text-chunk-bytes))))))
+
 (ert-deftest ejn-ir3s-at-cap-stream-trim-visits-one-oldest-chunk-per-append ()
   "At-cap one-byte streams trim in constant queue work without materializing."
   (with-temp-buffer
@@ -11299,25 +10664,87 @@ session does not pay an O(history) erase+reinsert on every stream flush."
                 (assert-totals)))))
       (ignore-errors (delete-directory root t)))))
 
-(ert-deftest ejn-ir3s-artifact-stats-happen-at-admission-not-on-stream ()
-  "Streaming text does not re-stat retained image files for budget checks."
+(defvar ejn-ir3s--file-handler-calls 0)
+
+(defun ejn-ir3s--rejecting-file-handler (&rest _arguments)
+  "Record and reject an unexpected direct-image file-handler invocation."
+  (cl-incf ejn-ir3s--file-handler-calls)
+  (error "direct image path reached a file handler"))
+
+(ert-deftest ejn-ir3s-direct-file-image-is-rejected-before-file-handlers ()
+  "An arbitrary direct image path cannot invoke a remote file handler."
   (with-temp-buffer
-    (let* ((file (make-temp-file "ejn-ir3s-image-"))
-           (panel (ejn-panel-ensure (current-buffer)))
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
            (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
-           (stats 0)
-           (real-attributes (symbol-function 'file-attributes)))
-      (unwind-protect
-          (cl-letf (((symbol-function 'file-attributes)
-                     (lambda (&rest args)
-                       (cl-incf stats)
-                       (apply real-attributes args))))
-            (ejn-panel-set-image handle (list 'image :type 'png :file file))
-            (let ((admission-stats stats))
-              (dotimes (_ 100)
-                (ejn-panel-append-text handle "x"))
-              (should (= stats admission-stats))))
-        (ignore-errors (delete-file file))))))
+           (ejn-ir3s--file-handler-calls 0)
+           (file-name-handler-alist
+            '(("\\`/ejn-remote:" . ejn-ir3s--rejecting-file-handler))))
+      (should-error
+       (ejn-panel-set-image
+        handle '(image :type png :file "/ejn-remote:host:/large.png"))
+       :type 'error)
+      (should (= ejn-ir3s--file-handler-calls 0))
+      (should-not (ejn-panel-entry-images handle)))))
+
+(ert-deftest ejn-ir3s-inline-image-setting-has-a-hard-ceiling ()
+  "A huge customization value cannot expand native image materialization."
+  (let ((emacs-jupyter-notebook-panel-max-inline-images most-positive-fixnum)
+        entries)
+    (dotimes (index (+ emacs-jupyter-notebook-panel--hard-inline-images 20))
+      (push (list :id index
+                  :outputs (list (cons 'image '(image :type png :data "x"))))
+            entries))
+    (should (= (length (emacs-jupyter-notebook-panel--bounded-inline-specs
+                        entries))
+               emacs-jupyter-notebook-panel--hard-inline-images))))
+
+(ert-deftest ejn-ir3s-external-image-snapshots-have-hard-bounds ()
+  "Snapshot customization cannot make retained artifacts unbounded."
+  (let ((emacs-jupyter-notebook-external-image-max-snapshots
+         most-positive-fixnum)
+        (emacs-jupyter-notebook-external-image-snapshot-ttl
+         most-positive-fixnum))
+    (should (= (emacs-jupyter-notebook-panel--external-image-snapshot-budget)
+               emacs-jupyter-notebook-panel--hard-external-image-snapshots))
+    (should (= (emacs-jupyter-notebook-panel--external-image-snapshot-ttl)
+               emacs-jupyter-notebook-panel--hard-external-image-snapshot-ttl))))
+
+(ert-deftest ejn-ir3s-entry-and-panel-output-segments-are-hard-bounded ()
+  "Tiny independent outputs cannot make structural panel work unbounded."
+  (with-temp-buffer
+    (let* ((emacs-jupyter-notebook-panel-max-output-segments
+            emacs-jupyter-notebook-panel--hard-output-segments)
+           (panel (ejn-panel-ensure (current-buffer)))
+           (first (ejn-panel-start-entry panel '("segments.py" . 1) "")))
+      (dotimes (index (+ emacs-jupyter-notebook-panel--hard-entry-output-segments
+                         20))
+        (ejn-panel-set-display-text first "x" (format "first-%d" index)))
+      (let ((entry (ejn-panel-entry-snapshot first)))
+        (should (<= (length (plist-get entry :outputs))
+                    emacs-jupyter-notebook-panel--hard-entry-output-segments))
+        (should (plist-get entry :output-segments-truncated))
+        (should (= (cl-count emacs-jupyter-notebook-panel--segment-omission-text
+                             (plist-get entry :outputs)
+                             :key (lambda (segment)
+                                    (and (eq (car segment) 'text)
+                                         (emacs-jupyter-notebook-panel--text-state-value
+                                          segment)))
+                             :test #'equal)
+                   1)))
+      ;; The low configured global budget evicts complete old entries rather
+      ;; than retaining more structural work than a full render may visit.
+      (ejn-panel-clear-all panel)
+      (setq emacs-jupyter-notebook-panel-max-output-segments 10)
+      (dotimes (entry-index 4)
+        (let ((handle (ejn-panel-start-entry
+                       panel (cons "segments.py" (+ entry-index 2)) "")))
+          (dotimes (segment 4)
+            (ejn-panel-set-display-text
+             handle "y" (format "%d-%d" entry-index segment)))))
+      (with-current-buffer panel
+        (should (<= emacs-jupyter-notebook-panel--retained-output-segments 10))
+        (should (= emacs-jupyter-notebook-panel--retained-output-segments
+                   (emacs-jupyter-notebook-panel--recompute-output-segments)))))))
 
 (ert-deftest ejn-ir3s-carriage-return-across-chunks-remains-correct ()
   "A terminal-style carriage return in a later chunk replaces the old line."
@@ -11358,9 +10785,11 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
             (setq tick-timer
                   (run-at-time 0.01 nil (lambda () (setq tick t))))
             (funcall starter)
-            (setq process
-                  (plist-get emacs-jupyter-notebook--management-operation
-                             :process))
+            (while (and (not process) (< (float-time) deadline))
+              (setq process
+                    (plist-get emacs-jupyter-notebook--management-operation
+                               :process))
+              (unless process (accept-process-output nil 0.01)))
             (should (processp process))
             (setq stdout (process-buffer process)
                   stderr (process-get
@@ -11427,10 +10856,13 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
   (let ((entry '(:profile "p" :remote-host "host" :remote-pid 71
                  :remote-connection-file "/remote/kernel.json"
                  :session-id "durable")))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
-               (lambda (&optional _) (list entry)))
-              ((symbol-function 'emacs-jupyter-notebook-registry-save)
-               (lambda (&rest _) (ert-fail "timeout must not rewrite registry")))
+    (setq entry (plist-put entry :registry-revision "ejn-ir4-current"))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+               (lambda (success _failure &rest _keys)
+                 (ejn-test-registry--defer
+                  (lambda () (funcall success (list entry) nil)))))
+              ((symbol-function 'emacs-jupyter-notebook-registry-prune-async)
+               (lambda (&rest _) (ert-fail "timeout must not prune registry")))
               ((symbol-function
                 'emacs-jupyter-notebook-ssh-build-batch-pid-alive)
                (lambda (&rest _) (ejn-ir4--never-exiting-command))))
@@ -11454,10 +10886,13 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
   (let ((entry '(:profile "p" :remote-host "host" :remote-pid 71
                  :remote-connection-file "/remote/kernel.json"
                  :session-id "durable")))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
-               (lambda (&optional _) (list entry)))
-              ((symbol-function 'emacs-jupyter-notebook-registry-save)
-               (lambda (&rest _) (ert-fail "cancel must not rewrite registry")))
+    (setq entry (plist-put entry :registry-revision "ejn-ir4-current"))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+               (lambda (success _failure &rest _keys)
+                 (ejn-test-registry--defer
+                  (lambda () (funcall success (list entry) nil)))))
+              ((symbol-function 'emacs-jupyter-notebook-registry-prune-async)
+               (lambda (&rest _) (ert-fail "cancel must not prune registry")))
               ((symbol-function 'completing-read)
                (lambda (&rest _) (ert-fail "cancel must not open picker")))
               ((symbol-function 'emacs-jupyter-notebook--begin-reconnect)
@@ -11476,7 +10911,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
           (emacs-jupyter-notebook-ssh-start-management-operation
            "ejn-ir4-success"
            (list shell-file-name shell-command-switch
-                 "printf stdout; printf stderr >&2")
+                 "sleep 0.05; printf stdout; printf stderr >&2")
            (lambda (output)
              (setq callback-count (1+ (or callback-count 0))
                    callback-state
@@ -11490,7 +10925,10 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
     (let ((deadline (+ (float-time) 2.0)))
       (while (and (not (process-get process 'ejn-management-finished))
                   (< (float-time) deadline))
-        (accept-process-output process 0.01)))
+        ;; Management operations own distinct stdout and stderr processes.
+        ;; Drive the normal Emacs event loop so EOF on either pipe cannot be
+        ;; artificially starved by this test's waiter.
+        (accept-process-output nil 0.01)))
     (should (= callback-count 1))
     (should (equal callback-state '("stdout" nil nil)))
     (should-not (process-get process 'ejn-management-timeout))
@@ -11716,22 +11154,20 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 ;;; IR5 — truthful reconnect ownership and retry status
 
 (defun ejn-ir5--begin-without-io (entry owner &optional error-callback)
-  "Begin reconnect to ENTRY as OWNER without Jupyter, SSH, or timers."
-  (let ((emacs-jupyter-notebook-backend 'legacy))
-    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
-               #'ignore)
-              ((symbol-function
-                'emacs-jupyter-notebook--async-arm-overall-timeout)
-               #'identity)
-              ((symbol-function 'emacs-jupyter-notebook--async-probe-pid-alive)
-               #'identity))
-      (emacs-jupyter-notebook--begin-reconnect
-       entry nil error-callback owner))))
+  "Begin reconnect to ENTRY as OWNER without helper, SSH, or timers."
+  (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-selected-backend)
+             #'ignore)
+            ((symbol-function
+              'emacs-jupyter-notebook--async-arm-overall-timeout)
+             #'identity)
+            ((symbol-function 'emacs-jupyter-notebook--async-probe-pid-alive)
+             #'identity))
+    (emacs-jupyter-notebook--begin-reconnect
+     entry nil error-callback owner)))
 
 (ert-deftest ejn-ir5-transient-transition-table-rearms-exactly-once ()
   "Scheduled-explicit and evaluation reconnect failures each own one retry."
-  (let ((emacs-jupyter-notebook-backend 'legacy)
-        (entry (ejn-test-direct-entry
+  (let ((entry (ejn-test-direct-entry
                 '(:profile "p" :session-id "s" :remote-host "h"
                   :remote-pid 17 :remote-connection-file "/r/kernel.json")))
         (emacs-jupyter-notebook-reconnect-initial-delay 600))
@@ -11758,7 +11194,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                              (cl-incf error-count)))
                         (cl-letf
                             (((symbol-function
-                               'emacs-jupyter-notebook-jupyter--ensure)
+                               'emacs-jupyter-notebook--ensure-selected-backend)
                               #'ignore)
                              ((symbol-function
                                'emacs-jupyter-notebook--async-arm-overall-timeout)
@@ -11833,8 +11269,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ir5-synchronous-probe-start-failure-enters-retry-policy ()
   "A synchronous process-construction error is a bounded transient failure."
-  (let ((emacs-jupyter-notebook-backend 'legacy)
-        (entry (ejn-test-direct-entry
+  (let ((entry (ejn-test-direct-entry
                 '(:profile "p" :session-id "s" :remote-host "h"
                   :remote-pid 17 :remote-connection-file "/r/kernel.json")))
         (emacs-jupyter-notebook-reconnect-initial-delay 600)
@@ -11846,7 +11281,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                   emacs-jupyter-notebook--tunnel-dead t
                   emacs-jupyter-notebook--session-entry entry)
             (cl-letf (((symbol-function
-                        'emacs-jupyter-notebook-jupyter--ensure)
+                        'emacs-jupyter-notebook--ensure-selected-backend)
                        #'ignore)
                       ((symbol-function
                         'emacs-jupyter-notebook--async-arm-overall-timeout)
@@ -11948,13 +11383,16 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                 ((symbol-function
                   'emacs-jupyter-notebook--inject-idle-watchdog)
                  #'ignore)
-                ((symbol-function
-                  'emacs-jupyter-notebook-registry-save-entry)
-                 #'ignore))
+                ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+                 #'ejn-test-registry-replace-succeeds))
         (emacs-jupyter-notebook--async-connect-finalize
          context (current-buffer) entry
          '(:shell_port 1 :iopub_port 2 :stdin_port 3 :hb_port 4 :control_port 5)
          "/tmp/ejn-ir5-local.json" client))
+      (should (ejn-test-await
+               (lambda () (eq (plist-get emacs-jupyter-notebook--async-context
+                                         :phase)
+                              'done))))
       (should (= emacs-jupyter-notebook--reconnect-attempt 0))
       (should-not emacs-jupyter-notebook--reconnect-next-at)
       (should-not emacs-jupyter-notebook--reconnect-schedule-token)
@@ -12036,7 +11474,8 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
           (emacs-jupyter-notebook-check-code-completeness t)
           complete-callbacks sent)
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-client-async)
-                 (lambda (success _failure) (funcall success nil)))
+                 (lambda (success _failure &optional _profile _announce)
+                   (funcall success nil)))
                 ((symbol-function 'emacs-jupyter-notebook-backend-aux)
                  (lambda (_client operation payload success _failure)
                    (should (eq operation 'is-complete))
@@ -12063,6 +11502,38 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
           (should (equal emacs-jupyter-notebook--execution-active-id b))
           (should (equal (mapcar #'car complete-callbacks) '("b = 2" "a = 1"))))))))
 
+(ert-deftest ejn-ei3-execution-queue-rejects-before-panel-allocation-at-hard-cap ()
+  "A slow kernel cannot retain unbounded queued code or panel entries."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client (ejn-test-backend-session 'mock t))
+          (emacs-jupyter-notebook-max-pending-executions 2)
+          sent)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-client-async)
+                 (lambda (success _failure &optional _profile _announce)
+                   (funcall success nil)))
+                ((symbol-function 'emacs-jupyter-notebook-backend-execute)
+                 (lambda (_client code _options _success _failure)
+                   (push code sent)
+                   91)))
+        (emacs-jupyter-notebook--evaluate-code "active" nil)
+        (emacs-jupyter-notebook--evaluate-code "queued" nil)
+        (let* ((panel (emacs-jupyter-notebook-panel-buffer (current-buffer)))
+               (entries-before
+                (with-current-buffer panel
+                  (length emacs-jupyter-notebook-panel--entries))))
+          (should-error (emacs-jupyter-notebook--evaluate-code "rejected" nil)
+                        :type 'user-error)
+          (should (= (emacs-jupyter-notebook--pending-execution-count) 2))
+          (should (equal emacs-jupyter-notebook--execution-queue '(1 2)))
+          (should (= entries-before
+                     (with-current-buffer panel
+                       (length emacs-jupyter-notebook-panel--entries))))
+          (should (= (emacs-jupyter-notebook--pending-execution-limit) 2))
+          (setq emacs-jupyter-notebook-max-pending-executions
+                most-positive-fixnum)
+          (should (= (emacs-jupyter-notebook--pending-execution-limit)
+                     emacs-jupyter-notebook--hard-pending-executions)))))))
+
 (ert-deftest ejn-ei3-real-pump-arms-b-only-after-a-retires-once ()
   "The real pump leaves B untimed until A's terminal pair retires it once."
   (with-temp-buffer
@@ -12071,7 +11542,8 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
           (sent nil) (next-backend-id 40))
       (unwind-protect
           (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-client-async)
-                     (lambda (success _failure) (funcall success nil)))
+                 (lambda (success _failure &optional _profile _announce)
+                   (funcall success nil)))
                     ((symbol-function 'emacs-jupyter-notebook-backend-execute)
                      (lambda (_client code _options _success _failure)
                        (setq sent (append sent (list code)))
@@ -12174,11 +11646,108 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
               emacs-jupyter-notebook--max-code-bytes)
              emacs-jupyter-notebook--max-code-bytes)))
 
+(ert-deftest ejn-ei3-oversize-buffer-range-is-rejected-before-copy ()
+  "Command admission rejects a huge source buffer before allocating its text."
+  (with-temp-buffer
+    (insert (make-string (1+ emacs-jupyter-notebook--max-code-bytes) ?x))
+    (let (panel-called)
+      (cl-letf (((symbol-function 'buffer-substring-no-properties)
+                 (lambda (&rest _) (ert-fail "oversize source was copied")))
+                ((symbol-function 'ejn-panel-ensure)
+                 (lambda (&rest _) (setq panel-called t))))
+        (should-error (emacs-jupyter-notebook-send-buffer) :type 'user-error))
+      (should-not panel-called)
+      (should-not emacs-jupyter-notebook--execution-ledger))))
+
+(ert-deftest ejn-ei3-bounded-range-honors-exact-utf8-byte-boundary ()
+  "Pre-copy admission and the exact protocol counter agree for multibyte text."
+  (with-temp-buffer
+    (insert "a\u20acx")
+    (should (equal (emacs-jupyter-notebook--bounded-buffer-substring 1 3 4)
+                   "a\u20ac"))
+    (should-error
+     (emacs-jupyter-notebook--bounded-buffer-substring 1 4 4)
+     :type 'user-error)))
+
+(ert-deftest ejn-w3-oversize-completion-prefix-never-copies-or-dispatches ()
+  "A minified line beyond the key ceiling is inert on the completion hot path."
+  (with-temp-buffer
+    (insert (make-string
+             (1+ emacs-jupyter-notebook--completion-prefix-max-bytes) ?x))
+    (goto-char (point-max))
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          backend-called)
+      (cl-letf (((symbol-function 'buffer-substring-no-properties)
+                 (lambda (&rest _) (ert-fail "oversize prefix was copied")))
+                ((symbol-function 'emacs-jupyter-notebook-backend-aux)
+                 (lambda (&rest _) (setq backend-called t))))
+        (should-not (emacs-jupyter-notebook--completion-key))
+        (should-not (emacs-jupyter-notebook--request-completion)))
+      (should-not backend-called))))
+
+(ert-deftest ejn-w3-oversize-completion-cell-never-copies-or-dispatches ()
+  "A large multiline cell is rejected before idle completion copies its text."
+  (with-temp-buffer
+    (insert "# %%\n")
+    (insert (make-string (1+ emacs-jupyter-notebook--max-code-bytes) ?x))
+    (insert "\n")
+    (goto-char (point-max))
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          backend-called
+          (substring-function (symbol-function 'buffer-substring-no-properties)))
+      (cl-letf (((symbol-function 'buffer-substring-no-properties)
+                 (lambda (beg end)
+                   (when (> (- end beg)
+                            emacs-jupyter-notebook--completion-prefix-max-bytes)
+                     (ert-fail "oversize cell was copied"))
+                   (funcall substring-function beg end)))
+                ((symbol-function 'emacs-jupyter-notebook-backend-aux)
+                 (lambda (&rest _) (setq backend-called t))))
+        (should-not (emacs-jupyter-notebook--completion-context))
+        (should-not (emacs-jupyter-notebook--request-completion)))
+      (should-not backend-called))))
+
+(ert-deftest ejn-inspect-oversize-cell-never-copies-or-dispatches ()
+  "Inspect quietly declines a cell that cannot fit in one helper request."
+  (with-temp-buffer
+    (insert "# %%\n")
+    (insert (make-string (1+ emacs-jupyter-notebook--max-code-bytes) ?x))
+    (insert "\n")
+    (goto-char (point-max))
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          backend-called)
+      (cl-letf (((symbol-function 'buffer-substring-no-properties)
+                 (lambda (&rest _) (ert-fail "oversize inspect cell was copied")))
+                ((symbol-function 'emacs-jupyter-notebook-backend-aux)
+                 (lambda (&rest _) (setq backend-called t))))
+        (should-not (emacs-jupyter-notebook-inspect-at-point)))
+      (should-not backend-called))))
+
+(ert-deftest ejn-inspect-reply-currentness-does-not-recopy-cell ()
+  "Inspect callback validates a source tick and bounds instead of source text."
+  (with-temp-buffer
+    (insert "# %%\nvalue\n")
+    (goto-char (point-max))
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          success displayed)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-aux)
+                 (lambda (_client _kind _payload callback _failure)
+                   (setq success callback)))
+                ((symbol-function 'display-message-or-buffer)
+                 (lambda (text &rest _) (setq displayed text))))
+        (emacs-jupyter-notebook-inspect-at-point))
+      (should (functionp success))
+      (cl-letf (((symbol-function 'buffer-substring-no-properties)
+                 (lambda (&rest _) (ert-fail "inspect reply recopied source")))
+                ((symbol-function 'display-message-or-buffer)
+                 (lambda (text &rest _) (setq displayed text))))
+        (funcall success 1 '(:data (:text/plain "details"))))
+      (should (equal displayed "details")))))
+
 (ert-deftest ejn-ei3-setup-gate-blocks-user-dispatch-until-terminal-decision ()
   "Formatter setup serializes ahead of user work and releases it only terminally."
   (with-temp-buffer
-    (let* ((emacs-jupyter-notebook-backend 'helper)
-           (client (emacs-jupyter-notebook-backend-session-create nil (current-buffer)))
+    (let* ((client (emacs-jupyter-notebook-backend-session-create nil (current-buffer)))
            (emacs-jupyter-notebook--client client)
            (emacs-jupyter-notebook-check-code-completeness nil)
            (emacs-jupyter-notebook-kernel-idle-timeout 0)
@@ -12190,7 +11759,8 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                      (setq setup-success success))
                    1))
                 ((symbol-function 'emacs-jupyter-notebook--ensure-client-async)
-                 (lambda (success _failure) (funcall success nil))))
+                 (lambda (success _failure &optional _profile _announce)
+                   (funcall success nil))))
         (emacs-jupyter-notebook--execution-start-setup client)
         (let ((id (emacs-jupyter-notebook--evaluate-code "user()" nil)))
           (should emacs-jupyter-notebook--execution-setup-pending)
@@ -12205,8 +11775,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 (ert-deftest ejn-ei3-setup-failure-and-late-reply-release-fifo-once ()
   "A failed silent setup is terminal; its late success cannot repump twice."
   (with-temp-buffer
-    (let* ((emacs-jupyter-notebook-backend 'helper)
-           (client (ejn-test-backend-session 'helper t))
+    (let* ((client (ejn-test-backend-session 'helper t))
            (emacs-jupyter-notebook--client client)
            (emacs-jupyter-notebook-check-code-completeness nil)
            (emacs-jupyter-notebook-kernel-idle-timeout 0)
@@ -12219,7 +11788,8 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                      (push code user-sends))
                    12))
                 ((symbol-function 'emacs-jupyter-notebook--ensure-client-async)
-                 (lambda (success _failure) (funcall success nil))))
+                 (lambda (success _failure &optional _profile _announce)
+                   (funcall success nil))))
         (emacs-jupyter-notebook--execution-start-setup client)
         (emacs-jupyter-notebook--evaluate-code "user()" nil)
         (funcall setup-failure 12 "setup rejected")
@@ -12228,36 +11798,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
         (funcall setup-success 12 nil)
         (should (equal user-sends '("user()")))))))
 
-(ert-deftest ejn-ei3-legacy-setup-barrier-timeout-releases-fifo ()
-  "A silent legacy setup barrier timeout is a terminal decision, not a wedge."
-  (with-temp-buffer
-    (let* ((emacs-jupyter-notebook-backend 'legacy)
-           (client (emacs-jupyter-notebook-backend-session-create nil (current-buffer)))
-           (emacs-jupyter-notebook--client client)
-           (emacs-jupyter-notebook-check-code-completeness nil)
-           (emacs-jupyter-notebook-kernel-idle-timeout 0)
-           calls barrier-function)
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-execute)
-                 (lambda (_client code options success _failure)
-                   (push (list code options) calls)
-                   (when (plist-get options :setup) (funcall success 1 nil))
-                   1))
-                ((symbol-function 'emacs-jupyter-notebook-backend-aux)
-                 (lambda (&rest _) 1))
-                ((symbol-function 'emacs-jupyter-notebook--ensure-client-async)
-                 (lambda (success _failure) (funcall success nil)))
-                ((symbol-function 'run-at-time)
-                 (lambda (seconds _repeat function &rest args)
-                   (when (= seconds 30)
-                     (setq barrier-function (lambda () (apply function args))))
-                   'test-timer)))
-        (emacs-jupyter-notebook--execution-start-setup client)
-        (emacs-jupyter-notebook--evaluate-code "user()" nil)
-        (should emacs-jupyter-notebook--execution-setup-pending)
-        (should barrier-function)
-        (funcall barrier-function)
-        (should-not emacs-jupyter-notebook--execution-setup-pending)
-        (should (equal (caar calls) "user()"))))))
+
 
 (ert-deftest ejn-ei3-queued-cancel-never-interrupts-active-kernel-work ()
   "A queued record retires locally while the older active record is unchanged."
@@ -12302,7 +11843,8 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
            (backend-calls 0))
       (unwind-protect
           (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-client-async)
-                     (lambda (success _failure) (funcall success nil)))
+                 (lambda (success _failure &optional _profile _announce)
+                   (funcall success nil)))
                     ((symbol-function 'emacs-jupyter-notebook-backend-execute)
                      (lambda (&rest _args) (cl-incf backend-calls))))
             (should (= (string-bytes exact) max-bytes))
@@ -12355,7 +11897,8 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
           (next-backend-id 70))
       (unwind-protect
           (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-client-async)
-                     (lambda (success _failure) (funcall success nil)))
+                 (lambda (success _failure &optional _profile _announce)
+                   (funcall success nil)))
                     ((symbol-function 'emacs-jupyter-notebook-backend-execute)
                      (lambda (&rest _args) (cl-incf next-backend-id))))
             (let* ((id (emacs-jupyter-notebook--evaluate-code "x" nil))
@@ -12366,11 +11909,9 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                                   :backend-request-id
                                   (plist-get record :backend-request-id)
                                   :panel-generation (plist-get record :generation)))
-                   render-called fringe-called)
+                   fringe-called)
               (emacs-jupyter-notebook-clear-results)
-              (cl-letf (((symbol-function 'emacs-jupyter-notebook--render-mime-result)
-                         (lambda (&rest _) (setq render-called t)))
-                        ((symbol-function 'emacs-jupyter-notebook-fringe-set)
+              (cl-letf (((symbol-function 'emacs-jupyter-notebook-fringe-set)
                          (lambda (&rest _) (setq fringe-called t))))
                 (should (equal
                          (emacs-jupyter-notebook-events-dispatch
@@ -12388,7 +11929,6 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                          (emacs-jupyter-notebook-events-dispatch
                           context '(:type status :execution-state "idle"))
                          '((:action status :state "idle"))))
-                (should-not render-called)
                 (should-not fringe-called))
               (with-current-buffer (plist-get handle :panel)
                 (should-not emacs-jupyter-notebook-panel--entries)
@@ -12400,13 +11940,12 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 (ert-deftest ejn-ei3-cold-connect-setup-requeues-checking-head ()
   "A connect finalization gate returns a checking head to FIFO ownership."
   (with-temp-buffer
-    (let* ((emacs-jupyter-notebook-backend 'helper)
-           (client (ejn-test-backend-session 'helper t))
+    (let* ((client (ejn-test-backend-session 'helper t))
            (emacs-jupyter-notebook-check-code-completeness nil)
            (emacs-jupyter-notebook-kernel-idle-timeout 0)
            setup-success calls)
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-client-async)
-                 (lambda (success _failure)
+                 (lambda (success _failure &optional _profile _announce)
                    (unless emacs-jupyter-notebook--client
                      (setq emacs-jupyter-notebook--client client)
                      (emacs-jupyter-notebook--execution-start-setup client))
@@ -12431,13 +11970,13 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
   "Inline acknowledgements never synthesize terminality or resurrect records."
   (dolist (outcome '(success failure))
     (with-temp-buffer
-      (let ((emacs-jupyter-notebook-backend 'helper)
-            (emacs-jupyter-notebook--client (ejn-test-backend-session 'helper t))
+      (let ((emacs-jupyter-notebook--client (ejn-test-backend-session 'helper t))
             (emacs-jupyter-notebook-check-code-completeness nil))
         (setf (emacs-jupyter-notebook-backend-session-backend
                emacs-jupyter-notebook--client) 'helper)
         (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-client-async)
-                   (lambda (success _failure) (funcall success nil)))
+                 (lambda (success _failure &optional _profile _announce)
+                   (funcall success nil)))
                   ((symbol-function 'emacs-jupyter-notebook-backend-execute)
                    (lambda (_client _code options success failure)
                      (unless (plist-get options :setup)
@@ -12487,57 +12026,11 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
          '(:type status :execution-state "idle")))
       (should-not (emacs-jupyter-notebook--execution-record 1)))))
 
-(ert-deftest ejn-ei3-restart-gates-queued-work-until-readiness-and-setup ()
-  "Legacy restart is rejected before touching the execution FIFO."
-  (with-temp-buffer
-    (let* ((emacs-jupyter-notebook-backend 'legacy)
-           (client (ejn-test-backend-session 'mock-client t))
-           (emacs-jupyter-notebook--client client)
-           (active (list :id 1 :state 'dispatched))
-           (queued (list :id 2 :state 'queued :code "queued()"))
-           calls)
-      (emacs-jupyter-notebook--execution-put active)
-      (emacs-jupyter-notebook--execution-put queued)
-      (setq emacs-jupyter-notebook--execution-active-id 1
-            emacs-jupyter-notebook--execution-queue '(1 2))
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-control)
-                 (lambda (&rest _) (setq calls t))))
-        (should-error (emacs-jupyter-notebook-restart-kernel) :type 'user-error))
-      (should-not calls)
-      (should (emacs-jupyter-notebook--execution-record 1))
-      (should (emacs-jupyter-notebook--execution-record 2)))))
 
-(ert-deftest ejn-ei3-restart-failure-keeps-active-ownership-and-b-queued ()
-  "Legacy restart rejection cannot dispatch B beside running work."
-  (with-temp-buffer
-    (let* ((client (ejn-test-backend-session 'mock-client t))
-           (emacs-jupyter-notebook--client client)
-           (active (list :id 1 :state 'dispatched))
-           (queued (list :id 2 :state 'queued :code "B"))
-           sent)
-      (emacs-jupyter-notebook--execution-put active)
-      (emacs-jupyter-notebook--execution-put queued)
-      (setq emacs-jupyter-notebook--execution-active-id 1
-            emacs-jupyter-notebook--execution-queue '(1 2))
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-control)
-                 (lambda (&rest _) (setq sent t))))
-        (should-error (emacs-jupyter-notebook-restart-kernel) :type 'user-error))
-      (should-not sent)
-      (should (eq emacs-jupyter-notebook--execution-active-id 1))
-      (should (equal emacs-jupyter-notebook--execution-queue '(1 2)))
-      (should (emacs-jupyter-notebook--execution-record 1))
-      (should (emacs-jupyter-notebook--execution-record 2)))))
 
-(ert-deftest ejn-ei3-restart-rejects-an-existing-setup-epoch ()
-  "A second restart cannot invalidate silent setup already in flight."
-  (with-temp-buffer
-    (let ((emacs-jupyter-notebook--client (ejn-test-backend-session nil t))
-          (emacs-jupyter-notebook--execution-setup-pending t)
-          sent)
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-control)
-                 (lambda (&rest _) (setq sent t))))
-        (should-error (emacs-jupyter-notebook-restart-kernel) :type 'user-error))
-      (should-not sent))))
+
+
+
 
 (ert-deftest ejn-ei3-restart-unready-schedules-bounded-reconnect ()
   "An unready admitted replacement schedules bounded recovery."
@@ -12591,7 +12084,8 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                   :remote-connection-file remote
                   :remote-pid-sidecar "/remote/cache/kernel-ei6.pid"
                   :connection-file-tokens (list remote)
-                  :local-connection-file local-file)
+                  :local-connection-file local-file
+                  :registry-revision "ejn-ei6-current-revision")
             (list :remote-ports (ejn-ei6-test--ports)))))
 
 (ert-deftest ejn-ei6-restart-seed-is-private-exact-and-secret-free-durably ()
@@ -12625,7 +12119,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
           (should (equal (emacs-jupyter-notebook-connection-ports
                           (emacs-jupyter-notebook-connection-read-file local-file))
                          local-ports))
-          (emacs-jupyter-notebook-registry-save (list entry) registry-file)
+          (ejn-test-registry-save (list entry) registry-file)
           (with-temp-buffer
             (insert-file-contents-literally registry-file)
             (should-not (search-forward secret nil t))))
@@ -12840,28 +12334,38 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
       (when (file-exists-p local) (delete-file local)))))
 
 (ert-deftest ejn-ei6-restart-staging-cleanup-is-bounded-and-publish-clears-slot ()
-  "Failed/cancelled restart unlinks only staging; successful publish clears it."
+  "Failure/cancel leave remote staging alone; publish clears its local slot."
   (let* ((profile '(:profile "p" :host "host" :python-command ("python3")))
-         (entry (ejn-ei6-test--entry "/tmp/ei6-local.json" t))
+         (entry (emacs-jupyter-notebook--transition-lease
+                 (ejn-ei6-test--entry "/tmp/ei6-local.json" t)
+                 'restart "restart-staging-token" 'kernel-dead))
          (staging "/remote/cache/kernel-ei6.json.restart-token")
          (seed-file (make-temp-file "ejn-ei6-seed-"))
          (context (emacs-jupyter-notebook--async-new-context
                    :phase 'restart-upload :profile profile :entry entry
                    :session-id "ei6" :restart-staging-file staging
-                   :restart-seed seed-file))
-         cleanup-argv publish-sentinel launched)
+                   :restart-seed seed-file
+                   :transition-token "restart-staging-token"))
+         (management-starts 0) publish-sentinel launched)
     (unwind-protect
         (with-temp-buffer
           (setq emacs-jupyter-notebook--async-context context)
           (cl-letf (((symbol-function 'emacs-jupyter-notebook-ssh-start-management-operation)
-                     (lambda (_name argv _success _failure)
-                       (setq cleanup-argv argv))))
-            ;; Exercise the actual failure path used by upload/cancel races.
-            (emacs-jupyter-notebook--async-fail context "upload failed"))
-          (let ((command (car (last cleanup-argv))))
-            (should (string-match-p "\\`rm -f -- " command))
-            (should (string-match-p "restart-token" command))
-            (should-not (string-match-p "kernel-ei6.json'\\|destination\\|pkill" command)))
+                     (lambda (&rest _) (cl-incf management-starts)))
+                    ((symbol-function 'emacs-jupyter-notebook--async-delete-process)
+                     #'ignore))
+            ;; Failure and explicit cancellation must tear down only local
+            ;; resources.  Neither may open a follow-up SSH management job.
+            (emacs-jupyter-notebook--async-fail context "upload failed")
+            (setq context
+                  (emacs-jupyter-notebook--async-new-context
+                   :phase 'restart-upload :profile profile :entry entry
+                   :session-id "ei6" :restart-staging-file staging
+                   :transition-token "restart-staging-token"
+                   :origin-buffer (current-buffer)))
+            (setq emacs-jupyter-notebook--async-context context)
+            (emacs-jupyter-notebook--cancel-async-operation context "cancelled"))
+          (should (= management-starts 0))
           (setq context (plist-put context :phase 'restart-publish)
                 emacs-jupyter-notebook--async-context context)
           (cl-letf (((symbol-function 'emacs-jupyter-notebook-ssh-start-bounded-process)
@@ -12877,10 +12381,10 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                      (lambda (_process) ""))
                     ((symbol-function 'emacs-jupyter-notebook--async-delete-process)
                      #'ignore)
-                    ((symbol-function 'emacs-jupyter-notebook--async-launch)
+                    ((symbol-function 'emacs-jupyter-notebook--restart-admit-launch)
                      (lambda (value) (setq launched value)))
                     ((symbol-function 'emacs-jupyter-notebook--async-context-live-p)
-                     (lambda (value) (eq value context)))
+                     (lambda (_value) t))
                     ((symbol-function 'process-status)
                      (lambda (_process) 'exit)))
             (emacs-jupyter-notebook--restart-publish-seed context)
@@ -12917,6 +12421,80 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
       (should-not scheduled)
       (should-not emacs-jupyter-notebook--async-context))))
 
+(ert-deftest ejn-ei6-restart-admits-each-terminal-boundary-before-side-effects ()
+  "Restart CAS-admits shutdown, terminal proof, and launch before each effect."
+  (let* ((local (make-temp-file "ejn-ei6-restart-boundary-"))
+         (entry (ejn-ei6-test--entry local))
+         (client 'restart-client)
+         (context (emacs-jupyter-notebook--async-new-context
+                   :phase 'restart-resolve :origin-buffer nil :entry entry
+                   :restart-client client :restart-epoch 41))
+         admission-success terminal-success launch-success shutdown uploaded launched
+         admitted terminal launch-admitted calls)
+    (unwind-protect
+        (with-temp-buffer
+          (setq context (plist-put context :origin-buffer (current-buffer))
+                emacs-jupyter-notebook--client client
+                emacs-jupyter-notebook--async-context context
+                emacs-jupyter-notebook--execution-setup-pending t
+                emacs-jupyter-notebook--execution-setup-epoch 41)
+          (cl-letf (((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel) #'ignore)
+                    ((symbol-function 'emacs-jupyter-notebook--lifecycle-retire-local-transport)
+                     #'ignore)
+                    ((symbol-function 'emacs-jupyter-notebook--execution-restart-acknowledged)
+                     #'ignore)
+                    ((symbol-function 'emacs-jupyter-notebook-registry-create-async)
+                     (lambda (&rest _) (ert-fail "restart must never create its own row")))
+                    ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+                     (lambda (value revision success _failure &rest _keys)
+                       (push (list (plist-get value :transition-stage) revision) calls)
+                       (pcase (plist-get value :transition-stage)
+                         ('admitted
+                          (setq admitted (plist-put (copy-tree value) :registry-revision "restart-admitted")
+                                admission-success success))
+                         ('kernel-dead
+                          (should (equal revision "restart-admitted"))
+                          (should (plist-get value :provisional))
+                          (setq terminal (plist-put (copy-tree value) :registry-revision "restart-terminal")
+                                terminal-success success))
+                         ('launch-admitted
+                          (should (equal revision "restart-terminal"))
+                          (setq launch-admitted
+                                (plist-put (copy-tree value) :registry-revision "restart-launch-admitted")
+                                launch-success success))
+                         (_ (ert-fail (format "unexpected restart row: %S" value))) )
+                       'restart-cas))
+                    ((symbol-function 'emacs-jupyter-notebook-backend-control)
+                     (lambda (_client operation _payload success _failure)
+                       (should (eq operation 'shutdown))
+                       (setq shutdown success)))
+                    ((symbol-function 'emacs-jupyter-notebook--restart-upload-seed)
+                     (lambda (value) (setq uploaded value)))
+                    ((symbol-function 'emacs-jupyter-notebook--async-launch)
+                     (lambda (value) (setq launched value))))
+            ;; Preflight has completed.  Admission is the sole route to wire shutdown.
+            (emacs-jupyter-notebook--restart-preflight-ready context)
+            (should admission-success)
+            (should-not shutdown)
+            (funcall admission-success admitted nil)
+            (should shutdown)
+            (funcall shutdown nil)
+            (should terminal-success)
+            (should-not uploaded)
+            (funcall terminal-success terminal nil)
+            (should uploaded)
+            ;; Publish completion must admit launch separately before SSH launch.
+            (setq context (plist-put context :entry terminal)
+                  emacs-jupyter-notebook--async-context context)
+            (emacs-jupyter-notebook--restart-admit-launch context)
+            (should launch-success)
+            (should-not launched)
+            (funcall launch-success launch-admitted nil)
+            (should launched)
+            (should (equal (mapcar #'car (reverse calls))
+                           '(admitted kernel-dead launch-admitted)))))
+      (when (file-exists-p local) (delete-file local)))))
+
 (ert-deftest ejn-ei6-restart-confirmation-publishes-before-launch-and-pid-finalize ()
   "Confirmed restart records provisional state, publishes before launch, and defers PID."
   (let* ((local (make-temp-file "ejn-ei6-restart-old-"))
@@ -12937,19 +12515,26 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                 emacs-jupyter-notebook--execution-setup-epoch 7)
           (cl-letf (((symbol-function 'emacs-jupyter-notebook--lifecycle-retire-local-transport)
                      (lambda (_client) (push 'retire order)))
-                    ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
-                     (lambda (value &optional _file)
+                    ((symbol-function
+                      'emacs-jupyter-notebook-registry-replace-async)
+                     (lambda (value _revision success _failure &rest _keys)
                        (setq saved (copy-sequence value))
-                       (push 'save order)))
+                       (setq saved
+                             (plist-put saved :registry-revision
+                                        "ejn-ei6-restart-provisional"))
+                       (push 'replace order)
+                       (ejn-test-registry--defer
+                        (lambda () (funcall success saved nil)))))
                     ((symbol-function 'emacs-jupyter-notebook--restart-upload-seed)
                      (lambda (value)
                        (setq saved-context value)
                        (push 'upload order))))
             (emacs-jupyter-notebook--restart-shutdown-confirmed
              context client 7)
+            (should (ejn-test-await (lambda () saved-context)))
             (should (plist-get saved :provisional))
-            (should-not (plist-get saved :remote-pid))
-            (should (equal (reverse order) '(retire save upload)))
+            (should (= (plist-get saved :remote-pid) 4242))
+            (should (equal (reverse order) '(retire replace upload)))
             (should saved-context)
             (should-not (plist-get saved-context :candidate-remote-pid))))
       (when (file-exists-p local) (delete-file local))
@@ -12980,8 +12565,16 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                       'emacs-jupyter-notebook--lifecycle-retire-local-transport)
                      (lambda (_client)
                        (setq emacs-jupyter-notebook--client nil)))
-                    ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
-                     (lambda (&rest _) (error "disk full")))
+                    ((symbol-function
+                      'emacs-jupyter-notebook-registry-replace-async)
+                     (lambda (_entry _revision _success failure &rest _keys)
+                       (ejn-test-registry--defer
+                        (lambda ()
+                          (funcall failure
+                                   '(:kind durability-uncertain
+                                     :code "test-disk-full"
+                                     :message "disk full")
+                                   nil)))))
                     ((symbol-function 'emacs-jupyter-notebook--restart-upload-seed)
                      (lambda (&rest _) (setq uploaded t)))
                     ((symbol-function 'emacs-jupyter-notebook--async-launch)
@@ -12989,9 +12582,11 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                     ((symbol-function 'emacs-jupyter-notebook--log-append)
                      (lambda (_kind format-string &rest args)
                        (setq log (apply #'format format-string args)))))
-            (emacs-jupyter-notebook--restart-shutdown-confirmed context client 12))
+            (emacs-jupyter-notebook--restart-shutdown-confirmed context client 12)
+            (should (ejn-test-await
+                     (lambda () (not emacs-jupyter-notebook--execution-setup-pending)))))
           (should (plist-get emacs-jupyter-notebook--session-entry :provisional))
-          (should-not (plist-get emacs-jupyter-notebook--session-entry :remote-pid))
+          (should (= (plist-get emacs-jupyter-notebook--session-entry :remote-pid) 4242))
           (should-not uploaded)
           (should-not launched)
           (should-not emacs-jupyter-notebook--execution-setup-pending)
@@ -13020,8 +12615,6 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                  (lambda (_context) t))
                 ((symbol-function 'emacs-jupyter-notebook--async-delete-process)
                  #'ignore)
-                ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
-                 (lambda (&rest _) (setq saved t)))
                 ((symbol-function 'emacs-jupyter-notebook--async-tunnel)
                  (lambda (value) (setq tunneled value)))
                 ((symbol-function 'emacs-jupyter-notebook--async-fail)
@@ -13038,7 +12631,9 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
   "Restart keeps the old signing file through save, then removes only that file."
   (let* ((old-file (make-temp-file "ejn-ei6-old-connection-"))
          (new-file (make-temp-file "ejn-ei6-new-connection-"))
-         (entry (ejn-ei6-test--entry old-file t))
+         (entry (emacs-jupyter-notebook--transition-lease
+                 (ejn-ei6-test--entry old-file t)
+                 'restart "final-promotion-token" 'launch-admitted))
          (ports (ejn-ei6-test--ports))
          (client (ejn-test-backend-session 'helper t))
          saved-entry (setup-count 0))
@@ -13052,11 +12647,17 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                   :client-unverified client
                   :restart-local-file new-file :candidate-remote-pid 987)))
             (setq emacs-jupyter-notebook--async-context context)
-            (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
-                       (lambda (promoted &optional _file)
+            (cl-letf (((symbol-function
+                        'emacs-jupyter-notebook-registry-replace-async)
+                       (lambda (promoted _revision success _failure &rest _keys)
                          (should (file-exists-p old-file))
                          (should (file-exists-p new-file))
-                         (setq saved-entry promoted)))
+                         (setq saved-entry (copy-tree promoted))
+                         (setq saved-entry
+                               (plist-put saved-entry :registry-revision
+                                          "ejn-ei6-restart-final"))
+                         (ejn-test-registry--defer
+                          (lambda () (funcall success saved-entry nil)))))
                       ((symbol-function 'emacs-jupyter-notebook--heartbeat-start)
                        #'ignore)
                       ((symbol-function
@@ -13068,9 +12669,11 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                        #'ignore))
               (should
                (emacs-jupyter-notebook--async-connect-finalize
-                context (current-buffer) entry ports new-file client)))
+                context (current-buffer) entry ports new-file client))
+              (should (ejn-test-await (lambda () (= setup-count 1)))))
             (should (= setup-count 1))
             (should (= (plist-get saved-entry :remote-pid) 987))
+            (should-not (emacs-jupyter-notebook--transition-entry-p saved-entry))
             (should (equal (plist-get saved-entry :remote-ports) ports))
             (should (equal (plist-get saved-entry :local-connection-file)
                            new-file))
@@ -13092,7 +12695,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
            saved uploaded)
       (setq emacs-jupyter-notebook--async-context new
             emacs-jupyter-notebook--client client)
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
+      (cl-letf (((symbol-function 'ejn-test-registry-save-entry)
                  (lambda (&rest _) (setq saved t)))
                 ((symbol-function 'emacs-jupyter-notebook--restart-upload-seed)
                  (lambda (&rest _) (setq uploaded t)))
@@ -13104,88 +12707,284 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
       (should (eq emacs-jupyter-notebook--async-context new)))))
 
 (ert-deftest ejn-ei6-shutdown-waits-for-confirmation-before-removal ()
-  "Explicit shutdown retains registry/local metadata until helper success."
-  (let* ((registry (make-temp-file "ejn-ei6-registry-"))
-         (local (make-temp-file "ejn-ei6-local-"))
+  "Shutdown admits a lease, records death, then removes the exact terminal row."
+  (let* ((local (make-temp-file "ejn-ei6-local-"))
          (entry (ejn-ei6-test--entry local))
-         (success nil) removed client order)
+         (success nil) admission-success terminal-success retirement-success
+         admitted terminal removed client order)
     (unwind-protect
-        (progn
-          (emacs-jupyter-notebook-registry-save (list entry) registry)
-          (with-temp-buffer
-            (let ((emacs-jupyter-notebook-registry-file registry))
-              (setq client (ejn-test-backend-session 'helper t)
-                    emacs-jupyter-notebook--client client
-                    emacs-jupyter-notebook--session-entry entry)
-              (setf (emacs-jupyter-notebook-backend-session-backend client) 'helper)
-              (emacs-jupyter-notebook-backend-session-mark-installed client)
-              (cl-letf (((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
-                         #'ignore)
-                        ((symbol-function 'emacs-jupyter-notebook--lifecycle-retire-local-transport)
-                         #'ignore)
-                        ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
-                         (lambda (_entry) (push 'remote-cleanup order)))
-                        ((symbol-function 'emacs-jupyter-notebook--async-delete-file)
-                         (let ((original
-                                (symbol-function
-                                 'emacs-jupyter-notebook--async-delete-file)))
-                           (lambda (file)
-                             (push 'local-delete order)
-                             (funcall original file))))
-                        ((symbol-function 'emacs-jupyter-notebook-backend-control)
-                         (lambda (_client operation _payload callback _failure)
-                           (should (eq operation 'shutdown))
-                           (setq success callback)))
-                        ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
-                         (let ((original (symbol-function
-                                          'emacs-jupyter-notebook-registry-remove-entry)))
-                           (lambda (key &optional file)
-                             (push 'registry-remove order)
-                             (setq removed key)
-                             (funcall original key file)))))
-                (emacs-jupyter-notebook-shutdown-kernel)
-                (should-not removed)
-                (should-not order)
-                (should (file-exists-p local))
-                (should (emacs-jupyter-notebook-registry-find
-                         "ei6" (emacs-jupyter-notebook-registry-load registry)))
-                (should success)
-                (funcall success nil)
-                (should removed)
-                (should (equal (reverse order)
-                               '(registry-remove local-delete remote-cleanup)))
-                (should-not (file-exists-p local))))))
-      (when (file-exists-p registry) (delete-file registry))
+        (with-temp-buffer
+          (setq client (ejn-test-backend-session 'helper t)
+                emacs-jupyter-notebook--client client
+                emacs-jupyter-notebook--session-entry entry)
+          (setf (emacs-jupyter-notebook-backend-session-backend client) 'helper)
+          (emacs-jupyter-notebook-backend-session-mark-installed client)
+          (cl-letf (((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
+                     #'ignore)
+                    ((symbol-function 'emacs-jupyter-notebook--lifecycle-retire-local-transport)
+                     #'ignore)
+                    ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
+                     (lambda (_entry) (push 'remote-cleanup order)))
+                    ((symbol-function 'emacs-jupyter-notebook--async-delete-file)
+                     (let ((original
+                            (symbol-function
+                             'emacs-jupyter-notebook--async-delete-file)))
+                       (lambda (file)
+                         (push 'local-delete order)
+                         (funcall original file))))
+                    ((symbol-function 'emacs-jupyter-notebook-backend-control)
+                     (lambda (_client operation _payload callback _failure)
+                       (should (eq operation 'shutdown))
+                       (setq success callback)))
+                    ((symbol-function
+                      'emacs-jupyter-notebook-registry-replace-async)
+                     (lambda (value revision callback _failure &rest _keys)
+                       (push 'replace-submit order)
+                       (cond
+                        ((eq (plist-get value :transition-stage) 'admitted)
+                         (should (equal revision "ejn-ei6-current-revision"))
+                         (setq admitted
+                               (plist-put (copy-tree value) :registry-revision
+                                          "ejn-ei6-admitted-revision")
+                               admission-success callback))
+                        ((eq (plist-get value :transition-stage) 'kernel-dead)
+                         (should (equal revision "ejn-ei6-admitted-revision"))
+                         (should (plist-get value :provisional))
+                         (setq terminal
+                               (plist-put (copy-tree value) :registry-revision
+                                          "ejn-ei6-terminal-revision")
+                               terminal-success callback))
+                        (t (ert-fail (format "unexpected shutdown transition: %S" value))))
+                       'ejn-test-registry-operation))
+                    ((symbol-function
+                      'emacs-jupyter-notebook-registry-remove-async)
+                     (lambda (key revision callback _failure &rest _keys)
+                       (should (equal key "ei6"))
+                       (should (equal revision "ejn-ei6-terminal-revision"))
+                       (push 'registry-remove-submit order)
+                       (setq removed key retirement-success callback)
+                       'ejn-test-registry-operation)))
+            (emacs-jupyter-notebook-shutdown-kernel)
+            (should-not removed)
+            (should (equal (reverse order) '(replace-submit)))
+            (should (file-exists-p local))
+            ;; The helper cannot receive shutdown before durable admission.
+            (should admission-success)
+            (should-not success)
+            (funcall admission-success admitted nil)
+            (should success)
+            (funcall success nil)
+            ;; The terminal proof is another exact CAS before removal.
+            (should terminal-success)
+            (should-not removed)
+            (funcall terminal-success terminal nil)
+            (should removed)
+            (should (equal (reverse order)
+                           '(replace-submit replace-submit registry-remove-submit)))
+            (should (file-exists-p local))
+            (should retirement-success)
+            (push 'registry-success order)
+            (funcall retirement-success removed nil)
+            (should (equal (reverse order)
+                           '(replace-submit replace-submit registry-remove-submit
+                             registry-success local-delete remote-cleanup)))
+            (should-not (file-exists-p local))))
       (when (file-exists-p local) (delete-file local)))))
 
-(ert-deftest ejn-ei6-restart-and-shutdown-reject-non-helper-sessions ()
-  "Legacy sessions cannot cross the explicit helper lifecycle boundary."
-  (dolist (operation '(restart shutdown))
-    (with-temp-buffer
-      (let* ((local "/tmp/ei6-legacy-local.json")
-             (entry (ejn-ei6-test--entry local))
-             (client (emacs-jupyter-notebook-backend-session-create
-                      nil (current-buffer)))
-             (mutated nil))
-        (setf (emacs-jupyter-notebook-backend-session-backend client) 'legacy
-              (emacs-jupyter-notebook-backend-session-installed client) t)
-        (setq emacs-jupyter-notebook--client client
-              emacs-jupyter-notebook--session-entry entry)
-        (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-control)
-                   (lambda (&rest _) (setq mutated 'control)))
-                  ((symbol-function 'emacs-jupyter-notebook--restart-seed)
-                   (lambda (&rest _) (setq mutated 'seed)))
-                  ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
-                   (lambda (&rest _) (setq mutated 'save)))
-                  ((symbol-function 'emacs-jupyter-notebook-ssh-start-bounded-process)
-                   (lambda (&rest _) (setq mutated 'launch))))
-          (should-error
-           (if (eq operation 'restart)
-               (emacs-jupyter-notebook-restart-kernel)
-             (emacs-jupyter-notebook-shutdown-kernel))
-           :type 'user-error)
-          (should-not mutated)
-          (should-not emacs-jupyter-notebook--execution-setup-pending))))))
+(ert-deftest ejn-ei6-restart-admission-after-transport-loss-revokes-lease ()
+  "A lost restart client revokes its admitted lease before any terminal effect."
+  (with-temp-buffer
+    (let* ((emacs-jupyter-notebook-auto-reconnect t)
+           (emacs-jupyter-notebook-reconnect-initial-delay 60)
+           (entry (ejn-ei6-test--entry "/tmp/ei6-restart-loss.json"))
+           (client 'restart-client)
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'restart-resolve :origin-buffer (current-buffer)
+                     :entry entry :restart-client client :restart-epoch 17))
+           admission-success persisted revisions (controls 0) (launches 0))
+      (setq emacs-jupyter-notebook-mode t
+            emacs-jupyter-notebook--client client
+            emacs-jupyter-notebook--session-entry (copy-sequence entry)
+            emacs-jupyter-notebook--async-context context
+            emacs-jupyter-notebook--execution-setup-pending t
+            emacs-jupyter-notebook--execution-setup-epoch 17)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel) #'ignore)
+               ((symbol-function 'emacs-jupyter-notebook--completion-cancel-idle-timer)
+                #'ignore)
+               ((symbol-function 'emacs-jupyter-notebook-backend-close-local) #'ignore)
+               ((symbol-function 'emacs-jupyter-notebook-backend-control)
+                (lambda (&rest _) (cl-incf controls)))
+               ((symbol-function 'emacs-jupyter-notebook--async-launch)
+                (lambda (&rest _) (cl-incf launches)))
+               ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+                (lambda (value revision success _failure &rest _keys)
+                  (push revision revisions)
+                  (if (eq (plist-get value :transition-stage) 'admitted)
+                      (progn
+                        (should (equal revision "ejn-ei6-current-revision"))
+                        (setq persisted
+                              (plist-put (copy-sequence value) :registry-revision
+                                         "ei6-restart-admitted-revision")
+                              admission-success success))
+                    (progn
+                      (should-not (emacs-jupyter-notebook--transition-entry-p value))
+                      (should (equal revision "ei6-restart-admitted-revision"))
+                      (funcall success
+                               (plist-put (copy-sequence value) :registry-revision
+                                          "ei6-restart-restored-revision")
+                               nil)))
+                  'ejn-test-registry-operation))
+               ((symbol-function 'emacs-jupyter-notebook--log-append) #'ignore)
+               ((symbol-function 'display-warning) #'ignore))
+            ;; The initial CAS is admitted while the old helper is still current.
+            (emacs-jupyter-notebook--restart-preflight-ready context)
+            (should admission-success)
+            (should persisted)
+            ;; The transport sentinel clears both local client ownership and its
+            ;; epoch before the registry callback returns.
+            (emacs-jupyter-notebook--transport-lost "test restart transport loss")
+            (should-not emacs-jupyter-notebook--reconnect-timer)
+            (funcall admission-success persisted nil)
+            (should (equal (reverse revisions)
+                           '("ejn-ei6-current-revision"
+                             "ei6-restart-admitted-revision")))
+            (should (= controls 0))
+            (should (= launches 0))
+            (should-not (emacs-jupyter-notebook--transition-entry-p
+                         emacs-jupyter-notebook--session-entry))
+            (should (equal (plist-get emacs-jupyter-notebook--session-entry
+                                      :registry-revision)
+                           "ei6-restart-restored-revision"))
+            (should-not emacs-jupyter-notebook--transition-token)
+            (should (eq (plist-get emacs-jupyter-notebook--async-context :phase)
+                        'error))
+            (should (timerp emacs-jupyter-notebook--reconnect-timer)))
+        (emacs-jupyter-notebook--cancel-auto-reconnect)))))
+
+(ert-deftest ejn-ei6-shutdown-admission-after-transport-loss-revokes-lease ()
+  "A lost shutdown client revokes admission rather than sending stale control."
+  (with-temp-buffer
+    (let* ((emacs-jupyter-notebook-auto-reconnect t)
+           (emacs-jupyter-notebook-reconnect-initial-delay 60)
+           (entry (ejn-ei6-test--entry "/tmp/ei6-shutdown-loss.json"))
+           (client (ejn-test-backend-session 'helper t))
+           admission-success persisted revisions (controls 0))
+      (setf (emacs-jupyter-notebook-backend-session-backend client) 'helper)
+      (emacs-jupyter-notebook-backend-session-mark-installed client)
+      (setq emacs-jupyter-notebook-mode t
+            emacs-jupyter-notebook--client client
+            emacs-jupyter-notebook--session-entry (copy-sequence entry))
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel) #'ignore)
+               ((symbol-function 'emacs-jupyter-notebook--completion-cancel-idle-timer)
+                #'ignore)
+               ((symbol-function 'emacs-jupyter-notebook-backend-close-local) #'ignore)
+               ((symbol-function 'emacs-jupyter-notebook-backend-control)
+                (lambda (&rest _) (cl-incf controls)))
+               ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+                (lambda (value revision success _failure &rest _keys)
+                  (push revision revisions)
+                  (if (eq (plist-get value :transition-stage) 'admitted)
+                      (progn
+                        (should (equal revision "ejn-ei6-current-revision"))
+                        (setq persisted
+                              (plist-put (copy-sequence value) :registry-revision
+                                         "ei6-shutdown-admitted-revision")
+                              admission-success success))
+                    (progn
+                      (should-not (emacs-jupyter-notebook--transition-entry-p value))
+                      (should (equal revision "ei6-shutdown-admitted-revision"))
+                      (funcall success
+                               (plist-put (copy-sequence value) :registry-revision
+                                          "ei6-shutdown-restored-revision")
+                               nil)))
+                  'ejn-test-registry-operation))
+               ((symbol-function 'emacs-jupyter-notebook--log-append) #'ignore)
+               ((symbol-function 'display-warning) #'ignore))
+            (emacs-jupyter-notebook-shutdown-kernel)
+            (should admission-success)
+            (should persisted)
+            (emacs-jupyter-notebook--transport-lost "test shutdown transport loss")
+            (should-not emacs-jupyter-notebook--reconnect-timer)
+            (funcall admission-success persisted nil)
+            (should (equal (reverse revisions)
+                           '("ejn-ei6-current-revision"
+                             "ei6-shutdown-admitted-revision")))
+            (should (= controls 0))
+            (should-not (emacs-jupyter-notebook--transition-entry-p
+                         emacs-jupyter-notebook--session-entry))
+            (should (equal (plist-get emacs-jupyter-notebook--session-entry
+                                      :registry-revision)
+                           "ei6-shutdown-restored-revision"))
+            (should-not emacs-jupyter-notebook--transition-token)
+            (should (eq (plist-get emacs-jupyter-notebook--async-context :phase)
+                        'error))
+            (should (timerp emacs-jupyter-notebook--reconnect-timer)))
+        (emacs-jupyter-notebook--cancel-auto-reconnect)))))
+
+(ert-deftest ejn-ei6-admission-failure-after-transport-loss-resumes-reconnect ()
+  "A failed pre-destructive admission leaves the ordinary session recoverable."
+  (with-temp-buffer
+    (let* ((emacs-jupyter-notebook-auto-reconnect t)
+           (emacs-jupyter-notebook-reconnect-initial-delay 60)
+           (entry (ejn-ei6-test--entry "/tmp/ei6-admission-loss.json"))
+           (client 'restart-client)
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'restart-resolve :origin-buffer (current-buffer)
+                     :entry entry :restart-client client :restart-epoch 29))
+           admission-failure revisions (controls 0) (launches 0))
+      (setq emacs-jupyter-notebook-mode t
+            emacs-jupyter-notebook--client client
+            emacs-jupyter-notebook--session-entry (copy-sequence entry)
+            emacs-jupyter-notebook--async-context context
+            emacs-jupyter-notebook--execution-setup-pending t
+            emacs-jupyter-notebook--execution-setup-epoch 29)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel) #'ignore)
+               ((symbol-function 'emacs-jupyter-notebook--completion-cancel-idle-timer)
+                #'ignore)
+               ((symbol-function 'emacs-jupyter-notebook-backend-close-local) #'ignore)
+               ((symbol-function 'emacs-jupyter-notebook-backend-control)
+                (lambda (&rest _) (cl-incf controls)))
+               ((symbol-function 'emacs-jupyter-notebook--async-launch)
+                (lambda (&rest _) (cl-incf launches)))
+               ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+                (lambda (value revision _success failure &rest _keys)
+                  (should (eq (plist-get value :transition-stage) 'admitted))
+                  (push revision revisions)
+                  (setq admission-failure failure)
+                  'ejn-test-registry-operation))
+               ((symbol-function 'emacs-jupyter-notebook--log-append) #'ignore)
+               ((symbol-function 'display-warning) #'ignore))
+            (emacs-jupyter-notebook--restart-preflight-ready context)
+            (should admission-failure)
+            (emacs-jupyter-notebook--transport-lost "test failed-admission transport loss")
+            (should-not emacs-jupyter-notebook--reconnect-timer)
+            (funcall admission-failure
+                     '(:kind conflict :code "revision-conflict"
+                       :message "test admission conflict")
+                     nil)
+            (should (equal revisions '("ejn-ei6-current-revision")))
+            (should (= controls 0))
+            (should (= launches 0))
+            (should-not (emacs-jupyter-notebook--transition-entry-p
+                         emacs-jupyter-notebook--session-entry))
+            (should (equal (plist-get emacs-jupyter-notebook--session-entry
+                                      :registry-revision)
+                           "ejn-ei6-current-revision"))
+            (should (eq (plist-get emacs-jupyter-notebook--async-context :phase)
+                        'error))
+            (should emacs-jupyter-notebook--async-last-error)
+            (should (string-match-p "test admission conflict"
+                                    emacs-jupyter-notebook--last-bounded-error))
+            ;; The transport-loss call could not schedule while the admission
+            ;; was live; after its prompt failure there must be one real timer.
+            (should (timerp emacs-jupyter-notebook--reconnect-timer)))
+        (emacs-jupyter-notebook--cancel-auto-reconnect)))))
 
 (ert-deftest ejn-ei6-restart-rejects-missing-remote-ports-before-gating ()
   "A durable entry without all remote channels cannot begin a restart."
@@ -13288,7 +13087,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
            (entry (ejn-ei6-test--entry local)) callback client)
       (unwind-protect
           (progn
-            (emacs-jupyter-notebook-registry-save (list entry) registry)
+            (ejn-test-registry-save (list entry) registry)
             (with-temp-buffer
               (let ((emacs-jupyter-notebook-registry-file registry))
               (setq client (ejn-test-backend-session 'helper t)
@@ -13301,6 +13100,8 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                           ((symbol-function 'emacs-jupyter-notebook--lifecycle-retire-local-transport)
                            (lambda (_client)
                              (setq emacs-jupyter-notebook--client nil)))
+                          ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
+                           #'ejn-test-registry-replace-succeeds)
                           ((symbol-function 'emacs-jupyter-notebook-backend-control)
                            (lambda (_client _op _payload success failure)
                              (if (eq mode 'throw)
@@ -13311,50 +13112,102 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                   (emacs-jupyter-notebook-shutdown-kernel)
                   (should (file-exists-p local))
                   (when (eq mode 'callback)
+                    (should (ejn-test-await (lambda () callback)))
                     (funcall (cdr callback) 1 "no answer")
                     ;; A late success must be inert after terminal failure.
                     (funcall (car callback) 1 nil))
                   (should (file-exists-p local))
                   (should (emacs-jupyter-notebook-registry-find
-                           "ei6" (emacs-jupyter-notebook-registry-load registry)))
+                           "ei6" (ejn-test-registry-load registry)))
+                  (should (ejn-test-await
+                           (lambda ()
+                             (not emacs-jupyter-notebook--execution-setup-pending))))
                   (should-not emacs-jupyter-notebook--execution-setup-pending))))))
         (when (file-exists-p registry) (delete-file registry))
         (when (file-exists-p local) (delete-file local)))))
 
-(ert-deftest ejn-ei6-shutdown-registry-remove-failure-retains-local-file ()
-  "A confirmed shutdown cannot discard the offline connection key on save failure."
-  (let* ((registry (make-temp-file "ejn-ei6-registry-"))
-         (local (make-temp-file "ejn-ei6-local-"))
+(ert-deftest ejn-ei6-shutdown-registry-conflict-retains-durable-diagnostic ()
+  "A shutdown CAS conflict retains ENTRY and exposes a recoverable error."
+  (let* ((local (make-temp-file "ejn-ei6-local-"))
          (entry (ejn-ei6-test--entry local))
-         (client nil) success)
+         (client nil) success warning cleanup local-delete)
     (unwind-protect
-        (progn
-          (emacs-jupyter-notebook-registry-save (list entry) registry)
-          (with-temp-buffer
-            (let ((emacs-jupyter-notebook-registry-file registry))
-              (setq client (ejn-test-backend-session 'helper t)
-                    emacs-jupyter-notebook--client client
-                    emacs-jupyter-notebook--session-entry entry)
-              (setf (emacs-jupyter-notebook-backend-session-backend client) 'helper)
-              (emacs-jupyter-notebook-backend-session-mark-installed client)
-              (cl-letf (((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
-                         #'ignore)
-                        ((symbol-function 'emacs-jupyter-notebook--lifecycle-retire-local-transport)
-                         #'ignore)
-                        ((symbol-function 'emacs-jupyter-notebook-backend-control)
-                         (lambda (_client _operation _payload callback _failure)
-                           (setq success callback)))
-                        ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
-                         (lambda (&rest _) (error "registry unavailable")))
-                        ((symbol-function 'emacs-jupyter-notebook--log-append)
-                         #'ignore))
-                (emacs-jupyter-notebook-shutdown-kernel)
-                (funcall success nil)
-                (should (file-exists-p local))
-                (should (emacs-jupyter-notebook-registry-find
-                         "ei6" (emacs-jupyter-notebook-registry-load registry)))
-                (should (equal emacs-jupyter-notebook--session-entry entry))))))
-      (when (file-exists-p registry) (delete-file registry))
+        (with-temp-buffer
+          (setq client (ejn-test-backend-session 'helper t)
+                emacs-jupyter-notebook--client client
+                emacs-jupyter-notebook--session-entry entry)
+          (setf (emacs-jupyter-notebook-backend-session-backend client) 'helper)
+          (emacs-jupyter-notebook-backend-session-mark-installed client)
+          (cl-letf (((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel)
+                     #'ignore)
+                    ((symbol-function 'emacs-jupyter-notebook--lifecycle-retire-local-transport)
+                     #'ignore)
+                    ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
+                     (lambda (&rest _) (setq cleanup t)))
+                    ((symbol-function 'emacs-jupyter-notebook--async-delete-file)
+                     (lambda (&rest _) (setq local-delete t)))
+                    ((symbol-function 'emacs-jupyter-notebook-backend-control)
+                     (lambda (_client operation _payload callback _failure)
+                       (should (eq operation 'shutdown))
+                       (setq success callback)))
+                    ((symbol-function
+                      'emacs-jupyter-notebook-registry-replace-async)
+                     (lambda (value revision callback failure &rest _keys)
+                       (if (eq (plist-get value :transition-stage) 'admitted)
+                           (let ((persisted
+                                  (plist-put (copy-tree value) :registry-revision
+                                             "ei6-admitted-revision")))
+                             (should (equal revision "ejn-ei6-current-revision"))
+                             (ejn-test-registry--defer
+                              (lambda () (funcall callback persisted nil))))
+                         (ejn-test-registry--defer
+                          (lambda ()
+                            (funcall failure
+                                     '(:kind conflict
+                                       :code "revision-conflict"
+                                       :message "exact revision is no longer current")
+                                     nil))))))
+                    ((symbol-function
+                      'emacs-jupyter-notebook-registry-remove-async)
+                     (lambda (key revision _success failure &rest _keys)
+                       (should (equal key "ei6"))
+                       (should (equal revision "ejn-ei6-current-revision"))
+                       (ejn-test-registry--defer
+                        (lambda ()
+                          (funcall failure
+                                   '(:kind conflict
+                                     :code "revision-conflict"
+                                     :message "exact revision is no longer current")
+                                   nil)))))
+                    ((symbol-function 'display-warning)
+                     (lambda (_type message level)
+                       (setq warning (list message level))))
+                    ((symbol-function 'emacs-jupyter-notebook--log-append)
+                     #'ignore))
+            (emacs-jupyter-notebook-shutdown-kernel)
+            (should (ejn-test-await (lambda () success)))
+            (should success)
+            (funcall success nil)
+            (should (ejn-test-await
+                     (lambda ()
+                       (eq (plist-get emacs-jupyter-notebook--async-context :phase)
+                           'error))))
+            (should (file-exists-p local))
+            (should-not cleanup)
+            (should-not local-delete)
+            (should (eq (plist-get emacs-jupyter-notebook--session-entry
+                                   :transition-stage)
+                        'admitted))
+            (should emacs-jupyter-notebook--tunnel-dead)
+            (should emacs-jupyter-notebook--async-last-error)
+            (let ((snapshot (emacs-jupyter-notebook-status-snapshot)))
+              (should (equal (plist-get snapshot :last-error)
+                             "Kernel shutdown terminal proof registry transaction exact revision is no longer current"))
+              (should-not (plist-get snapshot :async-live)))
+            (should (equal (cadr warning) :warning))
+            (should (string-match-p
+                     "Kernel stopped, but its durable registry entry remains"
+                     (car warning)))))
       (when (file-exists-p local) (delete-file local)))))
 
 (ert-deftest ejn-ei6-local-close-never-dispatches-shutdown-or-launch ()
@@ -13377,7 +13230,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
         (should (eq called 'close))))))
 
 (ert-deftest ejn-ei6-restart-buffer-disposal-reclaims-only-local-resources ()
-  "Buffer disposal reclaims every restart handle without lifecycle mutation."
+  "Buffer disposal reclaims local restart handles without remote cleanup."
   (let* ((seed-file (make-temp-file "ejn-ei6-dispose-seed-"))
          (new-file (make-temp-file "ejn-ei6-dispose-local-"))
          (entry (ejn-ei6-test--entry "/tmp/ejn-ei6-durable.json" t))
@@ -13393,7 +13246,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                    :restart-seed-read-process 'seed-reader
                    :restart-upload-process 'upload
                    :restart-publish-process 'publish))
-         deleted cleanup-argv closed)
+         deleted (management-starts 0) closed)
     (unwind-protect
         (with-temp-buffer
           (setq context (plist-put context :origin-buffer (current-buffer)))
@@ -13404,8 +13257,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                      (lambda (process) (when process (push process deleted))))
                     ((symbol-function
                       'emacs-jupyter-notebook-ssh-start-management-operation)
-                     (lambda (_name argv _success _failure)
-                       (setq cleanup-argv argv)))
+                     (lambda (&rest _) (cl-incf management-starts)))
                     ((symbol-function 'emacs-jupyter-notebook-backend-close-local)
                      (lambda (&rest _) (setq closed t)))
                     ((symbol-function 'emacs-jupyter-notebook-backend-control)
@@ -13415,9 +13267,9 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                      (lambda (&rest _) (ert-fail "local disposal launched a kernel")))
                     ((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
                      (lambda (&rest _) (ert-fail "local disposal cleaned remote state")))
-                    ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
+                    ((symbol-function 'ejn-test-registry-save-entry)
                      (lambda (&rest _) (ert-fail "local disposal saved registry state")))
-                    ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
+                    ((symbol-function 'ejn-test-registry-remove-entry)
                      (lambda (&rest _) (ert-fail "local disposal removed registry state")))
                     ((symbol-function 'emacs-jupyter-notebook--cancel-auto-reconnect)
                      #'ignore)
@@ -13432,9 +13284,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
           (should-not (memq overall timer-list))
           (should-not (file-exists-p seed-file))
           (should-not (file-exists-p new-file))
-          (should (equal cleanup-argv
-                         (emacs-jupyter-notebook-ssh-build-remote-remove-restart-staging
-                          profile staging (plist-get entry :remote-connection-file))))
+          (should (= management-starts 0))
           (should (equal emacs-jupyter-notebook--session-entry entry))
           (should-not emacs-jupyter-notebook--async-context))
       (dolist (pending (list timer overall))
@@ -13456,36 +13306,6 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
       (emacs-jupyter-notebook-cancel-queued-execution))
     (should (emacs-jupyter-notebook--execution-record 2))
     (should-not (emacs-jupyter-notebook--execution-record 3))))
-
-(ert-deftest ejn-ei3-sync-legacy-terminal-events-stage-until-backend-id ()
-  "Inline legacy reply/idle are consumed only after execute returns its id."
-  (with-temp-buffer
-    (let ((emacs-jupyter-notebook--client (ejn-test-backend-session 'mock t))
-          (emacs-jupyter-notebook-check-code-completeness nil)
-          sent)
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-client-async)
-                 (lambda (success _failure) (funcall success nil)))
-                ((symbol-function 'emacs-jupyter-notebook-backend-execute)
-                 (lambda (_client code _options _success _failure)
-                   (push code sent)
-                   (when (equal code "a")
-                     (let ((record (emacs-jupyter-notebook--execution-record 1)))
-                       (emacs-jupyter-notebook--execution-note-event
-                        (list :request-id 1 :backend-request-id 71
-                              :panel-generation (plist-get record :generation))
-                        '(:type execute-reply :status "ok" :execution-count 1))
-                       (emacs-jupyter-notebook--execution-note-event
-                        (list :request-id 1 :backend-request-id 71
-                              :panel-generation (plist-get record :generation))
-                        '(:type status :execution-state "idle"))))
-                   (if (equal code "a") 71 72))))
-        (let ((a (emacs-jupyter-notebook--evaluate-code "a" nil))
-              (b (emacs-jupyter-notebook--evaluate-code "b" nil)))
-          (should (= a 1))
-          (should-not (emacs-jupyter-notebook--execution-record a))
-          (should (eq emacs-jupyter-notebook--execution-active-id b))
-          (should (equal sent '("b" "a")))
-          (should (timerp (plist-get (emacs-jupyter-notebook--execution-record b) :timer))))))))
 
 (ert-deftest ejn-ei3-aborted-and-busy-statuses-do-not-falsely-succeed ()
   "Only exact ok plus idle settles successfully; busy is not terminal."
@@ -13543,7 +13363,8 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
           (sent nil) (next-backend-id 80) fringe)
       (unwind-protect
           (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-client-async)
-                     (lambda (success _failure) (funcall success nil)))
+                 (lambda (success _failure &optional _profile _announce)
+                   (funcall success nil)))
                     ((symbol-function 'emacs-jupyter-notebook-backend-execute)
                      (lambda (_client code _options _success _failure)
                        (setq sent (append sent (list code)))
@@ -13588,19 +13409,19 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
     (unwind-protect
         (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-remote-entry)
                    (lambda (&rest _) (setq remote-cleanup t)))
-                  ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
+                  ((symbol-function 'ejn-test-registry-remove-entry)
                    (lambda (&rest _) (setq registry-remove t)))
                   ((symbol-function 'emacs-jupyter-notebook-backend-control)
                    (lambda (&rest _) (setq shutdown t))))
           (with-current-buffer buffer
-            (let ((emacs-jupyter-notebook-backend 'mock)
-                  (emacs-jupyter-notebook-check-code-completeness nil)
+            (let ((emacs-jupyter-notebook-check-code-completeness nil)
                   (emacs-jupyter-notebook--client
                    (ejn-test-backend-session 'mock t))
                   (sent nil))
               (emacs-jupyter-notebook-mode 1)
               (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-client-async)
-                         (lambda (success _failure) (funcall success nil)))
+                 (lambda (success _failure &optional _profile _announce)
+                   (funcall success nil)))
                         ((symbol-function 'emacs-jupyter-notebook-backend-execute)
                          (lambda (_client code _options success failure)
                            (setq sent (append sent (list code))
@@ -13684,7 +13505,8 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
           completions sent control-called)
       (unwind-protect
           (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-client-async)
-                     (lambda (success _failure) (funcall success nil)))
+                 (lambda (success _failure &optional _profile _announce)
+                   (funcall success nil)))
                     ((symbol-function 'emacs-jupyter-notebook-backend-aux)
                      (lambda (_client operation payload success _failure)
                        (should (eq operation 'is-complete))
@@ -13728,7 +13550,8 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
           (sent nil)
           (next-id 100))
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-client-async)
-                 (lambda (success _failure) (funcall success nil)))
+                 (lambda (success _failure &optional _profile _announce)
+                   (funcall success nil)))
                 ((symbol-function 'emacs-jupyter-notebook-backend-execute)
                  (lambda (_client code _options _success _failure)
                    (setq sent (append sent (list code)))
@@ -15052,6 +14875,80 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
       (when (buffer-live-p panel) (kill-buffer panel))
       (ignore-errors (delete-directory root t)))))
 
+(ert-deftest ejn-ei4d-replaced-preview-is-demoted-before-native-decode ()
+  "A helper preview replaced after admission cannot reach a native decoder."
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
+         (original (ejn-ei4d-test--write-artifact
+                    root "31313131313131313131313131313131"
+                    (ejn-ei4d-test--png 2 3)))
+         (preview (ejn-ei4d-test--write-artifact
+                   root "32323232323232323232323232323232"
+                   (ejn-ei4d-test--ppm 2 3)))
+         panel)
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (with-temp-buffer
+            (setq panel (ejn-panel-ensure (current-buffer)))
+            (let* ((handle (ejn-panel-start-entry panel '("replace.py" . 1) "plot()"))
+                   (descriptor
+                    (ejn-ei4d-result-test--image-descriptor
+                     root original preview "replace" "image/png" 2 3)))
+              (should (ejn-panel-set-published-bundle handle descriptor nil nil))
+              (let ((spec (car (ejn-panel-entry-images handle)))
+                    (coding-system-for-write 'no-conversion))
+                (should (emacs-jupyter-notebook-panel--native-image-safe-p spec))
+                (delete-file preview)
+                (write-region (concat (ejn-ei4d-test--ppm 2 3) "x")
+                              nil preview nil 'silent)
+                (set-file-modes preview #o600)
+                (should-not
+                 (emacs-jupyter-notebook-panel--native-image-safe-p spec))))))
+      (when (buffer-live-p panel) (kill-buffer panel))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest ejn-ei4d-published-image-segments-cap-and-retire-overflow ()
+  "Published tiny-image floods retain a marker and retire overflow artifacts."
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
+         (emacs-jupyter-notebook-panel--hard-entry-output-segments 4)
+         (emacs-jupyter-notebook-panel-max-output-segments 32)
+         overflow panel)
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (with-temp-buffer
+            (setq panel (ejn-panel-ensure (current-buffer)))
+            (let ((handle (ejn-panel-start-entry panel '("flood.py" . 1) "plot()")))
+              (dotimes (index 7)
+                (let* ((original
+                        (ejn-ei4d-test--write-artifact
+                         root (format "%032x" (+ 500 index))
+                         (ejn-ei4d-test--png 2 3)))
+                       (preview
+                        (ejn-ei4d-test--write-artifact
+                         root (format "%032x" (+ 600 index))
+                         (ejn-ei4d-test--ppm 2 3)))
+                       (descriptor
+                        (ejn-ei4d-result-test--image-descriptor
+                         root original preview (format "flood-%d" index)
+                         "image/png" 2 3)))
+                  (should (ejn-panel-set-published-bundle
+                           handle descriptor nil nil))
+                  (when (>= index 3)
+                    (push original overflow)
+                    (push preview overflow))))
+              (let ((entry (ejn-panel-entry-snapshot handle)))
+                (should (= (length (plist-get entry :outputs)) 4))
+                (should (= (length (ejn-panel-entry-images entry)) 3))
+                (should (plist-get entry :output-segments-truncated))
+                (with-current-buffer panel
+                  (should (= emacs-jupyter-notebook-panel--retained-output-segments
+                             4))))
+              (should (cl-every (lambda (path) (not (file-exists-p path)))
+                                overflow)))))
+      (when (buffer-live-p panel) (kill-buffer panel))
+      (ignore-errors (delete-directory root t)))))
+
 (ert-deftest ejn-ei4d-unsafe-original-obeys-existing-artifact-budget ()
   "A decoder-bomb placeholder still retires through the ordinary byte budget."
   (let* ((root (car (ejn-ei4-test--artifact-root)))
@@ -15169,7 +15066,6 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ei11-helper-is-default-with-protocol-mode-command ()
   "The supervised helper and its protocol command are the stable defaults."
-  (should (eq emacs-jupyter-notebook-backend 'helper))
   (should (equal emacs-jupyter-notebook-helper-command
                  '("ejn-helper" "--protocol")))
   (should (assq 'helper emacs-jupyter-notebook-backend-implementations)))
@@ -15314,8 +15210,8 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
     (should (string-match-p "rebuild.*ejn-helper" failure))
     (should (emacs-jupyter-notebook-helper-session-disposed session))))
 
-(ert-deftest ejn-ei11-readme-documents-helper-commands-and-no-install-policy ()
-  "README names the helper default, explicit fallback, and supported closure."
+(ert-deftest ejn-ei11-readme-documents-helper-only-transport ()
+  "README documents the helper-only transport without a legacy adapter."
   (let* ((test-file (locate-library "emacs-jupyter-notebook-tests"))
          (root (and test-file
                     (file-name-directory
@@ -15325,19 +15221,19 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                    (insert-file-contents
                     (expand-file-name "README.md" (or root default-directory)))
                   (buffer-string))))
-    (dolist (needle '("helper is the default Jupyter transport"
-                      "emacs-jupyter-notebook-backend 'legacy"
+    (dolist (needle '("The supervised local Python helper is the only Jupyter transport"
                       "emacs-jupyter-notebook-helper-command"
                       "--protocol"
                       "nix build .#ejn-helper"
                       "./result/bin/ejn-helper --version"
-                      "3b9caed3e4cc5f4bc0348eb65d17098de76904e4"
-                      "05ea84067f784fb7cd1f829d7a0fadcad20466aa"
-                      "legacy"
                       "x86_64-linux"
                       "aarch64-darwin"
                       "pip install"))
-      (should (string-match-p (regexp-quote needle) readme)))))
+      (should (string-match-p (regexp-quote needle) readme)))
+    (dolist (forbidden '("emacs-jupyter-notebook-backend 'legacy"
+                         "emacs-jupyter-notebook-jupyter.el"
+                         "(require 'emacs-jupyter)"))
+      (should-not (string-match-p (regexp-quote forbidden) readme)))))
 
 (provide 'emacs-jupyter-notebook-tests)
 

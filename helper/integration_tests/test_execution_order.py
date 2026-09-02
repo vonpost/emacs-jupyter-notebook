@@ -21,13 +21,20 @@ class ExecutionOrderTests(unittest.IsolatedAsyncioTestCase):
                     future = loop.create_future(); events = []
                     backend.start(operation, params, events.append, future.set_result)
                     return await future, events
-                connected, _ = await request("connect", {"connection_file": str(fixture.connection_path), "artifact_dir": str(artifact_dir)})
+                connected, _ = await request("connect", {"connection_file": str(fixture.connection_path), "artifact_dir": str(artifact_dir), "image_max_pixels": 4_194_304})
                 self.assertIsNone(connected.error)
                 for code, status in (("1 + 1", "ok"), ("raise ValueError('x')", "error"), ("pass", "ok")):
                     completion, events = await request("execute", {"code": code})
                     self.assertEqual(completion.result.get("status"), status)
                     self.assertEqual([event.name for event in events].count("execute_reply"), 1)
-                    self.assertEqual([event.name for event in events].count("status"), 1)
+                    self.assertEqual(
+                        [
+                            event.data.get("execution_state")
+                            for event in events
+                            if event.name == "status"
+                        ],
+                        ["busy", "idle"],
+                    )
                 backend.close()
                 await backend.wait_closed()
                 self.assertEqual(backend._tasks, set())
@@ -43,7 +50,7 @@ class ExecutionOrderTests(unittest.IsolatedAsyncioTestCase):
                     artifact_dir.mkdir(mode=0o700)
                     backend = JupyterBackend(deadline=8)
                     future = asyncio.get_running_loop().create_future()
-                    backend.start("connect", {"connection_file": str(fixture.connection_path), "artifact_dir": str(artifact_dir)}, lambda _event: None, future.set_result)
+                    backend.start("connect", {"connection_file": str(fixture.connection_path), "artifact_dir": str(artifact_dir), "image_max_pixels": 4_194_304}, lambda _event: None, future.set_result)
                     self.assertIsNone((await future).error)
                     future = asyncio.get_running_loop().create_future()
                     backend.start("execute", {"code": "pass"}, lambda _event: None, future.set_result)

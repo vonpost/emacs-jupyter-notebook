@@ -138,16 +138,6 @@ runtime dependencies or a protocol-version mismatch."
   :type '(repeat string)
   :group 'emacs-jupyter-notebook)
 
-(defcustom emacs-jupyter-notebook-backend 'helper
-  "Backend implementation used for local Jupyter protocol attachment.
-
-`helper' uses the supervised local Python helper and is the default.
-`legacy' keeps the emacs-jupyter adapter available as an explicit fallback
-during the final helper dogfood gate."
-  :type '(choice (const :tag "Supervised local helper" helper)
-                 (const :tag "Legacy emacs-jupyter adapter" legacy))
-  :group 'emacs-jupyter-notebook)
-
 (defcustom emacs-jupyter-notebook-helper-hello-timeout 5
   "Maximum seconds allowed for the helper's initial hello response.
 Invalid values fall back to a finite internal deadline."
@@ -184,32 +174,89 @@ This may lower but never raise the protocol v1 accumulator ceiling."
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-registry-file
-  (locate-user-emacs-file "emacs-jupyter-notebook/registry.el")
-  "File containing the durable local remote-kernel registry."
+  (locate-user-emacs-file "emacs-jupyter-notebook/registry-v1.json")
+  "Versioned JSON file containing the durable local remote-kernel registry.
+The one-shot registry worker exclusively owns file access.  The legacy Lisp
+registry format is intentionally not read or migrated."
   :type 'file
   :group 'emacs-jupyter-notebook)
 
+(defcustom emacs-jupyter-notebook-registry-worker-command
+  '("ejn-registry-worker")
+  "One-shot local registry transaction worker argv.
+The executable is resolved through PATH, a Nix `result/bin' link, or the
+checkout wrapper.  It receives one JSON request on stdin and writes exactly
+one bounded JSON response on stdout."
+  :type '(repeat string)
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-registry-worker-request-timeout 5
+  "Maximum seconds for one registry worker invocation.
+An invocation timeout is durability-uncertain because the worker may have
+committed before its response was lost; it is never retried automatically."
+  :type 'number
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-registry-worker-retry-deadline 15
+  "Maximum seconds for one logical registry request, including busy retries."
+  :type 'number
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-registry-worker-retry-initial-delay 0.05
+  "Initial delay in seconds before retrying a worker `busy' response."
+  :type 'number
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-registry-worker-retry-max-delay 1.0
+  "Maximum delay in seconds between worker `busy' retries."
+  :type 'number
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-registry-worker-output-max-bytes (* 384 1024)
+  "Maximum stdout bytes retained from one registry worker invocation."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-registry-worker-stderr-max-bytes (* 64 1024)
+  "Maximum stderr bytes retained from one registry worker invocation."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
 (defcustom emacs-jupyter-notebook-result-max-bytes 10485760
-  "Maximum byte size of result content stored per panel entry."
+  "Maximum byte size of result content stored per panel entry.
+This option may lower, but cannot raise, the package's immutable safety
+ceiling."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-panel-max-history-entries 200
   "Maximum number of result entries retained by one panel.
 When this or either total-retention budget is exceeded, the panel retires
-the oldest history entries and their local artifacts."
+the oldest history entries and their local artifacts.  This option may lower,
+but cannot raise, the package's immutable safety ceiling."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-panel-max-total-text-bytes (* 20 1024 1024)
-  "Maximum total byte size of text retained by one result panel."
+  "Maximum total byte size of text retained by one result panel.
+This option may lower, but cannot raise, the package's immutable safety
+ceiling."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-panel-max-total-artifact-bytes (* 100 1024 1024)
   "Maximum total byte size of image and MIME artifacts retained by one panel.
 This includes the actual bytes of panel-owned image files and matplotlib
-pickle MIME payloads."
+pickle MIME payloads.  This option may lower, but cannot raise, the package's
+immutable safety ceiling."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-panel-max-output-segments 4096
+  "Maximum ordered output segments retained by one panel.
+This bounds structural rendering even when a kernel emits many tiny images or
+independent display values.  The option may lower, but cannot raise, the
+package's immutable safety ceiling."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
@@ -240,9 +287,9 @@ A tall image inserted as one display property is a single screen line, so
 scrolling must jump its whole height at once (window-start can only land
 on line boundaries — even pixel-precise scroll modes anchor there).
 Slicing (the `doc-view'/EWW technique) makes each row its own screen
-line, so the scroll walks smoothly across figures.  Slicing asks Emacs for
-the rendered image size and can be expensive, so it is opt-in.  The panel's
-inline preview budget still bounds how many images can be sized this way.
+line, so the scroll walks smoothly across figures.  Slicing uses the
+helper-validated preview dimensions and never asks a native decoder to size
+retained history.  The panel's hard inline-preview budget bounds the work.
 Zoom, `o', `v', and RET continue to treat the figure as one output.  Only
 effective on graphical displays."
   :type 'boolean
@@ -253,7 +300,8 @@ effective on graphical displays."
 The newest this-many visible images are rendered; older images remain as
 lightweight placeholders and can still be opened externally with `o'.
 Keeping this value small bounds Emacs's native image-cache memory.  A
-non-positive value disables inline previews while preserving originals."
+non-positive value disables inline previews while preserving originals.
+Values above the package's immutable safety ceiling are clamped."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
@@ -271,7 +319,8 @@ Windows."
   "Seconds to retain a verified image snapshot after launching its viewer.
 Platform launchers such as `open' and `xdg-open' commonly exit before the GUI
 application consumes the path.  The independent snapshot therefore remains
-available for this bounded handoff period."
+available for this bounded handoff period.  This option may lower, but cannot
+raise, the package's immutable lifetime ceiling."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
@@ -279,7 +328,8 @@ available for this bounded handoff period."
   "Maximum pending and retained external image snapshots.
 Each snapshot may contain one original image up to the helper's artifact
 limit.  Reaching this bound rejects another open request until a pending job
-settles, a request is cancelled, or a retained snapshot expires."
+settles, a request is cancelled, or a retained snapshot expires.  This option
+may lower, but cannot raise, the package's immutable count ceiling."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
@@ -303,22 +353,26 @@ disabled unless that kernel and its transport are explicitly trusted."
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-connection-retrieve-attempts 40
-  "Number of attempts to retrieve a remote Jupyter connection file."
+  "Number of attempts to retrieve a remote Jupyter connection file.
+This option may lower, but cannot raise, the immutable attempt ceiling."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-connection-retrieve-delay 0.25
-  "Seconds between attempts to retrieve a remote connection file."
+  "Seconds between attempts to retrieve a remote connection file.
+The effective value has immutable positive lower and upper bounds."
   :type 'number
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-tunnel-wait-timeout 10
-  "Seconds to wait for local SSH tunnel ports before connecting Jupyter."
+  "Seconds to wait for local SSH tunnel ports before connecting Jupyter.
+The effective value has immutable positive lower and upper bounds."
   :type 'number
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-tunnel-wait-delay 0.05
-  "Seconds between checks while waiting for SSH tunnel ports."
+  "Seconds between checks while waiting for SSH tunnel ports.
+The effective value has immutable positive lower and upper bounds."
   :type 'number
   :group 'emacs-jupyter-notebook)
 
@@ -342,16 +396,18 @@ TRANSPORT-ONLY: it rebuilds the tunnel and client against the durable
 registry entry.  It never starts a remote kernel and never terminates one —
 a probe that confirms the registered kernel is gone (or is a different
 process) stops the loop and leaves the entry for an explicit command.
-Retries stop on a successful connect, on that confirmed-terminal probe, or
-when the minor mode is disabled / the buffer killed.  Set nil to only ever
-reconnect through an explicit command."
+Retries stop on a successful connect, on that confirmed-terminal probe, when
+`emacs-jupyter-notebook-reconnect-attempt-limit' is reached, or when the
+minor mode is disabled / the buffer killed.  Set nil to only ever reconnect
+through an explicit command."
   :type 'boolean
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-reconnect-initial-delay 2
   "Seconds before the first automatic reconnect attempt after a drop.
 Each subsequent failed attempt doubles the delay (exponential backoff)
-until it reaches `emacs-jupyter-notebook-reconnect-max-delay'."
+until it reaches `emacs-jupyter-notebook-reconnect-max-delay'.  The effective
+value cannot be zero or exceed the package's immutable recovery ceiling."
   :type 'number
   :group 'emacs-jupyter-notebook)
 
@@ -360,8 +416,19 @@ until it reaches `emacs-jupyter-notebook-reconnect-max-delay'."
 The exponential backoff that starts at
 `emacs-jupyter-notebook-reconnect-initial-delay' never grows past this
 value, so a long outage settles into one attempt every this-many seconds
-instead of giving up."
+instead of giving up.  The effective value cannot be zero or exceed the
+package's immutable five-minute recovery ceiling."
   :type 'number
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-reconnect-attempt-limit 72
+  "Maximum automatic reconnect attempts in one transport-loss episode.
+Automatic recovery is deliberately finite: after this many failed attempts,
+EJN stops its timer and leaves the durable kernel registry entry untouched for
+an explicit reconnect or helper restart.  The effective value is always a
+positive finite integer and cannot exceed the package's immutable 288-attempt
+ceiling; invalid values fall back to 72."
+  :type 'integer
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-heartbeat-interval 20
@@ -369,12 +436,14 @@ instead of giving up."
 The heartbeat fires a `kernel_info_request' and treats no reply
 within `emacs-jupyter-notebook-heartbeat-timeout' as a miss.  After
 `emacs-jupyter-notebook-heartbeat-misses-allowed' consecutive
-misses the tunnel is flagged dead."
+misses the tunnel is flagged dead.  The effective interval is positive and
+cannot exceed the package's immutable liveness ceiling."
   :type 'number
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-heartbeat-timeout 3
-  "Seconds to wait for a kernel-info heartbeat reply before counting a miss."
+  "Seconds to wait for a kernel-info heartbeat reply before counting a miss.
+The effective timeout is positive and capped independently of the interval."
   :type 'number
   :group 'emacs-jupyter-notebook)
 
@@ -388,10 +457,10 @@ that the remote kernel outlives Emacs."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
-(defcustom emacs-jupyter-notebook-jupyter-connect-timeout 45
-  "Seconds emacs-jupyter may spend during initial client connection.
-This needs to be generous for high-latency remote kernels, especially
-when the remote side uses Nix or other environment initialization."
+(defcustom emacs-jupyter-notebook-connect-arbitration-timeout 45
+  "Seconds allowed to arbitrate helper readiness against remote PID liveness.
+The core caps this below the helper's own kernel-info verification deadline so
+a live but busy kernel can be adopted without waiting for that later timeout."
   :type 'number
   :group 'emacs-jupyter-notebook)
 
@@ -400,9 +469,10 @@ when the remote side uses Nix or other environment initialization."
 An attempt that is still in flight (any phase: launch, probe, retrieve,
 tunnel, connect) after this many seconds is failed with a timeout error.
 This is the backstop that guarantees no connection attempt can wedge a
-buffer forever even if an individual phase's own bounding fails.  Set to
-nil or a non-positive value to disable the deadline."
-  :type '(choice (const :tag "No overall deadline" nil) number)
+buffer forever even if an individual phase's own bounding fails.  Invalid or
+non-positive values fall back to 180 seconds, and values above the package's
+hard ten-minute ceiling are capped."
+  :type 'number
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-ssh-process-timeout 60
@@ -412,9 +482,9 @@ process that is still running after this many seconds is killed and its
 attempt failed with a timeout error.  This bounds the processes that ride
 a ControlMaster or otherwise outlive their `ConnectTimeout'.  The tunnel
 is NOT bounded here (it is meant to live indefinitely); it is bounded by
-the keepalives and the overall attempt deadline instead.  Set to nil or a
-non-positive value to disable the per-process watchdog."
-  :type '(choice (const :tag "No per-process deadline" nil) number)
+the keepalives and the overall attempt deadline instead.  The effective
+one-shot deadline is always finite and cannot be disabled."
+  :type 'number
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-management-process-timeout 60
@@ -428,21 +498,10 @@ Emacs.  A non-positive or non-numeric value falls back to 60 seconds."
 (defcustom emacs-jupyter-notebook-management-output-max-bytes (* 1024 1024)
   "Maximum bytes retained per stdout or stderr management buffer.
 The newest output is retained with an explicit truncation marker.  This bound
-cannot be disabled: invalid values use a 1 MiB hard fallback so a noisy remote
-command cannot grow Emacs memory without limit while its watchdog is pending."
+cannot be disabled or raised: invalid or larger values use the immutable 1 MiB
+ceiling so a noisy remote command cannot grow Emacs memory without limit while
+its watchdog is pending."
   :type 'integer
-  :group 'emacs-jupyter-notebook)
-
-(defcustom emacs-jupyter-notebook-jupyter-request-timeout 2
-  "Seconds to wait for runtime completion, inspect, and completeness replies."
-  :type 'number
-  :group 'emacs-jupyter-notebook)
-
-(defcustom emacs-jupyter-notebook-jupyter-completion-timeout 0.35
-  "Seconds to wait for runtime completion replies.
-Completion runs from `completion-at-point-functions', so this should stay
-short to avoid making normal editing feel blocked."
-  :type 'number
   :group 'emacs-jupyter-notebook)
 
 ;;; W3 completion customization
@@ -450,8 +509,9 @@ short to avoid making normal editing feel blocked."
 (defcustom emacs-jupyter-notebook-completion-idle 0.10
   "Seconds of idle time before sending an async completion request.
 The capf returns immediately; the request fires only after the user
-pauses typing for this long.  Smaller values feel snappier but hammer
-the kernel during fast typing."
+pauses typing for this long.  The effective value has immutable positive
+lower and upper bounds so invalid customization cannot create a timer storm
+or silently defer completion for hours."
   :type 'number
   :group 'emacs-jupyter-notebook)
 
@@ -459,29 +519,134 @@ the kernel during fast typing."
   "Maximum number of cached completion replies per buffer.
 Evicted in least-recently-used order.  The cache key is
 \(point . line-up-to-point\), so identical contexts within a single
-buffer reuse the prior reply without a round trip."
+buffer reuse the prior reply without a round trip.  This option may lower,
+but cannot raise, the package's immutable cache ceiling."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-check-code-completeness nil
   "Whether to ask the kernel if a cell is complete before evaluation.
-This uses Jupyter's `is_complete_request' and may block up to
-`emacs-jupyter-notebook-jupyter-request-timeout' seconds."
+The request is asynchronous and uses the helper backend's bounded auxiliary
+request deadline."
   :type 'boolean
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-evaluation-timeout 120
-  "Seconds to wait before warning about a possibly unresponsive evaluation."
+  "Seconds before interrupting a possibly unresponsive evaluation.
+The effective value is positive and capped at one hour, after which one equal
+terminal grace may elapse before the ambiguous local transport is retired."
   :type 'number
   :group 'emacs-jupyter-notebook)
 
-(defcustom emacs-jupyter-notebook-watch-expressions nil
-  "Named expressions to evaluate with each Jupyter execute request.
-Each element is (NAME . EXPRESSION), where NAME labels the displayed
-watch value and EXPRESSION is code evaluated by the kernel through
-Jupyter's `user_expressions' field.  Watch values are displayed in the
-panel under the entry header."
-  :type '(alist :key-type string :value-type string)
+(defconst emacs-jupyter-notebook--hard-connection-retrieve-attempts 160)
+(defconst emacs-jupyter-notebook--hard-connection-retrieve-delay 5.0)
+(defconst emacs-jupyter-notebook--hard-tunnel-wait-timeout 60.0)
+(defconst emacs-jupyter-notebook--hard-tunnel-wait-delay 1.0)
+(defconst emacs-jupyter-notebook--hard-reconnect-initial-delay 60.0)
+(defconst emacs-jupyter-notebook--hard-reconnect-max-delay 300.0)
+(defconst emacs-jupyter-notebook--hard-reconnect-attempt-limit 288)
+(defconst emacs-jupyter-notebook--hard-evaluation-timeout 3600.0)
+(defconst emacs-jupyter-notebook--hard-heartbeat-interval 300.0)
+(defconst emacs-jupyter-notebook--hard-heartbeat-timeout 60.0)
+(defconst emacs-jupyter-notebook--hard-heartbeat-misses 10)
+(defconst emacs-jupyter-notebook--hard-completion-idle 5.0)
+(defconst emacs-jupyter-notebook--hard-ssh-process-timeout 600.0)
+(defconst emacs-jupyter-notebook--hard-prune-ssh-timeout 60)
+
+(defun emacs-jupyter-notebook--bounded-positive-option
+    (value fallback minimum maximum)
+  "Normalize numeric VALUE between MINIMUM and MAXIMUM, else FALLBACK."
+  (if (and (numberp value) (= value value) (> value 0))
+      (min maximum (max minimum value))
+    fallback))
+
+(defun emacs-jupyter-notebook--effective-connection-retrieve-attempts ()
+  "Return the immutable bounded connection retrieval attempt count."
+  (let ((value emacs-jupyter-notebook-connection-retrieve-attempts))
+    (if (and (integerp value) (> value 0))
+        (min value emacs-jupyter-notebook--hard-connection-retrieve-attempts)
+      40)))
+
+(defun emacs-jupyter-notebook--effective-connection-retrieve-delay ()
+  "Return the immutable bounded connection retrieval delay."
+  (emacs-jupyter-notebook--bounded-positive-option
+   emacs-jupyter-notebook-connection-retrieve-delay 0.25 0.05
+   emacs-jupyter-notebook--hard-connection-retrieve-delay))
+
+(defun emacs-jupyter-notebook--effective-tunnel-wait-timeout ()
+  "Return the immutable bounded tunnel readiness deadline."
+  (emacs-jupyter-notebook--bounded-positive-option
+   emacs-jupyter-notebook-tunnel-wait-timeout 10.0 1.0
+   emacs-jupyter-notebook--hard-tunnel-wait-timeout))
+
+(defun emacs-jupyter-notebook--effective-tunnel-wait-delay ()
+  "Return the immutable bounded tunnel readiness polling delay."
+  (emacs-jupyter-notebook--bounded-positive-option
+   emacs-jupyter-notebook-tunnel-wait-delay 0.05 0.025
+   emacs-jupyter-notebook--hard-tunnel-wait-delay))
+
+(defun emacs-jupyter-notebook--effective-reconnect-initial-delay ()
+  "Return the immutable bounded initial automatic reconnect delay."
+  (emacs-jupyter-notebook--bounded-positive-option
+   emacs-jupyter-notebook-reconnect-initial-delay 2.0 0.1
+   emacs-jupyter-notebook--hard-reconnect-initial-delay))
+
+(defun emacs-jupyter-notebook--effective-reconnect-max-delay ()
+  "Return the immutable bounded maximum automatic reconnect delay."
+  (emacs-jupyter-notebook--bounded-positive-option
+   emacs-jupyter-notebook-reconnect-max-delay 300.0 0.1
+   emacs-jupyter-notebook--hard-reconnect-max-delay))
+
+(defun emacs-jupyter-notebook--effective-reconnect-attempt-limit ()
+  "Return the immutable bounded automatic reconnect attempt limit."
+  (let ((value emacs-jupyter-notebook-reconnect-attempt-limit))
+    (if (and (integerp value) (> value 0))
+        (min value emacs-jupyter-notebook--hard-reconnect-attempt-limit)
+      72)))
+
+(defun emacs-jupyter-notebook--effective-evaluation-timeout ()
+  "Return the immutable bounded user execution timeout."
+  (emacs-jupyter-notebook--bounded-positive-option
+   emacs-jupyter-notebook-evaluation-timeout 120.0 1.0
+   emacs-jupyter-notebook--hard-evaluation-timeout))
+
+(defun emacs-jupyter-notebook--effective-heartbeat-interval ()
+  "Return the immutable bounded heartbeat interval."
+  (emacs-jupyter-notebook--bounded-positive-option
+   emacs-jupyter-notebook-heartbeat-interval 20.0 1.0
+   emacs-jupyter-notebook--hard-heartbeat-interval))
+
+(defun emacs-jupyter-notebook--effective-heartbeat-timeout ()
+  "Return the immutable bounded per-heartbeat reply timeout."
+  (emacs-jupyter-notebook--bounded-positive-option
+   emacs-jupyter-notebook-heartbeat-timeout 3.0 0.1
+   emacs-jupyter-notebook--hard-heartbeat-timeout))
+
+(defun emacs-jupyter-notebook--effective-heartbeat-misses ()
+  "Return the immutable bounded consecutive heartbeat miss count."
+  (let ((value emacs-jupyter-notebook-heartbeat-misses-allowed))
+    (if (and (integerp value) (> value 0))
+        (min value emacs-jupyter-notebook--hard-heartbeat-misses)
+      2)))
+
+(defun emacs-jupyter-notebook--effective-completion-idle ()
+  "Return the immutable bounded completion debounce delay."
+  (emacs-jupyter-notebook--bounded-positive-option
+   emacs-jupyter-notebook-completion-idle 0.10 0.025
+   emacs-jupyter-notebook--hard-completion-idle))
+
+(defun emacs-jupyter-notebook--effective-ssh-process-timeout (&optional override)
+  "Return a finite bounded one-shot SSH deadline, honoring OVERRIDE."
+  (emacs-jupyter-notebook--bounded-positive-option
+   (or override emacs-jupyter-notebook-ssh-process-timeout)
+   60.0 0.1 emacs-jupyter-notebook--hard-ssh-process-timeout))
+
+(defcustom emacs-jupyter-notebook-max-pending-executions 32
+  "Maximum active and queued user executions retained by one source buffer.
+New evaluations are rejected before panel or ledger allocation when this
+bound is reached.  This option may lower, but cannot raise, the package's
+immutable queue ceiling."
+  :type 'integer
   :group 'emacs-jupyter-notebook)
 
 ;; W2.10: removed legacy inline-overlay customizations
@@ -547,9 +712,15 @@ package is loaded, or rebuild the keymap manually."
 (defcustom emacs-jupyter-notebook-log-max-lines 2000
   "Maximum number of lines retained in the `*emacs-jupyter-notebook log*' buffer.
 The log buffer is append-only.  After every append the oldest lines are
-trimmed until the buffer is at most this many lines tall.  Set to a small
-value to keep memory bounded on long sessions; set to a large value if you
-want a longer scrollback for debugging."
+trimmed until the buffer is at most this many lines tall.  This option may
+lower, but cannot raise, the package's immutable line ceiling."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-log-max-bytes (* 2 1024 1024)
+  "Maximum bytes retained in the `*emacs-jupyter-notebook log*' buffer.
+The byte and line limits are enforced together after every append.  This
+option may lower, but cannot raise, the package's immutable byte ceiling."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
@@ -625,9 +796,17 @@ The non-destructive registry prune (`prune-dead-kernels' and the
 reconnect picker) runs ONE ssh per host to ask which recorded kernel PIDs
 are still alive.  This caps how long an unreachable host can stall Emacs;
 a host that does not answer within the timeout is treated as UNKNOWN and
-its entries are NEVER pruned."
+its entries are NEVER pruned.  The effective value is an integer from one to
+sixty seconds so it is valid for both OpenSSH and the local watchdog."
   :type 'integer
   :group 'emacs-jupyter-notebook)
+
+(defun emacs-jupyter-notebook--effective-prune-ssh-timeout (&optional override)
+  "Return a finite OpenSSH-compatible liveness timeout, honoring OVERRIDE."
+  (ceiling
+   (emacs-jupyter-notebook--bounded-positive-option
+    (or override emacs-jupyter-notebook-prune-ssh-timeout)
+    5.0 1.0 emacs-jupyter-notebook--hard-prune-ssh-timeout)))
 
 (defcustom emacs-jupyter-notebook-viewer-auto-open nil
   "When non-nil, automatically open every pickled figure in the local viewer.

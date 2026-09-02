@@ -48,10 +48,40 @@
             '';
             pythonImportsCheck = [ "ejn_helper" ];
           };
+          ejn-registry-worker = python.pkgs.buildPythonApplication {
+            pname = "ejn-registry-worker";
+            version = "0.1.0";
+            pyproject = true;
+            src = ./registry_worker;
+            build-system = [ python.pkgs.setuptools ];
+
+            doCheck = true;
+            checkPhase = ''
+              runHook preCheck
+              python -m unittest discover -s tests -p 'test_*.py'
+              runHook postCheck
+            '';
+            doInstallCheck = true;
+            installCheckPhase = ''
+              runHook preInstallCheck
+              response=$(printf '%s\n' '{}' | "$out/bin/ejn-registry-worker")
+              RESPONSE="$response" python -c 'import json, os; value = json.loads(os.environ["RESPONSE"]); assert value == {"v": 1, "ok": False, "error": {"code": "invalid-request", "message": "registry request has an invalid version"}}'
+              runHook postInstallCheck
+            '';
+            pythonImportsCheck = [ "ejn_registry_worker" ];
+          };
+          ejn-runtime = pkgs.symlinkJoin {
+            name = "emacs-jupyter-notebook-runtime";
+            paths = [ ejn-helper ejn-registry-worker ];
+            postBuild = ''
+              test -x "$out/bin/ejn-helper"
+              test -x "$out/bin/ejn-registry-worker"
+            '';
+          };
         in
         {
-          inherit ejn-helper;
-          default = ejn-helper;
+          inherit ejn-helper ejn-registry-worker ejn-runtime;
+          default = ejn-runtime;
         });
 
       apps = forAllSystems (pkgs: {
@@ -59,6 +89,11 @@
           type = "app";
           program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.ejn-helper}/bin/ejn-helper";
           meta.description = "Run the EJN local Jupyter transport helper";
+        };
+        ejn-registry-worker = {
+          type = "app";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.ejn-registry-worker}/bin/ejn-registry-worker";
+          meta.description = "Run one transactional EJN registry operation";
         };
         default = self.apps.${pkgs.stdenv.hostPlatform.system}.ejn-helper;
       });

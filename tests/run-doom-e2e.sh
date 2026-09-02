@@ -71,7 +71,8 @@ terminate_private_tree() {
 }
 
 wait_for_pid_exit() {
-  local pid=$1 seconds=$2 deadline=$((SECONDS + seconds))
+  local pid=$1 seconds=$2
+  local deadline=$((SECONDS + seconds))
   while kill -0 "$pid" >/dev/null 2>&1 && (( SECONDS < deadline )); do
     sleep 0.1
   done

@@ -93,7 +93,7 @@ class OutputIsolationTests(unittest.TestCase):
                 0, RUNNER.EMACS_OUTPUT_LIMIT + 1, bytearray(b"bounded tail"))
         with self.assertRaisesRegex(RuntimeError, "failed with 7"):
             RUNNER.check_emacs_result(7, len(good), good)
-        with self.assertRaisesRegex(RuntimeError, "exact 13/13 ERT summary"):
+        with self.assertRaisesRegex(RuntimeError, "exact 17/17 ERT summary"):
             RUNNER.check_emacs_result(0, 4, bytearray(b"nope"))
 
     def test_failure_tempdir_is_retained_until_explicit_bounded_removal(self) -> None:

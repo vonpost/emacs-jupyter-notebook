@@ -232,9 +232,20 @@ def _normalize_auxiliary(operation: str | None, content: Mapping[str, object]) -
             raise BackendError("protocol-error")
         result = {"found": found}
         if "data" in content:
-            if not isinstance(content["data"], Mapping):
+            data = content["data"]
+            if not isinstance(data, Mapping):
                 raise BackendError("protocol-error")
-            result["data"] = _bounded_value(content["data"], budget, 0)
+            # Inspect data is a MIME bundle, not an execution output channel.
+            # Never serialize rich MIME (which can contain unbounded base64)
+            # into a helper response; retain only its bounded plain-text view.
+            text = data.get("text/plain")
+            if text is not None and not isinstance(text, str):
+                raise BackendError("protocol-error")
+            result["data"] = {}
+            if text is not None:
+                result["data"]["text/plain"] = budget.text(
+                    text, MAX_DOCUMENTATION_BYTES
+                )
         if "metadata" in content:
             if not isinstance(content["metadata"], Mapping):
                 raise BackendError("protocol-error")
@@ -967,11 +978,18 @@ class JupyterBackend:
                     lambda event: self._output_event(pending, event),
                 )
         elif message_type == "status" and state.accept_iopub(message):
+            status = content if isinstance(content, Mapping) else {}
+            if status.get("execution_state") == "busy":
+                # Busy is a correlated, non-terminal progress transition.
+                # It must reach Emacs promptly, but it cannot participate in
+                # terminal ordering or completion arbitration.
+                self._deliver_event(pending.event_callback, "status", status)
+                return
             # The terminal status must follow every earlier IOPub output for
             # this execution.  Output normalization is deliberately queued so
             # its worker, not the channel reader, delivers the idle event.
             pending.idle_received = True
-            pending.idle_content = content if isinstance(content, Mapping) else {}
+            pending.idle_content = status
             if not self._outputs.has_pending(
                 pending.output_attachment, state.jupyter_id
             ):

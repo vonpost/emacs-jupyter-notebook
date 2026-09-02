@@ -369,7 +369,7 @@ Depends on: W1. May start in parallel with W2.
 
 File scope:
 - `emacs-jupyter-notebook.el` (the completion-at-point function)
-- `emacs-jupyter-notebook-jupyter.el` (adapter; already exists for complete)
+- `emacs-jupyter-notebook-helper-backend.el` and the supervised helper adapter
 - `tests/emacs-jupyter-notebook-tests.el`
 
 Goal: Completion that never blocks the UI even on high-latency links. This
@@ -696,8 +696,8 @@ Per-row dependencies:
       in the user-facing message.
 - [x] sha=2b9b2a0 W7.2 ERT: `--async-retrieve` exhausts its retries → context phase
       `error`, last-error captured in the snapshot, no leaked launch/scp
-      processes or temp files. (Test currently `:expected-result :failed`
-      because it uncovered CC1; flip to `:passed` when CC1 lands.)
+      processes or temp files.  The leak assertion originally exposed CC1;
+      CC1 later landed and this is now an ordinary passing regression.
 - [x] sha=05d73e0 W7.3 ERT: `cancel-operation` during tunnel phase tears down the
       tunnel process and the registry remains untouched (or removed,
       depending on `:owns-kernel`); assert both branches.
@@ -719,7 +719,8 @@ Per-row dependencies:
           masked by the same xfail marker meant only for the CC1 leak
           assertion.  Fix: split into two ERTs — one that asserts the
           normal retry-exhaustion behavior (passes today), and one that
-          asserts the no-leak invariant (xfailed pending CC1).
+          asserts the no-leak invariant (xfailed at this historical checkpoint;
+          CC1 later landed and the test now passes normally).
       (b) HIGH: W7.5 no-tramp static check does a raw regex scan, so
           `(require 'tramp` inside a comment or docstring produces a false
           positive.  Fix: strip Emacs-Lisp comments before searching, and
@@ -1082,7 +1083,7 @@ subplot crops all siblings, killing Emacs reaps the viewer.
 
 ## W17 — Sliced panel images (smooth scrolling over figures)
 
-- [x] sha=PENDING W17 sliced image rendering.  MOTIVATION: a tall figure
+- [x] sha=ec9cb76 W17 sliced image rendering.  MOTIVATION: a tall figure
       inserted as ONE display property is a single screen line; Emacs can
       only anchor window-start on line boundaries, so any scroll crossing
       the figure jumps its whole height at once — even under emacs-mac /
@@ -1099,7 +1100,7 @@ subplot crops all siblings, killing Emacs reaps the viewer.
 
 ## W16 — Panel correctness under evil + interleaved outputs + macOS viewer
 
-- [x] sha=PENDING W16 panel/viewer dogfooding batch (macOS + Doom host).
+- [x] sha=33dcea2 W16 panel/viewer dogfooding batch (macOS + Doom host).
       - EVIL SHADOWED EVERY PANEL KEY: under evil (Doom) special-mode
         buffers land in motion/normal state whose maps shadow the panel's
         single-key commands — `H' was move-to-window-top, `v' opened visual
@@ -1143,7 +1144,7 @@ subplot crops all siblings, killing Emacs reaps the viewer.
 
 ## W15 — Busy kernels are alive: heartbeat + reconnect (dogfooding)
 
-- [x] sha=PENDING W15 busy-kernel correctness.  MOTIVATION: two dogfooding
+- [x] sha=e6f74de W15 busy-kernel correctness.  MOTIVATION: two dogfooding
       failures shared one root cause — SHELL-CHANNEL SILENCE WAS TREATED AS
       DEATH, but a busy kernel is SUPPOSED to be silent on shell (messages
       queue behind the running cell).  For ML training workloads (cells that
@@ -1182,7 +1183,7 @@ subplot crops all siblings, killing Emacs reaps the viewer.
 
 ## W14 — Panel/completion/viewer dogfooding fixes
 
-- [x] sha=PENDING W14 dogfooding fixes (live UX bugs found while using the
+- [x] sha=9be73ba/15abdba W14 dogfooding fixes (live UX bugs found while using the
       package against a real Docker remote).
       - tqdm PROGRESS: stream output now resolves carriage returns
         (`--apply-carriage-returns`), so a `\r`-repainted progress bar
@@ -1206,18 +1207,17 @@ subplot crops all siblings, killing Emacs reaps the viewer.
         slightly-older remote often loads instead of raising "Grouper object
         has no attribute _ordering".  On any residual failure the panel PNG
         is kept and the message names the local matplotlib version.
-      - KNOWN/OPEN: kernel tunnel drops+reconnects roughly every ~5 min on
-        the dogfooding host (recovers cleanly).  Likely an absolute-age
-        NAT/firewall/ProxyJump session cap rather than idle timeout (the
-        15 s ServerAlive keepalive defeats idle drops).  Diagnose via
-        `C-c j L`; if it correlates with the W13 ControlMaster, test with
-        `emacs-jupyter-notebook-ssh-control-master' nil.  Not yet fixed.
+      - Historical dogfood finding: the tunnel dropped roughly every five
+        minutes.  W19 later added bounded transport-loss recovery, phase and
+        process deadlines, keepalives, and explicit helper restart/status
+        controls; current helper-only stress and remote gates cover tunnel
+        death without replacing the kernel.
 
 ---
 
 ## W13 — Async-ordering races + macOS/Docker dogfooding fixes
 
-- [x] sha=PENDING W13 async-ordering hardening.  MOTIVATION: the deferred
+- [x] sha=ec26387/7e283ed W13 async-ordering hardening.  MOTIVATION: the deferred
       Tier-3 items from the 2026-07-09 review (REVIEW_ACTION_PLAN.md) plus two
       regressions/bugs found live while dogfooding on a fresh macOS + Docker
       host.  All land with deterministic ERT coverage (433 tests green).
@@ -1352,10 +1352,10 @@ subplot crops all siblings, killing Emacs reaps the viewer.
       is purely additive.  DESIGN DECISIONS appended
       (2026-07-07): the idle self-reap as a user-approved exception to "remote
       kernel outlives Emacs"; and `prune-dead-kernels` as a non-destructive
-      dead-entry prune.  Async note: the picker/
-      command run a bounded, per-host synchronous ssh probe — acceptable because
-      it is one ssh per host with a hard ConnectTimeout, matching the existing
-      reconnect flow's synchronous-ish ssh; the timeout caps worst-case stall.
+      dead-entry prune.  This row originally used a bounded per-host
+      synchronous SSH probe.  W19/IR4 later replaced it with cancellable async
+      children and independent hard deadlines; no current picker/prune command
+      blocks the Emacs UI on SSH.
       TESTS (+13 deterministic ERT): watchdog snippet shape (idempotency guard,
       embeds `%d` timeout, pre_run_cell AND post_run_cell, daemon thread,
       SIGTERM + `os._exit(0)`, stdlib-only, no matplotlib); injection embeds the
@@ -1369,8 +1369,9 @@ subplot crops all siblings, killing Emacs reaps the viewer.
       The existing destructive-command tests are unchanged (still
       `clean-orphaned-kernels`); the keymap test pins `w`→clean-orphaned-kernels
       and `P`→prune-dead-kernels.
-      VERIFICATION: `Ran 405 tests, 405 results as expected, 0 unexpected,
-      1 expected failures` (CC1); byte-compile adds no new warnings (only the
+      VERIFICATION at this historical checkpoint: `Ran 405 tests, 405 results
+      as expected, 0 unexpected, 1 expected failures` (CC1, fixed later);
+      byte-compile adds no new warnings (only the
       two pre-existing `evil-visual-beginning`/`-end` free-variable refs).
 
 ## W10 — Recover client-less sessions (dangling entry/tunnel is reapable debris)
@@ -1433,8 +1434,9 @@ subplot crops all siblings, killing Emacs reaps the viewer.
       (adapter calls the callback exactly once, raise propagates), and
       `ejn-w10-connect-nil-client-transitions-context-to-error` (end-to-end
       `--async-connect` → adapter callback(nil) → ERROR, never silently done).
-      Verification: `Ran 390 tests, 390 results as expected, 0 unexpected`
-      (1 expected failure, CC1).  Byte-compile: no NEW warnings (only the
+      Verification at this historical checkpoint: `Ran 390 tests, 390 results
+      as expected, 0 unexpected` (1 expected failure, CC1, fixed later).
+      Byte-compile: no NEW warnings (only the
       pre-existing `evil-visual-beginning`/`-end` free-variable warnings,
       shifted to ~2264/2265 by the added lines).
 ---
@@ -1478,8 +1480,9 @@ subplot crops all siblings, killing Emacs reaps the viewer.
       reply shape (`:cursor_start 9 :cursor_end 9', matches
       ["clear" "copy" "get"]) through `--completion-result-from-reply'
       yields (START END COLLECTION . PROPS) with START == END == point and
-      the bare names.  VERIFICATION: `Ran 388 tests, 388 as expected,
-      0 unexpected, 1 expected failure' (CC1); byte-compile adds no new
+      the bare names.  VERIFICATION at this historical checkpoint: `Ran 388
+      tests, 388 as expected, 0 unexpected, 1 expected failure' (CC1, fixed
+      later); byte-compile adds no new
       warnings (only the two pre-existing evil-visual-* free-variable refs);
       live ipykernel smoke reconfirmed `d.' -> cursor_start==cursor_end==9
       with bare attribute names `['clear','copy','fromkeys','get',...]`.
@@ -1494,11 +1497,6 @@ subplot crops all siblings, killing Emacs reaps the viewer.
 
 ## Future workstreams (not yet scheduled)
 
-- **W20 isolated local Jupyter helper.** Replace the main-thread
-  `emacs-jupyter` transport with a supervised, bounded local helper while
-  preserving the durable remote-kernel/SSH-forward architecture.  The
-  task-level claim ledger, protocol contract, dependency graph, and acceptance
-  tests are in `HELPER_TRANSPORT_PLAN.md`.
 - **Multi-buffer sharing one kernel.** Registry refcount + buffer set per
   session-id + tunnel-share. Requires reconsidering W1.1's kill-buffer-hook
   to refcount instead of unconditionally tearing down.
@@ -1514,4 +1512,11 @@ subplot crops all siblings, killing Emacs reaps the viewer.
 Move rows here when they land, with sha. Keep workstream order. This keeps
 the active sections short and the history auditable.
 
-- _none yet_
+- **W20 isolated local Jupyter helper (completed 2026-09-02).** Production uses
+  the supervised bounded helper and transactional registry worker while
+  retaining the durable remote-kernel/SSH-forward architecture.  Final gates
+  include 879 ERTs, 221 helper unit tests, 25 registry-worker tests, 53
+  real-Jupyter integration tests, graphical 100-image cache/viewport stress,
+  and isolated Doom recovery through a tunnel failure during a 125-second
+  execution.  See `HELPER_TRANSPORT_PLAN.md` and
+  `docs/dogfood/2026-09-02-ag4.md`.

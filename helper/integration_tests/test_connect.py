@@ -20,11 +20,12 @@ from ejn_helper.jupyter_backend import JupyterBackend
 from kernel_fixture import LocalKernelFixture
 
 
-def _connect_params(connection_path: Path, artifact_dir: Path) -> dict[str, str]:
+def _connect_params(connection_path: Path, artifact_dir: Path) -> dict[str, object]:
     artifact_dir.mkdir(mode=0o700, exist_ok=True)
     return {
         "connection_file": str(connection_path),
         "artifact_dir": str(artifact_dir),
+        "image_max_pixels": 4_194_304,
     }
 
 

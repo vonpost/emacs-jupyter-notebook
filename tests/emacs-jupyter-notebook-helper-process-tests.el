@@ -444,6 +444,200 @@
       (when (buffer-live-p owner) (kill-buffer owner))
       (ejn-et2--clean))))
 
+(ert-deftest ejn-et2-stderr-pipe-construction-failure-disposes-the-session ()
+  "A stderr-pipe constructor error cannot retain the newly allocated buffer."
+  (let ((emacs-jupyter-notebook-helper-command (list "python3" ejn-et2--fixture "silent"))
+        (owner (generate-new-buffer " *ejn-et2-pipe-failure-owner*"))
+        (real-generate-new-buffer (symbol-function 'generate-new-buffer))
+        (created-buffers nil)
+        (failure-count 0)
+        (sent-count 0)
+        session)
+    (unwind-protect
+        (cl-letf (((symbol-function 'generate-new-buffer)
+                   (lambda (&rest arguments)
+                     (let ((buffer (apply real-generate-new-buffer arguments)))
+                       (push buffer created-buffers)
+                       buffer)))
+                  ((symbol-function 'make-pipe-process)
+                   (lambda (&rest _arguments)
+                     (error "injected stderr pipe constructor failure")))
+                  ((symbol-function 'process-send-string)
+                   (lambda (&rest _arguments)
+                     (cl-incf sent-count))))
+          (setq session
+                (emacs-jupyter-notebook-helper-start
+                 :buffer owner
+                 :failure-callback (lambda (&rest _) (cl-incf failure-count))))
+          (should (= failure-count 1))
+          (should (= sent-count 0))
+          (ejn-et2--assert-disposed-slots-cleared session)
+          (should (cl-every (lambda (buffer) (not (buffer-live-p buffer)))
+                            created-buffers))
+          (ejn-et2--assert-no-local-leaks))
+      (dolist (buffer created-buffers)
+        (when (buffer-live-p buffer) (kill-buffer buffer)))
+      (when (buffer-live-p owner) (kill-buffer owner))
+      (ejn-et2--clean))))
+
+(ert-deftest ejn-et2-inline-terminal-sentinel-waits-for-session-publication ()
+  "An inline terminal sentinel settles only after all local ownership exists."
+  (let* ((emacs-jupyter-notebook-helper-command (list "python3" ejn-et2--fixture "silent"))
+         (owner (generate-new-buffer " *ejn-et2-inline-terminal-owner*"))
+         (main (make-process :name "ejn-et2-inline-terminal-main"
+                             :command '("sh" "-c" "exit 7")
+                             :connection-type 'pipe :coding 'binary :noquery t))
+         (stderr (make-pipe-process :name "ejn-et2-inline-terminal-stderr"
+                                    :buffer nil :coding 'binary :noquery t))
+         (failure-count 0)
+         (sent-count 0)
+         session)
+    (unwind-protect
+        (progn
+          (should (ejn-et2--await (lambda () (not (process-live-p main))) 1))
+          (cl-letf (((symbol-function 'make-pipe-process)
+                     (lambda (&rest _arguments) stderr))
+                    ((symbol-function 'make-process)
+                     (lambda (&rest arguments)
+                       (funcall (plist-get arguments :sentinel)
+                                main "exited during construction\n")
+                       main))
+                    ((symbol-function 'process-send-string)
+                     (lambda (&rest _arguments) (cl-incf sent-count))))
+            (setq session
+                  (emacs-jupyter-notebook-helper-start
+                   :buffer owner
+                   :failure-callback (lambda (&rest _) (cl-incf failure-count))))
+            (should (ejn-et2--await (lambda () (= failure-count 1)) 1))
+            (should (= sent-count 0))
+            (ejn-et2--assert-disposed-slots-cleared session)
+            (should-not (process-live-p main))
+            (should-not (process-live-p stderr))
+            (ejn-et2--assert-no-local-leaks)))
+      (when (process-live-p main) (delete-process main))
+      (when (process-live-p stderr) (delete-process stderr))
+      (when (buffer-live-p owner) (kill-buffer owner))
+      (ejn-et2--clean))))
+
+(ert-deftest ejn-et2-dead-main-return-settles-after-publication ()
+  "A dead child returned without a sentinel cannot leave startup wedged."
+  (let* ((emacs-jupyter-notebook-helper-command (list "python3" ejn-et2--fixture "silent"))
+         (owner (generate-new-buffer " *ejn-et2-dead-return-owner*"))
+         (main (make-process :name "ejn-et2-dead-return-main"
+                             :command '("sh" "-c" "exit 9")
+                             :connection-type 'pipe :coding 'binary :noquery t))
+         (stderr (make-pipe-process :name "ejn-et2-dead-return-stderr"
+                                    :buffer nil :coding 'binary :noquery t))
+         (failure-count 0)
+         (sent-count 0)
+         session)
+    (unwind-protect
+        (progn
+          (should (ejn-et2--await (lambda () (not (process-live-p main))) 1))
+          (cl-letf (((symbol-function 'make-pipe-process)
+                     (lambda (&rest _arguments) stderr))
+                    ((symbol-function 'make-process)
+                     (lambda (&rest _arguments) main))
+                    ((symbol-function 'process-send-string)
+                     (lambda (&rest _arguments) (cl-incf sent-count))))
+            (setq session
+                  (emacs-jupyter-notebook-helper-start
+                   :buffer owner
+                   :failure-callback (lambda (&rest _) (cl-incf failure-count))))
+            (should (ejn-et2--await (lambda () (= failure-count 1)) 1))
+            (should (= sent-count 0))
+            (ejn-et2--assert-disposed-slots-cleared session)
+            (should-not (process-live-p main))
+            (should-not (process-live-p stderr))
+            (ejn-et2--assert-no-local-leaks)))
+      (when (process-live-p main) (delete-process main))
+      (when (process-live-p stderr) (delete-process stderr))
+      (when (buffer-live-p owner) (kill-buffer owner))
+      (ejn-et2--clean))))
+
+(ert-deftest ejn-et2-hello-deadline-construction-failure-sends-no-hello ()
+  "A helper without a hello deadline is failed before it writes a frame."
+  (let* ((emacs-jupyter-notebook-helper-command (list "python3" ejn-et2--fixture "silent"))
+         (owner (generate-new-buffer " *ejn-et2-hello-timer-owner*"))
+         (main (make-pipe-process :name "ejn-et2-hello-timer-main"
+                                  :buffer nil :coding 'binary :noquery t))
+         (stderr (make-pipe-process :name "ejn-et2-hello-timer-stderr"
+                                    :buffer nil :coding 'binary :noquery t))
+         (real-run-at-time (symbol-function 'run-at-time))
+         (failure-count 0)
+         (sent-count 0)
+         session)
+    (unwind-protect
+        (cl-letf (((symbol-function 'make-pipe-process)
+                   (lambda (&rest _arguments) stderr))
+                  ((symbol-function 'make-process)
+                   (lambda (&rest _arguments) main))
+                  ((symbol-function 'run-at-time)
+                   (lambda (delay repeat function &rest arguments)
+                     (if (eq function #'emacs-jupyter-notebook-helper--hello-deadline)
+                         (error "injected hello deadline constructor failure")
+                       (apply real-run-at-time delay repeat function arguments))))
+                  ((symbol-function 'process-send-string)
+                   (lambda (&rest _arguments) (cl-incf sent-count))))
+          (setq session
+                (emacs-jupyter-notebook-helper-start
+                 :buffer owner
+                 :failure-callback (lambda (&rest _) (cl-incf failure-count))))
+          (should (= failure-count 1))
+          (should (= sent-count 0))
+          (ejn-et2--assert-disposed-slots-cleared session)
+          (should-not (process-live-p main))
+          (should-not (process-live-p stderr))
+          (ejn-et2--assert-no-local-leaks))
+      (when (process-live-p main) (delete-process main))
+      (when (process-live-p stderr) (delete-process stderr))
+      (when (buffer-live-p owner) (kill-buffer owner))
+      (ejn-et2--clean))))
+
+(ert-deftest ejn-et2-inline-hello-deadline-does-not-admit-a-frame ()
+  "An eager timer callback cannot leave a stale timer or send after failure."
+  (let* ((emacs-jupyter-notebook-helper-command (list "python3" ejn-et2--fixture "silent"))
+         (owner (generate-new-buffer " *ejn-et2-inline-hello-owner*"))
+         (main (make-pipe-process :name "ejn-et2-inline-hello-main"
+                                  :buffer nil :coding 'binary :noquery t))
+         (stderr (make-pipe-process :name "ejn-et2-inline-hello-stderr"
+                                    :buffer nil :coding 'binary :noquery t))
+         (real-run-at-time (symbol-function 'run-at-time))
+         (returned-timer (run-at-time 60 nil #'ignore))
+         (failure-count 0)
+         (sent-count 0)
+         session)
+    (unwind-protect
+        (cl-letf (((symbol-function 'make-pipe-process)
+                   (lambda (&rest _arguments) stderr))
+                  ((symbol-function 'make-process)
+                   (lambda (&rest _arguments) main))
+                  ((symbol-function 'run-at-time)
+                   (lambda (delay repeat function &rest arguments)
+                     (if (eq function #'emacs-jupyter-notebook-helper--hello-deadline)
+                         (progn
+                           (apply function arguments)
+                           returned-timer)
+                       (apply real-run-at-time delay repeat function arguments))))
+                  ((symbol-function 'process-send-string)
+                   (lambda (&rest _arguments) (cl-incf sent-count))))
+          (setq session
+                (emacs-jupyter-notebook-helper-start
+                 :buffer owner
+                 :failure-callback (lambda (&rest _) (cl-incf failure-count))))
+          (should (= failure-count 1))
+          (should (= sent-count 0))
+          (should-not (memq returned-timer timer-list))
+          (ejn-et2--assert-disposed-slots-cleared session)
+          (should-not (process-live-p main))
+          (should-not (process-live-p stderr))
+          (ejn-et2--assert-no-local-leaks))
+      (when (timerp returned-timer) (cancel-timer returned-timer))
+      (when (process-live-p main) (delete-process main))
+      (when (process-live-p stderr) (delete-process stderr))
+      (when (buffer-live-p owner) (kill-buffer owner))
+      (ejn-et2--clean))))
+
 (ert-deftest ejn-et2-stderr-filter-never-inserts-an-oversized-chunk ()
   (let* ((emacs-jupyter-notebook-helper-stderr-max-bytes 32)
          (owner (generate-new-buffer " *ejn-et2-stderr-owner*"))
@@ -579,6 +773,53 @@
                  (lambda () (> (length (emacs-jupyter-notebook-helper-session-late-responses session)) late-count))))
         (should (<= (length (emacs-jupyter-notebook-helper-session-late-responses session)) 64))
         (should (= callback-count 1))))))
+
+(ert-deftest ejn-et3-request-deadline-setup-failure-is-not-admitted ()
+  "A request without a timer cannot consume a slot or write a helper frame."
+  (let (first-id callbacks sent fail-next)
+    (ejn-et3--with-ready (session "normal")
+      (setq fail-next t)
+      (let ((real-run-at-time (symbol-function 'run-at-time)))
+        (cl-letf (((symbol-function 'run-at-time)
+                   (lambda (delay repeat function &rest args)
+                     (if (and fail-next
+                              (eq function
+                                  #'emacs-jupyter-notebook-helper--request-deadline))
+                         (progn
+                           (setq fail-next nil)
+                           (error "injected request deadline allocation failure"))
+                       (apply real-run-at-time delay repeat function args))))
+                  ((symbol-function 'emacs-jupyter-notebook-helper--send-envelope)
+                   (lambda (_session id _op _params)
+                     (push id sent))))
+          (setq first-id
+                (emacs-jupyter-notebook-helper-request
+                 session "ping" (make-hash-table :test 'equal)
+                 (lambda (_session _response error)
+                   (push error callbacks))))
+          (should (= 1 (length callbacks)))
+          (should (string-match-p "cannot arm helper request deadline"
+                                  (car callbacks)))
+          (should-not sent)
+          (should-not (gethash first-id
+                               (emacs-jupyter-notebook-helper-session-requests session)))
+          ;; The failed provisional slot is gone, so a later request can be
+          ;; admitted normally.  A late response for the failed id is inert.
+          (let ((second-id
+                 (emacs-jupyter-notebook-helper-request
+                  session "ping" (make-hash-table :test 'equal) #'ignore)))
+            (should (equal sent (list second-id)))
+            (should (= 1 (hash-table-count
+                          (emacs-jupyter-notebook-helper-session-requests session))))
+            (ejn-et3--feed
+             session
+             (ejn-et3--object "v" 1 "kind" "response" "id" first-id "ok" t
+                              "result" (make-hash-table :test 'equal)))
+            (should (= 1 (length callbacks)))
+            (should (ejn-et2--await
+                     (lambda ()
+                       (emacs-jupyter-notebook-helper-session-late-responses session))
+                     1))))))))
 
 (ert-deftest ejn-et3-credit-is-exact-and-responses-run-at-zero-credit ()
   (let ((request-log (make-temp-file "ejn-et3-credit"))

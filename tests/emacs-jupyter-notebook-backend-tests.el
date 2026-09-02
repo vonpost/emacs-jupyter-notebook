@@ -8,7 +8,6 @@
 (require 'cl-lib)
 (require 'emacs-jupyter-notebook-backend)
 (require 'emacs-jupyter-notebook-events)
-(require 'emacs-jupyter-notebook-jupyter)
 
 (defvar emacs-jupyter-notebook--client)
 (declare-function emacs-jupyter-notebook-restart-kernel
@@ -25,13 +24,13 @@
   (accept-process-output nil 0.01))
 
 (defmacro ejn-ei1-test-with-fake-backend (binding &rest body)
-  "Run BODY with DISPATCH installed as the selected fake backend dispatcher."
+  "Run BODY with DISPATCH replacing the helper backend dispatcher."
   (declare (indent 1) (debug t))
   (let ((dispatch (car binding)))
-    `(let ((emacs-jupyter-notebook-backend 'ei1-fake)
-           (emacs-jupyter-notebook-backend-implementations
-            (cons (cons 'ei1-fake ,dispatch)
-                  emacs-jupyter-notebook-backend-implementations)))
+    `(let ((emacs-jupyter-notebook-backend-implementations
+            (cons (cons 'helper ,dispatch)
+                  (cl-remove-if (lambda (entry) (eq (car entry) 'helper))
+                                emacs-jupyter-notebook-backend-implementations))))
        ,@body)))
 
 (ert-deftest ejn-ei1-contract-returns-id-before-sync-dispatch-callback ()
@@ -233,15 +232,15 @@
                             (emacs-jupyter-notebook-backend-session-requests session)))))
           (when (buffer-live-p buffer) (kill-buffer buffer)))))))
 
-(ert-deftest ejn-ei1-contract-rejects-raw-legacy-clients ()
+(ert-deftest ejn-ei1-contract-rejects-raw-non-session-clients ()
   "Every public operation requires one persistent opaque session."
   (should-error
    (emacs-jupyter-notebook-backend-execute
-    'raw-legacy-client "x" nil #'ignore #'ignore)
+    'raw-client "x" nil #'ignore #'ignore)
    :type 'error)
   (should-error
    (emacs-jupyter-notebook-backend-close-local
-    'raw-legacy-client #'ignore #'ignore)
+    'raw-client #'ignore #'ignore)
    :type 'error))
 
 (ert-deftest ejn-ei1-attached-state-is-explicit-and-not-liveness ()
@@ -344,17 +343,69 @@
 (ert-deftest ejn-ei1-close-local-has-a-finite-acknowledgement-deadline ()
   "A broken backend cannot leave a close consumer waiting forever."
   (let ((emacs-jupyter-notebook-backend-close-timeout 0.01)
-        errors)
+        (disposed 0) errors)
     (ejn-ei1-test-with-fake-backend
         ((lambda (&rest _ignored) nil))
       (let ((session (emacs-jupyter-notebook-backend-session-create)))
+        (setf (emacs-jupyter-notebook-backend-session-data session) 'local-state)
+        (emacs-jupyter-notebook-backend-session-set-local-disposer
+         session (lambda (_reason) (cl-incf disposed)))
         (emacs-jupyter-notebook-backend-close-local
          session #'ignore
          (lambda (&rest value) (push value errors)))
         (accept-process-output nil 0.03)
         (ejn-ei1-test--run-timers)
+        (should (= disposed 1))
         (should (= 1 (length errors)))
         (should (string-match-p "timed out" (cadar errors)))))))
+
+(ert-deftest ejn-ei1-close-deadline-setup-failure-retires-local-resources ()
+  "Failure to create generic close's timer cannot strand adapter resources."
+  (let ((emacs-jupyter-notebook-backend-close-timeout 0.01)
+        disposed errors dispatched)
+    (ejn-ei1-test-with-fake-backend
+        ((lambda (&rest _ignored) (setq dispatched t)))
+      (let ((session (emacs-jupyter-notebook-backend-session-create)))
+        (setf (emacs-jupyter-notebook-backend-session-data session) 'local-state)
+        (emacs-jupyter-notebook-backend-session-set-local-disposer
+         session (lambda (reason) (push reason disposed)))
+        (let ((real-run-at-time (symbol-function 'run-at-time)))
+          (cl-letf (((symbol-function 'run-at-time)
+                     (lambda (delay repeat function &rest args)
+                       (if (= delay emacs-jupyter-notebook-backend-close-timeout)
+                           (error "injected generic close deadline allocation failure")
+                         (apply real-run-at-time delay repeat function args)))))
+            (emacs-jupyter-notebook-backend-close-local
+             session #'ignore (lambda (_id reason) (push reason errors))))
+        (should-not dispatched)
+        (should (emacs-jupyter-notebook-backend-session-closed session))
+        (should-not (emacs-jupyter-notebook-backend-session-data session))
+        (should-not (emacs-jupyter-notebook-backend-session-local-disposer session))
+        (should (= 1 (length disposed)))
+        (ejn-ei1-test--run-timers)
+        (should (= 1 (length errors)))
+        (should (string-match-p "cannot arm backend local close deadline"
+                                (car errors))))))))
+
+(ert-deftest ejn-ei1-close-dispatch-error-retires-local-resources ()
+  "An unexpected adapter dispatch error cannot strand its local process."
+  (let ((disposed 0) errors)
+    (ejn-ei1-test-with-fake-backend
+        ((lambda (&rest _ignored) (error "injected close dispatch failure")))
+      (let ((session (emacs-jupyter-notebook-backend-session-create)))
+        (setf (emacs-jupyter-notebook-backend-session-data session) 'local-state)
+        (emacs-jupyter-notebook-backend-session-set-local-disposer
+         session (lambda (_reason) (cl-incf disposed)))
+        (emacs-jupyter-notebook-backend-close-local
+         session #'ignore (lambda (_id reason) (push reason errors)))
+        (ejn-ei1-test--run-timers)
+        (should (= disposed 1))
+        (should (= (length errors) 1))
+        (should (string-match-p "injected close dispatch failure"
+                                (error-message-string (car errors))))
+        (should-not (emacs-jupyter-notebook-backend-session-data session))
+        (should-not
+         (emacs-jupyter-notebook-backend-session-local-disposer session))))))
 
 (ert-deftest ejn-ei1-restart-rejects-a-generic-backend-without-control ()
   "The core must not issue destructive lifecycle work through a generic backend."
@@ -396,70 +447,59 @@
           (ejn-ei1-test--run-timers)
           (should (string-match-p "injected" (cdar logs))))))))
 
-(ert-deftest ejn-ei1-static-production-has-no-direct-jupyter-calls ()
-  "Only the legacy adapter may call the emacs-jupyter public API directly."
+(ert-deftest ejn-ei1-static-production-is-helper-only ()
+  "Production source exposes no emacs-jupyter transport or selector."
   (let* ((root (expand-file-name ".." ejn-ei1-test--directory))
-         (adapter (expand-file-name "emacs-jupyter-notebook-jupyter.el" root))
-         (allowed '(emacs-jupyter-notebook-jupyter-backend-dispatch
-                    emacs-jupyter-notebook-jupyter-backend-ensure
-                    jupyter-cmd))
+         (deleted-adapter "emacs-jupyter-notebook-jupyter")
+         (selector 'emacs-jupyter-notebook-backend)
          offenders)
     (cl-labels
-        ((direct-elements
-          (tail)
-          (cond
-           ((null tail) nil)
-           ((consp tail)
-            (or (direct-call (car tail))
-                (direct-elements (cdr tail))))
-           (t (direct-call tail))))
-         (direct-call
+        ((record
+          (file kind value)
+          (push (list (file-name-nondirectory file) kind value) offenders))
+         (jupyter-feature-p
+          (feature)
+          (and (symbolp feature)
+               (string-match-p "\\`jupyter\\(?:-\\|\\'\\)"
+                               (symbol-name feature))))
+         (selector-target
           (form)
+          (if (and (consp form) (eq (car form) 'quote))
+              (cadr form)
+            form))
+         (walk
+          (file form)
           (cond
-           ((atom form) nil)
-           ((eq (car-safe form) 'quote) nil)
-           ((and (eq (car-safe form) 'function)
-                 (not (consp (cadr form))))
-            nil)
-           ((and (symbolp (car form))
-                 (not (memq (car form) allowed))
-                 (string-match-p
-                  "\\`\\(?:jupyter-\\|emacs-jupyter-notebook-jupyter-\\)"
-                  (symbol-name (car form))))
-            (car form))
-           ;; Lisp constants may contain dotted pairs.  Recurse over the cons
-           ;; tree instead of requiring every source form to be a proper list.
-           (t (direct-elements form)))))
+           ((consp form)
+            (let ((head (car form)))
+              (when (and (symbolp head)
+                         (string-match-p "\\`jupyter-" (symbol-name head)))
+                (record file 'call head))
+              (when (and (memq head '(defvar defconst defcustom defvar-local defvaralias))
+                         (eq (selector-target (cadr form)) selector))
+                (record file 'selector selector))
+              (when (eq head 'require)
+                (let ((feature (cadr form)))
+                  (when (and (consp feature)
+                             (eq (car feature) 'quote)
+                             (jupyter-feature-p (cadr feature)))
+                    (record file 'require (cadr feature)))))
+              ;; Constants may contain dotted pairs, so recurse through the
+              ;; complete cons tree rather than assuming a proper list.
+              (walk file (car form))
+              (walk file (cdr form)))))))
       (dolist (file (directory-files root t
                                      "\\`emacs-jupyter-notebook.*\\.el\\'"))
-        (unless (equal file adapter)
-          (with-temp-buffer
-            (insert-file-contents file)
-            (goto-char (point-min))
-            (condition-case nil
-                (while t
-                  (let ((call (direct-call (read (current-buffer)))))
-                    (when call
-                      (push (cons (file-name-nondirectory file) call) offenders))))
-              (end-of-file nil))))))
-    (should-not offenders)))
-
-(ert-deftest ejn-ei1-backend-source-does-not-eagerly-require-legacy-adapter ()
-  "Selecting a future backend must not load the legacy transport as a side effect."
-  (let ((source (expand-file-name "../emacs-jupyter-notebook-backend.el"
-                                  ejn-ei1-test--directory))
-        eager)
-    (with-temp-buffer
-      (insert-file-contents source)
-      (goto-char (point-min))
-      (condition-case nil
-          (while t
-            (let ((form (read (current-buffer))))
-              (when (and (eq (car-safe form) 'require)
-                         (equal (cadr form) ''emacs-jupyter-notebook-jupyter))
-                (setq eager t))))
-        (end-of-file nil)))
-    (should-not eager)))
+        (with-temp-buffer
+          (insert-file-contents file)
+          (when (search-forward deleted-adapter nil t)
+            (record file 'deleted-adapter deleted-adapter))
+          (goto-char (point-min))
+          (condition-case nil
+              (while t (walk file (read (current-buffer))))
+            (end-of-file nil))))
+    (should-not (boundp selector))
+    (should-not offenders))))
 
 (defun ejn-ei1r-test--snapshot (source handle)
   "Return the user-visible event state for SOURCE and HANDLE."
@@ -469,8 +509,8 @@
                   (emacs-jupyter-notebook-fringe-state (plist-get handle :cell-key)))
         :kernel (with-current-buffer source emacs-jupyter-notebook--kernel-status)))
 
-(defun ejn-ei1r-test--run-event (event &optional legacy)
-  "Apply EVENT to a fresh source/panel pair, optionally via legacy translation."
+(defun ejn-ei1r-test--run-event (event)
+  "Apply normalized helper EVENT to a fresh source/panel pair."
   (let ((source (generate-new-buffer " *ejn-ei1r-source*")))
     (unwind-protect
         (with-current-buffer source
@@ -479,58 +519,46 @@
           (let* ((panel (ejn-panel-ensure source))
                  (handle (ejn-panel-start-entry panel '("x.py" . 1) "x = 1"))
                  (context (list :buffer source :entry-handle handle :request-id nil))
-                 (normalized
-                  (if legacy
-                      (let ((content (plist-get event :legacy-content))
-                            (type (plist-get event :legacy-type)))
-                        (cl-letf (((symbol-function 'jupyter-message-content)
-                                   (lambda (_message) content)))
-                          (emacs-jupyter-notebook-jupyter--legacy-event type 'legacy)))
-                    (plist-get event :normalized))))
+                 (normalized (plist-get event :normalized)))
             (cl-letf (((symbol-function 'emacs-jupyter-notebook-events--schedule-input)
                        (lambda (&rest _ignored) :scheduled)))
               (emacs-jupyter-notebook-events-dispatch context normalized))
             (ejn-ei1r-test--snapshot source handle)))
       (when (buffer-live-p source) (kill-buffer source)))))
 
-(ert-deftest ejn-ei1r-normalized-events-match-legacy-translation ()
-  "Every normalized event has exactly one legacy translation and behavior."
+(ert-deftest ejn-ei1r-helper-normalized-events-have-expected-reducer-behavior ()
+  "Every helper-normalized event has the expected direct reducer behavior."
   (dolist
       (event
        (list
         (list :normalized '(:type stream :name "stdout" :text "stream\n")
-              :legacy-type "stream" :legacy-content '(:name "stdout" :text "stream\n") :text "stream\n")
+              :text "stream\n")
         (list :normalized '(:type clear :wait nil)
-              :legacy-type "clear_output" :legacy-content '(:wait nil) :text "")
+              :text "")
         (list :normalized '(:type result :data (:text/plain "42"))
-              :legacy-type "execute_result" :legacy-content '(:data (:text/plain "42")) :text "42")
+              :text "42")
         (list :normalized '(:type display :data (:text/plain "shown"))
-              :legacy-type "display_data" :legacy-content '(:data (:text/plain "shown")) :text "shown")
+              :text "shown")
         (list :normalized '(:type update-display :data (:text/plain "updated"))
-              :legacy-type "update_display_data" :legacy-content '(:data (:text/plain "updated")) :text "updated")
+              :text "updated")
         (list :normalized '(:type error :traceback ("one" "two"))
-              :legacy-type "error" :legacy-content '(:traceback ("one" "two")) :text "one\ntwo")
+              :text "one\ntwo")
         (list :normalized '(:type execute-reply :status "ok" :execution-count 3)
-              :legacy-type "execute_reply" :legacy-content '(:status "ok" :execution_count 3)
               ;; EI3 owns terminal presentation only after correlated idle.
               :text "" :status 'running :fringe nil)
         (list :normalized '(:type status :execution-state "busy")
-              :legacy-type "status" :legacy-content '(:execution_state "busy") :text "" :kernel 'busy)
+              :text "" :kernel 'busy)
         (list :normalized '(:type status :execution-state "idle")
-              :legacy-type "status" :legacy-content '(:execution_state "idle") :text "" :kernel 'idle)
+              :text "" :kernel 'idle)
         (list :normalized '(:type input-request :prompt "value: " :password t)
-              :legacy-type "input_request" :legacy-content '(:prompt "value: " :password t) :text "value: ")
+              :text "value: ")
         (list :normalized '(:type truncation :text "[truncated]\n")
-              :legacy-type nil :legacy-content nil :text "[truncated]\n")))
-    (let ((direct (ejn-ei1r-test--run-event event))
-          (translated (if (plist-get event :legacy-type)
-                          (ejn-ei1r-test--run-event event t)
-                        (ejn-ei1r-test--run-event event))))
-      (should (equal direct translated))
-      (should (equal (plist-get direct :text) (plist-get event :text)))
-      (should (eq (plist-get direct :status) (or (plist-get event :status) 'running)))
-      (should (eq (plist-get direct :fringe) (plist-get event :fringe)))
-      (should (eq (plist-get direct :kernel) (plist-get event :kernel))))))
+              :text "[truncated]\n")))
+    (let ((snapshot (ejn-ei1r-test--run-event event)))
+      (should (equal (plist-get snapshot :text) (plist-get event :text)))
+      (should (eq (plist-get snapshot :status) (or (plist-get event :status) 'running)))
+      (should (eq (plist-get snapshot :fringe) (plist-get event :fringe)))
+      (should (eq (plist-get snapshot :kernel) (plist-get event :kernel))))))
 
 (ert-deftest ejn-ei1r-reducer-drops-malformed-late-and-retired-events ()
   "Malformed events log; late/retired output cannot recreate presentation."
@@ -624,8 +652,8 @@
       (emacs-jupyter-notebook-events-dispatch context '(:type update-display :data (:text/plain "update")))
       (should (equal (ejn-panel-entry-text handle) "update")))))
 
-(ert-deftest ejn-ei1r-watch-output-suppresses-execute-reply-error-fallback ()
-  "Watch output is retained while EI3 waits for correlated idle to finish."
+(ert-deftest ejn-ei1r-execute-reply-error-without-result-appends-fallback ()
+  "An error reply remains visible when no earlier result event explained it."
   (with-temp-buffer
     (let* ((source (current-buffer))
            (panel (ejn-panel-ensure source))
@@ -635,10 +663,8 @@
       (emacs-jupyter-notebook-events-dispatch
        context
        '(:type execute-reply :status "error" :execution-count 4
-         :watch-text "\n[watch]\nx: 1\n"
          :ename "ValueError" :evalue "boom"))
-      (should (equal (ejn-panel-entry-text handle) "\n[watch]\nx: 1\n"))
-      (should-not (string-match-p "ValueError" (ejn-panel-entry-text handle)))
+      (should (equal (ejn-panel-entry-text handle) "ValueError: boom"))
       (should (eq (plist-get (ejn-panel-entry-snapshot handle) :status) 'running)))))
 
 (ert-deftest ejn-ei3-non-ok-reply-status-uses-error-presentation ()
@@ -649,27 +675,6 @@
                 'error)))
   (should (eq (emacs-jupyter-notebook-events--reply-status '(:status "ok"))
               'ok)))
-
-(ert-deftest ejn-ei1r-retired-legacy-output-logs-at-a-bounded-rate ()
-  "Retired legacy output is rejected before decode with a capped diagnostic."
-  (with-temp-buffer
-    (let* ((source (current-buffer))
-           (panel (ejn-panel-ensure source))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x"))
-           (stream (cadr (assoc "stream"
-                                (emacs-jupyter-notebook-jupyter--callbacks source handle))))
-           (emacs-jupyter-notebook-jupyter--late-callback-log-count 0)
-           messages)
-      (ejn-panel-clear-all panel)
-      (cl-letf (((symbol-function 'message)
-                 (lambda (format-string &rest args)
-                   (push (apply #'format format-string args) messages)))
-                ((symbol-function 'jupyter-message-content)
-                 (lambda (&rest _) (ert-fail "retired output decoded"))))
-        (dotimes (_ (1+ emacs-jupyter-notebook-jupyter--late-callback-log-limit))
-          (funcall stream 'retired-stream))
-        (should (= (length messages)
-                   emacs-jupyter-notebook-jupyter--late-callback-log-limit))))))
 
 (provide 'emacs-jupyter-notebook-backend-tests)
 

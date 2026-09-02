@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Checkout-only launcher.  Packaged/Nix installs provide this command directly.
+set -euo pipefail
+root=$(cd -- "$(dirname -- "$0")/.." && pwd -P)
+export PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
+exec "${PYTHON:-python3}" -m ejn_registry_worker

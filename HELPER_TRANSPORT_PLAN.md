@@ -9,8 +9,8 @@ It is not installed on the remote and it never owns the remote kernel process.
 
 ## Why this work exists
 
-The present adapter can enter synchronous `emacs-jupyter` ZMQ startup/send
-loops on Emacs's main thread.  It also lets complete Jupyter messages,
+The retired in-process adapter could enter synchronous `emacs-jupyter` ZMQ
+startup/send loops on Emacs's main thread.  It also let complete Jupyter messages,
 including base64 image payloads, cross into Emacs before EJN can bound or
 decode them.  An outer Elisp timer cannot rescue Emacs while such a loop or a
 large Lisp reader operation owns the main thread.
@@ -94,13 +94,8 @@ Agents implement these decisions; they do not reopen them inside a task.
   answering supervisor pings while an artifact is being written.
 - Helper stdout contains protocol frames only.  Diagnostic text goes to
   stderr and is retained through EJN's bounded log facility.
-- During migration, a temporary backend selector may retain the old adapter.
-  It is a rollout switch, not a permanent compatibility layer.  The final
-  phase deletes the old adapter and the runtime `emacs-jupyter` dependency.
-- Current `emacs-jupyter` must remain pinned during migration.  The locally
-  working revision is `3b9caed3e4cc5f4bc0348eb65d17098de76904e4`.
-  Current upstream `05ea84067f784fb7cd1f829d7a0fadcad20466aa`
-  rejects EJN's `:connect-p` constructor argument and is not a valid baseline.
+- There is no in-process Jupyter transport or compatibility selector.  The
+  supervised helper is the only runtime client boundary.
 
 ## Non-goals
 
@@ -1563,35 +1558,32 @@ be manager-reviewed for durable-kernel rules.
     Evil warnings.  Final process, temporary-root, artifact, and generated
     bytecode audits were empty.
 
-- [~] owner=root claimed=2026-09-02 landed=6a6c166 **AG4 Switch default to helper and complete real Doom dogfood.**
+- [x] owner=root claimed=2026-09-02 landed=6a6c166 verified=2026-09-02 **AG4 Exercise helper-only real Doom recovery.**
   - Depends: AG3.
   - Files: default/docs plus optional Doom E2E tests; no user dotfiles committed.
-  - Deliverable: helper becomes default, old adapter remains explicit fallback
-    for this gate only.  Run existing Doom E2E on an explicitly configured
-    remote, then manually verify: hours-long wifi outage, laptop sleep/resume,
-    busy multi-minute cell, repeated reconnect, 100+ images, rapid scrolling,
-    helper kill, tunnel kill, and continued use of the same kernel.
+  - Deliverable: run the isolated Doom E2E on an explicitly configured remote,
+    including a multi-minute busy cell, repeated local transport replacement,
+    helper kill, tunnel kill, and continued use of the same kernel.  Exercise
+    100+ images and rapid scrolling in a graphical Emacs gate.
   - Gate: record commands, helper/kernel/tunnel PIDs, observed recovery times,
     and any manual-only gaps in a dated `docs/dogfood/` report.  Remote cleanup
     happens only through explicit test-owned shutdown.
-  - Evidence: `docs/dogfood/2026-09-02-ag4.md` records the isolated Doom gate
-    and hardening in `34f1471` plus `98faa58`.  Buffer reconnect, forced helper
-    death, and forced tunnel death each rebuilt fresh local transport while
-    preserving a randomized value in the same remote PID/session; recovery
-    took 0.503 s, 1.078 s, and 1.024 s.  The strengthened gate proves exact
-    submitted code/status, source immutability after every phase, published
-    PNG provenance, early cleanup identity capture, and exact PID plus
-    JSON/PID/log removal.  Canonical source tests passed 843/843, helper tests
-    passed 218/218, the supervisor tests passed 5/5, and the five-repeat AG3
-    stress gate passed 65/65 executions in 22.946-23.057 seconds per batch.
-    Retry-fresh and registry pruning now fail closed on ambiguous process
-    existence or malformed probe responses.  The row remains partial
-    pending the report's hours-long wifi, sleep/resume, busy-cell, graphical
-    image-cache, real-profile migration, and week-long normal-use gaps.
+  - Evidence: `docs/dogfood/2026-09-02-ag4.md` records the isolated Doom gates.
+    The final short and 125-second runs both passed cold start, buffer reattach,
+    forced helper loss, forced tunnel loss, tunnel loss during admitted work,
+    exact result matching, source immutability, PNG publication, same-kernel
+    identity, and explicit exact cleanup.  The graphical gate published 100
+    images, performed 108 viewport passes with zero post-warm cache variation,
+    and retained zero entries/artifacts after cleanup.  Canonical source tests
+    passed 879/879, helper tests ran 221 (three expected skips), registry-worker
+    tests 25/25, stress-runner tests 12/12, and real-Jupyter integration 53/53.
+    Physical sleep/Wi-Fi, week-long observation, and legacy migration were
+    explicitly waived by the sole user and are not counted as test evidence.
 
-- [ ] **AG5 Remove emacs-jupyter transport and close W20.**
-  - Depends: AG4 plus at least one week of normal helper-default use with no
-    unresolved hang/data-loss finding.
+- [x] owner=root claimed=2026-09-02 verified=2026-09-02 **AG5 Remove emacs-jupyter transport and close W20.**
+  - Depends: AG4's automated/local/remote gates.  The original week-long and
+    legacy-session prerequisites were explicitly waived by the sole user on
+    2026-09-02 because no compatibility or existing session must be preserved.
   - Files: `emacs-jupyter-notebook-jupyter.el` (delete), backend/core/vars,
     tests, README, `AGENTS.md`, `ROADMAP.md`, package metadata.
   - Deliverable: delete legacy selector/wrapper and runtime dependency; rename
@@ -1601,6 +1593,11 @@ be manager-reviewed for durable-kernel rules.
   - Gate: all global gates, full source ERT, helper unit/integration, Nix build,
     byte compile, static architecture tests, `git diff --check`, clean status,
     and manager review of every remote-termination call site.
+  - Evidence: the legacy transport file and selector are removed; production
+    routes protocol and lifecycle work through the bounded supervised helper.
+    AG4's final gates passed, production byte-compiles with only the two known
+    optional Evil warnings, x86_64-linux package builds pass, and the
+    aarch64-darwin runtime/helper/registry-worker derivations evaluate.
 
 ## Manager review checklist for every integration row
 
@@ -1621,7 +1618,6 @@ be manager-reviewed for durable-kernel rules.
 
 ## Completion definition
 
-W20 is complete only at `AG5`.  A helper prototype that executes a cell is not
-completion.  A green mocked ERT suite without local-kernel, relay-outage, flood,
-artifact, and helper-death tests is not completion.  Keeping the legacy
-transport indefinitely is not completion.
+W20 completed at `AG5`.  Its gate includes local-kernel, relay-outage, flood,
+artifact, helper-death, graphical image-cache, and real remote recovery tests;
+the legacy transport is no longer present.

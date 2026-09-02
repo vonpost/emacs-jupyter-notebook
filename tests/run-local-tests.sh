@@ -78,5 +78,11 @@ if [[ -d "$ROOT/helper/tests" ]]; then
     "$PYTHON" -m unittest discover -s "$ROOT/helper/tests" -p 'test_*.py'
 fi
 
+if [[ -d "$ROOT/registry_worker/tests" ]]; then
+  run_with_deadline env TMPDIR="$RUN_TMPDIR" PYTHONPATH="$ROOT/registry_worker" \
+    PYTHONPYCACHEPREFIX="$RUN_PYCACHE" \
+    "$PYTHON" -m unittest discover -s "$ROOT/registry_worker/tests" -p 'test_*.py'
+fi
+
 run_with_deadline env TMPDIR="$RUN_TMPDIR" PYTHONPYCACHEPREFIX="$RUN_PYCACHE" \
   "$PYTHON" "$ROOT/tests/stress/test_run_ag3.py"

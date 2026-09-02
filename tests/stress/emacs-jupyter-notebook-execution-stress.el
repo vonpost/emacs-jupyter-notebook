@@ -287,8 +287,7 @@ state transitions are production functions.
                (scheduled 0))
     (unwind-protect
         (progn
-          (setf (emacs-jupyter-notebook-backend-session-backend client) 'helper
-                (emacs-jupyter-notebook-backend-session-data client) adapter-state)
+          (setf (emacs-jupyter-notebook-backend-session-data client) adapter-state)
           (when admitted
             (puthash "ag3-boundary-wire"
                      (list :ledger-id request-id :backend-request-id backend-id

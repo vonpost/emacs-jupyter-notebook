@@ -74,23 +74,12 @@ rejected rather than interpreted.
 
 ### Local helper transport
 
-The supervised local Python helper is the default Jupyter transport.  Its
+The supervised local Python helper is the only Jupyter transport.  Its
 protocol-mode command can be configured before loading the package:
 
 ```elisp
 (setq emacs-jupyter-notebook-helper-command
       '("ejn-helper" "--protocol"))
-```
-
-The old `emacs-jupyter` adapter remains an explicit fallback during the final
-dogfood gate.  If selecting it, keep `emacs-jupyter` pinned to the
-known-working revision
-`3b9caed3e4cc5f4bc0348eb65d17098de76904e4`; upstream revision
-`05ea84067f784fb7cd1f829d7a0fadcad20466aa` rejects EJN's `:connect-p`
-constructor argument:
-
-```elisp
-(setq emacs-jupyter-notebook-backend 'legacy)
 ```
 
 The helper is local only; it does not install anything on a remote host or
@@ -128,9 +117,9 @@ An absolute Nix store closure path is valid as well:
 
 The flake supports only `x86_64-linux` and `aarch64-darwin`.  For a local
 development checkout, `nix develop` supplies the declared dependencies, but
-ordinary EJN startup executes only the configured helper command.  It never
-performs an implicit `nix build`, `nix run`, `pip install`, network download,
-remote provisioning, or legacy-session compatibility shim.
+ordinary EJN operation executes only the configured helper and registry-worker
+commands.  It never performs an implicit `nix build`, `nix run`, `pip install`,
+network download, remote provisioning, or compatibility transport.
 
 ### ProxyJump / ssh config
 
@@ -206,7 +195,7 @@ Evaluation output never appears in the source buffer. A dedicated side panel (`*
 
 Image originals are kept in private disposable local files instead of the Emacs Lisp heap. The newest `emacs-jupyter-notebook-panel-max-inline-images` images in the current view render as bounded previews; older figures remain lightweight placeholders, which keeps Emacs's native image cache from growing with the full history. Press `o` anywhere on an image entry to open the original with the platform viewer. The files and cached image specs are released when the panel is killed.
 
-Sliced line-height rendering remains available through `emacs-jupyter-notebook-panel-slice-images`, but is disabled by default because determining every rendered image height can make a large history expensive. When enabled, slicing applies only to the bounded inline-preview set.
+Sliced line-height rendering remains available through `emacs-jupyter-notebook-panel-slice-images`. It is disabled by default and applies only to the bounded inline-preview set. When enabled, row counts come from the helper-validated preview dimensions; panel rendering never calls `image-size` across retained history.
 
 Toggle the view inside the panel with `H`, or globally with `C-c j t`. `q` buries the panel. `RET` anywhere in an entry jumps to its originating cell. `n` / `p` step between entries. A cell's text and figures interleave in arrival order, like a notebook — printing and plotting in the same cell shows both. Inline previews use zoom keys (`+`, `-`, `=`). `o` opens any stored PNG/JPEG image externally; `v` remains the matplotlib-pickle interactive viewer command (see below). Under evil (Doom/Spacemacs) the panel uses emacs state so all of these single-key commands work as listed.
 
@@ -216,9 +205,9 @@ Medical-imaging and array-heavy work needs a real interactive figure — pixel-v
 
 ### How it works (zero per-remote install)
 
-The remote kernel stays completely headless (inline / Agg). On connect (and again after `restart-kernel`) Emacs injects a small, in-memory IPython display formatter into the running kernel session — a silent `execute_request` with `store_history` off that creates no panel entry and writes **nothing** to the remote filesystem. From then on, every inline-displayed `matplotlib.figure.Figure` automatically carries a custom MIME payload, `application/x-ejn-mpl-pickle` (base64 of `pickle.dumps(fig)`), **alongside** the normal `image/png`. The registration is lazy (it does not force a matplotlib import until a figure is actually displayed) and idempotent. Everything it needs — IPython, matplotlib, `pickle`/`base64` — is already present on any Python Jupyter kernel that can plot. There is no `pip install` and no per-remote provisioning: add a new remote and the feature just works.
+The remote kernel stays completely headless (inline / Agg). On connect (and again after `restart-kernel`) EJN sends a silent, in-memory IPython display-formatter setup request with `store_history` off; it creates no panel entry and writes nothing to the remote filesystem. Each displayed `matplotlib.figure.Figure` then carries the custom pickle MIME alongside its normal image. The local helper decodes both MIME payloads outside Emacs, enforces byte/pixel limits, and publishes identity-bound local artifact descriptors. Base64 image and pickle strings never enter the Emacs Lisp heap. There is no per-remote provisioning.
 
-Emacs keeps rendering the PNG thumbnail in the panel exactly as before and stashes the pickle on the panel entry. When you open a figure interactively (`C-c j I` on a cell, or `v` on a panel plot entry), Emacs decodes the pickle to a local temp file and hands the path to a persistent **local** viewer process over a unix-domain socket. The viewer unpickles the figure, reattaches a GUI canvas, installs the enhancements, and shows the window:
+Emacs renders only the helper's bounded canonical preview and retains the original-image and pickle descriptors on the panel entry. When you open a figure interactively (`C-c j I` on a cell, or `v` on a panel plot entry), Emacs hands the confined pickle descriptor to a persistent **local** viewer process over a Unix-domain socket. The viewer verifies the pinned artifact, unpickles the figure in its own process, reattaches a GUI canvas, installs the enhancements, and shows the window:
 
 - **Hover readout**: over an `imshow` image the coordinate readout shows integer `row`/`col` and the pixel `value` under the cursor.
 - **Linked zoom/pan**: zooming or panning one `imshow` subplot crops all sibling `imshow` subplots to the same limits.

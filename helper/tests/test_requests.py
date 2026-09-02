@@ -12,6 +12,23 @@ from ejn_helper.jupyter_backend import JupyterBackend
 
 
 class ExecutionStateTests(unittest.TestCase):
+    def test_busy_is_correlated_once_and_cannot_follow_idle(self):
+        state = ExecutionState("jupyter")
+        busy = {
+            "parent_header": {"msg_id": "jupyter"},
+            "msg_type": "status",
+            "content": {"execution_state": "busy"},
+        }
+        idle = {
+            "parent_header": {"msg_id": "jupyter"},
+            "msg_type": "status",
+            "content": {"execution_state": "idle"},
+        }
+        self.assertTrue(state.accept_iopub(busy))
+        self.assertFalse(state.accept_iopub(busy))
+        self.assertTrue(state.accept_iopub(idle))
+        self.assertFalse(state.accept_iopub(busy))
+
     def test_reply_idle_any_order_duplicate_and_unrelated(self):
         state = ExecutionState("jupyter")
         unrelated = {"parent_header": {"msg_id": "other"}, "msg_type": "execute_reply", "content": {}}
@@ -264,6 +281,35 @@ class BackendReaderTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual((await asyncio.wait_for(completion, 1)).result, {"status": "ok"})
         self.assertEqual([event.name for event in events], ["status", "execute_reply"])
+
+    async def test_busy_status_is_correlated_once_without_completing_execution(self):
+        backend, _client = await self._backend()
+        events = []
+        _token, completion = await self._start(backend, "execute", {"code": "x"}, events)
+        busy = self._message("exec-1", "status", {"execution_state": "busy"})
+        await self.queues["iopub"].put(busy)
+        await self.queues["iopub"].put(busy)
+        await asyncio.sleep(0)
+        self.assertEqual(
+            [(event.name, event.data) for event in events],
+            [("status", {"execution_state": "busy"})],
+        )
+        self.assertFalse(completion.done())
+        await self.queues["shell"].put(
+            self._message("exec-1", "execute_reply", {"status": "ok"})
+        )
+        await self.queues["iopub"].put(
+            self._message("exec-1", "status", {"execution_state": "idle"})
+        )
+        self.assertEqual((await asyncio.wait_for(completion, 1)).result, {"status": "ok"})
+        self.assertEqual(
+            [(event.name, event.data) for event in events],
+            [
+                ("status", {"execution_state": "busy"}),
+                ("execute_reply", {"status": "ok"}),
+                ("status", {"execution_state": "idle"}),
+            ],
+        )
 
     async def test_queue_empty_does_not_fail_readers_and_stdin_is_correlated(self):
         backend, _client = await self._backend()
