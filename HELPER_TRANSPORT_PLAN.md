@@ -1563,7 +1563,7 @@ be manager-reviewed for durable-kernel rules.
     Evil warnings.  Final process, temporary-root, artifact, and generated
     bytecode audits were empty.
 
-- [ ] **AG4 Switch default to helper and complete real Doom dogfood.**
+- [~] owner=root claimed=2026-09-02 **AG4 Switch default to helper and complete real Doom dogfood.**
   - Depends: AG3.
   - Files: default/docs plus optional Doom E2E tests; no user dotfiles committed.
   - Deliverable: helper becomes default, old adapter remains explicit fallback
