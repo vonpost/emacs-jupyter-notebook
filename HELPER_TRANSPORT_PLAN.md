@@ -1512,7 +1512,7 @@ be manager-reviewed for durable-kernel rules.
     text/modified flag unchanged and all resources bounded.
   - Gate: 20 consecutive batch runs under external timeout; no remote host.
 
-- [~] owner=root claimed=2026-09-02 **AG2R Keep published artifact leases panel-owned.**
+- [x] owner=root claimed=2026-09-02 landed=faf5be2 **AG2R Keep published artifact leases panel-owned.**
   - Depends: EI9, AG2 discovery.
   - Files: `emacs-jupyter-notebook-result.el`, focused result lifecycle tests.
   - Deliverable: validate and capture helper-published image/pickle artifacts
@@ -1521,6 +1521,13 @@ be manager-reviewed for durable-kernel rules.
     Source buffers must retain no published-artifact capability state.
   - Gate: deterministic source-current/panel-destination regression for image
     and pickle bundles, focused artifact lifecycle tests, then the AG2 E2E gate.
+  - Landed verification: all four AG2R lifecycle regressions and all 25 EI4
+    artifact tests passed.  The source-frozen AG2 gate completed 20/20 real
+    Emacs/helper/kernel repetitions in 21-23 seconds per run.  The final
+    canonical source suite passed 817/817 ERTs and 218/218 helper tests (three
+    expected host skips).  Production byte-compilation reported only the two
+    pre-existing optional Evil warnings; final process, temporary-root, and
+    generated-bytecode audits were empty.
 
 - [ ] **AG3 Run outage, flood, and large-output stress gates.**
   - Depends: AG2.
