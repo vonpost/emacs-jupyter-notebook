@@ -25,12 +25,20 @@ EMACS_OUTPUT_TAIL_LIMIT = 128 * 1024
 FIXTURE_OUTPUT_LIMIT = 64 * 1024
 BRIDGE_OUTPUT_LIMIT = 1024 * 1024
 STATE_JSON_LIMIT = 1024 * 1024
+CONNECTION_JSON_LIMIT = 64 * 1024
 METRICS_JSON_LIMIT = 1024 * 1024
+ERROR_DETAIL_LIMIT = 240
 EXPECTED_ERT_SUMMARY = b"Ran 13 tests, 13 results as expected, 0 unexpected"
 
 
 def die(message: str) -> RuntimeError:
     return RuntimeError(f"AG3: {message}")
+
+
+def bounded_detail(error: BaseException | str, limit: int = ERROR_DETAIL_LIMIT) -> str:
+    """Return diagnostic text without allowing an untrusted path to flood logs."""
+    detail = str(error)
+    return detail if len(detail) <= limit else detail[:limit - 3] + "..."
 
 
 def read_bounded(path: Path, limit: int, label: str) -> bytes:
@@ -39,14 +47,22 @@ def read_bounded(path: Path, limit: int, label: str) -> bytes:
         with path.open("rb") as stream:
             value = stream.read(limit + 1)
     except OSError as exc:
-        raise die(f"cannot read {label}: {exc}") from exc
+        raise die(f"cannot read {label}: {bounded_detail(exc)}") from exc
     if len(value) > limit:
         raise die(f"{label} exceeded {limit} bytes")
     return value
 
 
+def read_bounded_json(path: Path, limit: int, label: str) -> object:
+    """Read and parse a small JSON document, never parsing an unbounded body."""
+    try:
+        return json.loads(read_bounded(path, limit, label))
+    except (ValueError, RecursionError) as exc:
+        raise die(f"invalid {label} JSON: {bounded_detail(exc)}") from exc
+
+
 def state(path: Path, owner: str, pid: int, ready: bool = True) -> dict:
-    value = json.loads(read_bounded(path, STATE_JSON_LIMIT, "relay bridge state"))
+    value = read_bounded_json(path, STATE_JSON_LIMIT, "relay bridge state")
     if not isinstance(value, dict) or value.get("owner_token") != owner:
         raise die("relay bridge state ownership mismatch")
     if value.get("bridge_pid") != pid:
@@ -62,10 +78,12 @@ def state(path: Path, owner: str, pid: int, ready: bool = True) -> dict:
             raise die("relay bridge did not publish exactly five channel ports")
         if any(type(port) is not int or not 0 < port < 65536 for port in ports.values()):
             raise die("relay bridge returned invalid channel port")
-        try:
-            connection = json.loads(Path(connection).read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise die(f"cannot read rewritten relay connection: {exc}") from exc
+        if len(connection) > 4096:
+            raise die("rewritten relay connection path exceeded 4096 characters")
+        connection = read_bounded_json(
+            Path(connection), CONNECTION_JSON_LIMIT, "rewritten relay connection")
+        if not isinstance(connection, dict):
+            raise die("rewritten relay connection is not an object")
         if connection.get("ip") not in {"127.0.0.1", "::1", "localhost"}:
             raise die("rewritten relay connection is not loopback")
         if any(connection.get(f"{name}_port") != port for name, port in ports.items()):
@@ -85,6 +103,7 @@ def state(path: Path, owner: str, pid: int, ready: bool = True) -> dict:
 def wait_state(path: Path, owner: str, bridge: subprocess.Popen[bytes], timeout: float,
                output: bytearray, output_bytes: int) -> tuple[dict, int]:
     deadline = time.monotonic() + timeout
+    last_error: str | None = None
     while time.monotonic() < deadline:
         output_bytes = drain_output(
             bridge, output, output_bytes, BRIDGE_OUTPUT_LIMIT)
@@ -95,10 +114,11 @@ def wait_state(path: Path, owner: str, bridge: subprocess.Popen[bytes], timeout:
         if path.is_file():
             try:
                 return state(path, owner, bridge.pid), output_bytes
-            except (OSError, ValueError, RuntimeError):
-                pass
+            except (OSError, ValueError, RuntimeError) as exc:
+                last_error = bounded_detail(exc)
         time.sleep(POLL)
-    raise die("relay bridge readiness timed out")
+    detail = f"; last state error: {last_error}" if last_error else ""
+    raise die(f"relay bridge readiness timed out{detail}")
 
 
 def stop(process: subprocess.Popen[bytes] | None, deadline: float) -> None:
@@ -363,8 +383,7 @@ def run_once(args: argparse.Namespace, number: int) -> None:
             check_emacs_result(child.returncode, child_output_bytes, child_output)
             if not metrics.is_file():
                 raise die("Emacs emitted no structured metrics")
-            parsed = json.loads(read_bounded(
-                metrics, METRICS_JSON_LIMIT, "structured metrics"))
+            parsed = read_bounded_json(metrics, METRICS_JSON_LIMIT, "structured metrics")
             if not isinstance(parsed, list) or not parsed:
                 raise die("structured metrics are empty")
             print(json.dumps({"batch": number, "elapsed": round(time.monotonic() - started, 3),

@@ -24,6 +24,33 @@ from kernel_fixture import LocalKernelFixture  # noqa: E402
 from tcp_relays import TcpRelayHarness  # noqa: E402
 
 
+REQUEST_JSON_LIMIT = 16 * 1024
+ERROR_DETAIL_LIMIT = 240
+
+
+def bounded_detail(error: BaseException | str, limit: int = ERROR_DETAIL_LIMIT) -> str:
+    """Keep malformed control-file diagnostics useful and bounded."""
+    detail = str(error)
+    return detail if len(detail) <= limit else detail[:limit - 3] + "..."
+
+
+def read_request_json(path: Path) -> object:
+    """Read one claimed control request before parsing its bounded body."""
+    try:
+        with path.open("rb") as stream:
+            body = stream.read(REQUEST_JSON_LIMIT + 1)
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot read bridge request: {bounded_detail(exc)}") from exc
+    if len(body) > REQUEST_JSON_LIMIT:
+        raise RuntimeError(f"bridge request exceeded {REQUEST_JSON_LIMIT} bytes")
+    try:
+        return json.loads(body)
+    except (ValueError, RecursionError) as exc:
+        raise RuntimeError(
+            f"invalid bridge request JSON: {bounded_detail(exc)}") from exc
+
+
 def write_json(path: Path, value: object) -> None:
     temporary = path.with_name(path.name + ".tmp")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -127,7 +154,7 @@ async def run(args: argparse.Namespace) -> int:
                     bridge.seen_requests.append(nonce)
                     if len(bridge.seen_requests) > 256:
                         del bridge.seen_requests[:128]
-                    payload = json.loads(claimed.read_text(encoding="utf-8"))
+                    payload = read_request_json(claimed)
                     if not isinstance(payload, dict) or payload.get("token") != args.token:
                         raise RuntimeError("invalid bridge request")
                     operation = payload.get("op")
@@ -145,7 +172,7 @@ async def run(args: argparse.Namespace) -> int:
                     else:
                         raise RuntimeError("unsupported bridge operation")
                 except Exception as exc:
-                    result = {"ok": False, "error": str(exc)[:240]}
+                    result = {"ok": False, "error": bounded_detail(exc)}
                 write_json(response, result)
                 claimed.unlink(missing_ok=True)
             await asyncio.sleep(0.02)

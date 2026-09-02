@@ -477,6 +477,116 @@ W4.4 dead-PID probe test); production code must not."
             (should-not
              (re-search-forward "(sleep-for\\b" nil t))))))))
 
+(ert-deftest ejn-w4.7-local-port-probe-is-explicitly-nonblocking ()
+  "Tunnel readiness must never wait synchronously for a TCP connect."
+  (let (arguments)
+    (cl-letf (((symbol-function 'make-network-process)
+               (lambda (&rest args)
+                 (setq arguments args)
+                 'mock-port-probe)))
+      (should (eq (emacs-jupyter-notebook--start-local-port-probe 54321)
+                  'mock-port-probe)))
+    (should (eq (plist-get arguments :nowait) t))
+    (should (eq (plist-get arguments :noquery) t))
+    (should (eq (plist-get arguments :family) 'ipv4))
+    (should (equal (plist-get arguments :host) "127.0.0.1"))
+    (should (= (plist-get arguments :service) 54321))))
+
+(ert-deftest ejn-w4.7-tunnel-tick-owns-connecting-probe-and-timer ()
+  "A pending TCP connect returns to Emacs with a deadline-owned timer."
+  (let ((tunnel (start-process "ejn-w47-tunnel" nil "sleep" "60"))
+        (probe (start-process "ejn-w47-probe" nil "sleep" "60"))
+        started-port scheduled)
+    (unwind-protect
+        (with-temp-buffer
+          (let ((context
+                 (emacs-jupyter-notebook--async-new-context
+                  :phase 'tunnel
+                  :origin-buffer (current-buffer)
+                  :tunnel-process tunnel
+                  :tunnel-pending-ports '(:shell_port)
+                  :local-ports '(:shell_port 54321)
+                  :deadline (+ (float-time) 10))))
+            (setq emacs-jupyter-notebook--async-context context)
+            (cl-letf (((symbol-function
+                        'emacs-jupyter-notebook--start-local-port-probe)
+                       (lambda (port)
+                         (setq started-port port)
+                         probe))
+                      ((symbol-function 'run-at-time)
+                       (lambda (&rest args)
+                         (setq scheduled args)
+                         'mock-tunnel-timer)))
+              (emacs-jupyter-notebook--async-wait-tunnel-tick context))
+            (should (= started-port 54321))
+            (should (eq (plist-get context :tunnel-probe-process) probe))
+            (should (eq (plist-get context :timer) 'mock-tunnel-timer))
+            (should (eq (nth 2 scheduled)
+                        #'emacs-jupyter-notebook--async-wait-tunnel-tick))))
+      (when (process-live-p probe) (delete-process probe))
+      (when (process-live-p tunnel) (delete-process tunnel)))))
+
+(ert-deftest ejn-w4.7-open-tunnel-probe-advances-without-network-wait ()
+  "An open final probe is disposed before advancing to Jupyter connect."
+  (let* ((tunnel (start-process "ejn-w47-open-tunnel" nil "sleep" "60"))
+         (probe (start-process "ejn-w47-open-probe" nil "sleep" "60"))
+         (real-process-status (symbol-function 'process-status))
+         disposed connected)
+    (unwind-protect
+        (with-temp-buffer
+          (let ((context
+                 (emacs-jupyter-notebook--async-new-context
+                  :phase 'tunnel
+                  :origin-buffer (current-buffer)
+                  :tunnel-process tunnel
+                  :tunnel-probe-process probe
+                  :tunnel-pending-ports '(:shell_port)
+                  :local-ports '(:shell_port 54321)
+                  :deadline (+ (float-time) 10))))
+            (setq emacs-jupyter-notebook--async-context context)
+            (cl-letf (((symbol-function 'process-status)
+                       (lambda (process)
+                         (if (eq process probe)
+                             'open
+                           (funcall real-process-status process))))
+                      ((symbol-function 'emacs-jupyter-notebook--async-delete-process)
+                       (lambda (process) (setq disposed process)))
+                      ((symbol-function 'emacs-jupyter-notebook--async-connect)
+                       (lambda (_context) (setq connected t))))
+              (emacs-jupyter-notebook--async-wait-tunnel-tick context))
+            (should (eq disposed probe))
+            (should connected)
+            (should-not (plist-get context :tunnel-probe-process))
+            (should-not (plist-get context :tunnel-pending-ports))))
+      (when (process-live-p probe) (delete-process probe))
+      (when (process-live-p tunnel) (delete-process tunnel)))))
+
+(ert-deftest ejn-w4.7-tunnel-deadline-disposes-connecting-probe ()
+  "A dropped SYN cannot outlive the tunnel-readiness deadline."
+  (let ((tunnel (start-process "ejn-w47-timeout-tunnel" nil "sleep" "60"))
+        (probe (start-process "ejn-w47-timeout-probe" nil "sleep" "60"))
+        failure)
+    (unwind-protect
+        (with-temp-buffer
+          (let ((context
+                 (emacs-jupyter-notebook--async-new-context
+                  :phase 'tunnel
+                  :origin-buffer (current-buffer)
+                  :tunnel-process tunnel
+                  :tunnel-probe-process probe
+                  :tunnel-pending-ports '(:shell_port)
+                  :deadline (1- (float-time)))))
+            (setq emacs-jupyter-notebook--async-context context)
+            (cl-letf (((symbol-function 'emacs-jupyter-notebook--async-fail)
+                       (lambda (_context reason) (setq failure reason))))
+              (emacs-jupyter-notebook--async-wait-tunnel-tick context))
+            (should failure)
+            (should (string-match-p "Timed out waiting" failure))
+            (should-not (process-live-p probe))
+            (should-not (plist-get context :tunnel-probe-process))))
+      (when (process-live-p probe) (delete-process probe))
+      (when (process-live-p tunnel) (delete-process tunnel)))))
+
 ;; W4.7: `ejn-connect-entry-waits-for-tunnel-before-jupyter-connect' was
 ;; removed along with the synchronous `--connect-entry'.  The async
 ;; tunnel-readiness behavior it asserted is covered by the
@@ -5723,12 +5833,14 @@ hooks, so mode enable does not install them."
   (with-temp-buffer
     (let* ((launch (start-process "ejn-test-launch" nil "sleep" "60"))
            (scp (start-process "ejn-test-scp" nil "sleep" "60"))
+           (tunnel-probe (start-process "ejn-test-tunnel-probe" nil "sleep" "60"))
            (tunnel (start-process "ejn-test-tunnel-ctx" nil "sleep" "60"))
            (remote-copy (make-temp-file "ejn-remote-" nil ".json"))
            (context (emacs-jupyter-notebook--async-new-context
                      :phase 'tunnel
                      :launch-process launch
                      :scp-process scp
+                     :tunnel-probe-process tunnel-probe
                      :tunnel-process tunnel
                      :remote-copy remote-copy
                      :origin-buffer (current-buffer))))
@@ -5736,6 +5848,7 @@ hooks, so mode enable does not install them."
       (emacs-jupyter-notebook--release-local-resources)
       (should-not (process-live-p launch))
       (should-not (process-live-p scp))
+      (should-not (process-live-p tunnel-probe))
       (should-not (process-live-p tunnel))
       (should-not (file-exists-p remote-copy))
       (should-not emacs-jupyter-notebook--async-context))))
@@ -9425,9 +9538,10 @@ prune."
                  (lambda (_kept &optional _file) nil))
                 ((symbol-function
                   'emacs-jupyter-notebook--classify-registry-liveness-async)
-                 (lambda (_entries _token callback)
+                 (lambda (probed-entries _token callback)
                    (funcall callback
-                            (list (cons live 'alive) (cons dead 'dead)) nil)))
+                            (list (cons (car probed-entries) 'alive)
+                                  (cons (cadr probed-entries) 'dead)) nil)))
                 ((symbol-function 'message)
                  (lambda (fmt &rest args) (setq msg (apply #'format fmt args)))))
       (with-temp-buffer
@@ -9462,9 +9576,10 @@ alive/unknown ones; the dead ghost is removed from the registry too."
                (lambda () nil))
               ((symbol-function
                 'emacs-jupyter-notebook--classify-registry-liveness-async)
-               (lambda (_entries _token callback)
+               (lambda (probed-entries _token callback)
                  (funcall callback
-                          (list (cons live 'alive) (cons dead 'dead)) nil)))
+                          (list (cons (car probed-entries) 'alive)
+                                (cons (cadr probed-entries) 'dead)) nil)))
               ((symbol-function 'completing-read)
                (lambda (_prompt collection &rest _)
                  (setq offered collection)
@@ -9480,6 +9595,122 @@ alive/unknown ones; the dead ghost is removed from the registry too."
           ;; The dead ghost was pruned from the durable registry.
           (should (member live saved))
           (should-not (member dead saved))))))
+
+(ert-deftest ejn-w11-prune-dead-kernels-preserves-concurrent-addition ()
+  "Async explicit pruning must not discard an entry added during its probe."
+  (let* ((dead (ejn-w11--entry "dead" 200 "up.example"))
+         (added (ejn-w11--entry "added" 300 "up.example"))
+         (current (list dead))
+         callback probed saved)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
+               (lambda (&optional _file) current))
+              ((symbol-function 'emacs-jupyter-notebook-registry-save)
+               (lambda (entries &optional _file)
+                 (setq saved (copy-tree entries)
+                       current entries)))
+              ((symbol-function
+                'emacs-jupyter-notebook--classify-registry-liveness-async)
+               (lambda (entries _token continuation)
+                 (setq probed entries callback continuation))))
+      (with-temp-buffer
+        (emacs-jupyter-notebook-prune-dead-kernels)
+        (should callback)
+        ;; Simulate a separate completion path persisting a new kernel while
+        ;; the liveness SSH probe is outstanding.
+        (setq current (list dead added))
+        (funcall callback (list (cons (car probed) 'dead)) nil)
+        (should (equal current (list added)))
+        (should (equal saved (list added)))))))
+
+(ert-deftest ejn-w11-prune-dead-kernels-preserves-concurrent-same-key-refresh ()
+  "Async explicit pruning must not delete a same-key entry refreshed in flight."
+  (let* ((dead (ejn-w11--entry "session" 200 "up.example"))
+         (refreshed (plist-put (copy-tree dead) :remote-pid 201))
+         (current (list dead))
+         callback probed save-called)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
+               (lambda (&optional _file) current))
+              ((symbol-function 'emacs-jupyter-notebook-registry-save)
+               (lambda (&rest _) (setq save-called t)))
+              ((symbol-function
+                'emacs-jupyter-notebook--classify-registry-liveness-async)
+               (lambda (entries _token continuation)
+                 (setq probed entries callback continuation))))
+      (with-temp-buffer
+        (emacs-jupyter-notebook-prune-dead-kernels)
+        (should callback)
+        ;; The replacement has the same registry key but a different durable
+        ;; PID, so the old positive-death answer no longer authorizes removal.
+        (setq current (list refreshed))
+        (funcall callback (list (cons (car probed) 'dead)) nil)
+        (should (equal current (list refreshed)))
+        (should-not save-called)))))
+
+(ert-deftest ejn-w11-picker-prune-preserves-concurrent-addition ()
+  "Reconnect picker pruning must retain and offer entries added in flight."
+  (let* ((dead (ejn-w11--entry "dead" 200 "up.example"))
+         (added (ejn-w11--entry "added" 300 "up.example"))
+         (current (list dead))
+         callback probed saved offered selected)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
+               (lambda (&optional _file) current))
+              ((symbol-function 'emacs-jupyter-notebook-registry-save)
+               (lambda (entries &optional _file)
+                 (setq saved (copy-tree entries)
+                       current entries)))
+              ((symbol-function
+                'emacs-jupyter-notebook--current-file-registry-entry)
+               (lambda () nil))
+              ((symbol-function
+                'emacs-jupyter-notebook--classify-registry-liveness-async)
+               (lambda (entries _token continuation)
+                 (setq probed entries callback continuation)))
+              ((symbol-function 'completing-read)
+               (lambda (_prompt collection &rest _)
+                 (setq offered collection)
+                 (caar collection))))
+      (with-temp-buffer
+        (emacs-jupyter-notebook--read-registry-entry-async
+         (lambda (entry) (setq selected entry)))
+        (should callback)
+        (setq current (list dead added))
+        (funcall callback (list (cons (car probed) 'dead)) nil)
+        (should (equal current (list added)))
+        (should (equal saved (list added)))
+        (should (= (length offered) 1))
+        (should (equal selected added))))))
+
+(ert-deftest ejn-w11-picker-prune-preserves-concurrent-same-key-refresh ()
+  "Reconnect picker must offer a same-key entry refreshed during its probe."
+  (let* ((dead (ejn-w11--entry "session" 200 "up.example"))
+         (refreshed (plist-put (copy-tree dead) :remote-pid 201))
+         (current (list dead))
+         callback probed save-called offered selected)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
+               (lambda (&optional _file) current))
+              ((symbol-function 'emacs-jupyter-notebook-registry-save)
+               (lambda (&rest _) (setq save-called t)))
+              ((symbol-function
+                'emacs-jupyter-notebook--current-file-registry-entry)
+               (lambda () nil))
+              ((symbol-function
+                'emacs-jupyter-notebook--classify-registry-liveness-async)
+               (lambda (entries _token continuation)
+                 (setq probed entries callback continuation)))
+              ((symbol-function 'completing-read)
+               (lambda (_prompt collection &rest _)
+                 (setq offered collection)
+                 (caar collection))))
+      (with-temp-buffer
+        (emacs-jupyter-notebook--read-registry-entry-async
+         (lambda (entry) (setq selected entry)))
+        (should callback)
+        (setq current (list refreshed))
+        (funcall callback (list (cons (car probed) 'dead)) nil)
+        (should (equal current (list refreshed)))
+        (should-not save-called)
+        (should (= (length offered) 1))
+        (should (equal selected refreshed))))))
 
 ;;; W19 — reconnect robustness
 

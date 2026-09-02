@@ -25,6 +25,9 @@
 (defconst ejn-doom-e2e--command-output-limit (* 64 1024)
   "Maximum bytes retained from each bounded cleanup-command stream.")
 
+(defconst ejn-doom-e2e--progress-output-limit (* 128 1024)
+  "Maximum bytes retained in the shell harness progress file.")
+
 (defun ejn-doom-e2e--bounded-string (value)
   "Return VALUE truncated to the E2E metric string bound."
   (let* ((unbounded (format "%s" value))
@@ -82,8 +85,42 @@ a new deadline."
     (unless (and (file-name-absolute-p progress-file)
                  (not (string-match-p "[\0\n\r]" progress-file)))
       (error "EJN_DOOM_E2E_PROGRESS_FILE must be a plain absolute path"))
-    (write-region (concat (ejn-doom-e2e--bounded-string text) "\n")
-                  nil progress-file 'append 'silent)))
+    ;; The runner creates this file inside its private run directory.  Do not
+    ;; let a pathological retry loop turn failure diagnostics into an
+    ;; unbounded file; retaining the first bounded phase sequence is enough
+    ;; to identify where the run stopped.
+    (let* ((attributes (file-attributes progress-file))
+           (size (and attributes (file-attribute-size attributes)))
+           (line (concat (ejn-doom-e2e--bounded-string text) "\n")))
+      (when (and (integerp size)
+                 (< size ejn-doom-e2e--progress-output-limit))
+        (let* ((remaining (- ejn-doom-e2e--progress-output-limit size))
+               (end (min (length line) remaining)))
+          ;; `substring' counts characters while the cap counts bytes.  Walk
+          ;; back only across this already-tiny line so a multibyte diagnostic
+          ;; can never exceed the file cap at its final byte boundary.
+          (while (> (string-bytes (substring line 0 end)) remaining)
+            (setq end (1- end)))
+          (write-region (substring line 0 end)
+                        nil progress-file 'append 'silent))))))
+
+(defun ejn-doom-e2e--evidence-directory ()
+  "Return the runner-owned evidence directory, if one was configured.
+The deterministic preflights intentionally run without it; only the live
+E2E body requires a private directory so a failing run keeps its source and
+registry beside bounded daemon and client diagnostics."
+  (when-let ((directory (getenv "EJN_DOOM_E2E_EVIDENCE_DIR")))
+    (unless (and (file-name-absolute-p directory)
+                 (file-directory-p directory)
+                 (not (string-match-p "[\0\n\r]" directory)))
+      (error "EJN_DOOM_E2E_EVIDENCE_DIR must name an existing plain absolute directory"))
+    directory))
+
+(defun ejn-doom-e2e--make-evidence-file (prefix &optional suffix)
+  "Create a private E2E evidence file named by PREFIX and optional SUFFIX."
+  (if-let ((directory (ejn-doom-e2e--evidence-directory)))
+      (make-temp-file (expand-file-name prefix directory) nil suffix)
+    (make-temp-file prefix nil suffix)))
 
 (defun ejn-doom-e2e--phase-budget (deadline phase)
   "Record PHASE and return its remaining share of the execution DEADLINE."
@@ -728,6 +765,25 @@ cleanup failure that prompted preservation."
      (format "captured-entry save failed: %s"
              (ejn-doom-e2e--bounded-string (error-message-string err))))))
 
+(defun ejn-doom-e2e--public-shutdown-disposition (buffer entry)
+  "Classify whether BUFFER can safely invoke the public shutdown command.
+The public command correctly asks before superseding an in-flight start or
+reconnect.  A headless E2E cleanup must never enter that prompt: its positive
+PID ENTRY is already independently authorized for the exact SSH cleanup
+fallback.  This classifier therefore makes the decision explicit and leaves
+all durable state untouched until that fallback succeeds."
+  (cond
+   ((not (buffer-live-p buffer)) 'no-live-buffer)
+   (t
+    (with-current-buffer buffer
+      (cond
+       ((null emacs-jupyter-notebook--session-entry) 'no-live-entry)
+       ((not (ejn-doom-e2e--same-direct-entry-p
+              entry emacs-jupyter-notebook--session-entry))
+        'live-entry-mismatch)
+       ((emacs-jupyter-notebook--async-in-progress-p) 'in-flight-attempt)
+       (t 'eligible))))))
+
 (defun ejn-doom-e2e--shutdown-test-owned-kernel (buffer entry &optional absolute-deadline)
   "Explicitly stop test-owned ENTRY, then verify its exact PID is dead.
 The normal helper shutdown is preferred.  The identity-bound SSH cleanup is
@@ -740,31 +796,38 @@ other kernel.  ABSOLUTE-DEADLINE, when non-nil, bounds a multi-entry cleanup."
       (error (concat "Doom E2E cleanup requires a promoted positive remote PID; "
                      "provisional recovery evidence was retained")))
     (ejn-doom-e2e--record-progress "cleanup started")
-    (when (buffer-live-p buffer)
-      (with-current-buffer buffer
-        (let ((live-entry emacs-jupyter-notebook--session-entry))
-          (cond
-           ((null live-entry)
-            (setq shutdown-error "no live session entry for public shutdown"))
-           ((not (ejn-doom-e2e--same-direct-entry-p entry live-entry))
-            (setq shutdown-error
-                  (format "refused public shutdown for non-test-owned live entry: %S"
-                          (ejn-doom-e2e--entry-remote-identity live-entry))))
-           (t
-            (condition-case err
-                (progn
-                  (ejn-doom-e2e--record-progress "requesting helper shutdown")
-                  (emacs-jupyter-notebook-shutdown-kernel :force)
-                  (ejn-doom-e2e--record-progress "waiting for helper shutdown")
-                  (unless (ejn-doom-e2e--wait-for-shutdown
-                           buffer (ejn-doom-e2e--cleanup-budget
-                                   deadline "helper shutdown" 8))
-                    (setq shutdown-error "helper shutdown acknowledgement timed out"))
-                  (ejn-doom-e2e--record-progress "helper shutdown wait finished"))
-              (error
-               ;; The bounded fallback below still owns only ENTRY's persisted
-               ;; PID and connection-token identity.
-               (setq shutdown-error (error-message-string err)))))))))
+    (pcase (ejn-doom-e2e--public-shutdown-disposition buffer entry)
+      ('eligible
+       (with-current-buffer buffer
+         (condition-case err
+             (progn
+               (ejn-doom-e2e--record-progress "requesting helper shutdown")
+               (emacs-jupyter-notebook-shutdown-kernel :force)
+               (ejn-doom-e2e--record-progress "waiting for helper shutdown")
+               (unless (ejn-doom-e2e--wait-for-shutdown
+                        buffer (ejn-doom-e2e--cleanup-budget
+                                deadline "helper shutdown" 8))
+                 (setq shutdown-error "helper shutdown acknowledgement timed out"))
+               (ejn-doom-e2e--record-progress "helper shutdown wait finished"))
+           (error
+            ;; The bounded fallback below still owns only ENTRY's persisted
+            ;; PID and connection-token identity.
+            (setq shutdown-error (error-message-string err))))))
+      ('in-flight-attempt
+       ;; `:force' skips only the destructive-kernel confirmation; the public
+       ;; command still asks `y-or-n-p' before cancelling this attempt.  Do
+       ;; not cancel it here: that would change durable package state just to
+       ;; satisfy a test.  The exact fallback below has its own deadline and
+       ;; can terminate only ENTRY's verified PID/connection-token identity.
+       (setq shutdown-error
+             "public shutdown skipped because a connection attempt is in flight")
+       (ejn-doom-e2e--record-progress
+        "skipping public shutdown: async attempt active; using exact fallback"))
+      (disposition
+       (setq shutdown-error
+             (format "public shutdown unavailable (%s)" disposition))
+       (ejn-doom-e2e--record-progress
+        (format "skipping public shutdown: %s" disposition))))
     (ejn-doom-e2e--record-progress "probing remote PID after helper shutdown")
     (unless (ejn-doom-e2e--remote-entry-dead-p
              entry (ejn-doom-e2e--cleanup-budget
@@ -879,9 +942,9 @@ identity and is verified through an exact PID liveness probe."
          (profile (plist-put
                    (ejn-doom-e2e--profile-with-overrides configured-profile-name)
                    :profile profile-name))
-         (source-file (make-temp-file "ejn-doom-e2e-" nil ".py"))
+         (source-file (ejn-doom-e2e--make-evidence-file "source-" ".py"))
          (session-prefix (ejn-doom-e2e--session-prefix-for-source source-file))
-         (registry-file (make-temp-file "ejn-doom-e2e-registry-"))
+         (registry-file (ejn-doom-e2e--make-evidence-file "registry-"))
          (timeout (ejn-doom-e2e--timeout))
          (deadline (+ (float-time) timeout))
          (token-output (format "EJN token survived reconnect: %s" token))
@@ -1385,13 +1448,94 @@ identity and is verified through an exact PID liveness probe."
         (should-not public-shutdown)
         (should-not remote-command)))))
 
+(ert-deftest ejn-doom-e2e-cleanup-skips-public-shutdown-during-attempt ()
+  "A promoted entry with an active attempt reaches only exact cleanup.
+This is the headless-failure state that made `shutdown-kernel' invoke
+`y-or-n-p' before `:force' could take effect.  The harness must retain the
+durable entry through an independently bounded remote cleanup instead."
+  (let* ((session "doom-promoted")
+         (connection (format "/tmp/kernel-%s.json" session))
+         (entry (list :launch-kind 'direct :provisional nil :remote-pid 17171
+                      :profile "doom-private" :local-file "/tmp/doom-owned.py"
+                      :session-id session :remote-connection-file connection
+                      :remote-pid-sidecar
+                      (concat (string-remove-suffix ".json" connection) ".pid")
+                      :connection-file-tokens (list "-f" connection)))
+         prompt-called cleanup-argv
+         (probe-count 0))
+    (with-temp-buffer
+      (setq emacs-jupyter-notebook--session-entry entry
+            emacs-jupyter-notebook--async-context
+            (list :phase 'retrieve :entry entry :origin-buffer (current-buffer)))
+      (cl-letf (((symbol-function 'y-or-n-p)
+                 (lambda (&rest _args)
+                   (setq prompt-called t)
+                   (error "interactive prompt reached from headless cleanup")))
+                ((symbol-function 'ejn-doom-e2e--remote-entry-dead-p)
+                 (lambda (&rest _args)
+                   (setq probe-count (1+ probe-count))
+                   (> probe-count 1)))
+                ((symbol-function 'emacs-jupyter-notebook-ssh-build-remote-cleanup)
+                 (lambda (profile candidate)
+                   (should (equal (plist-get profile :profile) "doom-private"))
+                   (should (ejn-doom-e2e--same-direct-entry-p entry candidate))
+                   '("exact-cleanup")))
+                ((symbol-function 'ejn-doom-e2e--run-command)
+                 (lambda (argv &optional _timeout)
+                   (setq cleanup-argv argv)
+                   "__EJN_CLEANUP_DONE__\n")))
+        (should (eq (ejn-doom-e2e--public-shutdown-disposition
+                     (current-buffer) entry)
+                    'in-flight-attempt))
+        (should (ejn-doom-e2e--shutdown-test-owned-kernel
+                 (current-buffer) entry (+ (float-time) 3)))
+        (should-not prompt-called)
+        (should (equal cleanup-argv '("exact-cleanup")))
+        (should (= probe-count 2))
+        ;; The fallback receives ENTRY directly; it does not cancel the live
+        ;; attempt or erase its durable authority before exact cleanup proves
+        ;; the remote disposition.
+        (should (ejn-doom-e2e--same-direct-entry-p
+                 entry emacs-jupyter-notebook--session-entry))
+        (should (ejn-doom-e2e--same-direct-entry-p
+                 entry (plist-get emacs-jupyter-notebook--async-context
+                                  :entry)))))))
+
+(ert-deftest ejn-doom-e2e-progress-file-never-exceeds-byte-cap ()
+  "Progress retention remains bounded even at a one-byte final boundary."
+  (let* ((progress (make-temp-file "ejn-doom-progress-"))
+         (process-environment (copy-sequence process-environment)))
+    (unwind-protect
+        (progn
+          (with-temp-file progress
+            (insert (make-string (1- ejn-doom-e2e--progress-output-limit) ?x)))
+          (setenv "EJN_DOOM_E2E_PROGRESS_FILE" progress)
+          (ejn-doom-e2e--record-progress "final diagnostic")
+          (should (= (file-attribute-size (file-attributes progress))
+                     ejn-doom-e2e--progress-output-limit)))
+      (when (file-exists-p progress) (delete-file progress)))))
+
+(ert-deftest ejn-doom-e2e-evidence-files-stay-in-owned-directory ()
+  "The optional live-E2E evidence root owns its source and registry files."
+  (let* ((directory (make-temp-file "ejn-doom-evidence-" t))
+         (process-environment (copy-sequence process-environment))
+         file)
+    (unwind-protect
+        (progn
+          (setenv "EJN_DOOM_E2E_EVIDENCE_DIR" directory)
+          (setq file (ejn-doom-e2e--make-evidence-file "source-" ".py"))
+          (should (equal (file-name-directory file)
+                         (file-name-as-directory directory))))
+      (when (file-exists-p file) (delete-file file))
+      (when (file-directory-p directory) (delete-directory directory)))))
+
 (defun ejn-doom-e2e-run ()
   "Run deterministic harness preflights, then the remote Doom E2E body."
   (let* ((process-environment (copy-sequence process-environment))
          (_ (setenv "EJN_DOOM_E2E_PROGRESS_FILE" nil))
          (stats
           (ert-run-tests-batch
-           "\\`ejn-doom-e2e-\\(bounded-command\\|failure-evidence\\|recovery-rejects\\|cleanup-\\(?:marker-mismatch\\|covers-drifted\\|refuses-foreign\\)\\|provisional-entry\\|source-pristine\\)")))
+           "\\`ejn-doom-e2e-\\(bounded-command\\|evidence-files\\|failure-evidence\\|progress-file\\|recovery-rejects\\|cleanup-\\(?:marker-mismatch\\|covers-drifted\\|refuses-foreign\\|skips-public-shutdown\\)\\|provisional-entry\\|source-pristine\\)")))
     (unless (zerop (ert-stats-completed-unexpected stats))
       (error "Doom E2E deterministic harness preflight failed")))
   (ejn-doom-e2e-python-cell-evaluates-on-mother))

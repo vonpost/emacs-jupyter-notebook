@@ -1117,6 +1117,9 @@ disposer does not prevent the remaining disposers from running."
        (plist-get context :restart-seed-read-process)))
     (ignore-errors
       (emacs-jupyter-notebook--async-delete-process
+       (plist-get context :tunnel-probe-process)))
+    (ignore-errors
+      (emacs-jupyter-notebook--async-delete-process
        (plist-get context :tunnel-process)))
     (ignore-errors
       (emacs-jupyter-notebook--cleanup-restart-staging context))
@@ -2276,6 +2279,52 @@ completion or `cancelled'.  Failed/timed-out hosts are classified `unknown'."
           :kept-entries (nreverse kept)
           :pruned-entries (nreverse dead))))
 
+(defun emacs-jupyter-notebook--registry-entry-prune-identity (entry)
+  "Return ENTRY's conservative durable identity for asynchronous pruning.
+The complete serialized entry is the identity.  A concurrent refresh may
+change any field that helps identify or reconnect a kernel, including fields
+added in a later version; accepting only an exact snapshot match therefore
+fails closed rather than deleting a newly refreshed same-key entry."
+  (copy-tree entry))
+
+(defun emacs-jupyter-notebook--commit-confirmed-dead-registry-entries
+    (confirmed-dead &optional file)
+  "Commit CONFIRMED-DEAD removals against a freshly loaded registry FILE.
+Only entries whose registry key and complete durable identity still equal a
+probed confirmed-dead snapshot are removed.  Return a plist containing the
+actual `:pruned-entries' and current `:kept-entries'."
+  (let* ((identities
+          (mapcar
+           (lambda (entry)
+             (list (emacs-jupyter-notebook--registry-entry-key entry)
+                   (emacs-jupyter-notebook--registry-entry-prune-identity
+                    entry)))
+           confirmed-dead))
+         ;; Reload immediately before the only write.  The probe may have
+         ;; taken long enough for another path to add or refresh an entry.
+         (current (emacs-jupyter-notebook-registry-load file))
+         (kept nil)
+         (pruned nil))
+    (dolist (entry current)
+      (if (cl-some
+           (lambda (identity)
+             (and (equal (emacs-jupyter-notebook--registry-entry-key entry)
+                         (nth 0 identity))
+                  (equal
+                   (emacs-jupyter-notebook--registry-entry-prune-identity
+                    entry)
+                   (nth 1 identity))))
+           identities)
+          (push entry pruned)
+        (push entry kept)))
+    (setq kept (nreverse kept)
+          pruned (nreverse pruned))
+    ;; A nil fresh read also prevents an async prune from overwriting a
+    ;; concurrently removed or unreadable registry with its old snapshot.
+    (when pruned
+      (emacs-jupyter-notebook-registry-save kept file))
+    (list :pruned-entries pruned :kept-entries kept)))
+
 (defun emacs-jupyter-notebook--prune-dead-registry-entries (&optional file probe-fn)
   "Prune registry entries whose remote kernel is confirmed DEAD.  W11(B).
 Load the registry from FILE, classify liveness via PROBE-FN, and rewrite
@@ -2284,14 +2333,21 @@ kills a live kernel; keeps every `alive' AND `unknown' entry (an
 unreachable host cannot cause a false prune).  The file is only rewritten
 when at least one entry is actually pruned.  Return a plist
 \(:pruned N :alive A :unknown U :kept-entries (...) :pruned-entries (...))."
-  (let* ((entries (emacs-jupyter-notebook-registry-load file))
+  (let* ((entries (mapcar #'copy-tree
+                          (emacs-jupyter-notebook-registry-load file)))
          (classification (emacs-jupyter-notebook--classify-registry-liveness
                           entries probe-fn))
          (result (emacs-jupyter-notebook--registry-liveness-result
-                  entries classification)))
-    (when (plist-get result :pruned-entries)
-      (emacs-jupyter-notebook-registry-save
-       (plist-get result :kept-entries) file))
+                  entries classification))
+         (commit
+          (emacs-jupyter-notebook--commit-confirmed-dead-registry-entries
+           (plist-get result :pruned-entries) file)))
+    (setq result (plist-put result :pruned
+                            (length (plist-get commit :pruned-entries))))
+    (setq result (plist-put result :pruned-entries
+                            (plist-get commit :pruned-entries)))
+    (setq result (plist-put result :kept-entries
+                            (plist-get commit :kept-entries)))
     result))
 
 (defun emacs-jupyter-notebook--choose-registry-entry (entries)
@@ -2331,7 +2387,8 @@ when at least one entry is actually pruned.  Return a plist
 
 (defun emacs-jupyter-notebook--read-registry-entry-async (callback)
   "Probe the registry asynchronously, then invoke CALLBACK with a chosen entry."
-  (let ((entries (emacs-jupyter-notebook-registry-load)))
+  (let ((entries (mapcar #'copy-tree
+                         (emacs-jupyter-notebook-registry-load))))
     (unless entries
       (user-error "No kernel sessions found in registry"))
     (let ((token (emacs-jupyter-notebook--management-begin
@@ -2347,12 +2404,15 @@ when at least one entry is actually pruned.  Return a plist
            (let* ((result (emacs-jupyter-notebook--registry-liveness-result
                            entries classification))
                   (dead (plist-get result :pruned-entries))
-                  (survivors (plist-get result :kept-entries)))
-             (when dead
-               (emacs-jupyter-notebook-registry-save survivors)
+                  (commit
+                   (emacs-jupyter-notebook--commit-confirmed-dead-registry-entries
+                    dead))
+                  (pruned (plist-get commit :pruned-entries))
+                  (survivors (plist-get commit :kept-entries)))
+             (when pruned
                (message
                 "emacs-jupyter-notebook: pruned %d dead kernel entr%s from picker"
-                (length dead) (if (= (length dead) 1) "y" "ies")))
+                (length pruned) (if (= (length pruned) 1) "y" "ies")))
              (if (null survivors)
                  (message
                   "emacs-jupyter-notebook: all registered kernels are dead")
@@ -2381,15 +2441,20 @@ when at least one entry is actually pruned.  Return a plist
        (when (memq (process-status process) '(exit signal))
          (message "Jupyter tunnel %s: %s" process (string-trim event)))))))
 
-(defun emacs-jupyter-notebook--local-port-open-p (port)
-  "Return non-nil when PORT accepts a TCP connection on localhost."
-  (condition-case nil
-      (let ((proc (open-network-stream
-                   (format "emacs-jupyter-notebook-port-%s" port)
-                   nil "127.0.0.1" port)))
-        (delete-process proc)
-        t)
-    (error nil)))
+(defun emacs-jupyter-notebook--start-local-port-probe (port)
+  "Start and return a non-blocking localhost TCP probe for PORT.
+The caller owns the returned process and must dispose it.  In particular,
+`:nowait' is load-bearing: a dropped SYN must never block Emacs while the
+outer tunnel-readiness deadline is waiting to run."
+  (make-network-process
+   :name (format "emacs-jupyter-notebook-port-%s" port)
+   :buffer nil
+   :host "127.0.0.1"
+   :service port
+   :family 'ipv4
+   :nowait t
+   :noquery t
+   :sentinel #'ignore))
 
 ;; W4.7: the synchronous `--wait-for-tunnel' that blocked the UI with
 ;; `sleep-for' has been removed.  The async tunnel-readiness poller in
@@ -2564,6 +2629,8 @@ attempt.  Only the exact non-nil generation installed by
                        :busy-probe-process nil
                        :log-process nil
                        :tunnel-process nil
+                       :tunnel-probe-process nil
+                       :tunnel-pending-ports nil
                        :local-ports nil
                        :remote-ports nil
                        :connection nil
@@ -2643,8 +2710,9 @@ A single buffer owns a single connection — two attempts must never run
 in parallel.  When SUPERSEDE-RECONNECT is non-nil, an existing reconnect
 attempt is cancelled locally without prompting; this makes an explicit
 reconnect command the reliable escape hatch from a wedged background
-attempt.  A start attempt still requires confirmation because cancelling
-it may terminate the kernel that attempt launched."
+attempt.  A start attempt still requires confirmation because abandoning an
+admitted launch can leave a remote kernel that must be recovered through the
+durable registry."
   (emacs-jupyter-notebook--ensure-no-replacement-operation)
   (when (emacs-jupyter-notebook--async-in-progress-p)
     (if (or (and supersede-reconnect
@@ -2942,6 +3010,8 @@ underlying stderr matches a known SSH failure pattern."
     (emacs-jupyter-notebook--async-delete-process
      (plist-get context :launch-probe-process))
     (emacs-jupyter-notebook--async-delete-process (plist-get context :scp-process))
+    (emacs-jupyter-notebook--async-delete-process
+     (plist-get context :tunnel-probe-process))
     (emacs-jupyter-notebook--async-delete-process (plist-get context :tunnel-process))
     ;; W4.8: dispose the W4.4 PID-probe process too so its stdout/stderr
     ;; buffers do not leak when the probe itself fails the context.
@@ -3592,6 +3662,10 @@ clobbering any newer attempt while re-issuing SCP against a killed kernel."
       (setq context (emacs-jupyter-notebook--async-put context :tunnel-process tunnel))
       (setq context (emacs-jupyter-notebook--async-put context :phase 'tunnel))
       (setq context (emacs-jupyter-notebook--async-put context :local-ports local-ports))
+      (setq context
+            (emacs-jupyter-notebook--async-put
+             context :tunnel-pending-ports
+             (copy-sequence emacs-jupyter-notebook-connection-port-keys)))
       (when (emacs-jupyter-notebook--async-buffer-live-p context)
         (with-current-buffer (plist-get context :origin-buffer)
           (emacs-jupyter-notebook--install-tunnel-sentinel tunnel (current-buffer))))
@@ -3601,33 +3675,76 @@ clobbering any newer attempt while re-issuing SCP against a killed kernel."
       (emacs-jupyter-notebook--async-message context "waiting for SSH tunnel ports")
       (emacs-jupyter-notebook--async-wait-tunnel-tick context))))
 
+(defun emacs-jupyter-notebook--async-schedule-tunnel-tick (context)
+  "Schedule the next non-blocking tunnel readiness check for CONTEXT."
+  (let* ((remaining (max 0 (- (plist-get context :deadline) (float-time))))
+         (delay (min emacs-jupyter-notebook-tunnel-wait-delay remaining))
+         (timer (run-at-time
+                 delay nil
+                 #'emacs-jupyter-notebook--async-wait-tunnel-tick context)))
+    (emacs-jupyter-notebook--async-put context :timer timer)))
+
+(defun emacs-jupyter-notebook--async-dispose-tunnel-probe (context)
+  "Dispose CONTEXT's current local port probe and clear its ownership slot."
+  (emacs-jupyter-notebook--async-delete-process
+   (plist-get context :tunnel-probe-process))
+  (emacs-jupyter-notebook--async-put context :tunnel-probe-process nil))
+
 (defun emacs-jupyter-notebook--async-wait-tunnel-tick (context)
-  "Check tunnel readiness for CONTEXT and reschedule if needed."
-  (when (eq (plist-get context :phase) 'tunnel)
+  "Advance CONTEXT's deadline-owned, non-blocking tunnel readiness probe."
+  (when (and (eq (plist-get context :phase) 'tunnel)
+             (emacs-jupyter-notebook--async-context-live-p context))
+    (setq context (emacs-jupyter-notebook--async-cancel-timer context))
     (let* ((tunnel (plist-get context :tunnel-process))
-           (local-ports (plist-get context :local-ports))
-           (pending
-            (cl-remove-if
-             (lambda (key)
-               (emacs-jupyter-notebook--local-port-open-p
-                (plist-get local-ports key)))
-             emacs-jupyter-notebook-connection-port-keys)))
+           (probe (plist-get context :tunnel-probe-process))
+           (probe-status (and (processp probe) (process-status probe)))
+           (pending (plist-get context :tunnel-pending-ports)))
       (cond
        ((not (process-live-p tunnel))
+        (emacs-jupyter-notebook--async-dispose-tunnel-probe context)
         (emacs-jupyter-notebook--async-fail
          context "Jupyter SSH tunnel exited before ports were ready"))
-       ((null pending)
-        (emacs-jupyter-notebook--async-connect context))
        ((>= (float-time) (plist-get context :deadline))
+        (emacs-jupyter-notebook--async-dispose-tunnel-probe context)
         (emacs-jupyter-notebook--async-fail
          context
          (format "Timed out waiting for Jupyter SSH tunnel ports: %s"
                  (mapconcat #'symbol-name pending ", "))))
+       ((eq probe-status 'open)
+        (setq context
+              (emacs-jupyter-notebook--async-dispose-tunnel-probe context))
+        (setq context
+              (emacs-jupyter-notebook--async-put
+               context :tunnel-pending-ports (cdr pending)))
+        ;; At most five successful probes recurse here.  Each individual
+        ;; connect remains `:nowait', so this never waits on network I/O.
+        (emacs-jupyter-notebook--async-wait-tunnel-tick context))
+       ((eq probe-status 'connect)
+        (emacs-jupyter-notebook--async-schedule-tunnel-tick context))
+       (probe
+        (setq context
+              (emacs-jupyter-notebook--async-dispose-tunnel-probe context))
+        (setq context
+              (emacs-jupyter-notebook--async-put
+               context :tunnel-pending-ports
+               (copy-sequence emacs-jupyter-notebook-connection-port-keys)))
+        (emacs-jupyter-notebook--async-schedule-tunnel-tick context))
+       ((null pending)
+        (emacs-jupyter-notebook--async-connect context))
        (t
-        (let ((timer (run-at-time
-                      emacs-jupyter-notebook-tunnel-wait-delay nil
-                      #'emacs-jupyter-notebook--async-wait-tunnel-tick context)))
-          (emacs-jupyter-notebook--async-put context :timer timer)))))))
+        (condition-case err
+            (let ((started
+                   (emacs-jupyter-notebook--start-local-port-probe
+                    (plist-get (plist-get context :local-ports) (car pending)))))
+              (setq context
+                    (emacs-jupyter-notebook--async-put
+                     context :tunnel-probe-process started))
+              (emacs-jupyter-notebook--async-schedule-tunnel-tick context))
+          (error
+           (emacs-jupyter-notebook--log-append
+            'tunnel "local port probe could not start: %s"
+            (error-message-string err))
+           (emacs-jupyter-notebook--async-schedule-tunnel-tick context))))))))
 
 (defun emacs-jupyter-notebook--async-connect-finalize (context buffer entry local-ports local-file client &optional busy)
   "Finalize the async connect for CONTEXT in BUFFER with CLIENT.
@@ -6478,7 +6595,8 @@ This only tidies the local registry.  For the destructive per-profile
 remote nuke (kill every kernel in a profile's cache dir and delete its
 files) see `emacs-jupyter-notebook-clean-orphaned-kernels'."
   (interactive)
-  (let ((entries (emacs-jupyter-notebook-registry-load)))
+  (let ((entries (mapcar #'copy-tree
+                         (emacs-jupyter-notebook-registry-load))))
     (if (not entries)
         (message "emacs-jupyter-notebook: registry is empty; nothing to prune")
       (let ((token (emacs-jupyter-notebook--management-begin
@@ -6492,12 +6610,12 @@ files) see `emacs-jupyter-notebook-clean-orphaned-kernels'."
              (let* ((result
                      (emacs-jupyter-notebook--registry-liveness-result
                       entries classification))
-                    (pruned (plist-get result :pruned))
+                    (commit
+                     (emacs-jupyter-notebook--commit-confirmed-dead-registry-entries
+                      (plist-get result :pruned-entries)))
+                    (pruned (length (plist-get commit :pruned-entries)))
                     (alive (plist-get result :alive))
                     (unknown (plist-get result :unknown)))
-               (when (> pruned 0)
-                 (emacs-jupyter-notebook-registry-save
-                  (plist-get result :kept-entries)))
                (message
                 "emacs-jupyter-notebook: pruned %d dead kernel entr%s; %d live remain%s"
                 pruned (if (= pruned 1) "y" "ies") alive
@@ -6546,10 +6664,9 @@ W5.3/IR4/IR5: four branches.
   deadline.  This never changes the registry or sends a kernel termination.
 - If an async context is in progress (launch / retrieve / tunnel /
   connect), cancel it via `--cancel-async-operation' — the evaluation
-  branch is NOT taken because there is no live kernel to interrupt.  A
-  start attempt (`:owns-kernel') also has the remote kernel it launched
-  killed so it is not orphaned; a reconnect attempt leaves its
-  pre-existing kernel alone.
+  branch is NOT taken because there is no live client to interrupt.  Both
+  start and reconnect cancellation release only local resources; an admitted
+  start remains in the durable registry for later recovery.
 - If an automatic reconnect is scheduled, cancel its owned timer and clear
   the advertised next-retry state.  A stale callback from that timer is
   generation-guarded and cannot start an attempt afterward.
