@@ -1503,7 +1503,7 @@ be manager-reviewed for durable-kernel rules.
     framing/CLI tests passed 15/15, and the canonical source suite passed
     813/813 ERTs plus 218/218 helper unit tests (three expected host skips).
 
-- [~] owner=terra-ag2 claimed=2026-09-02 **AG2 Run Emacs/helper/local-kernel end-to-end suite.**
+- [x] owner=terra-ag2 claimed=2026-09-02 landed=9fc80ce **AG2 Run Emacs/helper/local-kernel end-to-end suite.**
   - Depends: AG1.
   - Files: `tests/emacs-jupyter-notebook-helper-e2e.el`, runner only.
   - Deliverable: source buffer -> helper -> TH2 kernel -> panel path without SSH
@@ -1511,6 +1511,15 @@ be manager-reviewed for durable-kernel rules.
     interrupt, helper kill/reconnect, restart, and shutdown.  Assert source
     text/modified flag unchanged and all resources bounded.
   - Gate: 20 consecutive batch runs under external timeout; no remote host.
+  - Landed verification: three real Emacs/helper/direct-kernel scenarios cover
+    the interactive surface, ambiguous helper death without replay, and public
+    restart/shutdown orchestration.  The final source-frozen gate completed
+    20/20 repetitions in 21-23 seconds per batch.  Its token-bound supervisor
+    verified exact Emacs, bridge, and kernel process groups plus exact artifact
+    and temporary roots; the final residue audit was empty.  The canonical
+    source suite passed 817/817 ERTs and 218/218 helper tests (three expected
+    host skips), and both Elisp and runner static checks passed with only the
+    two known optional Evil byte-compiler warnings.
 
 - [x] owner=root claimed=2026-09-02 landed=faf5be2 **AG2R Keep published artifact leases panel-owned.**
   - Depends: EI9, AG2 discovery.
