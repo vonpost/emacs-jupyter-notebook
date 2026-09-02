@@ -1349,7 +1349,8 @@ same identity-pinned bytes it executes in its bounded worker."
   (when (and (listp pickle) (not (plist-get pickle :deleted)))
     (plist-put pickle :retired t)
     (when (<= (or (plist-get pickle :leases) 0) 0)
-      (when (emacs-jupyter-notebook-panel--delete-published-artifact pickle)
+      (when (eq (emacs-jupyter-notebook-panel--delete-published-artifact pickle)
+                t)
         (plist-put pickle :deleted t)))))
 
 (defun emacs-jupyter-notebook-panel--set-pickle-metadata (handle pickle)
@@ -1375,8 +1376,10 @@ same identity-pinned bytes it executes in its bounded worker."
   "Store one validated confined pickle metadata record on HANDLE."
   (when (ejn-panel-entry-live-p handle)
     (emacs-jupyter-notebook-panel--set-pickle-metadata
-     handle (emacs-jupyter-notebook-panel--published-pickle
-             root path sha256 size root-identity))))
+     handle
+     (with-current-buffer (plist-get handle :panel)
+       (emacs-jupyter-notebook-panel--published-pickle
+        root path sha256 size root-identity)))))
 
 (defun ejn-panel-set-published-bundle (handle image pickle update-p)
   "Atomically admit IMAGE and PICKLE descriptors, returning a boolean.
@@ -1396,20 +1399,22 @@ pickle follows the image's existing cross-entry target."
                  (or (not update-p) target))
         ;; Validate both publications before changing the entry.  Descriptor
         ;; rejection therefore leaves the existing image/pickle bundle intact.
-        (let ((pickle-meta
-               (and pickle
-                    (emacs-jupyter-notebook-panel--published-pickle
-                     (plist-get pickle :root) (plist-get pickle :path)
-                     (plist-get pickle :sha256) (plist-get pickle :size)
-                     (plist-get pickle :root-identity)
-                     (plist-get pickle :artifact-capability))))
-              (image-spec
-               (and image
-                    (emacs-jupyter-notebook-panel--published-image-bundle-spec
-                     image)))
-              (panel (plist-get effective :panel))
-              (old-entry (ejn-panel-entry-snapshot effective))
-              old-images old-pickle old-timer replace-pickle-p new-entry committed)
+        (let* ((panel (plist-get effective :panel))
+               (pickle-meta
+                (and pickle
+                     (with-current-buffer panel
+                       (emacs-jupyter-notebook-panel--published-pickle
+                        (plist-get pickle :root) (plist-get pickle :path)
+                        (plist-get pickle :sha256) (plist-get pickle :size)
+                        (plist-get pickle :root-identity)
+                        (plist-get pickle :artifact-capability)))))
+               (image-spec
+                (and image
+                     (with-current-buffer panel
+                       (emacs-jupyter-notebook-panel--published-image-bundle-spec
+                        image))))
+               (old-entry (ejn-panel-entry-snapshot effective))
+               old-images old-pickle old-timer replace-pickle-p new-entry committed)
           (when old-entry
             (setq old-pickle (plist-get old-entry :mpl-pickle)
                   old-timer (plist-get old-entry :pickle-open-timer))
@@ -1523,20 +1528,22 @@ pickle follows the image's existing cross-entry target."
         (emacs-jupyter-notebook-panel--retire-pickle pickle)))))
 
 (defun emacs-jupyter-notebook-panel--delete-published-artifact (artifact)
-  "Retire ARTIFACT through its identity-bound local capability."
+  "Retire ARTIFACT through its identity-bound local capability.
+Return t after immediate deletion, `queued' for a pending bulk deletion, and
+nil when ARTIFACT could not be safely retired."
   (when (listp artifact)
     (let ((capability (plist-get artifact :artifact-capability)))
       (if (hash-table-p emacs-jupyter-notebook-panel--bulk-published-deletions)
           (let ((file (plist-get artifact :file))
                 (identity (plist-get artifact :identity)))
-            (when (and identity
+            (when (and (stringp file) identity
                        (emacs-jupyter-notebook-artifacts-capability-valid-p capability))
               (let* ((key (cons (emacs-jupyter-notebook-artifacts-capability-root capability)
                                 (emacs-jupyter-notebook-artifacts-capability-root-identity capability)))
                      (bucket (gethash key emacs-jupyter-notebook-panel--bulk-published-deletions)))
-                (puthash key (list capability (cons (cons file identity) (cadr bucket)))
+                (puthash key (list capability (cons artifact (cadr bucket)))
                          emacs-jupyter-notebook-panel--bulk-published-deletions)
-                t)))
+                'queued)))
         (when (emacs-jupyter-notebook-artifacts-delete-leaf
                capability (plist-get artifact :file) (plist-get artifact :identity))
           (when (emacs-jupyter-notebook-artifacts-release-if-empty capability)
@@ -1548,22 +1555,38 @@ pickle follows the image's existing cross-entry target."
           t)))))
 
 (defun emacs-jupyter-notebook-panel--flush-bulk-published-deletions (table)
-  "Perform every helper publication batch in TABLE once per root."
+  "Perform every helper publication batch in TABLE once per root.
+Mark metadata deleted only for paths the identity-pinned batch actually
+removed, so a failed batch remains conservatively owned and retriable."
   (when (hash-table-p table)
     (maphash
      (lambda (_key bucket)
-       (ignore-errors
-         (emacs-jupyter-notebook-artifacts-delete-leaves
-          (car bucket) (delete-dups (nreverse (cadr bucket))))))
+       (let* ((capability (car bucket))
+              (artifacts (delete-dups (nreverse (cadr bucket))))
+              (deleted
+               (ignore-errors
+                 (emacs-jupyter-notebook-artifacts-delete-leaves
+                  capability
+                  (mapcar (lambda (artifact)
+                            (cons (plist-get artifact :file)
+                                  (plist-get artifact :identity)))
+                          artifacts)))))
+         (dolist (artifact artifacts)
+           (when (member (plist-get artifact :file) deleted)
+             (plist-put artifact :deleted t)))))
      table)))
 
 (defun emacs-jupyter-notebook-panel--retire-original-if-released (image)
   "Delete IMAGE's original after both entry retirement and opener release."
-  (let ((props (cdr image)))
-    (when (and (plist-get props :ejn-retired)
+  (let* ((props (cdr image))
+         (original (plist-get props :ejn-original)))
+    (when (and original
+               (not (plist-get original :deleted))
+               (plist-get props :ejn-retired)
                (<= (or (plist-get props :ejn-original-open-leases) 0) 0))
-      (emacs-jupyter-notebook-panel--delete-published-artifact
-       (plist-get props :ejn-original)))))
+      (when (eq (emacs-jupyter-notebook-panel--delete-published-artifact original)
+                t)
+        (plist-put original :deleted t)))))
 
 (defun emacs-jupyter-notebook-panel--retire-image (panel image)
   "Flush materialized preview IMAGE and retire its owned artifact bundle."
@@ -1745,28 +1768,38 @@ normal Emacs exit; it never consults source, registry, SSH, or kernel state."
             ;; A pending verifier or pickle viewer owns a publication beyond
             ;; this panel entry.  Keep the shared artifact lease attached to
             ;; that metadata until its deferred identity-pinned retirement.
-            (deferred-capabilities (make-hash-table :test #'eq)))
+            (deferred-capabilities (make-hash-table :test #'eq))
+            (retired-publications nil))
         (dolist (cell emacs-jupyter-notebook-panel--entries)
           (let ((outputs (plist-get (cdr cell) :outputs)))
             (emacs-jupyter-notebook-panel--retire-outputs panel outputs)
             (dolist (segment outputs)
               (when (eq (car segment) 'image)
-                (when-let ((original (plist-get (cdr (cdr segment))
-                                                 :ejn-original)))
-                  (unless (plist-get original :deleted)
-                    (when-let ((capability
-                                (plist-get original :artifact-capability)))
-                      (puthash capability t deferred-capabilities)))))))
+                (let* ((image (cdr segment))
+                       (props (cdr image)))
+                  (when-let ((original (plist-get props :ejn-original)))
+                    (push (cons original
+                                (> (or (plist-get props
+                                                  :ejn-original-open-leases)
+                                       0)
+                                   0))
+                          retired-publications))))))
           (let ((entry (emacs-jupyter-notebook-panel--cancel-pickle-open-timer
                         (cdr cell))))
             (let ((pickle (plist-get entry :mpl-pickle)))
               (emacs-jupyter-notebook-panel--retire-pickle pickle)
-              (when (and pickle (not (plist-get pickle :deleted)))
-                (when-let ((capability (plist-get pickle :artifact-capability)))
-                  (puthash capability t deferred-capabilities))))
+              (when pickle
+                (push (cons pickle (> (or (plist-get pickle :leases) 0) 0))
+                      retired-publications)))
             (setcdr cell (plist-put entry :mpl-pickle nil))))
         (emacs-jupyter-notebook-panel--flush-bulk-published-deletions
          emacs-jupyter-notebook-panel--bulk-published-deletions)
+        (dolist (publication retired-publications)
+          (let ((artifact (car publication))
+                (viewer-owned-p (cdr publication)))
+            (when (and viewer-owned-p (not (plist-get artifact :deleted)))
+              (when-let ((capability (plist-get artifact :artifact-capability)))
+                (puthash capability t deferred-capabilities)))))
         (setq emacs-jupyter-notebook-panel--deferred-artifact-capabilities
               deferred-capabilities))
       (setq emacs-jupyter-notebook-panel--inline-image-specs nil)

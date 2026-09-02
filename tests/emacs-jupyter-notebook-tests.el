@@ -13601,6 +13601,211 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
       (when (buffer-live-p panel) (kill-buffer panel))
       (ignore-errors (delete-directory root t)))))
 
+(ert-deftest ejn-ag2r-published-image-capability-belongs-to-panel ()
+  "AG2R: source-current publication transfers its helper lease to the panel."
+  (pcase-let ((`(,root . ,helper-cap) (ejn-ei4-test--artifact-root)))
+    (let* ((file (ejn-ei4v-test--artifact-file root "ag2r-image" "image"))
+           (source (generate-new-buffer " *ejn-ag2r-source*"))
+           panel panel-cap)
+      (unwind-protect
+          (with-current-buffer source
+            (setq panel (ejn-panel-ensure source))
+            (let* ((handle (ejn-panel-start-entry
+                            panel '("ag2r.py" . 1) "display()"))
+                   (descriptor (ejn-ei4v-test--descriptor
+                                root file "image/png" "ag2r-image")))
+              ;; This call intentionally runs with SOURCE current, matching
+              ;; the helper event callback's ownership context.
+              (should (ejn-panel-set-published-bundle
+                       handle descriptor nil nil))
+              (should-not emacs-jupyter-notebook-panel--published-artifact-capabilities)
+              (with-current-buffer panel
+                (let ((table emacs-jupyter-notebook-panel--published-artifact-capabilities))
+                  (should (hash-table-p table))
+                  (should (= (hash-table-count table) 1))
+                  (setq panel-cap
+                        (gethash
+                         (cons root
+                               (emacs-jupyter-notebook-artifacts-capability-root-identity
+                                helper-cap))
+                         table))
+                  (should (emacs-jupyter-notebook-artifacts-capability-valid-p
+                           panel-cap))
+                  (should-not (eq panel-cap helper-cap)))))
+              ;; Releasing the helper/backend lease first must leave the
+              ;; publication for the panel lease, then clear removes both.
+              (emacs-jupyter-notebook-artifacts-release helper-cap)
+              (should-not (emacs-jupyter-notebook-artifacts-capability-valid-p
+                           helper-cap))
+              (should (file-exists-p file))
+              (ejn-panel-clear-all panel)
+              (should-not (file-exists-p file))
+              (should-not (emacs-jupyter-notebook-artifacts-capability-valid-p
+                           panel-cap))
+              (with-current-buffer panel
+                (should-not
+                 emacs-jupyter-notebook-panel--published-artifact-capabilities))
+              (should-not (file-directory-p root))
+              (ejn-panel-clear-all panel)
+              (should-not (file-directory-p root))))
+        (when (buffer-live-p panel) (kill-buffer panel))
+        (when (buffer-live-p source) (kill-buffer source))
+        (ignore-errors (emacs-jupyter-notebook-artifacts-retire helper-cap))
+        (ignore-errors (delete-directory root t)))))
+
+(ert-deftest ejn-ag2r-published-bundle-capability-release-orderings ()
+  "AG2R: combined image/pickle publication is owned by the panel buffer."
+  (pcase-let ((`(,root . ,helper-cap) (ejn-ei4-test--artifact-root)))
+    (let* ((image (ejn-ei4v-test--artifact-file root "ag2r-bundle-image" "image"))
+           (pickle (ejn-ei4v-test--artifact-file root "ag2r-bundle-pickle" "pickle"))
+           (source (generate-new-buffer " *ejn-ag2r-bundle-source*"))
+           panel panel-cap)
+      (unwind-protect
+          (with-current-buffer source
+            (setq panel (ejn-panel-ensure source))
+            (let* ((handle (ejn-panel-start-entry
+                            panel '("ag2r.py" . 2) "bundle()"))
+                   (image-descriptor (ejn-ei4v-test--descriptor
+                                      root image "image/png" "ag2r-bundle"))
+                   (pickle-descriptor (ejn-ei4v-test--descriptor
+                                       root pickle nil "ag2r-bundle")))
+              (should (ejn-panel-set-published-bundle
+                       handle image-descriptor pickle-descriptor nil))
+              (should-not emacs-jupyter-notebook-panel--published-artifact-capabilities)
+              (with-current-buffer panel
+                (let ((table emacs-jupyter-notebook-panel--published-artifact-capabilities))
+                  (should (hash-table-p table))
+                  (should (= (hash-table-count table) 1))
+                  (setq panel-cap (car (hash-table-values table)))
+                  (should (emacs-jupyter-notebook-artifacts-capability-valid-p
+                           panel-cap))))
+              ;; Clear first: the helper lease still keeps the now-empty root
+              ;; alive until backend/helper disposal releases its capability.
+              (ejn-panel-clear-all panel)
+              (should (file-directory-p root))
+              (should-not (file-exists-p image))
+              (should-not (file-exists-p pickle))
+              (should-not (emacs-jupyter-notebook-artifacts-capability-valid-p
+                           panel-cap))
+              (with-current-buffer panel
+                (should-not
+                 emacs-jupyter-notebook-panel--published-artifact-capabilities))
+              (should (emacs-jupyter-notebook-artifacts-capability-valid-p
+                       helper-cap))
+              (emacs-jupyter-notebook-artifacts-release helper-cap)
+              (should-not (file-directory-p root))
+              (ejn-panel-clear-all panel)
+              (should-not (file-directory-p root))))
+        (when (buffer-live-p panel) (kill-buffer panel))
+        (when (buffer-live-p source) (kill-buffer source))
+        (ignore-errors (emacs-jupyter-notebook-artifacts-retire helper-cap))
+        (ignore-errors (delete-directory root t))))))
+
+(ert-deftest ejn-ag2r-published-pickle-capability-belongs-to-panel ()
+  "AG2R: standalone source-current pickle admission is panel-owned."
+  (pcase-let ((`(,root . ,helper-cap) (ejn-ei4-test--artifact-root)))
+    (let* ((file (ejn-ei4v-test--artifact-file root "ag2r-pickle" "pickle"))
+           (source (generate-new-buffer " *ejn-ag2r-pickle-source*"))
+           panel panel-cap viewer)
+      (unwind-protect
+          (with-current-buffer source
+            (setq panel (ejn-panel-ensure source))
+            (let ((handle (ejn-panel-start-entry
+                           panel '("ag2r.py" . 3) "pickle()")))
+              (should
+               (ejn-panel-set-published-pickle
+                handle root file (ejn-ei4-test--content-sha256 file)
+                (file-attribute-size (file-attributes file 'integer))
+                (emacs-jupyter-notebook-artifacts-capability-root-identity
+                 helper-cap)))
+              (should-not
+               emacs-jupyter-notebook-panel--published-artifact-capabilities)
+              (with-current-buffer panel
+                (let ((table
+                       emacs-jupyter-notebook-panel--published-artifact-capabilities))
+                  (should (hash-table-p table))
+                  (should (= (hash-table-count table) 1))
+                  (setq panel-cap (car (hash-table-values table)))
+                  (should (emacs-jupyter-notebook-artifacts-capability-valid-p
+                           panel-cap))))
+              (setq viewer (ejn-panel-acquire-pickle handle))
+              (should viewer)
+              (ejn-panel-clear-all panel)
+              (should (file-exists-p file))
+              (should (emacs-jupyter-notebook-artifacts-capability-valid-p
+                       panel-cap))
+              (with-current-buffer panel
+                (should-not
+                 emacs-jupyter-notebook-panel--published-artifact-capabilities))
+              (should (emacs-jupyter-notebook-artifacts-capability-valid-p
+                       helper-cap))
+              (emacs-jupyter-notebook-artifacts-release helper-cap)
+              (should (file-directory-p root))
+              (ejn-panel-release-pickle viewer)
+              (should-not (file-exists-p file))
+              (should-not (emacs-jupyter-notebook-artifacts-capability-valid-p
+                           panel-cap))
+              (should-not (file-directory-p root))
+              (ejn-panel-clear-all panel)
+              (should-not (file-directory-p root))))
+        (when (buffer-live-p panel) (kill-buffer panel))
+        (when (buffer-live-p source) (kill-buffer source))
+        (ignore-errors (emacs-jupyter-notebook-artifacts-retire helper-cap))
+        (ignore-errors (delete-directory root t))))))
+
+(ert-deftest ejn-ag2r-bulk-delete-failure-releases-unused-panel-lease ()
+  "AG2R: failed bulk unlink keeps honest metadata without leaking a lease."
+  (pcase-let ((`(,root . ,helper-cap) (ejn-ei4-test--artifact-root)))
+    (let* ((image-file
+            (ejn-ei4v-test--artifact-file root "ag2r-fail-image" "image"))
+           (pickle-file
+            (ejn-ei4v-test--artifact-file root "ag2r-fail-pickle" "pickle"))
+           (source (generate-new-buffer " *ejn-ag2r-fail-source*"))
+           panel panel-cap image pickle original)
+      (unwind-protect
+          (with-current-buffer source
+            (setq panel (ejn-panel-ensure source))
+            (let ((handle (ejn-panel-start-entry
+                           panel '("ag2r.py" . 4) "failure()")))
+              (should
+               (ejn-panel-set-published-bundle
+                handle
+                (ejn-ei4v-test--descriptor
+                 root image-file "image/png" "ag2r-failure")
+                (ejn-ei4v-test--descriptor
+                 root pickle-file nil "ag2r-failure")
+                nil))
+              (setq image (car (ejn-panel-entry-images handle))
+                    pickle (ejn-panel-entry-pickle handle)
+                    original (plist-get (cdr image) :ejn-original))
+              (with-current-buffer panel
+                (setq panel-cap
+                      (car (hash-table-values
+                            emacs-jupyter-notebook-panel--published-artifact-capabilities))))
+              (cl-letf (((symbol-function
+                          'emacs-jupyter-notebook-artifacts-delete-leaves)
+                         (lambda (&rest _) nil)))
+                (ejn-panel-clear-all panel))
+              (should (file-exists-p image-file))
+              (should (file-exists-p pickle-file))
+              (should-not (plist-get original :deleted))
+              (should-not (plist-get pickle :deleted))
+              (should-not (emacs-jupyter-notebook-artifacts-capability-valid-p
+                           panel-cap))
+              (with-current-buffer panel
+                (should-not
+                 emacs-jupyter-notebook-panel--published-artifact-capabilities))
+              (should (file-directory-p root))
+              (emacs-jupyter-notebook-artifacts-release helper-cap)
+              (should-not (emacs-jupyter-notebook-artifacts-capability-valid-p
+                           helper-cap))
+              (should (file-directory-p root))
+              (should-not (directory-files root nil "\`\.ejn-live-" t))))
+        (when (buffer-live-p panel) (kill-buffer panel))
+        (when (buffer-live-p source) (kill-buffer source))
+        (ignore-errors (emacs-jupyter-notebook-artifacts-retire helper-cap))
+        (ignore-errors (delete-directory root t))))))
+
 (ert-deftest ejn-ei4v-invalid-or-unknown-bundle-is-not-admitted ()
   "Malformed and unknown update bundles leave the panel untouched for discard."
   (let* ((root (car (ejn-ei4-test--artifact-root)))
