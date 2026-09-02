@@ -1538,7 +1538,7 @@ be manager-reviewed for durable-kernel rules.
     pre-existing optional Evil warnings; final process, temporary-root, and
     generated-bytecode audits were empty.
 
-- [~] owner=terra-ag3 claimed=2026-09-02 **AG3 Run outage, flood, and large-output stress gates.**
+- [x] owner=terra-ag3 claimed=2026-09-02 landed=3555e7d **AG3 Run outage, flood, and large-output stress gates.**
   - Depends: AG2.
   - Files: `tests/stress/*`, test docs only.
   - Deliverable: automate Global Gates 3-8 with TH1/TH3, including the 50 ms
@@ -1548,6 +1548,20 @@ be manager-reviewed for durable-kernel rules.
   - Gate: five repetitions of the full stress set; capture elapsed time and
     peak accumulator/queue/artifact metrics in test output.  Thresholds are
     assertions, not a human reading of logs.
+  - Landed verification: the final supported wrapper completed five fresh
+    process repetitions, 65/65 AG3 ERT executions, in 22.64-22.90 seconds per
+    batch.  The flood delivered 12,576-14,407 events per run within asserted
+    queue/raw limits; the artifact gate spooled the exact 64 MiB value and
+    recorded 9-10 successful pings initiated while the real worker partial
+    file existed.  Panel retention remained at seven entries/two previews
+    across rerender and live window viewport/detach/reattach paths, with exact
+    retirement.  The direct supervisor rejects unsupported platforms and
+    non-finite deadlines, and the independent fixture rejects bounded hostile
+    input and truncated frames.  The canonical source suite passed 817/817
+    ERTs plus 218/218 helper tests (three expected skips).  Stress byte-compile
+    was warning-free; production compile reported only the two known optional
+    Evil warnings.  Final process, temporary-root, artifact, and generated
+    bytecode audits were empty.
 
 - [ ] **AG4 Switch default to helper and complete real Doom dogfood.**
   - Depends: AG3.
