@@ -116,6 +116,27 @@
           (should (equal seen (list (list owner session "lost")))))
       (when (buffer-live-p owner) (kill-buffer owner)))))
 
+(ert-deftest ejn-ei1-reentrant-transport-failure-fences-queued-success ()
+  "A transport failure latched in dispatch prevents an earlier success delivery."
+  (let (seen)
+    (ejn-ei1-test-with-fake-backend
+        ((lambda (session _request _operation _payload success _failure _emit)
+           (funcall success 'connected)
+           (emacs-jupyter-notebook-backend-session-notify-transport-failure
+            session "transport failed in dispatch")))
+      (let ((session
+             (emacs-jupyter-notebook-backend-session-create
+              nil nil
+              (lambda (_session reason) (push (list 'failure reason) seen)))))
+        (emacs-jupyter-notebook-backend-connect
+         session "/tmp/reentrant.json"
+         (lambda (_id value) (push (list 'success value) seen))
+         (lambda (_id reason) (push (list 'request-failure reason) seen)))
+        (should-not seen)
+        (should-not (emacs-jupyter-notebook-backend-session-live-p session))
+        (ejn-ei1-test--run-timers)
+        (should (equal seen '((failure "transport failed in dispatch"))))))))
+
 (ert-deftest ejn-ei1-callbacks-and-events-run-in-the-session-owner ()
   "Timer and transport callback context cannot leak across source buffers."
   (let ((owner (generate-new-buffer " *ejn-ei1-owner-context*"))

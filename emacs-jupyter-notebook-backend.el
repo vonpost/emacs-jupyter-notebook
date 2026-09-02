@@ -114,6 +114,16 @@ single request."
        (let ((buffer (emacs-jupyter-notebook-backend-session-owner-buffer session)))
          (or (null buffer) (buffer-live-p buffer)))))
 
+(defun emacs-jupyter-notebook-backend-session-live-p (session)
+  "Return non-nil when SESSION still owns a usable local transport.
+
+This predicate exposes only the generic session lifecycle; backend-private
+state remains opaque.  In particular, a connect consumer must check this
+again when adopting a deferred success because transport failure may retire
+the session after the reply was queued."
+  (and (emacs-jupyter-notebook-backend--session-live-p session)
+       (not (emacs-jupyter-notebook-backend-session-failure-emitted session))))
+
 (defun emacs-jupyter-notebook-backend-session-mark-attached (session)
   "Record that SESSION owns usable local Jupyter channel handles.
 
@@ -122,13 +132,13 @@ fallback to retain an attached-but-shell-busy session after verification times
 out."
   (unless (emacs-jupyter-notebook-backend-session-p session)
     (error "Not an emacs-jupyter-notebook backend session"))
-  (when (emacs-jupyter-notebook-backend--session-live-p session)
+  (when (emacs-jupyter-notebook-backend-session-live-p session)
     (setf (emacs-jupyter-notebook-backend-session-attached session) t)
     session))
 
 (defun emacs-jupyter-notebook-backend-session-attached-p (session)
   "Return non-nil when SESSION has usable local channel handles."
-  (and (emacs-jupyter-notebook-backend--session-live-p session)
+  (and (emacs-jupyter-notebook-backend-session-live-p session)
        (emacs-jupyter-notebook-backend-session-attached session)))
 
 (defun emacs-jupyter-notebook-backend-session-mark-installed (session)
@@ -146,7 +156,7 @@ down a session that has already been adopted for a busy remote kernel."
 
 (defun emacs-jupyter-notebook-backend-session-installed-p (session)
   "Return non-nil when SESSION is the core-installed local transport."
-  (and (emacs-jupyter-notebook-backend--session-live-p session)
+  (and (emacs-jupyter-notebook-backend-session-live-p session)
        (emacs-jupyter-notebook-backend-session-installed session)))
 
 (defun emacs-jupyter-notebook-backend--close-timeout ()
@@ -208,6 +218,21 @@ barrier even when a dispatcher replied synchronously or re-entrantly."
                        (apply #'emacs-jupyter-notebook-backend--call-safely
                               function args)))))))
 
+(defun emacs-jupyter-notebook-backend--deliver-request
+    (session function failure-p &rest args)
+  "Deliver a deferred request callback only while SESSION remains usable.
+FUNCTION receives ARGS.  A request FAILURE remains observable after a
+session-level failure latch, while a previously queued success is fenced."
+  (when (or failure-p
+            (emacs-jupyter-notebook-backend-session-live-p session))
+    (apply #'emacs-jupyter-notebook-backend--call-safely function args)))
+
+(defun emacs-jupyter-notebook-backend--deliver-event
+    (session function &rest args)
+  "Deliver a deferred event callback only while SESSION remains usable."
+  (when (emacs-jupyter-notebook-backend-session-live-p session)
+    (apply #'emacs-jupyter-notebook-backend--call-safely function args)))
+
 (defun emacs-jupyter-notebook-backend--finish (request value failure-p)
   "Deliver VALUE for REQUEST once, unless its local session was retired."
   (let ((session (emacs-jupyter-notebook-backend-request-session request)))
@@ -220,10 +245,12 @@ barrier even when a dispatcher replied synchronously or re-entrantly."
       ;; cannot accumulate late request objects.
       (when (emacs-jupyter-notebook-backend--session-live-p session)
         (emacs-jupyter-notebook-backend--defer session
+         #'emacs-jupyter-notebook-backend--deliver-request
+         session
          (if failure-p
              (emacs-jupyter-notebook-backend-request-error-callback request)
            (emacs-jupyter-notebook-backend-request-callback request))
-         (emacs-jupyter-notebook-backend-request-id request) value)))))
+         failure-p (emacs-jupyter-notebook-backend-request-id request) value)))))
 
 (defun emacs-jupyter-notebook-backend-request-fail (request reason)
   "Terminally fail REQUEST without changing its session's local ownership.
@@ -250,10 +277,19 @@ backend dispatch stack and consumer errors cannot escape into the transport."
   (when (and (emacs-jupyter-notebook-backend--session-live-p session)
              (not (emacs-jupyter-notebook-backend-session-failure-emitted session)))
     (setf (emacs-jupyter-notebook-backend-session-failure-emitted session) t)
+    ;; The failure latch is synchronous.  Fence successes/events that were
+    ;; queued earlier in this same dispatcher turn before the owner observes
+    ;; the failure asynchronously.
+    (dolist (timer (emacs-jupyter-notebook-backend-session-timers session))
+      (when (timerp timer) (cancel-timer timer)))
+    (setf (emacs-jupyter-notebook-backend-session-timers session) nil)
     (let ((sink (emacs-jupyter-notebook-backend-session-failure-sink session)))
       (when sink
         (if (> (or (emacs-jupyter-notebook-backend-session-dispatch-depth session) 0) 0)
-            (emacs-jupyter-notebook-backend--defer session sink session reason)
+            ;; This terminal lifecycle delivery must survive the now-failed
+            ;; usability predicate and the core's subsequent local close.
+            (emacs-jupyter-notebook-backend--defer-close
+             session sink session reason)
           (emacs-jupyter-notebook-backend--call-in-owner
            session sink session reason))))))
 
@@ -264,10 +300,10 @@ Only an event emitted re-entrantly from the public dispatch call is deferred.
 Later transport events run the sink synchronously, so the next backend can
 apply backpressure at its real drain boundary instead of accumulating one
 timer per output frame."
-  (when (emacs-jupyter-notebook-backend--session-live-p session)
+  (when (emacs-jupyter-notebook-backend-session-live-p session)
     (if (> (or (emacs-jupyter-notebook-backend-session-dispatch-depth session) 0) 0)
         (emacs-jupyter-notebook-backend--defer
-         session
+         session #'emacs-jupyter-notebook-backend--deliver-event session
          (emacs-jupyter-notebook-backend-session-event-sink session) session event)
       (emacs-jupyter-notebook-backend--call-in-owner
        session (emacs-jupyter-notebook-backend-session-event-sink session)
@@ -277,7 +313,7 @@ timer per output frame."
   "Start OPERATION with PAYLOAD and return its request id immediately."
   (unless (emacs-jupyter-notebook-backend-session-p session)
     (error "Not an emacs-jupyter-notebook backend session"))
-  (unless (emacs-jupyter-notebook-backend--session-live-p session)
+  (unless (emacs-jupyter-notebook-backend-session-live-p session)
     (error "The backend session is closed"))
   (let* ((id (cl-incf emacs-jupyter-notebook-backend--request-counter))
          (request (emacs-jupyter-notebook-backend--make-request

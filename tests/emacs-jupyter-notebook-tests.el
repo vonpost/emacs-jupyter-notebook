@@ -4755,6 +4755,8 @@ the evaluate flow."
                       :origin-buffer (current-buffer))))
         (setq emacs-jupyter-notebook--async-context context)
         (setq session (ejn-test-backend-session 'mock-client t))
+        (setq context (emacs-jupyter-notebook--async-put
+                       context :client-unverified session))
         (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
                    (lambda (entry &optional _file)
                      (setq saved-entry entry))))
@@ -4783,6 +4785,116 @@ the evaluate flow."
          context buffer entry local-ports local-file nil)
         (should-not emacs-jupyter-notebook--client)
         (should (eq (plist-get emacs-jupyter-notebook--async-context :phase) 'error))))))
+
+(ert-deftest ejn-connect-helper-loss-invalidates-deferred-success ()
+  "A queued connect success cannot install after its provisional helper dies."
+  (with-temp-buffer
+    (let* ((buffer (current-buffer))
+           (entry (ejn-test-direct-entry
+                   '(:profile "p" :session-id "helper-race"
+                     :provisional t)))
+           (session (ejn-test-backend-session 'mock-client t))
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'connect :entry entry
+                     :remote-ports (plist-get entry :remote-ports)
+                     :client-unverified session :origin-buffer buffer
+                     :owns-kernel t
+                     :error-callback (lambda (&rest _) nil)))
+           saved scheduled-entry)
+      (setf (emacs-jupyter-notebook-backend-session-failure-sink session)
+            #'emacs-jupyter-notebook--backend-transport-failed)
+      (setq emacs-jupyter-notebook--async-context context)
+      ;; Model the backend's zero-delay delivery after kernel_info succeeded.
+      (emacs-jupyter-notebook-backend--defer
+       session #'emacs-jupyter-notebook--async-connect-finalize
+       context buffer entry
+       '(:shell_port 1 :iopub_port 2 :stdin_port 3 :hb_port 4 :control_port 5)
+       "/tmp/helper-race.json" session)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-close-local)
+                 (lambda (closing callback _error-callback)
+                   (setf (emacs-jupyter-notebook-backend-session-closed closing) t)
+                   (funcall callback 1 nil)
+                   1))
+                ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
+                 (lambda (&rest _) (setq saved t)))
+                ((symbol-function 'emacs-jupyter-notebook--schedule-auto-reconnect)
+                 (lambda ()
+                   (setq scheduled-entry
+                         emacs-jupyter-notebook--session-entry))))
+        (emacs-jupyter-notebook-backend-session-notify-transport-failure
+         session "helper exited before install")
+        (ejn-test-drain-zero-delay-timers))
+      (should (eq (plist-get context :phase) 'error))
+      (should emacs-jupyter-notebook--tunnel-dead)
+      (should (equal scheduled-entry entry))
+      (should-not emacs-jupyter-notebook--client)
+      (should-not saved))))
+
+(ert-deftest ejn-connect-tunnel-loss-invalidates-deferred-success ()
+  "A queued connect success cannot install after its provisional tunnel dies."
+  (with-temp-buffer
+    (let* ((buffer (current-buffer))
+           (tunnel 'provisional-tunnel)
+           (entry (ejn-test-direct-entry
+                   '(:profile "p" :session-id "tunnel-race")))
+           (session (ejn-test-backend-session 'mock-client t))
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'connect :entry entry
+                     :remote-ports (plist-get entry :remote-ports)
+                     :tunnel-process tunnel :client-unverified session
+                     :origin-buffer buffer
+                     :error-callback (lambda (&rest _) nil)))
+           saved)
+      (setq emacs-jupyter-notebook--async-context context
+            emacs-jupyter-notebook--tunnel-process tunnel)
+      (emacs-jupyter-notebook-backend--defer
+       session #'emacs-jupyter-notebook--async-connect-finalize
+       context buffer entry
+       '(:shell_port 1 :iopub_port 2 :stdin_port 3 :hb_port 4 :control_port 5)
+       "/tmp/tunnel-race.json" session)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-close-local)
+                 (lambda (closing callback _error-callback)
+                   (setf (emacs-jupyter-notebook-backend-session-closed closing) t)
+                   (funcall callback 1 nil)
+                   1))
+                ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
+                 (lambda (&rest _) (setq saved t))))
+        ;; Invoke the exact transition used by the tunnel sentinel before the
+        ;; already queued backend success gets a chance to run.
+        (emacs-jupyter-notebook--transport-lost
+         "SSH tunnel exited before install" nil tunnel)
+        (ejn-test-drain-zero-delay-timers))
+      (should (eq (plist-get context :phase) 'error))
+      (should emacs-jupyter-notebook--tunnel-dead)
+      (should-not emacs-jupyter-notebook--tunnel-process)
+      (should-not emacs-jupyter-notebook--client)
+      (should-not saved))))
+
+(ert-deftest ejn-connect-finalize-revalidates-provisional-session ()
+  "The install boundary rejects a session retired before its callback runs."
+  (with-temp-buffer
+    (let* ((buffer (current-buffer))
+           (entry (ejn-test-direct-entry
+                   '(:profile "p" :session-id "retired-race")))
+           (session (ejn-test-backend-session 'mock-client t))
+           (context (emacs-jupyter-notebook--async-new-context
+                     :phase 'connect :entry entry
+                     :remote-ports (plist-get entry :remote-ports)
+                     :client-unverified session :origin-buffer buffer
+                     :error-callback (lambda (&rest _) nil)))
+           saved)
+      (setf (emacs-jupyter-notebook-backend-session-closed session) t)
+      (setq emacs-jupyter-notebook--async-context context)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
+                 (lambda (&rest _) (setq saved t))))
+        (should
+         (emacs-jupyter-notebook--async-connect-finalize
+          context buffer entry
+          '(:shell_port 1 :iopub_port 2 :stdin_port 3 :hb_port 4 :control_port 5)
+          "/tmp/retired-race.json" session)))
+      (should (eq (plist-get context :phase) 'error))
+      (should-not emacs-jupyter-notebook--client)
+      (should-not saved))))
 
 (ert-deftest ejn-async-connect-timeout-fails-context ()
   (with-temp-buffer
@@ -8530,19 +8642,21 @@ wiring.  Skipped when no local python3 is available in this environment."
         (codes nil))
     (with-temp-buffer
       (let ((buffer (current-buffer))
+            (client (ejn-test-backend-session 'mock-client t))
             (context (emacs-jupyter-notebook--async-new-context
                       :phase 'connect
                       :entry entry
                       :remote-ports (plist-get entry :remote-ports)
                       :origin-buffer (current-buffer))))
+        (setq context (emacs-jupyter-notebook--async-put
+                       context :client-unverified client))
         (setq emacs-jupyter-notebook--async-context context)
         (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
                    (lambda (_entry &optional _file) nil))
                   ((symbol-function 'emacs-jupyter-notebook-jupyter-execute-silent)
                    (lambda (_client code) (push code codes))))
         (emacs-jupyter-notebook--async-connect-finalize
-         context buffer entry local-ports local-file
-         (ejn-test-backend-session 'mock-client t))
+         context buffer entry local-ports local-file client)
         (ejn-test-drain-zero-delay-timers))
         ;; A watchdog snippet carrying the configured timeout was sent.
         (should (cl-some (lambda (c) (string-match-p "_EJN_WD_TIMEOUT = 7200" c))
@@ -9092,6 +9206,7 @@ initial delay instead of inheriting this recovery's accumulated attempts."
            (context (emacs-jupyter-notebook--async-new-context
                      :phase 'connect :entry entry :session-id "s"
                      :remote-ports (plist-get entry :remote-ports)
+                     :client-unverified session
                      :origin-buffer (current-buffer))))
       (setq emacs-jupyter-notebook--async-context context)
       (setq emacs-jupyter-notebook--reconnect-attempt 5)
@@ -10897,6 +11012,8 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                     nil (current-buffer)))
            (timer (run-at-time 600 nil #'ignore)))
       (emacs-jupyter-notebook-backend-session-mark-attached client)
+      (setq context (emacs-jupyter-notebook--async-put
+                     context :client-unverified client))
       (setq emacs-jupyter-notebook--async-context context
             emacs-jupyter-notebook--reconnect-attempt 4
             emacs-jupyter-notebook--reconnect-next-at (+ (float-time) 600)
@@ -12012,6 +12129,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                   :phase 'connect :origin-buffer (current-buffer)
                   :entry entry :session-id "ei6" :remote-ports ports
                   :restart-client client :restart-epoch 8
+                  :client-unverified client
                   :restart-local-file new-file :candidate-remote-pid 987)))
             (setq emacs-jupyter-notebook--async-context context)
             (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-save-entry)

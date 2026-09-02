@@ -132,6 +132,8 @@ any pre-existing `_repr_mimebundle_', and a graceful no-op when
 ;; Forward declarations: these are declared `defvar-local' further down, but
 ;; the setup and transport-failure helpers above that section reference them.
 (defvar emacs-jupyter-notebook--client)
+(defvar emacs-jupyter-notebook--session-entry)
+(defvar emacs-jupyter-notebook--tunnel-process)
 (defvar emacs-jupyter-notebook--tunnel-dead)
 (defvar emacs-jupyter-notebook--kernel-status)
 
@@ -144,6 +146,26 @@ any pre-existing `_repr_mimebundle_', and a graceful no-op when
 (defun emacs-jupyter-notebook--backend-transport-failed (session reason)
   "Atomically retire local SESSION after helper/protocol transport failure."
   (emacs-jupyter-notebook--transport-lost reason session nil))
+
+(defun emacs-jupyter-notebook--async-connect-transport-fail (context reason)
+  "Fail CONTEXT after losing one of its provisional local transports.
+
+The remote kernel and registry remain untouched.  The already durable direct
+entry becomes the buffer's local recovery handle before retry scheduling."
+  (when (emacs-jupyter-notebook--async-context-live-p context)
+    (let ((tunnel (plist-get context :tunnel-process))
+          (entry (plist-get context :entry)))
+      (when (eq tunnel emacs-jupyter-notebook--tunnel-process)
+        (setq emacs-jupyter-notebook--tunnel-process nil))
+      (when (emacs-jupyter-notebook-ssh-direct-entry-valid-p entry)
+        (setq emacs-jupyter-notebook--session-entry (copy-sequence entry)))
+      (setq emacs-jupyter-notebook--tunnel-dead t
+            emacs-jupyter-notebook--kernel-status nil)
+      (emacs-jupyter-notebook--async-fail context reason)
+      ;; Reconnect contexts normally schedule through their error callback;
+      ;; this also covers a first start whose provisional entry is durable.
+      ;; Scheduler ownership guards make the second request idempotent.
+      (emacs-jupyter-notebook--schedule-auto-reconnect))))
 
 (defun emacs-jupyter-notebook--helper-input-reply
     (client request helper-request-id input-id)
@@ -1295,15 +1317,35 @@ callbacks and process sentinels so stale local resources cannot affect a
 replacement session.  This never changes the durable registry, remote
 connection file, or remote kernel; it only starts the existing deduplicated
 automatic reconnect loop after local resources are gone."
-  (let ((client emacs-jupyter-notebook--client)
-        (tunnel emacs-jupyter-notebook--tunnel-process))
-    (when (and (or (null expected-client) (eq expected-client client))
-               (or (null expected-tunnel) (eq expected-tunnel tunnel))
+  (let* ((client emacs-jupyter-notebook--client)
+         (tunnel emacs-jupyter-notebook--tunnel-process)
+         (context emacs-jupyter-notebook--async-context)
+         (provisional-client (and context
+                                  (plist-get context :client-unverified)))
+         (provisional-tunnel (and context
+                                  (plist-get context :tunnel-process)))
+         (provisional-loss
+          (and (emacs-jupyter-notebook--async-context-live-p context)
+               (eq (plist-get context :phase) 'connect)
+               (or (and expected-client
+                        (eq expected-client provisional-client))
+                   (and expected-tunnel
+                        (eq expected-tunnel provisional-tunnel))))))
+    (cond
+     ;; During connect, the context owns the helper and tunnel before either is
+     ;; installed in the buffer.  Retire that exact attempt immediately.  A
+     ;; generic transport-loss transition would reject an unverified helper,
+     ;; or clear only the tunnel, and a previously queued zero-delay connect
+     ;; success could then resurrect the failed transport.
+     (provisional-loss
+      (emacs-jupyter-notebook--async-connect-transport-fail context reason))
+     ((and (or (null expected-client) (eq expected-client client))
+           (or (null expected-tunnel) (eq expected-tunnel tunnel))
                ;; A heartbeat can discover loss after an earlier local
                ;; cleanup left no client/process.  `--tunnel-dead' is the
                ;; latch for that resource-less transition; all identified
                ;; helper/tunnel failures still require exact ownership above.
-               (or client tunnel (not emacs-jupyter-notebook--tunnel-dead)))
+           (or client tunnel (not emacs-jupyter-notebook--tunnel-dead)))
       ;; Invalidate local-only setup before settling user records.  A setup
       ;; callback can otherwise arrive during this transition and pump work
       ;; against the dying client between two ledger classifications.
@@ -1340,7 +1382,23 @@ automatic reconnect loop after local resources are gone."
       (force-mode-line-update t)
       ;; The existing scheduler owns de-duplication through its timer/token
       ;; guards and never relaunches or terminates the durable kernel.
-      (emacs-jupyter-notebook--schedule-auto-reconnect))))
+      (emacs-jupyter-notebook--schedule-auto-reconnect)))))
+
+(defun emacs-jupyter-notebook--async-connect-transport-current-p
+    (context client)
+  "Return non-nil when CONTEXT still owns live CLIENT and its SSH tunnel.
+
+The backend delivers connect success asynchronously.  Both local resources
+can die after that success is queued but before its consumer runs, so durable
+installation must revalidate their exact ownership at the commit boundary."
+  (let ((tunnel (plist-get context :tunnel-process)))
+    (and (eq client (plist-get context :client-unverified))
+         (emacs-jupyter-notebook-backend-session-attached-p client)
+         (eq tunnel emacs-jupyter-notebook--tunnel-process)
+         ;; Unit-level finalize fixtures predate the process-bearing connect
+         ;; context.  Real connects always carry a process; when present it
+         ;; must still be live even if its sentinel has not run yet.
+         (or (not (processp tunnel)) (process-live-p tunnel)))))
 
 (defun emacs-jupyter-notebook--execution-code-bytes (code &optional ceiling)
   "Return CODE's UTF-8 byte count, stopping just above CEILING when supplied.
@@ -3507,17 +3565,28 @@ user traffic establishes responsiveness without retaining that request."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when (and (eq emacs-jupyter-notebook--async-context context)
-                 (eq (plist-get context :phase) 'connect))
+                 (eq (plist-get context :phase) 'connect)
+                 ;; A success for a different provisional session is stale;
+                 ;; leave the real attempt and its timeout untouched.
+                 (or (not client)
+                     (eq client (plist-get context :client-unverified))))
         (emacs-jupyter-notebook--async-cancel-timer
          emacs-jupyter-notebook--async-context)
         (emacs-jupyter-notebook--async-cancel-overall-timer
          emacs-jupyter-notebook--async-context)
-        (if (not client)
-            (progn
-              (emacs-jupyter-notebook--async-fail
-               emacs-jupyter-notebook--async-context
-               "Kernel did not respond to kernel_info_request")
-              t)
+        (cond
+         ((not client)
+          (emacs-jupyter-notebook--async-fail
+           emacs-jupyter-notebook--async-context
+           "Kernel did not respond to kernel_info_request")
+          t)
+         ((not (emacs-jupyter-notebook--async-connect-transport-current-p
+                context client))
+          (emacs-jupyter-notebook--async-connect-transport-fail
+           context
+           "Local helper or SSH tunnel ended before connection installation")
+          t)
+         (t
           (let ((old-local-file
                  (plist-get (plist-get context :entry)
                             :local-connection-file))
@@ -3624,7 +3693,7 @@ user traffic establishes responsiveness without retaining that request."
                             "Could not finalize connected kernel session: %s"
                           "Could not persist connected kernel session: %s")
                         (error-message-string err)))
-               t))))))))
+               t)))))))))
 
 (defun emacs-jupyter-notebook--connect-verified-late (buffer client)
   "Record that CLIENT answered kernel-info after a busy finalize in BUFFER.

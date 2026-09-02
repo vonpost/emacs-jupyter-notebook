@@ -49,7 +49,8 @@ turn into an unbounded wait."
         value))))
 
 (defun ejn-doom-e2e--timeout ()
-  "Return the overall E2E timeout in seconds."
+  "Return the primary E2E execution deadline in seconds.
+Explicit identity-bound cleanup has its own separately bounded timeout."
   (ejn-doom-e2e--positive-number "EJN_DOOM_E2E_TIMEOUT" 90 600))
 
 (defun ejn-doom-e2e--cleanup-timeout ()
@@ -67,10 +68,10 @@ turn into an unbounded wait."
                   nil progress-file 'append 'silent)))
 
 (defun ejn-doom-e2e--phase-budget (deadline phase)
-  "Record PHASE and return its remaining share of the overall DEADLINE."
+  "Record PHASE and return its remaining share of the execution DEADLINE."
   (let ((remaining (- deadline (float-time))))
     (unless (> remaining 0)
-      (error "Doom E2E overall deadline expired before %s" phase))
+      (error "Doom E2E execution deadline expired before %s" phase))
     (ejn-doom-e2e--record-progress
      (format "%s %.1fs remaining" phase remaining))
     remaining))
@@ -227,42 +228,79 @@ profile can be exercised without editing the user's configuration."
              (ejn-doom-e2e--bounded-string
               (plist-get emacs-jupyter-notebook--async-context :error))))))
 
-(defun ejn-doom-e2e--panel-entries-for (buffer)
-  "Return BUFFER's raw panel entries while rendering through public accessors."
-  (let ((panel (emacs-jupyter-notebook-panel-buffer buffer)))
+(defconst ejn-doom-e2e--failed-entry-statuses
+  '(error cancelled outcome-unknown)
+  "Terminal panel statuses that make an E2E execution immediately fail.")
+
+(defun ejn-doom-e2e--entry-for-exact-code (buffer code)
+  "Return BUFFER's sole panel entry whose submitted CODE is exactly CODE.
+An E2E must not let output from a prior evaluation or unrelated cell satisfy a
+current assertion.  Matching the stored code also keeps the check valid across
+history/latest rendering toggles."
+  (let ((panel (emacs-jupyter-notebook-panel-buffer buffer)) matches)
     (when (buffer-live-p panel)
       (with-current-buffer panel
-        (mapcar #'cdr emacs-jupyter-notebook-panel--entries)))))
+        (setq matches
+              (cl-remove-if-not
+               (lambda (cell) (equal (plist-get (cdr cell) :code) code))
+               emacs-jupyter-notebook-panel--entries))))
+    (when (> (length matches) 1)
+      (error "Doom E2E found %d panel entries for one exact submitted code"
+             (length matches)))
+    (cdr (car matches))))
 
-(defun ejn-doom-e2e--wait-for-result-text (buffer text timeout)
-  "Return non-nil when BUFFER's panel text output matches TEXT by TIMEOUT."
+(defun ejn-doom-e2e--wait-for-entry-result (buffer code predicate timeout label)
+  "Wait for exact submitted CODE in BUFFER to be `ok' and satisfy PREDICATE.
+LABEL appears in bounded failures.  Any terminal non-success status fails at
+once; waiting for unrelated global panel output would hide that failure."
   (let ((deadline (+ (float-time) timeout))
-        found)
-    (while (and (not found) (< (float-time) deadline))
+        entry)
+    (while (and (not entry) (< (float-time) deadline))
       (accept-process-output nil 0.1)
       (unless (buffer-live-p buffer)
-        (error "E2E source buffer was killed"))
+        (error "E2E source buffer was killed while waiting for %s" label))
       (ejn-doom-e2e--check-async-error buffer)
-      (setq found
-            (cl-some (lambda (entry)
-                       (string-match-p (regexp-quote text)
-                                       (ejn-panel-entry-text entry)))
-                     (ejn-doom-e2e--panel-entries-for buffer))))
-    found))
+      (let ((candidate (ejn-doom-e2e--entry-for-exact-code buffer code)))
+        (when candidate
+          (let ((status (plist-get candidate :status)))
+            (when (memq status ejn-doom-e2e--failed-entry-statuses)
+              (error "E2E %s reached terminal %S for exact code: %s"
+                     label status (ejn-doom-e2e--bounded-string code)))
+            (when (eq status 'ok)
+              (unless (funcall predicate candidate)
+                (error "E2E %s finished `ok' without its expected result for exact code: %s"
+                       label (ejn-doom-e2e--bounded-string code)))
+              (setq entry candidate))))))
+    entry))
 
-(defun ejn-doom-e2e--wait-for-result-image (buffer timeout)
-  "Return non-nil when BUFFER's panel has an output image by TIMEOUT."
-  (let ((deadline (+ (float-time) timeout))
-        found)
-    (while (and (not found) (< (float-time) deadline))
-      (accept-process-output nil 0.1)
-      (unless (buffer-live-p buffer)
-        (error "E2E source buffer was killed"))
-      (ejn-doom-e2e--check-async-error buffer)
-      (setq found
-            (cl-some (lambda (entry) (ejn-panel-entry-images entry))
-                     (ejn-doom-e2e--panel-entries-for buffer))))
-    found))
+(defun ejn-doom-e2e--wait-for-result-text (buffer code text timeout)
+  "Return exact CODE's `ok' entry when its text output includes TEXT."
+  (ejn-doom-e2e--wait-for-entry-result
+   buffer code
+   (lambda (entry)
+     (string-match-p (regexp-quote text) (ejn-panel-entry-text entry)))
+   timeout (format "text output %S" text)))
+
+(defun ejn-doom-e2e--wait-for-result-image (buffer code timeout)
+  "Return exact CODE's `ok' entry when it carries a published PNG output."
+  (ejn-doom-e2e--wait-for-entry-result
+   buffer code
+   (lambda (entry)
+     (cl-some
+      (lambda (image)
+        (and (eq (car-safe image) 'image)
+             (equal (plist-get (cdr image) :ejn-original-mime) "image/png")
+             (plist-get (cdr image) :ejn-original)))
+      (ejn-panel-entry-images entry)))
+   timeout "published PNG panel output"))
+
+(defun ejn-doom-e2e--assert-source-pristine (buffer baseline phase)
+  "Assert BUFFER remains exactly BASELINE and unmodified after PHASE."
+  (with-current-buffer buffer
+    (unless (equal (buffer-string) baseline)
+      (error "Doom E2E source text changed during %s" phase))
+    (when (buffer-modified-p)
+      (error "Doom E2E source buffer became modified during %s" phase))))
 
 (defun ejn-doom-e2e--wait-for-client (buffer timeout)
   "Return a live backend client for BUFFER before TIMEOUT."
@@ -354,6 +392,51 @@ profile can be exercised without editing the user's configuration."
   (list :remote-pid (plist-get entry :remote-pid)
         :session-id (plist-get entry :session-id)
         :remote-connection-file (plist-get entry :remote-connection-file)))
+
+(defun ejn-doom-e2e--same-direct-entry-p (expected candidate)
+  "Return non-nil when CANDIDATE is exactly EXPECTED's direct kernel entry."
+  (and (emacs-jupyter-notebook-ssh-direct-entry-valid-p expected)
+       (emacs-jupyter-notebook-ssh-direct-entry-valid-p candidate)
+       (equal (plist-get expected :remote-pid) (plist-get candidate :remote-pid))
+       (equal (plist-get expected :session-id) (plist-get candidate :session-id))
+       (equal (plist-get expected :remote-connection-file)
+              (plist-get candidate :remote-connection-file))
+       (equal (plist-get expected :remote-pid-sidecar)
+              (plist-get candidate :remote-pid-sidecar))
+       (equal (plist-get expected :connection-file-tokens)
+              (plist-get candidate :connection-file-tokens))))
+
+(defun ejn-doom-e2e--recover-test-owned-direct-entry
+    (buffer source-file registry-file &optional expected)
+  "Recover this E2E's direct entry, never selecting an unrelated kernel.
+Look first at BUFFER's live session/context, then at the private registry for
+SOURCE-FILE.  EXPECTED, when non-nil, narrows recovery to its exact persisted
+PID and connection-token identity.  The temporary registry has no unrelated
+sessions, but the source-file restriction remains a deliberate guard."
+  (let (candidates matches)
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (push emacs-jupyter-notebook--session-entry candidates)
+        (push (plist-get emacs-jupyter-notebook--async-context :entry)
+              candidates)))
+    (dolist (entry (emacs-jupyter-notebook-registry-load registry-file))
+      (when (equal (plist-get entry :local-file) source-file)
+        (push entry candidates)))
+    (setq candidates
+          (cl-remove-duplicates
+           (cl-remove-if-not #'emacs-jupyter-notebook-ssh-direct-entry-valid-p
+                             candidates)
+           :test #'equal))
+    (setq matches
+          (if expected
+              (cl-remove-if-not
+               (lambda (candidate)
+                 (ejn-doom-e2e--same-direct-entry-p expected candidate))
+               candidates)
+            candidates))
+    (when (> (length matches) 1)
+      (error "Doom E2E found multiple direct entries for its private source file"))
+    (copy-sequence (car matches))))
 
 (defun ejn-doom-e2e--check-recovery-state (buffer expected-identity)
   "Reject terminal recovery failure or durable identity drift in BUFFER.
@@ -475,13 +558,12 @@ The phase-unique history execution proves a fresh round trip without modifying
 the visited source or allowing an old panel result to satisfy the check."
   (let ((output (format "EJN token verified after %s: %s" phase token)))
     (ejn-doom-e2e--record-progress (format "dispatching token after %s" phase))
-    (with-current-buffer buffer
-      (emacs-jupyter-notebook--evaluate-code
-       (format "assert ejn_doom_e2e_token == %S\nprint(%S)\n" token output)
-       nil))
-    (ejn-doom-e2e--record-progress (format "waiting for token after %s" phase))
-    (unless (ejn-doom-e2e--wait-for-result-text buffer output timeout)
-      (error "Kernel-side token did not survive %s" phase))
+    (let ((code (format "assert ejn_doom_e2e_token == %S\nprint(%S)\n" token output)))
+      (with-current-buffer buffer
+        (emacs-jupyter-notebook--evaluate-code code nil))
+      (ejn-doom-e2e--record-progress (format "waiting for token after %s" phase))
+      (unless (ejn-doom-e2e--wait-for-result-text buffer code output timeout)
+        (error "Kernel-side token did not survive %s" phase)))
     (ejn-doom-e2e--record-progress (format "token verified after %s" phase))
     output))
 
@@ -499,7 +581,8 @@ the visited source or allowing an old panel result to satisfy the check."
                (output (ignore-errors
                          (ejn-doom-e2e--run-command argv (min 5 remaining)))))
           (setq dead (and (stringp output)
-                          (string-match-p "__EJN_DEAD__" output)))
+                          (equal (string-trim output)
+                                 "__EJN_DEAD__\n__EJN_DONE__")))
           (unless dead
             (accept-process-output nil (min 0.2 remaining)))))
       dead)))
@@ -511,34 +594,49 @@ only a bounded fallback when its result is unknown; it cannot target any
 other kernel."
   (let ((timeout (ejn-doom-e2e--cleanup-timeout))
         shutdown-error)
+    (unless (emacs-jupyter-notebook-ssh-direct-entry-valid-p entry)
+      (error "Doom E2E has no valid test-owned direct kernel identity for cleanup"))
     (ejn-doom-e2e--record-progress "cleanup started")
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
-        (when emacs-jupyter-notebook--session-entry
-          (condition-case err
-              (progn
-                (ejn-doom-e2e--record-progress "requesting helper shutdown")
-                (emacs-jupyter-notebook-shutdown-kernel :force)
-                (ejn-doom-e2e--record-progress "waiting for helper shutdown")
-                (ejn-doom-e2e--wait-for-shutdown buffer timeout)
-                (ejn-doom-e2e--record-progress "helper shutdown wait finished"))
-            (error
-             ;; A bounded, explicit SSH fallback below still owns only this
-             ;; entry's persisted PID and connection-token identity.
-             (setq shutdown-error (error-message-string err)))))))
-    (unless (emacs-jupyter-notebook-ssh-direct-entry-valid-p entry)
-      (error "Doom E2E has no valid test-owned direct kernel identity for cleanup"))
+        (let ((live-entry emacs-jupyter-notebook--session-entry))
+          (cond
+           ((null live-entry)
+            (setq shutdown-error "no live session entry for public shutdown"))
+           ((not (ejn-doom-e2e--same-direct-entry-p entry live-entry))
+            (setq shutdown-error
+                  (format "refused public shutdown for non-test-owned live entry: %S"
+                          (ejn-doom-e2e--entry-remote-identity live-entry))))
+           (t
+            (condition-case err
+                (progn
+                  (ejn-doom-e2e--record-progress "requesting helper shutdown")
+                  (emacs-jupyter-notebook-shutdown-kernel :force)
+                  (ejn-doom-e2e--record-progress "waiting for helper shutdown")
+                  (unless (ejn-doom-e2e--wait-for-shutdown buffer timeout)
+                    (setq shutdown-error "helper shutdown acknowledgement timed out"))
+                  (ejn-doom-e2e--record-progress "helper shutdown wait finished"))
+              (error
+               ;; The bounded fallback below still owns only ENTRY's persisted
+               ;; PID and connection-token identity.
+               (setq shutdown-error (error-message-string err)))))))))
     (ejn-doom-e2e--record-progress "probing remote PID after helper shutdown")
     (unless (ejn-doom-e2e--remote-entry-dead-p entry timeout)
       (ejn-doom-e2e--record-progress "running identity-bound SSH cleanup fallback")
-      (ejn-doom-e2e--run-command
-       (emacs-jupyter-notebook-ssh-build-remote-cleanup
-        (emacs-jupyter-notebook--entry-profile entry) entry)
-       timeout)
-      (unless (ejn-doom-e2e--remote-entry-dead-p entry timeout)
-        (error "Test-owned remote kernel PID %s remained alive after bounded cleanup"
-               (plist-get entry :remote-pid))))
-    (ejn-doom-e2e--record-progress "remote PID cleanup confirmed")
+      (setq shutdown-error
+            (or shutdown-error "helper shutdown left the remote PID alive")))
+    ;; Run the exact cleanup even after a confirmed helper shutdown.  Its dead
+    ;; PID branch is what synchronously removes the connection, sidecar, and
+    ;; log files; the package's own best-effort cleanup may still be queued.
+    (ejn-doom-e2e--run-command
+     (emacs-jupyter-notebook-ssh-build-remote-cleanup
+      (emacs-jupyter-notebook--entry-profile entry) entry)
+     timeout)
+    (unless (ejn-doom-e2e--remote-entry-dead-p entry timeout)
+      (error "Test-owned remote kernel PID %s remained alive after bounded cleanup"
+             (plist-get entry :remote-pid)))
+    (ejn-doom-e2e--record-progress
+     "remote PID and session-file cleanup confirmed")
     (when shutdown-error
       (message "Doom E2E helper shutdown fell back to identity-bound cleanup: %s"
                (ejn-doom-e2e--bounded-string shutdown-error)))
@@ -562,6 +660,9 @@ identity and is verified through an exact PID liveness probe."
          (token-output (format "EJN token survived reconnect: %s" token))
          (buffer nil)
          (buffer2 nil)
+         (source-baseline nil)
+         (image-code nil)
+         (state-code nil)
          (entry-after-start nil)
          (identity-before nil)
          (identity-after nil)
@@ -584,6 +685,13 @@ identity and is verified through an exact PID liveness probe."
           (emacs-jupyter-notebook-registry-file registry-file)
           (emacs-jupyter-notebook-connection-retrieve-attempts 80)
           (emacs-jupyter-notebook-connection-retrieve-delay 0.25)
+          ;; The isolated E2E must never wait for a password, passphrase, or
+          ;; host-key prompt.  OpenSSH keeps the first value for most options,
+          ;; so prepend this before both global and profile-specific options.
+          (emacs-jupyter-notebook-ssh-options
+           (append '("-o" "BatchMode=yes")
+                   emacs-jupyter-notebook-ssh-options))
+          (emacs-jupyter-notebook-ssh-batch-mode t)
           (emacs-jupyter-notebook-kernel-idle-timeout 0)
           ;; E2E deliberately exercises the production auto-reconnect path,
           ;; with only its retry delays shortened for a bounded test runtime.
@@ -609,26 +717,46 @@ identity and is verified through an exact PID liveness probe."
                     (format "assert ejn_doom_e2e_token == %S\n" token)
                     (format "print(%S)\n" token-output))
             (save-buffer)
+            (setq source-baseline (buffer-string))
             (python-mode)
             (emacs-jupyter-notebook-mode 1)
             (goto-char (point-min))
             (forward-line 1)
+            (setq image-code (emacs-jupyter-notebook-cell-code))
             (emacs-jupyter-notebook-send-cell)
-            (unless (ejn-doom-e2e--wait-for-result-image
+            ;; Capture a cleanup authority as soon as the initial connection is
+            ;; live, before waiting on any panel rendering assertion that may
+            ;; itself fail.
+            (unless (ejn-doom-e2e--wait-for-client
                      buffer (ejn-doom-e2e--phase-budget
-                             deadline "waiting for PNG panel output"))
+                             deadline "waiting for initial helper connection"))
+              (error "Timed out waiting for initial helper connection on %S" profile-name))
+            (setq entry-after-start
+                  (ejn-doom-e2e--recover-test-owned-direct-entry
+                   buffer source-file registry-file))
+            (unless entry-after-start
+              (error "Doom E2E could not capture its direct entry after initial connection"))
+            (unless (ejn-doom-e2e--wait-for-result-image
+                     buffer image-code
+                     (ejn-doom-e2e--phase-budget
+                      deadline "waiting for PNG panel output"))
               (error "Timed out waiting for PNG panel output from %S" profile-name))
             (goto-char (point-min))
             (search-forward "# %% state")
             (forward-line 1)
+            (setq state-code (emacs-jupyter-notebook-cell-code))
             (emacs-jupyter-notebook-send-cell)
             (unless (ejn-doom-e2e--wait-for-result-text
-                     buffer "EJN state token installed"
+                     buffer state-code "EJN state token installed"
                      (ejn-doom-e2e--phase-budget
                       deadline "waiting for state token output"))
               (error "Timed out waiting for text panel output from %S" profile-name))
-            (setq entry-after-start (copy-sequence emacs-jupyter-notebook--session-entry)
-                  identity-before (ejn-doom-e2e--capture-identity buffer)))
+            (setq identity-before (ejn-doom-e2e--capture-identity buffer))
+            (unless (ejn-doom-e2e--same-direct-entry-p
+                     entry-after-start emacs-jupyter-notebook--session-entry)
+              (error "Doom E2E live entry drifted after initial execution"))
+            (ejn-doom-e2e--assert-source-pristine
+             buffer source-baseline "initial PNG and state executions"))
           ;; Phase 2: killing this buffer must only discard local state.
           (kill-buffer buffer)
           (setq buffer nil)
@@ -665,6 +793,8 @@ identity and is verified through an exact PID liveness probe."
              buffer2 token "buffer reconnect"
              (ejn-doom-e2e--phase-budget
               deadline "verifying state after buffer reconnect"))
+            (ejn-doom-e2e--assert-source-pristine
+             buffer2 source-baseline "buffer reconnect token proof")
             ;; Phase 3: kill only the actual helper subprocess.  Its process
             ;; sentinel, rather than a test-only reconnect call, must retire
             ;; local state and schedule automatic transport recovery.
@@ -684,6 +814,8 @@ identity and is verified through an exact PID liveness probe."
              buffer2 token "helper recovery"
              (ejn-doom-e2e--phase-budget
               deadline "verifying state after helper recovery"))
+            (ejn-doom-e2e--assert-source-pristine
+             buffer2 source-baseline "helper recovery token proof")
             ;; Phase 4: independently kill only the active SSH tunnel.  The
             ;; core is expected to rebuild both local transport processes
             ;; against the unchanged durable remote kernel identity.
@@ -703,6 +835,8 @@ identity and is verified through an exact PID liveness probe."
              buffer2 token "tunnel recovery"
              (ejn-doom-e2e--phase-budget
               deadline "verifying state after tunnel recovery"))
+            (ejn-doom-e2e--assert-source-pristine
+             buffer2 source-baseline "tunnel recovery token proof")
             (setq metrics
                   (list :status 'ok
                         :profile profile-name
@@ -736,19 +870,40 @@ identity and is verified through an exact PID liveness probe."
                         (plist-get tunnel-recovery-before :tunnel-pid)
                         :tunnel-pid-after-tunnel-recovery
                         (plist-get tunnel-recovery-after :tunnel-pid)))))
-      ;; Explicit test-owned cleanup happens before deleting any evidence.
-      (when entry-after-start
-        (condition-case err
-            (setq cleanup-confirmed
-                  (ejn-doom-e2e--shutdown-test-owned-kernel buffer2 entry-after-start))
-          (error
-           (setq cleanup-error (error-message-string err)))))
+      ;; Explicit test-owned cleanup happens before deleting any evidence.  If
+      ;; the early capture was interrupted, recover only the one direct entry
+      ;; tied to this temporary source/registry pair; never broaden cleanup.
+      (let ((cleanup-entry
+             (or entry-after-start
+                 (condition-case err
+                     (ejn-doom-e2e--recover-test-owned-direct-entry
+                      (or buffer2 buffer) source-file registry-file)
+                   (error
+                    (setq cleanup-error
+                          (format "could not recover test-owned direct entry: %s"
+                                  (error-message-string err)))
+                    nil)))))
+        (if cleanup-entry
+            (condition-case err
+                (setq cleanup-confirmed
+                      (ejn-doom-e2e--shutdown-test-owned-kernel buffer2 cleanup-entry))
+              (error
+               (setq cleanup-error (error-message-string err))))
+          (setq cleanup-error
+                (or cleanup-error
+                    "no valid direct entry was captured or recoverable for test-owned cleanup"))))
       (when (buffer-live-p buffer2) (kill-buffer buffer2))
       (when (buffer-live-p buffer) (kill-buffer buffer))
       ;; If a test-owned remote kernel was started but identity-bound cleanup
       ;; could not prove it is gone, retain these local files for diagnosis
       ;; rather than deleting the durable reconnect evidence under it.
-      (when (or (null entry-after-start) cleanup-confirmed)
+      (unless cleanup-confirmed
+        (ejn-doom-e2e--record-progress
+         (format
+          "cleanup unconfirmed (%s); evidence retained source=%s registry=%s"
+          (or cleanup-error "test body failed before cleanup confirmation")
+          source-file registry-file)))
+      (when cleanup-confirmed
         (when (file-exists-p source-file) (delete-file source-file))
         (when (file-exists-p registry-file) (delete-file registry-file)))))
     (when cleanup-error

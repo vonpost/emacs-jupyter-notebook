@@ -315,6 +315,10 @@ run in the deterministic suite."
     (unwind-protect
         (with-current-buffer buffer
           (let ((emacs-jupyter-notebook-default-profile (plist-get profile :profile))
+                ;; This test covers the direct emacs-jupyter adapter seam.
+                ;; Keep that backend choice local so helper remains the default
+                ;; for the rest of the remote suite and normal operation.
+                (emacs-jupyter-notebook-backend 'legacy)
                 (emacs-jupyter-notebook-remote-profiles
                  `((,(plist-get profile :profile) . ,profile)))
                 (emacs-jupyter-notebook-connection-retrieve-attempts 120)

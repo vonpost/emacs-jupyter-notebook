@@ -5,9 +5,10 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 EMACS=${EMACS:-emacs}
 EMACSCLIENT=${EMACSCLIENT:-emacsclient}
 DOOM_INIT_DIRECTORY=${DOOM_INIT_DIRECTORY:-"$HOME/.config/emacs"}
-SERVER_NAME=${EJN_DOOM_E2E_SERVER:-"ejn-doom-e2e-$$"}
-LOG_FILE=$(mktemp "${TMPDIR:-/tmp}/ejn-doom-e2e.XXXXXX.log")
-PROGRESS_FILE=$(mktemp "${TMPDIR:-/tmp}/ejn-doom-e2e.XXXXXX.progress")
+RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ejn-doom-e2e.XXXXXX")
+SERVER_NAME=${EJN_DOOM_E2E_SERVER:-"ejn-doom-e2e-${RUN_DIR##*/}"}
+LOG_FILE="$RUN_DIR/daemon.log"
+PROGRESS_FILE="$RUN_DIR/progress.log"
 SHELL_TIMEOUT=${EJN_DOOM_E2E_SHELL_TIMEOUT:-240}
 DAEMON_PID=
 
@@ -44,13 +45,55 @@ run_bounded() {
 
 daemon_owned() {
   [[ "$DAEMON_PID" =~ ^[1-9][0-9]*$ ]] || return 1
-  ps -p "$DAEMON_PID" -o command= 2>/dev/null |
-    grep -F -- "--daemon=$SERVER_NAME" >/dev/null
+  local command
+  command=$(ps -p "$DAEMON_PID" -ww -o command= 2>/dev/null) || return 1
+  [[ -n "$command" ]] || return 1
+
+  if [[ -r "/proc/$DAEMON_PID/cmdline" ]]; then
+    local -a argv=()
+    local argument
+    while IFS= read -r -d '' argument; do
+      argv+=("$argument")
+    done < "/proc/$DAEMON_PID/cmdline"
+    local daemon_seen= init_seen=
+    for ((index = 0; index < ${#argv[@]}; index++)); do
+      case "${argv[index]}" in
+        "--daemon=$SERVER_NAME") daemon_seen=1 ;;
+        --init-directory=*)
+          [[ "${argv[index]#--init-directory=}" == "$DOOM_INIT_DIRECTORY" ]] && init_seen=1
+          ;;
+        --init-directory)
+          (( index + 1 < ${#argv[@]} )) &&
+            [[ "${argv[index + 1]}" == "$DOOM_INIT_DIRECTORY" ]] && init_seen=1
+          ;;
+      esac
+    done
+    [[ -n "$daemon_seen" && -n "$init_seen" ]]
+  else
+    # BSD ps has no NUL argv view.  The exact server flag and the exact init
+    # directory are still both required before touching a daemon by name.
+    [[ " $command " == *" --daemon=$SERVER_NAME "* ]] &&
+      ([[ " $command " == *" --init-directory $DOOM_INIT_DIRECTORY "* ]] ||
+       [[ " $command " == *" --init-directory=$DOOM_INIT_DIRECTORY "* ]])
+  fi
 }
 
 cleanup() {
-  if ! run_bounded 10 "$EMACSCLIENT" -s "$SERVER_NAME" --eval '(kill-emacs)' \
-    >/dev/null 2>&1; then
+  if daemon_owned; then
+    # Recheck ownership inside the addressed server as well.  If the socket
+    # name is replaced after daemon_owned, this expression cannot kill the
+    # replacement daemon.
+    local graceful=
+    graceful=$(run_bounded 10 "$EMACSCLIENT" -s "$SERVER_NAME" --eval \
+      "(if (= (emacs-pid) $DAEMON_PID)
+           (progn (run-at-time 0 nil #'kill-emacs) 'ejn-owned)
+         'ejn-refused)" 2>/dev/null) || true
+    if [[ "$graceful" == "ejn-owned" ]]; then
+      for _ in {1..20}; do
+        kill -0 "$DAEMON_PID" >/dev/null 2>&1 || break
+        sleep 0.1
+      done
+    fi
     if daemon_owned; then
       kill -TERM "$DAEMON_PID" >/dev/null 2>&1 || true
       for _ in {1..20}; do
@@ -60,12 +103,26 @@ cleanup() {
       if daemon_owned; then
         kill -KILL "$DAEMON_PID" >/dev/null 2>&1 || true
       fi
+    elif kill -0 "$DAEMON_PID" >/dev/null 2>&1; then
+      printf 'Doom E2E refused signal cleanup: PID/cmdline ownership changed (%s)\n' \
+        "$DAEMON_PID" >&2
     fi
+  elif [[ -n "$DAEMON_PID" ]]; then
+    printf 'Doom E2E refused daemon cleanup: PID/cmdline ownership changed (%s)\n' \
+      "$DAEMON_PID" >&2
   fi
-  rm -f "$LOG_FILE" "$PROGRESS_FILE"
+  rm -rf "$RUN_DIR"
 }
 
 trap cleanup EXIT
+
+# A caller may intentionally provide a stable name, but this harness must
+# never attach to or later terminate a daemon that existed before this run.
+if run_bounded 3 "$EMACSCLIENT" -s "$SERVER_NAME" --eval '(emacs-pid)' \
+  >/dev/null 2>&1; then
+  printf 'Refusing Doom E2E: server name is already live: %s\n' "$SERVER_NAME" >&2
+  exit 2
+fi
 
 if ! run_bounded "$SHELL_TIMEOUT" "$EMACS" --init-directory "$DOOM_INIT_DIRECTORY" --daemon="$SERVER_NAME" \
   >"$LOG_FILE" 2>&1; then
