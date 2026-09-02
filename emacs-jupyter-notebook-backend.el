@@ -7,8 +7,8 @@
 ;;; Commentary:
 ;; The notebook core talks to this small, asynchronous contract rather than
 ;; to an emacs-jupyter object.  A session is opaque outside this file.  The
-;; temporary `legacy' implementation is deliberately selected by default;
-;; future transports only need to implement `backend-dispatch'.
+;; supervised local helper is the default; `legacy' remains an explicit
+;; fallback during the final dogfood gate.
 
 ;;; Code:
 

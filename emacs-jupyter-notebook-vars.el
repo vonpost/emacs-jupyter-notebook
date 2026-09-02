@@ -138,14 +138,14 @@ runtime dependencies or a protocol-version mismatch."
   :type '(repeat string)
   :group 'emacs-jupyter-notebook)
 
-(defcustom emacs-jupyter-notebook-backend 'legacy
+(defcustom emacs-jupyter-notebook-backend 'helper
   "Backend implementation used for local Jupyter protocol attachment.
 
-`legacy' uses the existing emacs-jupyter adapter.  It remains the default
-through the transport rollout; selecting another symbol requires a backend
-implementation registered with `emacs-jupyter-notebook-backend-implementations'."
-  :type '(choice (const :tag "Legacy emacs-jupyter adapter" legacy)
-                 (symbol :tag "Registered experimental backend"))
+`helper' uses the supervised local Python helper and is the default.
+`legacy' keeps the emacs-jupyter adapter available as an explicit fallback
+during the final helper dogfood gate."
+  :type '(choice (const :tag "Supervised local helper" helper)
+                 (const :tag "Legacy emacs-jupyter adapter" legacy))
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-helper-hello-timeout 5

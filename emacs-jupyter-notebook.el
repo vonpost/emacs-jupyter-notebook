@@ -2871,10 +2871,10 @@ by the remote login shell, so Emacs verifies its complete home-relative suffix."
        (file-name-absolute-p connection-file)
        (emacs-jupyter-notebook--kernelspec-bounded-string-p requested-file)
        (cond
-        ((file-name-absolute-p requested-file)
-         (equal connection-file requested-file))
         ((string-prefix-p "~/" requested-file)
          (string-suffix-p (substring requested-file 1) connection-file))
+        ((file-name-absolute-p requested-file)
+         (equal connection-file requested-file))
         (t nil))))
 
 (defun emacs-jupyter-notebook--parse-resolved-kernelspec

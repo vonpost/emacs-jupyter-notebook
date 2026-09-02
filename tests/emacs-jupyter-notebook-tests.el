@@ -18,13 +18,14 @@
   "Create a test backend session with optional legacy RAW-CLIENT data.
 When ATTACHED is non-nil, mark the opaque session as locally attached so
 busy-kernel reconnect arbitration may retain it after verification times out."
-  (let ((session (emacs-jupyter-notebook-backend-session-create
-                  nil (current-buffer))))
-    (when raw-client
-      (setf (emacs-jupyter-notebook-backend-session-data session) raw-client))
-    (when attached
-      (emacs-jupyter-notebook-backend-session-mark-attached session))
-    session))
+  (let ((emacs-jupyter-notebook-backend 'legacy))
+    (let ((session (emacs-jupyter-notebook-backend-session-create
+                    nil (current-buffer))))
+      (when raw-client
+        (setf (emacs-jupyter-notebook-backend-session-data session) raw-client))
+      (when attached
+        (emacs-jupyter-notebook-backend-session-mark-attached session))
+      session)))
 
 (defun ejn-test-direct-entry (entry)
   "Return a strict direct-launch registry ENTRY for reconnect tests."
@@ -482,7 +483,8 @@ W4.4 dead-PID probe test); production code must not."
 ;; `ejn-async-wait-tunnel-*' tests.
 
 (ert-deftest ejn-start-remote-kernel-uses-async-launch ()
-  (let ((emacs-jupyter-notebook-remote-profiles
+  (let ((emacs-jupyter-notebook-backend 'legacy)
+        (emacs-jupyter-notebook-remote-profiles
           '(("p" . (:host "example.com" :remote-cwd "~" :kernelspec "python3"))))
         started)
     (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
@@ -546,7 +548,8 @@ nothing, so the buffer keeps its single in-progress attempt."
 (ert-deftest ejn-start-remote-kernel-accepting-cancel-supersedes-attempt ()
   "W12: accepting the cancel prompt (`y') aborts the in-progress attempt
 via `--cancel-async-operation' and proceeds with the new start."
-  (let ((emacs-jupyter-notebook-remote-profiles
+  (let ((emacs-jupyter-notebook-backend 'legacy)
+        (emacs-jupyter-notebook-remote-profiles
           '(("p" . (:host "example.com" :remote-cwd "~" :kernelspec "python3"))))
         started superseded)
     (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
@@ -593,7 +596,8 @@ via `--cancel-async-operation' and proceeds with the new start."
   ;; advances to `--async-retrieve' when the entry's `:remote-pid' is alive.
   ;; The probe is stubbed here to call retrieve directly so this test still
   ;; pins the contract "reconnect ends in async-retrieve, never sync SSH".
-  (let ((entry (ejn-test-direct-entry
+  (let ((emacs-jupyter-notebook-backend 'legacy)
+        (entry (ejn-test-direct-entry
                 '(:profile "p"
                   :remote-host "example.com"
                   :remote-cwd "~"
@@ -658,7 +662,8 @@ session, so reconnect must NOT be blocked by the guard — it reaps the
 stale buffer-local entry and proceeds to probe/retrieve the target entry.
 Pre-W10 this signalled `user-error \"A kernel is already active\"' and the
 wedged buffer could only be recovered by nuking the live kernel."
-  (let ((entry (ejn-test-direct-entry
+  (let ((emacs-jupyter-notebook-backend 'legacy)
+        (entry (ejn-test-direct-entry
                 '(:profile "p"
                   :remote-host "example.com"
                   :remote-cwd "~"
@@ -1680,6 +1685,26 @@ as part of local cleanup (kill-buffer-hook + mode-disable both route here)."
        (concat "\"-f\",\"" path path "\"") output t t)
       session "python3" path))))
 
+(ert-deftest ejn-kernelspec-parser-accepts-expanded-home-relative-request ()
+  "A remote shell may expand the requested `~/' path before reporting it."
+  (let* ((session "session")
+         (requested "~/.cache/ejn/kernel-session.json")
+         (expanded "/root/.cache/ejn/kernel-session.json")
+         (output
+          (concat
+           "EJN_CONNECTION_FILE=" expanded "\n"
+           (format (concat "{\"kernelspecs\":{\"python3\":{"
+                           "\"resource_dir\":\"/tmp/spec\",\"spec\":{"
+                           "\"argv\":[\"/usr/bin/python3\",\"-f\",\"%s\"],"
+                           "\"env\":{},\"metadata\":{"
+                           "\"ejn_connection_file\":\"%s\","
+                           "\"ejn_session_id\":\"%s\"}}}}}")
+                   expanded expanded session)))
+         (parsed (emacs-jupyter-notebook--parse-resolved-kernelspec
+                  output session "python3" requested)))
+    (should (equal (plist-get parsed :connection-file) expanded))
+    (should (equal (plist-get parsed :env) nil))))
+
 (ert-deftest ejn-kernelspec-parser-rejects-nul-and-duplicate-environment ()
   (should-not (emacs-jupyter-notebook--kernelspec-bounded-string-p
                (concat "a" (string 0) "b")))
@@ -2551,7 +2576,8 @@ in-progress attempt untouched."
       (delete-directory dir t))))
 
 (ert-deftest ejn-ht12r2-provisional-reconnect-recovers-pid-from-sidecar ()
-  (let ((entry (ejn-test-direct-entry
+  (let ((emacs-jupyter-notebook-backend 'legacy)
+        (entry (ejn-test-direct-entry
                 '(:profile "p" :session-id "provisional" :remote-host "h"
                   :remote-pid 1 :remote-connection-file "/tmp/k.json"
                   :provisional t)))
@@ -4189,7 +4215,8 @@ while surrounding text segments are left untouched."
   ;; Post-W4.4: tunnel-reconnect goes through `--async-probe-pid-alive'
   ;; before retrieve.  The probe is stubbed to call retrieve directly so
   ;; this test still pins the async-only contract.
-  (let ((entry (ejn-test-direct-entry
+  (let ((emacs-jupyter-notebook-backend 'legacy)
+        (entry (ejn-test-direct-entry
                 '(:profile "p"
                   :remote-host "example.com"
                   :remote-cwd "~"
@@ -4665,7 +4692,8 @@ the evaluate flow."
 
 
 (ert-deftest ejn-async-connect-calls-connect-async-function ()
-  (let ((entry '(:profile "p"
+  (let ((emacs-jupyter-notebook-backend 'legacy)
+        (entry '(:profile "p"
                  :remote-host "example.com"
                  :remote-connection-file "/tmp/kernel.json"
                  :session-id "session"))
@@ -6660,9 +6688,10 @@ adapter returns the unverified client synchronously."
   "W10 secondary: a connect whose adapter yields a nil client must move the
 async context to ERROR (surfacing the failure via `--async-fail'), never
 silently to `done'.  Drives the full `--async-connect' -> adapter
-callback(nil) -> `--async-connect-finalize' seam."
+  callback(nil) -> `--async-connect-finalize' seam."
   (with-temp-buffer
-    (let ((err-surfaced nil))
+    (let ((emacs-jupyter-notebook-backend 'legacy)
+          (err-surfaced nil))
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--install-tunnel-sentinel)
                  #'ignore)
                 ((symbol-function 'emacs-jupyter-notebook-jupyter-connect-async)
@@ -8977,7 +9006,8 @@ with backoff instead of giving up; a success schedules nothing further."
   "W19: an explicit reconnect is the reliable escape hatch from a wedged
 background attempt — it supersedes a stale RECONNECT attempt silently (no
 second prompt), because cancelling a reconnect never touches a kernel."
-  (let ((entry (ejn-test-direct-entry
+  (let ((emacs-jupyter-notebook-backend 'legacy)
+        (entry (ejn-test-direct-entry
                 '(:profile "p" :remote-host "h" :remote-cwd "~"
                   :kernelspec "python3" :remote-pid 1
                   :remote-connection-file "/r/k.json" :session-id "s")))
@@ -10652,19 +10682,21 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (defun ejn-ir5--begin-without-io (entry owner &optional error-callback)
   "Begin reconnect to ENTRY as OWNER without Jupyter, SSH, or timers."
-  (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
-             #'ignore)
-            ((symbol-function
-              'emacs-jupyter-notebook--async-arm-overall-timeout)
-             #'identity)
-            ((symbol-function 'emacs-jupyter-notebook--async-probe-pid-alive)
-             #'identity))
-    (emacs-jupyter-notebook--begin-reconnect
-     entry nil error-callback owner)))
+  (let ((emacs-jupyter-notebook-backend 'legacy))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-jupyter--ensure)
+               #'ignore)
+              ((symbol-function
+                'emacs-jupyter-notebook--async-arm-overall-timeout)
+               #'identity)
+              ((symbol-function 'emacs-jupyter-notebook--async-probe-pid-alive)
+               #'identity))
+      (emacs-jupyter-notebook--begin-reconnect
+       entry nil error-callback owner))))
 
 (ert-deftest ejn-ir5-transient-transition-table-rearms-exactly-once ()
   "Scheduled-explicit and evaluation reconnect failures each own one retry."
-  (let ((entry (ejn-test-direct-entry
+  (let ((emacs-jupyter-notebook-backend 'legacy)
+        (entry (ejn-test-direct-entry
                 '(:profile "p" :session-id "s" :remote-host "h"
                   :remote-pid 17 :remote-connection-file "/r/kernel.json")))
         (emacs-jupyter-notebook-reconnect-initial-delay 600))
@@ -10766,7 +10798,8 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ir5-synchronous-probe-start-failure-enters-retry-policy ()
   "A synchronous process-construction error is a bounded transient failure."
-  (let ((entry (ejn-test-direct-entry
+  (let ((emacs-jupyter-notebook-backend 'legacy)
+        (entry (ejn-test-direct-entry
                 '(:profile "p" :session-id "s" :remote-host "h"
                   :remote-pid 17 :remote-connection-file "/r/kernel.json")))
         (emacs-jupyter-notebook-reconnect-initial-delay 600)
@@ -14087,7 +14120,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
         (when emacs-jupyter-notebook-mode
           (emacs-jupyter-notebook-mode -1))))))
 
-;;; EI11 -- opt-in helper dogfood and fail-fast local setup
+;;; EI11 -- helper dogfood and fail-fast local setup
 
 (defun ejn-ei11--write-executable (file contents)
   "Write executable FILE containing CONTENTS for an isolated EI11 fixture."
@@ -14096,9 +14129,9 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
   (set-file-modes file #o700)
   file)
 
-(ert-deftest ejn-ei11-helper-remains-opt-in-with-protocol-mode-default ()
-  "The helper is selectable, but the stable default remains legacy."
-  (should (eq emacs-jupyter-notebook-backend 'legacy))
+(ert-deftest ejn-ei11-helper-is-default-with-protocol-mode-command ()
+  "The supervised helper and its protocol command are the stable defaults."
+  (should (eq emacs-jupyter-notebook-backend 'helper))
   (should (equal emacs-jupyter-notebook-helper-command
                  '("ejn-helper" "--protocol")))
   (should (assq 'helper emacs-jupyter-notebook-backend-implementations)))
@@ -14244,7 +14277,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
     (should (emacs-jupyter-notebook-helper-session-disposed session))))
 
 (ert-deftest ejn-ei11-readme-documents-helper-commands-and-no-install-policy ()
-  "README names the opt-in selector, protocol command, and supported closure."
+  "README names the helper default, explicit fallback, and supported closure."
   (let* ((test-file (locate-library "emacs-jupyter-notebook-tests"))
          (root (and test-file
                     (file-name-directory
@@ -14254,7 +14287,8 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                    (insert-file-contents
                     (expand-file-name "README.md" (or root default-directory)))
                   (buffer-string))))
-    (dolist (needle '("emacs-jupyter-notebook-backend 'helper"
+    (dolist (needle '("helper is the default Jupyter transport"
+                      "emacs-jupyter-notebook-backend 'legacy"
                       "emacs-jupyter-notebook-helper-command"
                       "--protocol"
                       "nix build .#ejn-helper"

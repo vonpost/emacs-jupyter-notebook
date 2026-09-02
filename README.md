@@ -72,20 +72,25 @@ to the opaque start session in `ejn_session_id`.  Emacs validates both before
 launching or retrieving anything.  Legacy `:jupyter-command` values are
 rejected rather than interpreted.
 
-### Optional local helper transport
+### Local helper transport
 
-The local Python helper is experimental and opt-in.  The default remains
-`legacy`, which uses the existing `emacs-jupyter` adapter.  During this
-migration, keep `emacs-jupyter` pinned to the known-working revision
-`3b9caed3e4cc5f4bc0348eb65d17098de76904e4`; upstream revision
-`05ea84067f784fb7cd1f829d7a0fadcad20466aa` rejects EJN's `:connect-p`
-constructor argument.  To select the helper, set the backend and its
-protocol-mode command before loading the package:
+The supervised local Python helper is the default Jupyter transport.  Its
+protocol-mode command can be configured before loading the package:
 
 ```elisp
-(setq emacs-jupyter-notebook-backend 'helper)
 (setq emacs-jupyter-notebook-helper-command
       '("ejn-helper" "--protocol"))
+```
+
+The old `emacs-jupyter` adapter remains an explicit fallback during the final
+dogfood gate.  If selecting it, keep `emacs-jupyter` pinned to the
+known-working revision
+`3b9caed3e4cc5f4bc0348eb65d17098de76904e4`; upstream revision
+`05ea84067f784fb7cd1f829d7a0fadcad20466aa` rejects EJN's `:connect-p`
+constructor argument:
+
+```elisp
+(setq emacs-jupyter-notebook-backend 'legacy)
 ```
 
 The helper is local only; it does not install anything on a remote host or

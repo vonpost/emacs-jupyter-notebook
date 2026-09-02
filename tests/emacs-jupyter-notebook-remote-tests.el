@@ -13,6 +13,7 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'emacs-jupyter-notebook)
+(require 'emacs-jupyter-notebook-result)
 
 (declare-function jupyter-eval "jupyter-client" (code &optional mime))
 (defvar jupyter-current-client)
@@ -88,9 +89,8 @@ overlays."
             (setq found
                   (cl-some
                    (lambda (entry)
-                     (let ((content (plist-get (cdr entry) :content)))
-                       (and content
-                            (string-match-p (regexp-quote text) content))))
+                     (string-match-p (regexp-quote text)
+                                     (ejn-panel-entry-text (cdr entry))))
                    emacs-jupyter-notebook-panel--entries))))))
     found))
 
@@ -183,6 +183,7 @@ overlays."
      (unwind-protect
          (with-current-buffer buffer
            (let ((emacs-jupyter-notebook-default-profile (plist-get profile :profile))
+                 (emacs-jupyter-notebook-backend 'legacy)
                  (emacs-jupyter-notebook-remote-profiles
                   `((,(plist-get profile :profile) . ,profile)))
                  (emacs-jupyter-notebook-connection-retrieve-attempts 80)
@@ -219,6 +220,7 @@ overlays."
      (unwind-protect
          (with-current-buffer buffer
            (let ((emacs-jupyter-notebook-default-profile (plist-get profile :profile))
+                 (emacs-jupyter-notebook-backend 'legacy)
                  (emacs-jupyter-notebook-remote-profiles
                   `((,(plist-get profile :profile) . ,profile)))
                  (emacs-jupyter-notebook-connection-retrieve-attempts 80)
@@ -259,6 +261,7 @@ overlays."
            (with-current-buffer first-buffer
              (setq buffer-file-name source-file)
              (let ((emacs-jupyter-notebook-default-profile (plist-get profile :profile))
+                   (emacs-jupyter-notebook-backend 'legacy)
                    (emacs-jupyter-notebook-remote-profiles
                     `((,(plist-get profile :profile) . ,profile)))
                    (emacs-jupyter-notebook-connection-retrieve-attempts 80)
@@ -274,6 +277,7 @@ overlays."
             (goto-char (point-min))
             (forward-line 1)
             (let ((emacs-jupyter-notebook-default-profile (plist-get profile :profile))
+                  (emacs-jupyter-notebook-backend 'legacy)
                   (emacs-jupyter-notebook-remote-profiles
                    `((,(plist-get profile :profile) . ,profile)))
                   (emacs-jupyter-notebook-connection-retrieve-attempts 80)
