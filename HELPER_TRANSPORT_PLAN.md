@@ -1538,7 +1538,7 @@ be manager-reviewed for durable-kernel rules.
     pre-existing optional Evil warnings; final process, temporary-root, and
     generated-bytecode audits were empty.
 
-- [ ] **AG3 Run outage, flood, and large-output stress gates.**
+- [~] owner=terra-ag3 claimed=2026-09-02 **AG3 Run outage, flood, and large-output stress gates.**
   - Depends: AG2.
   - Files: `tests/stress/*`, test docs only.
   - Deliverable: automate Global Gates 3-8 with TH1/TH3, including the 50 ms
