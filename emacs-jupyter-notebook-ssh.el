@@ -533,6 +533,16 @@ The resolver prefix is intentionally absent from the final process argv."
          (or (and (integerp pid) (> pid 0) (<= pid 2147483647))
              (and (eq (plist-get entry :provisional) t) (null pid))))))
 
+(defun emacs-jupyter-notebook-ssh-direct-entry-cleanup-valid-p (entry)
+  "Return non-nil when ENTRY carries authority for exact remote cleanup.
+
+A provisional direct entry with no promoted PID is valid durable recovery
+state, but it cannot authorize a signal or deletion of the remote connection,
+PID, and log files."
+  (and (emacs-jupyter-notebook-ssh-direct-entry-valid-p entry)
+       (let ((pid (plist-get entry :remote-pid)))
+         (and (integerp pid) (> pid 0)))))
+
 (defun emacs-jupyter-notebook-ssh--identity-token-hex (tokens)
   "Return a NUL-delimited UTF-8 hex needle for contiguous TOKENS."
   (concat
@@ -554,10 +564,13 @@ always exits 0 and prints an identity-aware result for the PID,
 followed by `__EJN_DONE__'.  CONNECTION-TOKENS is mandatory and identifies
 the exact contiguous connection-file argument sequence.  The
 remote command emits one of `__EJN_ALIVE_MATCH__', `__EJN_DEAD__',
-`__EJN_ALIVE_MISMATCH__', or `__EJN_INSPECT_UNAVAILABLE__', then the same
-`__EJN_DONE__' terminator.  It prefers the NUL-delimited argv exposed by
-Linux /proc and falls back to `ps' only when the expected token contains no
-whitespace, since `ps' cannot otherwise preserve argument boundaries."
+`__EJN_ALIVE_MISMATCH__', `__EJN_INSPECT_UNAVAILABLE__', or
+`__EJN_EXISTENCE_UNAVAILABLE__', then the same `__EJN_DONE__' terminator.
+The last result means `kill -0' failed but `ps' did not positively prove the
+PID absent, for example because signalling is not permitted.  It prefers the
+NUL-delimited argv exposed by Linux /proc and falls back to `ps' only when the
+expected token contains no whitespace, since `ps' cannot otherwise preserve
+argument boundaries."
   (unless (and (integerp pid) (> pid 0)
                (listp connection-tokens) (<= 1 (length connection-tokens) 2)
                (cl-every (lambda (token)
@@ -577,7 +590,16 @@ whitespace, since `ps' cannot otherwise preserve argument boundaries."
        (format
           (concat
            "pid=%s; set -- %s; needle=%s; "
-           "if ! kill -0 \"$pid\" 2>/dev/null; then echo __EJN_DEAD__; "
+           "pid_absent() { target=$1; "
+           "command -v ps >/dev/null 2>&1 || return 2; "
+           "ps_self=$(ps -p \"$$\" -o pid= 2>/dev/null); self_status=$?; "
+           "set -- $ps_self; "
+           "[ \"$self_status\" = 0 ] && [ \"$#\" = 1 ] && [ \"$1\" = \"$$\" ] || return 2; "
+           "observed=$(ps -p \"$target\" -o pid= 2>/dev/null); ps_status=$?; "
+           "[ \"$ps_status\" = 1 ] && [ -z \"$observed\" ]; }; "
+           "if ! kill -0 \"$pid\" 2>/dev/null; then "
+           "if pid_absent \"$pid\"; then "
+           "echo __EJN_DEAD__; else echo __EJN_EXISTENCE_UNAVAILABLE__; fi; "
            "elif [ -r \"/proc/$pid/cmdline\" ] && "
            "command -v od >/dev/null 2>&1 && command -v tr >/dev/null 2>&1; then "
            "actual=$(od -An -tx1 -v \"/proc/$pid/cmdline\" 2>/dev/null | tr -d ' \\n'); "
@@ -595,25 +617,43 @@ whitespace, since `ps' cannot otherwise preserve argument boundaries."
         pid quoted-tokens hex-needle)))))
 
 (defun emacs-jupyter-notebook-ssh-build-batch-pid-alive (profile pids &optional connect-timeout)
-  "Return an SSH argv reporting which of PIDS are alive on PROFILE's host.
+  "Return an SSH argv classifying PIDS on PROFILE's host.
 W11: the batched, per-host liveness probe behind the non-destructive
-registry prune.  One ssh runs a shell loop that echoes each PID that
-`kill -0' confirms alive (no signal is sent), then prints the sentinel
-`__EJN_DONE__' so callers can tell a genuine \"host answered, these are
-dead\" reply apart from a connection failure (which yields no sentinel and
-a non-zero ssh exit).  The loop always exits 0 because of the trailing
-sentinel `echo', so it does not trip a non-zero-exit error path.
+registry prune.  One ssh runs a shell loop that emits exactly one prefixed
+alive/dead/unknown record per PID, then prints `__EJN_DONE__'.  A failed
+`kill -0' is dead only when `ps' explicitly reports no such PID; EPERM,
+missing `ps', and malformed results are unknown and therefore never pruned.
+The loop always exits 0 because of the trailing sentinel `echo', so it does
+not trip a non-zero-exit error path.
 
 A bounded `ConnectTimeout' (CONNECT-TIMEOUT, default
 `emacs-jupyter-notebook-prune-ssh-timeout') plus `BatchMode=yes' guarantee
 an unreachable or auth-prompting host cannot hang Emacs — it fails fast
 and its PIDs stay UNKNOWN (never pruned)."
+  (unless (and (listp pids) pids
+               (cl-every (lambda (pid)
+                           (and (integerp pid) (> pid 0) (<= pid 2147483647)))
+                         pids))
+    (error "Batch PID probe requires positive integer PIDs"))
   (let* ((timeout (or connect-timeout emacs-jupyter-notebook-prune-ssh-timeout 5))
          (pid-list (mapconcat (lambda (p) (shell-quote-argument (format "%s" p)))
                               pids " "))
-         (remote (format
-                  "for p in %s; do kill -0 \"$p\" 2>/dev/null && echo \"$p\"; done; echo __EJN_DONE__"
-                  pid-list))
+         (remote
+          (format
+           (concat
+            "pid_absent() { target=$1; "
+            "command -v ps >/dev/null 2>&1 || return 2; "
+            "ps_self=$(ps -p \"$$\" -o pid= 2>/dev/null); self_status=$?; "
+            "set -- $ps_self; "
+            "[ \"$self_status\" = 0 ] && [ \"$#\" = 1 ] && [ \"$1\" = \"$$\" ] || return 2; "
+            "observed=$(ps -p \"$target\" -o pid= 2>/dev/null); ps_status=$?; "
+            "[ \"$ps_status\" = 1 ] && [ -z \"$observed\" ]; }; "
+            "for p in %s; do "
+            "if kill -0 \"$p\" 2>/dev/null; then echo \"__EJN_ALIVE__:$p\"; "
+            "else if pid_absent \"$p\"; then "
+            "echo \"__EJN_DEAD__:$p\"; else echo \"__EJN_UNKNOWN__:$p\"; fi; fi; "
+            "done; echo __EJN_DONE__")
+           pid-list))
          (argv (emacs-jupyter-notebook-ssh-command profile remote)))
     ;; Splice the bounding options in right after the ssh program name so
     ;; they apply to this one-shot probe without touching the shared
@@ -632,7 +672,7 @@ the persisted connection-bearing argv sequence matches Linux /proc or Darwin
          (tokens (plist-get entry :connection-file-tokens))
          (connection-file (plist-get entry :remote-connection-file))
          (sidecar (plist-get entry :remote-pid-sidecar)))
-    (unless (emacs-jupyter-notebook-ssh-direct-entry-valid-p entry)
+    (unless (emacs-jupyter-notebook-ssh-direct-entry-cleanup-valid-p entry)
       (error "Remote cleanup requires a direct entry with verified PID identity"))
     (let ((quoted-tokens (mapconcat #'shell-quote-argument tokens " "))
           (hex-needle
@@ -646,8 +686,22 @@ the persisted connection-bearing argv sequence matches Linux /proc or Darwin
       (emacs-jupyter-notebook-ssh-command
        profile
        (format
-        (concat "pid=%s; set -- %s; needle=%s; cleanup() { rm -f %s %s%s; }; "
-                "if ! kill -0 \"$pid\" 2>/dev/null; then cleanup; exit 0; fi; "
+        (concat "pid=%s; set -- %s; needle=%s; "
+                "pid_absent() { target=$1; "
+                "command -v ps >/dev/null 2>&1 || return 2; "
+                "ps_self=$(ps -p \"$$\" -o pid= 2>/dev/null); self_status=$?; "
+                "set -- $ps_self; "
+                "[ \"$self_status\" = 0 ] && [ \"$#\" = 1 ] && [ \"$1\" = \"$$\" ] || return 2; "
+                "observed=$(ps -p \"$target\" -o pid= 2>/dev/null); ps_status=$?; "
+                "[ \"$ps_status\" = 1 ] && [ -z \"$observed\" ]; }; "
+                "cleanup() { rm -f %s %s%s && "
+                "[ ! -e %s ] && [ ! -L %s ] && "
+                "[ ! -e %s ] && [ ! -L %s ]%s; }; "
+                "finish_cleanup() { cleanup && echo __EJN_CLEANUP_DONE__; }; "
+                "if ! kill -0 \"$pid\" 2>/dev/null; then "
+                "if pid_absent \"$pid\"; then "
+                "finish_cleanup; exit $?; fi; "
+                "echo EJN_CLEANUP_IDENTITY_UNCONFIRMED >&2; exit 1; fi; "
                 "matched=0; "
                 "if [ -r \"/proc/$pid/cmdline\" ] && command -v od >/dev/null 2>&1 && "
                 "command -v tr >/dev/null 2>&1; then "
@@ -660,11 +714,24 @@ the persisted connection-bearing argv sequence matches Linux /proc or Darwin
                 "sequence=\"${sequence}${sequence:+ }$expected\"; done; "
                 "if [ -n \"$args\" ] && [ \"$safe\" = 1 ]; then "
                 "case \" $args \" in *\" $sequence \"*) matched=1;; esac; fi; fi; "
-                "if [ \"$matched\" = 1 ]; then kill \"$pid\" && cleanup; exit $?; fi; "
+                "if [ \"$matched\" = 1 ]; then "
+                "kill \"$pid\" || exit $?; waited=0; "
+                "while kill -0 \"$pid\" 2>/dev/null && [ \"$waited\" -lt 50 ]; do "
+                "sleep 0.1; waited=$((waited + 1)); done; "
+                "if kill -0 \"$pid\" 2>/dev/null; then "
+                "echo EJN_CLEANUP_PID_STILL_ALIVE >&2; exit 1; fi; "
+                "if ! pid_absent \"$pid\"; then "
+                "echo EJN_CLEANUP_IDENTITY_UNCONFIRMED >&2; exit 1; fi; "
+                "finish_cleanup; exit $?; fi; "
                 "echo EJN_CLEANUP_IDENTITY_UNCONFIRMED >&2; exit 1")
         (shell-quote-argument (format "%s" pid)) quoted-tokens hex-needle
         remote-file remote-log
-        (if remote-sidecar (concat " " remote-sidecar) ""))))))
+        (if remote-sidecar (concat " " remote-sidecar) "")
+        remote-file remote-file remote-log remote-log
+        (if remote-sidecar
+            (concat " && [ ! -e " remote-sidecar " ]"
+                    " && [ ! -L " remote-sidecar " ]")
+          ""))))))
 
 (defun emacs-jupyter-notebook-ssh-build-remote-cat-log (profile connection-file)
   "Return an SSH argv list that prints a bounded tail for CONNECTION-FILE."

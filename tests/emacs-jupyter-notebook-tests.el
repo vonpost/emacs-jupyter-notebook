@@ -884,7 +884,188 @@ leaves absolute paths untouched."
                               "--connection-file=/home/u/.cache/ejn/kernel-session.json"))
                             remote-command))
     (should (string-match-p "/home/u/.cache/ejn/kernel-session.pid"
-                            remote-command))))
+                            remote-command))
+    (should (string-match-p "finish_cleanup.*__EJN_CLEANUP_DONE__"
+                            remote-command))
+    (should (string-match-p "EJN_CLEANUP_PID_STILL_ALIVE" remote-command))
+    (should (string-search "sleep 0.1; waited=" remote-command))
+    (should (string-search
+             "[ ! -e /home/u/.cache/ejn/kernel-session.json ]"
+             remote-command))
+    (should (string-search
+             "[ ! -L /home/u/.cache/ejn/kernel-session.json ]"
+             remote-command))
+    (should (string-search
+             "[ ! -L /home/u/.cache/ejn/kernel-session.pid ]"
+             remote-command))
+    (should-not (string-match-p "then cleanup; exit 0" remote-command))))
+
+(ert-deftest ejn-ssh-remote-cleanup-rejects-provisional-entry-without-pid ()
+  "Recovery metadata without a PID cannot authorize signals or file deletion."
+  (let ((entry
+         '(:launch-kind direct :remote-pid nil :provisional t
+           :session-id "provisional"
+           :remote-connection-file "/tmp/kernel-provisional.json"
+           :remote-pid-sidecar "/tmp/kernel-provisional.pid"
+           :connection-file-tokens ("-f" "/tmp/kernel-provisional.json"))))
+    (should (emacs-jupyter-notebook-ssh-direct-entry-valid-p entry))
+    (should-not (emacs-jupyter-notebook-ssh-direct-entry-cleanup-valid-p entry))
+    (should-error
+     (emacs-jupyter-notebook-ssh-build-remote-cleanup
+      '(:profile "p" :host "example.com") entry))))
+
+(ert-deftest ejn-ssh-remote-cleanup-dead-pid-proves-file-removal ()
+  "The dead-PID branch reports success only after every session file is absent."
+  (let* ((directory (make-temp-file "ejn-cleanup-proof-" t))
+         (connection (expand-file-name "kernel-proof.json" directory))
+         (sidecar (expand-file-name "kernel-proof.pid" directory))
+         (log (expand-file-name "kernel-proof.log" directory))
+         (entry (list :launch-kind 'direct :remote-pid 2147483647
+                      :provisional nil :session-id "proof"
+                      :remote-connection-file connection
+                      :remote-pid-sidecar sidecar
+                      :connection-file-tokens (list "-f" connection))))
+    (unwind-protect
+        (progn
+          ;; Dangling symlinks make `file-exists-p' false while the pathname
+          ;; still exists.  Cleanup must remove and verify both ordinary files
+          ;; and symlink residue before emitting its exact marker.
+          (with-temp-file connection (insert "owned"))
+          (make-symbolic-link "missing-sidecar-target" sidecar)
+          (make-symbolic-link "missing-log-target" log)
+          (let ((remote
+                 (car (last
+                       (emacs-jupyter-notebook-ssh-build-remote-cleanup
+                        '(:profile "p" :host "example.com") entry)))))
+            (with-temp-buffer
+              (should (zerop (call-process "sh" nil t nil "-c" remote)))
+              (should (equal (string-trim (buffer-string))
+                             "__EJN_CLEANUP_DONE__"))))
+          (dolist (file (list connection sidecar log))
+            (should-not (file-exists-p file))
+            (should-not (file-symlink-p file))))
+      (delete-directory directory t))))
+
+(ert-deftest ejn-ssh-remote-cleanup-kill-permission-failure-is-not-death ()
+  "A failed kill probe with a visible PID cannot authorize file removal."
+  (let* ((directory (make-temp-file "ejn-cleanup-permission-proof-" t))
+         (connection (expand-file-name "kernel-permission-proof.json" directory))
+         (sidecar (expand-file-name "kernel-permission-proof.pid" directory))
+         (log (expand-file-name "kernel-permission-proof.log" directory))
+         (entry (list :launch-kind 'direct :remote-pid 424242
+                      :provisional nil :session-id "permission-proof"
+                      :remote-connection-file connection
+                      :remote-pid-sidecar sidecar
+                      :connection-file-tokens (list "-f" connection))))
+    (unwind-protect
+        (progn
+          (dolist (file (list connection sidecar log))
+            (with-temp-file file (insert "owned")))
+          (let* ((remote
+                  (car (last
+                        (emacs-jupyter-notebook-ssh-build-remote-cleanup
+                         '(:profile "p" :host "example.com") entry))))
+                 ;; Simulate `kill -0' returning EPERM while `ps' positively
+                 ;; reports that the same numeric PID still exists.
+                 (wrapped
+                  (concat "kill() { return 1; }; "
+                          "ps() { printf '%s\\n' \"$2\"; return 0; }; "
+                          remote)))
+            (with-temp-buffer
+              (should-not (zerop (call-process "sh" nil t nil "-c" wrapped)))
+              (should (string-match-p "EJN_CLEANUP_IDENTITY_UNCONFIRMED"
+                                      (buffer-string)))
+              (should-not (string-match-p "__EJN_CLEANUP_DONE__"
+                                          (buffer-string)))))
+          (dolist (file (list connection sidecar log))
+            (should (file-exists-p file))))
+      (delete-directory directory t))))
+
+(ert-deftest ejn-ssh-remote-cleanup-live-identity-mismatch-preserves-everything ()
+  "A live PID without the exact connection tokens is neither signalled nor erased."
+  (let* ((directory (make-temp-file "ejn-cleanup-mismatch-proof-" t))
+         (connection (expand-file-name "kernel-mismatch-proof.json" directory))
+         (sidecar (expand-file-name "kernel-mismatch-proof.pid" directory))
+         (log (expand-file-name "kernel-mismatch-proof.log" directory))
+         (process (make-process :name "ejn-cleanup-mismatch-proof"
+                                :command '("sh" "-c" "exec sleep 30")
+                                :noquery t :buffer nil))
+         (pid (process-id process))
+         (entry (list :launch-kind 'direct :remote-pid pid
+                      :provisional nil :session-id "mismatch-proof"
+                      :remote-connection-file connection
+                      :remote-pid-sidecar sidecar
+                      :connection-file-tokens (list "-f" connection))))
+    (unwind-protect
+        (progn
+          (dolist (file (list connection sidecar log))
+            (with-temp-file file (insert "owned")))
+          (let ((remote
+                 (car (last
+                       (emacs-jupyter-notebook-ssh-build-remote-cleanup
+                        '(:profile "p" :host "example.com") entry)))))
+            (with-temp-buffer
+              (should-not (zerop (call-process "sh" nil t nil "-c" remote)))
+              (should (string-match-p "EJN_CLEANUP_IDENTITY_UNCONFIRMED"
+                                      (buffer-string)))
+              (should-not (string-match-p "__EJN_CLEANUP_DONE__"
+                                          (buffer-string)))))
+          (should (process-live-p process))
+          (dolist (file (list connection sidecar log))
+            (should (file-exists-p file))))
+      (when (process-live-p process) (delete-process process))
+      (delete-directory directory t))))
+
+(ert-deftest ejn-ssh-remote-cleanup-live-pid-proves-process-death ()
+  "The live-PID branch emits its marker only after the exact process is gone."
+  (let* ((directory (make-temp-file "ejn-cleanup-live-proof-" t))
+         (connection (expand-file-name "kernel-live-proof.json" directory))
+         (sidecar (expand-file-name "kernel-live-proof.pid" directory))
+         (log (expand-file-name "kernel-live-proof.log" directory))
+         (pid-file (expand-file-name "launcher.pid" directory))
+         pid)
+    (unwind-protect
+        (progn
+          (with-temp-file connection
+            (insert "trap 'exit 0' TERM\nwhile :; do sleep 0.1; done\n"))
+          (with-temp-file sidecar (insert "pending"))
+          (with-temp-file log (insert "owned"))
+          (should
+           (zerop
+            (call-process
+             "sh" nil nil nil "-c"
+             (format "nohup sh %s >/dev/null 2>&1 & echo $! > %s"
+                     (shell-quote-argument connection)
+                     (shell-quote-argument pid-file)))))
+          (setq pid
+                (string-to-number
+                 (string-trim
+                  (with-temp-buffer
+                    (insert-file-contents-literally pid-file)
+                    (buffer-string)))))
+          (should (> pid 0))
+          (let* ((entry (list :launch-kind 'direct :remote-pid pid
+                              :provisional nil :session-id "live-proof"
+                              :remote-connection-file connection
+                              :remote-pid-sidecar sidecar
+                              :connection-file-tokens (list connection)))
+                 (remote
+                  (car (last
+                        (emacs-jupyter-notebook-ssh-build-remote-cleanup
+                         '(:profile "p" :host "example.com") entry)))))
+            (with-temp-buffer
+              (should (zerop (call-process "sh" nil t nil "-c" remote)))
+              (should (equal (string-trim (buffer-string))
+                             "__EJN_CLEANUP_DONE__"))))
+          (should-not (zerop (call-process "sh" nil nil nil "-c"
+                                           (format "kill -0 %d 2>/dev/null" pid))))
+          (dolist (file (list connection sidecar log))
+            (should-not (file-exists-p file))
+            (should-not (file-symlink-p file))))
+      (when (and pid (> pid 0))
+        (ignore-errors
+          (call-process "sh" nil nil nil "-c" (format "kill %d 2>/dev/null" pid))))
+      (delete-directory directory t))))
 
 (ert-deftest ejn-ssh-remote-cat-log-targets-connection-log ()
   (let* ((emacs-jupyter-notebook-management-output-max-bytes 12345)
@@ -1305,6 +1486,26 @@ via stdout tokens (always exiting 0) so ssh failure is not read as death."
     (should (string-match-p "kill -0 \"\\$pid\"" remote))
     (should (string-match-p "__EJN_ALIVE_MATCH__" remote))
     (should (string-match-p "__EJN_DONE__" remote))))
+
+(ert-deftest ejn-w4.4-pid-alive-permission-denied-is-not-dead ()
+  "A failed `kill -0' is UNKNOWN unless `ps' positively proves absence."
+  (let* ((remote
+          (car (last
+                (emacs-jupyter-notebook-ssh-build-pid-alive
+                 '(:profile "p" :host "unused") 12345
+                 '("--connection-file=/r/kernel.json")))))
+         (script
+          (concat
+           "kill() { return 1; }; "
+           "ps() { printf '%s\\n' \"$2\"; return 0; }; "
+           remote)))
+    (with-temp-buffer
+      (should (zerop (process-file "sh" nil t nil "-c" script)))
+      (should (equal (buffer-string)
+                     "__EJN_EXISTENCE_UNAVAILABLE__\n__EJN_DONE__\n"))
+      (should (eq (emacs-jupyter-notebook--classify-pid-probe
+                   (buffer-string))
+                  'unreachable)))))
 
 (ert-deftest ejn-w4.8-async-probe-fails-when-no-pid ()
   "W4.8: when the registry entry has no `:remote-pid' (pre-W4.2 session)
@@ -1858,6 +2059,28 @@ as part of local cleanup (kill-buffer-hook + mode-disable both route here)."
                    (funcall run
                             (format "ps() { printf '%%s\\n' '/usr/bin/python3'; }; %s"
                                     space-no-proc))))))))
+
+(ert-deftest ejn-ht12r2-batch-pid-probe-is-explicitly-tristate ()
+  "Batch probes distinguish permission denial from proven PID absence."
+  (let* ((remote
+          (car (last
+                (emacs-jupyter-notebook-ssh-build-batch-pid-alive
+                 '(:profile "p" :host "unused") '(11 22 33)))))
+         (script
+          (concat
+           "kill() { [ \"$2\" = 11 ]; }; "
+           "ps() { "
+           "if [ \"$2\" = \"$$\" ]; then printf '%s\\n' \"$$\"; return 0; fi; "
+           "if [ \"$2\" = 22 ]; then return 1; fi; "
+           "printf '%s\\n' \"$2\"; return 0; }; "
+           remote)))
+    (with-temp-buffer
+      (should (zerop (process-file "sh" nil t nil "-c" script)))
+      (should (equal (split-string (buffer-string) "\n" t)
+                     '("__EJN_ALIVE__:11"
+                       "__EJN_DEAD__:22"
+                       "__EJN_UNKNOWN__:33"
+                       "__EJN_DONE__"))))))
 
 (ert-deftest ejn-ht12r2-cleanup-command-has-darwin-identity-fallback ()
   (let* ((entry (ejn-test-direct-entry
@@ -2814,19 +3037,306 @@ client) never kills the remote kernel — it is the durable reconnect surface."
       (should-not kernel-killed))))
 
 (ert-deftest ejn-retry-fresh-kernel-cleans-state-and-starts-profile ()
-  (let ((entry '(:profile "p" :session-id "old"))
+  (let ((entry (ejn-test-direct-entry
+                '(:profile "p" :session-id "old" :remote-pid 4242)))
         cleanup-called started-profile)
     (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
-               (lambda (reason skip-shutdown)
-                 (setq cleanup-called (list reason skip-shutdown))))
+               (lambda (reason cleanup-entry preserve-durable)
+                 (setq cleanup-called
+                       (list reason cleanup-entry preserve-durable))))
+              ((symbol-function 'emacs-jupyter-notebook--entry-profile)
+               (lambda (_entry) '(:profile "p" :host "example.com")))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-build-remote-cleanup)
+               (lambda (&rest _) '("ssh" "cleanup")))
+              ((symbol-function 'emacs-jupyter-notebook--management-launch)
+               (lambda (_token _name _argv success _failure &optional _timeout)
+                 (funcall success "__EJN_CLEANUP_DONE__\n")))
+              ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
+               #'ignore)
               ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
                (lambda (profile &optional _callback _error-callback)
                  (setq started-profile profile))))
       (with-temp-buffer
         (setq emacs-jupyter-notebook--session-entry entry)
         (emacs-jupyter-notebook-retry-fresh-kernel)
-        (should (equal cleanup-called (list "Retrying with fresh kernel" entry)))
+        (should (equal cleanup-called
+                       (list "Retrying with fresh kernel" entry t)))
         (should (equal started-profile "p"))))))
+
+(ert-deftest ejn-retry-fresh-kernel-refuses-provisional-entry-without-pid ()
+  "Fresh retry cannot erase an admitted launch before PID promotion."
+  (let* ((directory (make-temp-file "ejn-retry-provisional-" t))
+         (emacs-jupyter-notebook-registry-file
+          (expand-file-name "registry.eld" directory))
+         (entry (ejn-test-direct-entry
+                 '(:profile "p" :session-id "provisional-retry"
+                   :remote-pid nil :provisional t)))
+         cleaned started)
+    (unwind-protect
+        (progn
+          (emacs-jupyter-notebook-registry-save-entry entry)
+          (with-temp-buffer
+            (setq emacs-jupyter-notebook--async-context
+                  (emacs-jupyter-notebook--async-new-context
+                   :phase 'launch :entry entry :origin-buffer (current-buffer)))
+            (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
+                       (lambda (&rest _) (setq cleaned t)))
+                      ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
+                       (lambda (&rest _) (setq started t))))
+              (should-error (emacs-jupyter-notebook-retry-fresh-kernel)
+                            :type 'user-error)
+              (should-not cleaned)
+              (should-not started)
+              (should (equal (plist-get emacs-jupyter-notebook--async-context :entry)
+                             entry))))
+          (should (equal (emacs-jupyter-notebook-registry-load) (list entry))))
+      (delete-directory directory t))))
+
+(ert-deftest ejn-retry-fresh-kernel-cleanup-failure-retains-entry-and-does-not-start ()
+  "Ambiguous external cleanup restores recovery state and launches nothing."
+  (let ((entry (ejn-test-direct-entry
+                '(:profile "p" :session-id "failed-retry" :remote-pid 4242)))
+        cleaned removed started)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
+               (lambda (&rest _) (setq cleaned t)))
+              ((symbol-function 'emacs-jupyter-notebook--entry-profile)
+               (lambda (_entry) '(:profile "p" :host "example.com")))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-build-remote-cleanup)
+               (lambda (&rest _) '("ssh" "cleanup")))
+              ((symbol-function 'emacs-jupyter-notebook--management-launch)
+               (lambda (_token _name _argv _success failure &optional _timeout)
+                 (funcall failure 'timeout "network unavailable")))
+              ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
+               (lambda (&rest _) t))
+              ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
+               (lambda (&rest _) (setq removed t)))
+              ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
+               (lambda (&rest _) (setq started t)))
+              ((symbol-function 'display-warning) #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook--log-append) #'ignore))
+      (with-temp-buffer
+        (setq emacs-jupyter-notebook--session-entry entry)
+        (emacs-jupyter-notebook-retry-fresh-kernel)
+        (should cleaned)
+        (should-not removed)
+        (should-not started)
+        (should emacs-jupyter-notebook--tunnel-dead)
+        (should (equal emacs-jupyter-notebook--session-entry entry))))))
+
+(ert-deftest ejn-retry-fresh-kernel-public-cancel-restores-durable-entry ()
+  "Cancelling the real bounded cleanup child retains old recovery authority."
+  (let* ((directory (make-temp-file "ejn-retry-cancel-" t))
+         (emacs-jupyter-notebook-registry-file
+          (expand-file-name "registry.eld" directory))
+         (entry (ejn-test-direct-entry
+                 '(:profile "p" :session-id "cancel-retry" :remote-pid 4242)))
+         process started)
+    (unwind-protect
+        (progn
+          (emacs-jupyter-notebook-registry-save-entry entry)
+          (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
+                     (lambda (&rest _)
+                       (setq emacs-jupyter-notebook--session-entry nil)))
+                    ((symbol-function 'emacs-jupyter-notebook--entry-profile)
+                     (lambda (_entry) '(:profile "p" :host "example.com")))
+                    ((symbol-function 'emacs-jupyter-notebook-ssh-build-remote-cleanup)
+                     (lambda (&rest _) '("sh" "-c" "sleep 30")))
+                    ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
+                     (lambda (&rest _) (setq started t)))
+                    ((symbol-function 'display-warning) #'ignore)
+                    ((symbol-function 'emacs-jupyter-notebook--log-append) #'ignore))
+            (with-temp-buffer
+              (setq emacs-jupyter-notebook--session-entry entry)
+              (emacs-jupyter-notebook-retry-fresh-kernel)
+              (setq process
+                    (plist-get emacs-jupyter-notebook--management-operation :process))
+              (should (process-live-p process))
+              (emacs-jupyter-notebook-cancel-operation)
+              (should-not (process-live-p process))
+              (should-not (emacs-jupyter-notebook--management-active-p))
+              (should (equal emacs-jupyter-notebook--session-entry entry))
+              (should emacs-jupyter-notebook--tunnel-dead)
+              (should-not emacs-jupyter-notebook--reconnect-timer)
+              (should-not emacs-jupyter-notebook--reconnect-schedule-token)
+              (should-not started)))
+          (should (equal (emacs-jupyter-notebook-registry-load) (list entry))))
+      (when (process-live-p process) (delete-process process))
+      (delete-directory directory t))))
+
+(ert-deftest ejn-retry-fresh-kernel-exclusively-gates-buffer-work ()
+  "Start, reconnect, eval, lifecycle, and a second retry cannot cross cleanup."
+  (let ((entry (ejn-test-direct-entry
+                '(:profile "p" :session-id "owned-retry" :remote-pid 4242)))
+        cleanup-failure)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
+               #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook--entry-profile)
+               (lambda (_entry) '(:profile "p" :host "example.com")))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-build-remote-cleanup)
+               (lambda (&rest _) '("ssh" "cleanup")))
+              ((symbol-function 'emacs-jupyter-notebook--management-launch)
+               (lambda (_token _name _argv _success failure &optional _timeout)
+                 (setq cleanup-failure failure)))
+              ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
+               (lambda (&rest _) t))
+              ((symbol-function 'display-warning) #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook--log-append) #'ignore))
+      (with-temp-buffer
+        (setq buffer-file-name "/tmp/ejn-retry-owned.py"
+              emacs-jupyter-notebook--session-entry entry)
+        (emacs-jupyter-notebook-retry-fresh-kernel)
+        (should (emacs-jupyter-notebook--replacement-active-p))
+        (should-error (emacs-jupyter-notebook-start-remote-kernel "p")
+                      :type 'user-error)
+        (should-error (emacs-jupyter-notebook-reconnect-remote-kernel entry)
+                      :type 'user-error)
+        (should-error (emacs-jupyter-notebook--evaluate-code "1" nil)
+                      :type 'user-error)
+        (should-error (emacs-jupyter-notebook-restart-kernel)
+                      :type 'user-error)
+        (should-error (emacs-jupyter-notebook-shutdown-kernel)
+                      :type 'user-error)
+        (should-error (emacs-jupyter-notebook-retry-fresh-kernel)
+                      :type 'user-error)
+        (should cleanup-failure)
+        (funcall cleanup-failure 'cancelled "cancelled by test")
+        (should-not (emacs-jupyter-notebook--replacement-active-p))
+        (should (equal emacs-jupyter-notebook--session-entry entry))))))
+
+(ert-deftest ejn-retry-fresh-kernel-stale-callbacks-cannot-clobber-new-owner ()
+  "Late success and failure callbacks require the exact replacement token/entry."
+  (let* ((entry (ejn-test-direct-entry
+                 '(:profile "p" :session-id "stale-retry" :remote-pid 4242)))
+         (new-entry (ejn-test-direct-entry
+                     '(:profile "p" :session-id "new-owner" :remote-pid 4343)))
+         success failure started removed)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
+               #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook--entry-profile)
+               (lambda (_entry) '(:profile "p" :host "example.com")))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-build-remote-cleanup)
+               (lambda (&rest _) '("ssh" "cleanup")))
+              ((symbol-function 'emacs-jupyter-notebook--management-launch)
+               (lambda (_token _name _argv ok bad &optional _timeout)
+                 (setq success ok failure bad)))
+              ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
+               (lambda (&rest _) (setq removed t)))
+              ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
+               (lambda (&rest _) t))
+              ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
+               (lambda (&rest _) (setq started t)))
+              ((symbol-function 'display-warning) #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook--log-append) #'ignore))
+      (with-temp-buffer
+        (setq emacs-jupyter-notebook--session-entry entry)
+        (emacs-jupyter-notebook-retry-fresh-kernel)
+        (let ((old-token
+               (plist-get emacs-jupyter-notebook--management-operation :token))
+              (new-token (gensym "new-retry-")))
+          (emacs-jupyter-notebook--management-finish old-token)
+          (setq emacs-jupyter-notebook--management-operation
+                (list :token new-token :kind 'retry-fresh :entry new-entry)
+                emacs-jupyter-notebook--session-entry new-entry)
+          (funcall success "__EJN_CLEANUP_DONE__\n")
+          (funcall failure 'timeout "late failure")
+          (should-not removed)
+          (should-not started)
+          (should (equal emacs-jupyter-notebook--session-entry new-entry))
+          (should (emacs-jupyter-notebook--replacement-active-p
+                   new-token new-entry)))))))
+
+(ert-deftest ejn-retry-fresh-kernel-start-failure-never-resurrects-dead-entry ()
+  "Once exact cleanup commits, replacement construction cannot restore ENTRY."
+  (let ((entry (ejn-test-direct-entry
+                '(:profile "p" :session-id "dead-old" :remote-pid 4242)))
+        removed retained)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
+               #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook--entry-profile)
+               (lambda (_entry) '(:profile "p" :host "example.com")))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-build-remote-cleanup)
+               (lambda (&rest _) '("ssh" "cleanup")))
+              ((symbol-function 'emacs-jupyter-notebook--management-launch)
+               (lambda (_token _name _argv success _failure &optional _timeout)
+                 (funcall success "__EJN_CLEANUP_DONE__\n")))
+              ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
+               (lambda (&rest _) (setq removed t)))
+              ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
+               (lambda (&rest _) (setq retained t)))
+              ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
+               (lambda (&rest _) (error "replacement construction failed")))
+              ((symbol-function 'display-warning) #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook--log-append) #'ignore))
+      (with-temp-buffer
+        (setq emacs-jupyter-notebook--session-entry entry)
+        (emacs-jupyter-notebook-retry-fresh-kernel)
+        (should removed)
+        (should-not retained)
+        (should-not emacs-jupyter-notebook--session-entry)
+        (should-not (emacs-jupyter-notebook--replacement-active-p))))))
+
+(ert-deftest ejn-retry-fresh-kernel-registry-retirement-failure-starts-nothing ()
+  "Confirmed remote death remains retryable when durable retirement fails."
+  (let ((entry (ejn-test-direct-entry
+                '(:profile "p" :session-id "retire-failed" :remote-pid 4242)))
+        retained started)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
+               #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook--entry-profile)
+               (lambda (_entry) '(:profile "p" :host "example.com")))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-build-remote-cleanup)
+               (lambda (&rest _) '("ssh" "cleanup")))
+              ((symbol-function 'emacs-jupyter-notebook--management-launch)
+               (lambda (_token _name _argv success _failure &optional _timeout)
+                 (funcall success "__EJN_CLEANUP_DONE__\n")))
+              ((symbol-function 'emacs-jupyter-notebook-registry-remove-entry)
+               (lambda (&rest _) (error "registry read-only")))
+              ((symbol-function 'emacs-jupyter-notebook-registry-save-entry)
+               (lambda (&rest _) (setq retained t)))
+              ((symbol-function 'emacs-jupyter-notebook-start-remote-kernel)
+               (lambda (&rest _) (setq started t)))
+              ((symbol-function 'display-warning) #'ignore)
+              ((symbol-function 'emacs-jupyter-notebook--log-append) #'ignore))
+      (with-temp-buffer
+        (setq emacs-jupyter-notebook--session-entry entry)
+        (emacs-jupyter-notebook-retry-fresh-kernel)
+        (should retained)
+        (should-not started)
+        (should emacs-jupyter-notebook--tunnel-dead)
+        (should (equal emacs-jupyter-notebook--session-entry entry))
+        (should-not (emacs-jupyter-notebook--replacement-active-p))))))
+
+(ert-deftest ejn-retry-fresh-kernel-reserves-management-before-local-retirement ()
+  "An existing management owner or argv error leaves local state untouched."
+  (let ((entry (ejn-test-direct-entry
+                '(:profile "p" :session-id "reserve-first" :remote-pid 4242)))
+        cleaned)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
+               (lambda (&rest _) (setq cleaned t)))
+              ((symbol-function 'emacs-jupyter-notebook--entry-profile)
+               (lambda (_entry) '(:profile "p" :host "example.com")))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-build-remote-cleanup)
+               (lambda (&rest _) '("ssh" "cleanup"))))
+      (with-temp-buffer
+        (setq emacs-jupyter-notebook--session-entry entry
+              emacs-jupyter-notebook--management-operation
+              (list :token (gensym "other-management-") :label "other"))
+        (should-error (emacs-jupyter-notebook-retry-fresh-kernel)
+                      :type 'user-error)
+        (should-not cleaned)
+        (should (equal emacs-jupyter-notebook--session-entry entry))))
+    (setq cleaned nil)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--cleanup-current-state)
+               (lambda (&rest _) (setq cleaned t)))
+              ((symbol-function 'emacs-jupyter-notebook--entry-profile)
+               (lambda (_entry) '(:profile "p" :host "example.com")))
+              ((symbol-function 'emacs-jupyter-notebook-ssh-build-remote-cleanup)
+               (lambda (&rest _) (error "invalid cleanup argv"))))
+      (with-temp-buffer
+        (setq emacs-jupyter-notebook--session-entry entry)
+        (should-error (emacs-jupyter-notebook-retry-fresh-kernel))
+        (should-not cleaned)
+        (should (equal emacs-jupyter-notebook--session-entry entry))))))
 
 (ert-deftest ejn-retry-fresh-kernel-uses-async-context-profile ()
   (let (started-profile)
@@ -8709,9 +9219,9 @@ wiring.  Skipped when no local python3 is available in this environment."
 A dead PID on a host that ANSWERED is pruned; an unreachable host's
 entries (UNKNOWN) are kept — an unreachable host must never cause a false
 prune."
-  (let* ((live   (ejn-w11--entry "live"    "100" "up.example"))
-         (dead   (ejn-w11--entry "dead"    "200" "up.example"))
-         (ghost  (ejn-w11--entry "ghost"   "300" "down.example"))
+  (let* ((live   (ejn-w11--entry "live"    100 "up.example"))
+         (dead   (ejn-w11--entry "dead"    200 "up.example"))
+         (ghost  (ejn-w11--entry "ghost"   300 "down.example"))
          (nopid  (list :profile "p" :session-id "nopid" :remote-host "up.example"))
          (entries (list live dead ghost nopid))
          (saved nil)
@@ -8724,7 +9234,10 @@ prune."
                       (list :answered t
                             :alive (cl-remove-if-not
                                     (lambda (p) (equal (format "%s" p) "100"))
-                                    pids)))
+                                    pids)
+                            :dead (cl-remove-if-not
+                                   (lambda (p) (equal (format "%s" p) "200"))
+                                   pids)))
                      (t (list :answered nil :alive nil)))))))
     (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
                (lambda (&optional _file) entries))
@@ -8744,10 +9257,149 @@ prune."
         (should (member nopid saved))
         (should-not (member dead saved))))))
 
+(ert-deftest ejn-w11-prune-answered-omission-remains-unknown ()
+  "An answered probe may prune only PIDs carrying an explicit dead record."
+  (let* ((entry (ejn-w11--entry "ambiguous" "200" "up.example"))
+         (classification
+          (emacs-jupyter-notebook--classify-registry-liveness
+           (list entry)
+           (lambda (_profile _pids)
+             (list :answered t :alive nil :dead nil)))))
+    (should (eq (emacs-jupyter-notebook--liveness-status entry classification)
+                'unknown))))
+
+(ert-deftest ejn-w11-prune-malformed-pid-never-reaches-shell ()
+  "Malformed durable PIDs remain unknown without constructing a probe."
+  (let* ((entry (ejn-w11--entry "malformed" "-1" "up.example"))
+         called
+         (classification
+          (emacs-jupyter-notebook--classify-registry-liveness
+           (list entry)
+           (lambda (&rest _)
+             (setq called t)
+             (list :answered t :dead '("-1"))))))
+    (should-not called)
+    (should (eq (emacs-jupyter-notebook--liveness-status entry classification)
+                'unknown))))
+
+(ert-deftest ejn-w11-prune-separates-distinct-ssh-routes ()
+  "Profiles sharing a destination but not a port are probed independently."
+  (let* ((emacs-jupyter-notebook-remote-profiles
+          '(("p1" :host "same.example" :port 22)
+            ("p2" :host "same.example" :port 2222)))
+         (first (plist-put (ejn-w11--entry "first" 101 "same.example")
+                           :profile "p1"))
+         (second (plist-put (ejn-w11--entry "second" 202 "same.example")
+                            :profile "p2"))
+         calls
+         (classification
+          (emacs-jupyter-notebook--classify-registry-liveness
+           (list first second)
+           (lambda (profile pids)
+             (push (list (plist-get profile :port) pids) calls)
+             (list :answered t :alive pids :dead nil)))))
+    (should (= (length calls) 2))
+    (should (member '(22 (101)) calls))
+    (should (member '(2222 (202)) calls))
+    (should (eq (emacs-jupyter-notebook--liveness-status first classification)
+                'alive))
+    (should (eq (emacs-jupyter-notebook--liveness-status second classification)
+                'alive))))
+
+(ert-deftest ejn-w11-batch-pid-parser-is-exact-and-fail-closed ()
+  "Only one final terminal and one in-set record per PID form an answer."
+  (let ((valid
+         (emacs-jupyter-notebook--parse-batch-pid-liveness
+          (concat "banner\n__EJN_ALIVE__:11\n__EJN_DEAD__:22\n"
+                  "__EJN_UNKNOWN__:33\n__EJN_DONE__\n")
+          '(11 22 33))))
+    (should (plist-get valid :answered))
+    (should (equal (plist-get valid :alive) '("11")))
+    (should (equal (plist-get valid :dead) '("22"))))
+  (dolist (output
+           '(("__EJN_DEAD__:11\n__EJN_DONE__\n__EJN_DONE__\n" (11))
+             ("__EJN_DEAD__:11\n__EJN_DEAD__:11\n__EJN_DONE__\n" (11))
+             ("__EJN_DEAD__:11\n__EJN_DEAD__:99\n__EJN_DONE__\n" (11))
+             ("__EJN_DEAD__:11\n__EJN_BROKEN__:22\n__EJN_DONE__\n" (11 22))
+             ("__EJN_DEAD__:11\n__EJN_DONE__\ntrailing noise\n" (11))
+             ("__EJN_DEAD__:11\n__EJN_DONE__\n" (11 22))))
+    (should-not
+     (plist-get
+      (emacs-jupyter-notebook--parse-batch-pid-liveness
+       (car output) (cadr output))
+      :answered))))
+
+(ert-deftest ejn-w11-async-prune-parser-requires-consistent-explicit-records ()
+  "Async batch parsing preserves missing and contradictory PIDs as unknown."
+  (let* ((alive (ejn-w11--entry "alive" 11 "up.example"))
+         (dead (ejn-w11--entry "dead" 22 "up.example"))
+         (missing (ejn-w11--entry "missing" 33 "up.example"))
+         (entries (list alive dead missing))
+         classification reason token)
+    (with-temp-buffer
+      (setq token (emacs-jupyter-notebook--management-begin "test liveness"))
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'emacs-jupyter-notebook--entry-profile)
+                (lambda (_entry) '(:profile "p" :host "up.example")))
+               ((symbol-function
+                 'emacs-jupyter-notebook-ssh-build-batch-pid-alive)
+                (lambda (&rest _) '("ssh" "probe")))
+               ((symbol-function 'emacs-jupyter-notebook--management-launch)
+                (lambda (_token _name _argv success _failure &optional _timeout)
+                  (funcall
+                   success
+                   (concat "__EJN_ALIVE__:11\n"
+                           "__EJN_DEAD__:22\n"
+                           "__EJN_UNKNOWN__:33\n"
+                           "__EJN_DONE__\n")))))
+            (emacs-jupyter-notebook--classify-registry-liveness-async
+             entries token
+             (lambda (result terminal-reason)
+               (setq classification result reason terminal-reason))))
+        (emacs-jupyter-notebook--management-finish token)))
+    (should-not reason)
+    (should (eq (emacs-jupyter-notebook--liveness-status alive classification)
+                'alive))
+    (should (eq (emacs-jupyter-notebook--liveness-status dead classification)
+                'dead))
+    (should (eq (emacs-jupyter-notebook--liveness-status missing classification)
+                'unknown))))
+
+(ert-deftest ejn-w11-async-prune-parser-invalidates-whole-malformed-host ()
+  "Duplicate terminal output prevents every entry on the route from pruning."
+  (let* ((first (ejn-w11--entry "first" 11 "up.example"))
+         (second (ejn-w11--entry "second" 22 "up.example"))
+         classification token)
+    (with-temp-buffer
+      (setq token (emacs-jupyter-notebook--management-begin "test liveness"))
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'emacs-jupyter-notebook--entry-profile)
+                (lambda (_entry) '(:profile "p" :host "up.example")))
+               ((symbol-function
+                 'emacs-jupyter-notebook-ssh-build-batch-pid-alive)
+                (lambda (&rest _) '("ssh" "probe")))
+               ((symbol-function 'emacs-jupyter-notebook--management-launch)
+                (lambda (_token _name _argv success _failure &optional _timeout)
+                  (funcall
+                   success
+                   (concat "__EJN_ALIVE__:11\n"
+                           "__EJN_DEAD__:22\n"
+                           "__EJN_DONE__\n__EJN_DONE__\n")))))
+            (emacs-jupyter-notebook--classify-registry-liveness-async
+             (list first second) token
+             (lambda (result _reason) (setq classification result))))
+        (emacs-jupyter-notebook--management-finish token)))
+    (should (eq (emacs-jupyter-notebook--liveness-status first classification)
+                'unknown))
+    (should (eq (emacs-jupyter-notebook--liveness-status second classification)
+                'unknown))))
+
 (ert-deftest ejn-w11-prune-unreachable-host-keeps-entries ()
   "W11: when every host is unreachable, nothing is pruned and no save runs."
-  (let* ((a (ejn-w11--entry "a" "10" "down.example"))
-         (b (ejn-w11--entry "b" "20" "down.example"))
+  (let* ((a (ejn-w11--entry "a" 10 "down.example"))
+         (b (ejn-w11--entry "b" 20 "down.example"))
          (entries (list a b))
          (save-called nil)
          (probe (lambda (_profile _pids) (list :answered nil :alive nil))))
@@ -8763,8 +9415,8 @@ prune."
 
 (ert-deftest ejn-w11-prune-dead-kernels-messages-summary ()
   "W11: the command prunes and reports pruned/live counts."
-  (let* ((live (ejn-w11--entry "live" "100" "up.example"))
-         (dead (ejn-w11--entry "dead" "200" "up.example"))
+  (let* ((live (ejn-w11--entry "live" 100 "up.example"))
+         (dead (ejn-w11--entry "dead" 200 "up.example"))
          (entries (list live dead))
          (msg nil))
     (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-load)
@@ -8796,8 +9448,8 @@ prune."
 (ert-deftest ejn-w11-picker-excludes-dead-entries ()
   "W11: the reconnect picker drops confirmed-dead entries and only offers
 alive/unknown ones; the dead ghost is removed from the registry too."
-  (let* ((live  (ejn-w11--entry "live"  "100" "up.example"))
-         (dead  (ejn-w11--entry "dead"  "200" "up.example"))
+  (let* ((live  (ejn-w11--entry "live"  100 "up.example"))
+         (dead  (ejn-w11--entry "dead"  200 "up.example"))
          (entries (list live dead))
          (saved nil)
          (offered nil)

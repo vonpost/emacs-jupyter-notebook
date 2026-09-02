@@ -77,3 +77,6 @@ if [[ -d "$ROOT/helper/tests" ]]; then
     PYTHONPYCACHEPREFIX="$RUN_PYCACHE" \
     "$PYTHON" -m unittest discover -s "$ROOT/helper/tests" -p 'test_*.py'
 fi
+
+run_with_deadline env TMPDIR="$RUN_TMPDIR" PYTHONPYCACHEPREFIX="$RUN_PYCACHE" \
+  "$PYTHON" "$ROOT/tests/stress/test_run_ag3.py"
