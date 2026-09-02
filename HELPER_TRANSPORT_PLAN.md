@@ -1563,7 +1563,7 @@ be manager-reviewed for durable-kernel rules.
     Evil warnings.  Final process, temporary-root, artifact, and generated
     bytecode audits were empty.
 
-- [~] owner=root claimed=2026-09-02 **AG4 Switch default to helper and complete real Doom dogfood.**
+- [~] owner=root claimed=2026-09-02 landed=6a6c166 **AG4 Switch default to helper and complete real Doom dogfood.**
   - Depends: AG3.
   - Files: default/docs plus optional Doom E2E tests; no user dotfiles committed.
   - Deliverable: helper becomes default, old adapter remains explicit fallback
@@ -1574,6 +1574,16 @@ be manager-reviewed for durable-kernel rules.
   - Gate: record commands, helper/kernel/tunnel PIDs, observed recovery times,
     and any manual-only gaps in a dated `docs/dogfood/` report.  Remote cleanup
     happens only through explicit test-owned shutdown.
+  - Evidence: `docs/dogfood/2026-09-02-ag4.md` records the isolated Doom gate.
+    Buffer reconnect, forced helper death, and forced tunnel death each rebuilt
+    fresh local transport while preserving a randomized value in the same
+    remote PID/session; recovery took 0.512 s, 1.158 s, and 1.027 s.  Explicit
+    shutdown was independently verified by exact PID and session-file checks.
+    Canonical source tests passed 818/818 plus 218/218 helper tests, and the
+    five-repeat AG3 stress gate passed 65/65 executions after the default flip.
+    The row remains partial pending the report's hours-long wifi, sleep/resume,
+    busy-cell, graphical image-cache, real-profile migration, and week-long
+    normal-use gaps.
 
 - [ ] **AG5 Remove emacs-jupyter transport and close W20.**
   - Depends: AG4 plus at least one week of normal helper-default use with no
