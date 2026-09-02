@@ -10,6 +10,45 @@ The source file stays an ordinary Python file. Your normal Emacs, Git, LSP, lint
 
 The kernel can live on another machine. Emacs starts or reconnects to it through external `ssh`/`scp` commands and local port forwards. It does not use TRAMP, and the kernel does not die just because Emacs exits.
 
+## Doom Emacs Installation
+
+Add the package and its bundled runtime sources to `packages.el`:
+
+```elisp
+(package! code-cells)
+(package! emacs-jupyter-notebook
+  :recipe (:host github
+           :repo "vonpost/emacs-jupyter-notebook"
+           :files ("*.el" "viewer" "helper" "registry_worker"
+                   "flake.nix" "flake.lock")))
+```
+
+Then configure and enable it from `config.el`:
+
+```elisp
+(use-package! emacs-jupyter-notebook
+  :hook (python-mode . emacs-jupyter-notebook-mode)
+  :init
+  (setq emacs-jupyter-notebook-default-profile "workstation"
+        emacs-jupyter-notebook-remote-profiles
+        '(("workstation"
+           :host "user@example.org"
+           :remote-cwd "~/project"
+           :kernelspec "python3"))))
+```
+
+Run `doom sync` after changing `packages.el`.  There is no separate helper
+installation step.  On the first start, reconnect, or send that needs the
+local runtime, EJN finds Nix and builds the repository's pinned `.#default`
+closure in a background process.  The mode line shows `EJN…build`; `C-c j x`
+cancels the caller.  Multiple EJN buffers share one build.
+
+The flake supports `x86_64-linux` and `aarch64-darwin`.  GUI Emacs does not
+always inherit the login shell's PATH on macOS, so EJN also checks the standard
+Nix profile and Homebrew locations directly.  A first build may download
+substitutes, but Emacs remains responsive and subsequent builds reuse the Nix
+store.
+
 ## Basic Use
 
 Write Python cells with `# %%` markers:
@@ -84,23 +123,17 @@ protocol-mode command can be configured before loading the package:
 
 The helper is local only; it does not install anything on a remote host or
 change the remote kernel.  Its executable is resolved independently of
-`default-directory`, first through `exec-path` and then from the package
-checkout/build layout.  A missing executable is reported before a remote
-launch.  The bounded hello handshake rejects missing Python dependencies,
-malformed responses, and protocol-version mismatches without attempting a
-package installation or download.
+`default-directory`, first through `exec-path`, the most recently built Nix
+store closure, and then the package checkout/build layout.  When either bundled
+executable is missing, EJN asynchronously runs a single bounded
+`nix build --no-link --print-out-paths .#default` from the physical package
+source.  It resumes the original command only after both executables resolve.
+Build failure, excessive output, and timeout release every waiter so the next
+invocation can retry instead of remaining wedged.
 
-From a checkout with the repository's pinned Nix flake, build the closure and
-check the packaged executable explicitly:
-
-```sh
-nix build .#ejn-helper
-./result/bin/ejn-helper --version
-```
-
-The default bare command finds `result/bin/ejn-helper` beside the package
-source.  An absolute checkout path is also valid and remains independent of a
-source buffer's `default-directory`:
+Custom commands remain valid and are never silently replaced or built.  An
+absolute checkout path remains independent of a source buffer's
+`default-directory`:
 
 ```elisp
 (setq emacs-jupyter-notebook-helper-command
@@ -115,11 +148,11 @@ An absolute Nix store closure path is valid as well:
       '("/nix/store/...-ejn-helper-0.1.0/bin/ejn-helper" "--protocol"))
 ```
 
-The flake supports only `x86_64-linux` and `aarch64-darwin`.  For a local
-development checkout, `nix develop` supplies the declared dependencies, but
-ordinary EJN operation executes only the configured helper and registry-worker
-commands.  It never performs an implicit `nix build`, `nix run`, `pip install`,
-network download, remote provisioning, or compatibility transport.
+Set `emacs-jupyter-notebook-auto-build-runtime` to nil to disable automatic
+Nix builds.  `emacs-jupyter-notebook-runtime-build-timeout` (600 seconds by
+default) and `emacs-jupyter-notebook-runtime-build-output-max-bytes` bound the
+local child.  EJN never runs `pip install`, provisions the remote host, or
+falls back to a compatibility transport.
 
 ### ProxyJump / ssh config
 

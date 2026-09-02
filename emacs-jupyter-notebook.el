@@ -29,6 +29,7 @@
 (require 'emacs-jupyter-notebook-backend)
 (require 'emacs-jupyter-notebook-helper-backend)
 (require 'emacs-jupyter-notebook-helper-protocol)
+(require 'emacs-jupyter-notebook-runtime)
 (require 'emacs-jupyter-notebook-viewer)
 
 ;;; W8 — local interactive matplotlib viewer: remote formatter injection
@@ -141,6 +142,37 @@ any pre-existing `_repr_mimebundle_', and a graceful no-op when
   "Validate the local helper before admitting a remote launch."
   (emacs-jupyter-notebook-backend-ensure)
   (emacs-jupyter-notebook-helper-backend-ensure))
+
+(defun emacs-jupyter-notebook--runtime-command-buildable-p (command default-name)
+  "Return non-nil when missing COMMAND may be supplied as DEFAULT-NAME."
+  (and (listp command) (stringp (car command))
+       (cl-every #'stringp command)
+       (equal (car command) default-name)))
+
+(defun emacs-jupyter-notebook--runtime-probe ()
+  "Return readiness and auto-build eligibility for both local executables."
+  (let (helper-error registry-error)
+    (condition-case err
+        (emacs-jupyter-notebook-helper-resolve-argv)
+      (error (setq helper-error (error-message-string err))))
+    (condition-case err
+        (emacs-jupyter-notebook-registry-worker-resolve-argv)
+      (error (setq registry-error (error-message-string err))))
+    (list
+     :ready (not (or helper-error registry-error))
+     :buildable
+     (and (or (not helper-error)
+              (emacs-jupyter-notebook--runtime-command-buildable-p
+               emacs-jupyter-notebook-helper-command "ejn-helper"))
+          (or (not registry-error)
+              (emacs-jupyter-notebook--runtime-command-buildable-p
+               emacs-jupyter-notebook-registry-worker-command
+               "ejn-registry-worker")))
+     :reason (or helper-error registry-error))))
+
+(defun emacs-jupyter-notebook--runtime-ready-p ()
+  "Return non-nil when both required local runtime commands resolve."
+  (plist-get (emacs-jupyter-notebook--runtime-probe) :ready))
 
 (defun emacs-jupyter-notebook--backend-transport-failed (session reason)
   "Atomically retire local SESSION after helper/protocol transport failure."
@@ -896,7 +928,7 @@ Returns nil when no context exists or the context is at terminal phase
 \\='done or \\='error."
   (let* ((ctx emacs-jupyter-notebook--async-context)
          (phase (and ctx (plist-get ctx :phase))))
-    (and (memq phase '(launch probe retrieve tunnel connect)) phase)))
+    (and (memq phase '(runtime-build launch probe retrieve tunnel connect)) phase)))
 
 (defun emacs-jupyter-notebook--mode-line-string ()
   "Return the mode-line lighter string for the W6.2 state machine.
@@ -916,6 +948,7 @@ Precedence (highest first):
      (emacs-jupyter-notebook--tunnel-dead " EJN!")
      ((emacs-jupyter-notebook--management-active-p) " EJN…manage")
      (emacs-jupyter-notebook--async-last-error " EJN✗")
+     ((eq phase 'runtime-build) " EJN…build")
      ((eq phase 'launch)    " EJN…launch")
      ((eq phase 'probe)     " EJN…probe")
      ((eq phase 'retrieve)  " EJN…retrieve")
@@ -1141,6 +1174,9 @@ caller may have already promoted it into the registry entry as the offline
 reconnect key).  Each disposer is independently best-effort: a raise from one
   disposer does not prevent the remaining disposers from running."
   (when context
+    (ignore-errors
+      (when-let ((waiter (plist-get context :runtime-waiter)))
+        (emacs-jupyter-notebook-runtime-cancel-waiter waiter)))
     (ignore-errors
       (when-let ((owner (plist-get context :registry-owner)))
         (emacs-jupyter-notebook-registry-owner-cancel owner)))
@@ -2835,6 +2871,7 @@ attempt.  Only the exact non-nil generation installed by
                        :restart-upload-process nil
                        :restart-publish-process nil
                        :restart-local-file nil
+                       :runtime-waiter nil
                        :registry-owner nil
                        :registry-operation nil
                        :timer nil
@@ -2920,6 +2957,82 @@ W4.4 PID-probe sentinel already performs."
          (with-current-buffer buffer
            (and (eq emacs-jupyter-notebook--async-context context)
                 (emacs-jupyter-notebook--async-in-progress-p))))))
+
+(defun emacs-jupyter-notebook--runtime-build-handoff (context)
+  "Retire bootstrap CONTEXT and run its queued continuations exactly once."
+  (when (emacs-jupyter-notebook--async-context-live-p context)
+    (let ((continuations (plist-get context :runtime-continuations)))
+      (setq context (emacs-jupyter-notebook--async-put
+                     context :runtime-waiter nil))
+      (setq context (emacs-jupyter-notebook--async-put context :phase 'done))
+      (setq emacs-jupyter-notebook--async-context nil)
+      (force-mode-line-update t)
+      (dolist (continuation continuations)
+        (condition-case err
+            (funcall continuation)
+          (error
+           (display-warning
+            'emacs-jupyter-notebook
+            (format "Could not resume after local runtime build: %s"
+                    (error-message-string err)))))))))
+
+(defun emacs-jupyter-notebook--runtime-build-failed (context reason)
+  "Fail live bootstrap CONTEXT with bounded REASON."
+  (when (emacs-jupyter-notebook--async-context-live-p context)
+    (emacs-jupyter-notebook--async-fail context reason)))
+
+(defun emacs-jupyter-notebook--with-runtime-ready (continuation error-callback)
+  "Run CONTINUATION once the local helper runtime is ready.
+While one build already belongs to this buffer, append CONTINUATION and
+ERROR-CALLBACK to that exact context.  Otherwise create a cancellable
+`runtime-build' context whose deadline is owned by the shared runtime manager."
+  (cond
+   ((emacs-jupyter-notebook--runtime-ready-p)
+    (funcall continuation))
+   ((and (emacs-jupyter-notebook--async-in-progress-p)
+         (eq (plist-get emacs-jupyter-notebook--async-context :phase)
+             'runtime-build))
+    (let ((context emacs-jupyter-notebook--async-context))
+      (setq context
+            (emacs-jupyter-notebook--async-put
+             context :runtime-continuations
+             (append (plist-get context :runtime-continuations)
+                     (list continuation))))
+      (when error-callback
+        (emacs-jupyter-notebook--async-add-error-callback
+         context error-callback))
+      context))
+   (t
+    (let* ((buffer (current-buffer))
+           (context
+            (emacs-jupyter-notebook--async-new-context
+             :phase 'runtime-build :origin-buffer buffer
+             :runtime-continuations (list continuation)
+             :error-callback error-callback :owns-kernel nil)))
+      (setq emacs-jupyter-notebook--async-context context)
+      (let ((waiter
+             (emacs-jupyter-notebook-runtime-ensure
+              #'emacs-jupyter-notebook--runtime-probe
+              (lambda ()
+                (when (buffer-live-p buffer)
+                  (with-current-buffer buffer
+                    (emacs-jupyter-notebook--runtime-build-handoff context))))
+              (lambda (reason)
+                (when (buffer-live-p buffer)
+                  (with-current-buffer buffer
+                    (emacs-jupyter-notebook--runtime-build-failed
+                     context reason))))
+              buffer)))
+        ;; A missing Nix or malformed custom command may fail synchronously.
+        ;; Never write its now-dead waiter token back into an error context.
+        (when (and waiter
+                   (emacs-jupyter-notebook--async-context-live-p context))
+          (setq context (emacs-jupyter-notebook--async-put
+                         context :runtime-waiter waiter))
+          (emacs-jupyter-notebook--async-message
+           context "building the bundled local runtime with Nix")))
+      (force-mode-line-update t)
+      context))))
 
 (defun emacs-jupyter-notebook--ensure-no-async-operation (&optional supersede-reconnect)
   "Ensure the current buffer holds no in-flight connection attempt.
@@ -3235,6 +3348,11 @@ underlying stderr matches a known SSH failure pattern."
   (let ((error-data (emacs-jupyter-notebook--enrich-ssh-error error-data)))
     (setq context (emacs-jupyter-notebook--async-put context :phase 'error))
     (setq context (emacs-jupyter-notebook--async-put context :error error-data))
+    (when-let ((waiter (plist-get context :runtime-waiter)))
+      (ignore-errors
+        (emacs-jupyter-notebook-runtime-cancel-waiter waiter))
+      (setq context (emacs-jupyter-notebook--async-put
+                     context :runtime-waiter nil)))
     (when-let ((owner (plist-get context :registry-owner)))
       (ignore-errors
         (emacs-jupyter-notebook-registry-owner-cancel owner)))
@@ -4668,6 +4786,17 @@ this file.  ANNOUNCE-START emits the friendly first-start message at that same
 decision point."
   (emacs-jupyter-notebook--ensure-no-replacement-operation)
   (cond
+   ;; A first-use Nix build is a local prerequisite, not part of the remote
+   ;; connection deadline.  Queue the exact acquisition request and resume it
+   ;; only after both local executables have been resolved.
+   ((and (emacs-jupyter-notebook--async-in-progress-p)
+         (eq (plist-get emacs-jupyter-notebook--async-context :phase)
+             'runtime-build))
+    (emacs-jupyter-notebook--with-runtime-ready
+     (lambda ()
+       (emacs-jupyter-notebook--ensure-client-async
+        callback error-callback start-profile announce-start))
+     error-callback))
    ;; W13-H2: an attempt is already in flight — ATTACH to it and never
    ;; launch a parallel one.  This must precede the `--tunnel-dead' branch:
    ;; a reconnect leaves `--tunnel-dead' t until `--async-connect-finalize',
@@ -4680,6 +4809,12 @@ decision point."
     (when error-callback
       (emacs-jupyter-notebook--async-add-error-callback
        emacs-jupyter-notebook--async-context error-callback)))
+   ((not (emacs-jupyter-notebook--runtime-ready-p))
+    (emacs-jupyter-notebook--with-runtime-ready
+     (lambda ()
+       (emacs-jupyter-notebook--ensure-client-async
+        callback error-callback start-profile announce-start))
+     error-callback))
    ;; A dead tunnel with a durable session entry reconnects it.
    ((and emacs-jupyter-notebook--tunnel-dead
          emacs-jupyter-notebook--session-entry)
@@ -5897,15 +6032,14 @@ buffer had no prior `--session-entry'."
                  "If it is confirmed unavailable, use "
                  "`M-x emacs-jupyter-notebook-retry-fresh-kernel' instead"))))))
 
-;;;###autoload
-(defun emacs-jupyter-notebook-start-remote-kernel (profile-name &optional callback error-callback)
-  "Start a detached remote kernel for PROFILE-NAME asynchronously.
+(defun emacs-jupyter-notebook--start-remote-kernel-ready
+    (profile-name &optional callback error-callback)
+  "Start PROFILE-NAME after the complete local runtime has resolved.
 
 The durable registry is read before resolving a kernelspec or starting SSH.
 When the current file already has a durable row, that row is attached locally
 and the start is rejected in favor of reconnect or explicit replacement.
 CALLBACK and ERROR-CALLBACK are optional completion hooks."
-  (interactive (list (emacs-jupyter-notebook--read-profile-name)))
   (unless buffer-file-name
     (user-error "Buffer has no associated file"))
   (when (file-remote-p buffer-file-name)
@@ -5958,6 +6092,26 @@ CALLBACK and ERROR-CALLBACK are optional completion hooks."
         (format "Could not start direct-start registry preflight: %s"
                 (error-message-string err))))))))
 
+;;;###autoload
+(defun emacs-jupyter-notebook-start-remote-kernel
+    (profile-name &optional callback error-callback)
+  "Build the local runtime if needed, then start PROFILE-NAME asynchronously.
+CALLBACK and ERROR-CALLBACK are optional completion hooks.  The first use may
+start one shared, cancellable Nix build before the remote connection deadline."
+  (interactive (list (emacs-jupyter-notebook--read-profile-name)))
+  (unless buffer-file-name
+    (user-error "Buffer has no associated file"))
+  (when (file-remote-p buffer-file-name)
+    (user-error "Remote source buffers are unsupported; visit a local source file"))
+  (emacs-jupyter-notebook--ensure-no-async-operation)
+  (when (emacs-jupyter-notebook--active-session-p)
+    (user-error "A kernel is already active; shut it down or retry fresh first"))
+  (emacs-jupyter-notebook--with-runtime-ready
+   (lambda ()
+     (emacs-jupyter-notebook--start-remote-kernel-ready
+      profile-name callback error-callback))
+   error-callback))
+
 (defun emacs-jupyter-notebook--reconnect-selected-entry
     (entry callback error-callback interactivep &optional owner)
   "Reconnect to ENTRY after an asynchronous picker has selected it.
@@ -5983,24 +6137,35 @@ OWNER identifies an `explicit', `evaluation', or `automatic' initiator."
          (emacs-jupyter-notebook-retry-fresh-kernel profile-name)))
      (or owner 'explicit))))
 
+(defun emacs-jupyter-notebook--reconnect-remote-kernel-ready
+    (entry callback error-callback owner interactivep)
+  "Reconnect to ENTRY after local runtime readiness is established.
+INTERACTIVEP preserves whether the originating public command was interactive."
+  (if entry
+      (emacs-jupyter-notebook--reconnect-selected-entry
+       entry callback error-callback interactivep (or owner 'explicit))
+    (emacs-jupyter-notebook--read-registry-entry-async
+     (lambda (selected)
+       (emacs-jupyter-notebook--reconnect-selected-entry
+        selected callback error-callback interactivep
+        (or owner 'explicit))))))
+
 ;;;###autoload
 (defun emacs-jupyter-notebook-reconnect-remote-kernel
     (&optional entry callback error-callback owner)
-  "Reconnect current buffer to remote kernel ENTRY asynchronously.
+  "Build the local runtime if needed, then reconnect to remote kernel ENTRY.
 CALLBACK and ERROR-CALLBACK are optional completion hooks.  Interactively,
 probe registered kernels without blocking, then present the reconnect picker.
 OWNER is for internal callers and defaults to `explicit'."
   (interactive)
   (emacs-jupyter-notebook--ensure-no-replacement-operation)
+  (emacs-jupyter-notebook--ensure-no-async-operation t)
   (let ((interactivep (called-interactively-p 'interactive)))
-    (if entry
-        (emacs-jupyter-notebook--reconnect-selected-entry
-         entry callback error-callback interactivep (or owner 'explicit))
-      (emacs-jupyter-notebook--read-registry-entry-async
-       (lambda (selected)
-         (emacs-jupyter-notebook--reconnect-selected-entry
-          selected callback error-callback interactivep
-          (or owner 'explicit)))))))
+    (emacs-jupyter-notebook--with-runtime-ready
+     (lambda ()
+       (emacs-jupyter-notebook--reconnect-remote-kernel-ready
+        entry callback error-callback owner interactivep))
+     error-callback)))
 
 (defun emacs-jupyter-notebook--cold-start-p ()
   "Return non-nil when sending would trigger a cold remote-kernel start.

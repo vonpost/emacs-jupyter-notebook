@@ -178,24 +178,31 @@ fresh, longer transaction budget."
    (t
     (let ((root emacs-jupyter-notebook-registry--module-directory))
       (cl-loop for candidate in
-               (list (expand-file-name (concat "result/bin/" program) root)
-                     (expand-file-name (concat "../result/bin/" program) root)
-                     (expand-file-name (concat "registry_worker/bin/" program) root))
+               (delq nil
+                     (list
+                      (and (stringp emacs-jupyter-notebook--runtime-directory)
+                           (expand-file-name
+                            (concat "bin/" program)
+                            emacs-jupyter-notebook--runtime-directory))
+                      (expand-file-name (concat "result/bin/" program) root)
+                      (expand-file-name (concat "../result/bin/" program) root)
+                      (expand-file-name (concat "registry_worker/bin/" program) root)))
                when (file-executable-p candidate)
                return candidate)))))
 
 (defun emacs-jupyter-notebook-registry-worker-resolve-argv (&optional command)
   "Return executable argv for one local transactional registry worker.
-PATH is preferred, followed by a Nix `result/bin' link and the checkout
-wrapper.  This performs command discovery only, never registry I/O."
+PATH is preferred, followed by the auto-built closure, a Nix `result/bin'
+link, and the checkout wrapper.  This performs command discovery only, never
+registry I/O."
   (let ((argv (or command emacs-jupyter-notebook-registry-worker-command)))
     (unless (and (listp argv) (stringp (car argv))
                  (cl-every #'stringp argv))
       (error "Registry worker command must be a non-empty argv list of strings"))
     (let ((program (emacs-jupyter-notebook-registry--resolve-program (car argv))))
       (unless program
-        (error (concat "Cannot resolve EJN registry worker. Run nix build "
-                       ".#ejn-registry-worker or set "
+        (error (concat "Cannot resolve EJN registry worker. Retry the automatic "
+                       "Nix build or set "
                        "emacs-jupyter-notebook-registry-worker-command.")))
       (cons program (cdr argv)))))
 

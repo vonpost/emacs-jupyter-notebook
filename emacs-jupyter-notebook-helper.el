@@ -70,14 +70,13 @@ It receives the helper SESSION and already-redacted bounded text.")
   "The sole stderr startup code admitted into a user-facing failure reason.")
 
 (defconst emacs-jupyter-notebook-helper--missing-runtime-reason
-  (concat "EJN helper runtime dependencies are unavailable; run "
-          "nix build .#ejn-helper or set emacs-jupyter-notebook-helper-command.")
+  (concat "EJN helper runtime dependencies are unavailable; retry the "
+          "automatic Nix build or set emacs-jupyter-notebook-helper-command.")
   "Fixed actionable failure for the recognized missing-runtime marker.")
 
 (defconst emacs-jupyter-notebook-helper--protocol-mismatch-reason
   (concat "EJN helper protocol version mismatch; rebuild the matching helper "
-          "with nix build .#ejn-helper or update "
-          "emacs-jupyter-notebook-helper-command.")
+          "or update emacs-jupyter-notebook-helper-command.")
   "Fixed failure for a strictly recognized startup protocol mismatch.")
 
 (defconst emacs-jupyter-notebook-helper--missing-runtime-exit-status 78
@@ -144,9 +143,15 @@ resolution, while the fallback candidates below retain their normal names."
    (t
     (let* ((source (emacs-jupyter-notebook-helper--source-directory))
            (candidates
-            (list (expand-file-name (concat "result/bin/" program) source)
-                  (expand-file-name (concat "../result/bin/" program) source)
-                  (expand-file-name (concat "bin/" program) source))))
+            (delq nil
+                  (list
+                   (and (stringp emacs-jupyter-notebook--runtime-directory)
+                        (expand-file-name
+                         (concat "bin/" program)
+                         emacs-jupyter-notebook--runtime-directory))
+                   (expand-file-name (concat "result/bin/" program) source)
+                   (expand-file-name (concat "../result/bin/" program) source)
+                   (expand-file-name (concat "bin/" program) source)))))
       (cl-loop for candidate in candidates
                when (file-executable-p candidate)
                return (file-truename candidate))))))
@@ -161,8 +166,8 @@ empty or the executable cannot be found."
       (error "Helper command must be a non-empty argv list of strings"))
     (let ((program (emacs-jupyter-notebook-helper--resolve-program (car argv))))
       (unless program
-        (error (concat "Cannot resolve EJN helper executable.  Run "
-                       "nix build .#ejn-helper or set "
+        (error (concat "Cannot resolve EJN helper executable.  Retry the "
+                       "automatic Nix build or set "
                        "emacs-jupyter-notebook-helper-command.")))
       (cons program (cdr argv)))))
 

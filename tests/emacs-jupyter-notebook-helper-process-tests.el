@@ -261,10 +261,10 @@
           (emacs-jupyter-notebook-helper-resolve-argv)
           (ert-fail "expected helper resolution failure"))
       (error
-       (should (equal (error-message-string err)
-                      (concat "Cannot resolve EJN helper executable.  Run "
-                              "nix build .#ejn-helper or set "
-                              "emacs-jupyter-notebook-helper-command.")))))))
+        (should (equal (error-message-string err)
+                       (concat "Cannot resolve EJN helper executable.  Retry the "
+                               "automatic Nix build or set "
+                               "emacs-jupyter-notebook-helper-command.")))))))
 
 (ert-deftest ejn-et2-th1-silence-hits-the-hello-deadline ()
   (let ((ejn-et2--hello-timeout 0.12))

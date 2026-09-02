@@ -132,11 +132,37 @@ unchanged.  The default invokes the helper's protocol mode; do not remove
 default.  A bare executable name is resolved through `exec-path' and then
 beside this package's source/build tree, so loading the package through a
 checkout or Nix result symlink does not make the command depend on the
-current default directory.  Resolution never installs packages or downloads
-anything.  The bounded startup handshake rejects a helper with missing
-runtime dependencies or a protocol-version mismatch."
+current default directory.  With the default command, the first runtime-using
+operation may asynchronously build the pinned bundled Nix closure.  The
+bounded startup handshake rejects a helper with missing runtime dependencies
+or a protocol-version mismatch."
   :type '(repeat string)
   :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-auto-build-runtime t
+  "Build the bundled local runtime with Nix when it is first needed.
+When non-nil and the default helper or registry-worker executable is missing,
+the first start, reconnect, or evaluation command runs the repository's pinned
+`nix build .#default' asynchronously.  Concurrent source buffers share that
+one bounded build.  Custom executable names are never replaced or built."
+  :type 'boolean
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-runtime-build-timeout 600
+  "Maximum seconds allowed for the automatic local Nix runtime build.
+Invalid or excessive values fall back to a finite internal deadline."
+  :type 'number
+  :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-runtime-build-output-max-bytes 65536
+  "Maximum bytes retained from each automatic Nix build output stream.
+Exceeding the effective bounded limit terminates the local build."
+  :type 'integer
+  :group 'emacs-jupyter-notebook)
+
+(defvar emacs-jupyter-notebook--runtime-directory nil
+  "Resolved Nix store directory containing the auto-built local runtime.
+This is process-local discovery state, not durable notebook state.")
 
 (defcustom emacs-jupyter-notebook-helper-hello-timeout 5
   "Maximum seconds allowed for the helper's initial hello response.
@@ -184,9 +210,9 @@ registry format is intentionally not read or migrated."
 (defcustom emacs-jupyter-notebook-registry-worker-command
   '("ejn-registry-worker")
   "One-shot local registry transaction worker argv.
-The executable is resolved through PATH, a Nix `result/bin' link, or the
-checkout wrapper.  It receives one JSON request on stdin and writes exactly
-one bounded JSON response on stdout."
+The executable is resolved through PATH, the auto-built Nix closure, a Nix
+`result/bin' link, or the checkout wrapper.  It receives one JSON request on
+stdin and writes exactly one bounded JSON response on stdout."
   :type '(repeat string)
   :group 'emacs-jupyter-notebook)
 

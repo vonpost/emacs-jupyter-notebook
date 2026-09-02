@@ -78,6 +78,11 @@ These are binding for every workstream. Update only by appending a new entry.
   completion, inspect, send-cell, reconnect, fetch-log, list-procs, and
   clean-orphans. Initial first-time start may be slow (30–90 s on
   high-latency links is acceptable) but must remain non-blocking.
+- **2026-09-02 / Bundled runtime bootstraps itself.** When the default local
+  helper or registry worker is absent and Nix is installed, the first start,
+  reconnect, or evaluation runs one shared, bounded asynchronous build of the
+  pinned `.#default` flake output.  The remote connection deadline starts only
+  after that local prerequisite succeeds.  Custom commands are never replaced.
 - **2026-07-01 / Zero per-remote install.** Features must not require
   installing anything on the remote beyond a running Python Jupyter kernel
   (with matplotlib for the plotting features). Remote capability is added by

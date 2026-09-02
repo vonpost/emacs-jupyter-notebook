@@ -55,6 +55,29 @@
                     "\\`emacs-jupyter-notebook.*tests\\.el\\'")
    #'string<))
 
+(defun ejn-test-runner--make-runtime-fixture ()
+  "Create a no-op complete runtime so unrelated ERTs never invoke real Nix."
+  (let* ((root (make-temp-file "ejn-test-runtime-" t))
+         (bin (expand-file-name "bin" root)))
+    (make-directory bin t)
+    (dolist (name '("ejn-helper" "ejn-registry-worker"))
+      (let ((file (expand-file-name name bin)))
+        (with-temp-file file
+          (insert "#!/bin/sh\nexit 0\n"))
+        (set-file-modes file #o700)))
+    root))
+
+(defvar ejn-test-runner--runtime-fixture nil
+  "Temporary complete runtime used by unrelated local ERTs.")
+
+(defun ejn-test-runner--delete-runtime-fixture ()
+  "Delete the local ERT runtime fixture without masking Emacs exit."
+  (when (and (stringp ejn-test-runner--runtime-fixture)
+             (file-directory-p ejn-test-runner--runtime-fixture))
+    (ignore-errors
+      (delete-directory ejn-test-runner--runtime-fixture t)))
+  (setq ejn-test-runner--runtime-fixture nil))
+
 (ejn-test-runner--assert-no-project-elc)
 (let ((code-cells-dir (ejn-test-runner--code-cells-directory)))
   (add-to-list 'load-path ejn-test-runner--root)
@@ -62,7 +85,15 @@
   (add-to-list 'load-path code-cells-dir)
   (dolist (file (ejn-test-runner--local-test-files))
     (unless (string-match-p "-\\(?:remote\\|doom\\)-tests\\.el\\'" file)
-      (load file nil nil t))))
+      (load file nil nil t)))
+  ;; Existing orchestration tests mock the registry/helper layers below the
+  ;; new first-use gate.  Give them a complete inert runtime; the dedicated
+  ;; runtime tests dynamically clear this variable and own all process mocks.
+  (setq ejn-test-runner--runtime-fixture
+        (ejn-test-runner--make-runtime-fixture)
+        emacs-jupyter-notebook--runtime-directory
+        ejn-test-runner--runtime-fixture)
+  (add-hook 'kill-emacs-hook #'ejn-test-runner--delete-runtime-fixture))
 
 (provide 'run-local-tests)
 ;;; run-local-tests.el ends here

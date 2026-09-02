@@ -15057,6 +15057,86 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 ;;; EI11 -- helper dogfood and fail-fast local setup
 
+(ert-deftest ejn-runtime-first-start-defers-registry-until-build-success ()
+  "A cold direct start touches no registry or SSH state before bootstrap."
+  (let (bootstrap-success registry-called ready)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--runtime-ready-p)
+               (lambda () ready))
+              ((symbol-function 'emacs-jupyter-notebook-runtime-ensure)
+               (lambda (_probe success _failure &optional _buffer)
+                 (setq bootstrap-success success)
+                 'runtime-waiter))
+              ((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+               (lambda (&rest _)
+                 (setq registry-called t)
+                 'registry-operation)))
+      (with-temp-buffer
+        (setq buffer-file-name "/tmp/ejn-runtime-first-start.py")
+        (let ((context (emacs-jupyter-notebook-start-remote-kernel "default")))
+          (unwind-protect
+              (progn
+                (should (eq (plist-get context :phase) 'runtime-build))
+                (should (eq (plist-get context :runtime-waiter) 'runtime-waiter))
+                (should-not registry-called)
+                (setq ready t)
+                (funcall bootstrap-success)
+                (should registry-called)
+                (should (eq (plist-get emacs-jupyter-notebook--async-context :phase)
+                            'registry-start-preflight)))
+            (emacs-jupyter-notebook--cancel-async-context-locally
+             emacs-jupyter-notebook--async-context)
+            (setq emacs-jupyter-notebook--async-context nil)))))))
+
+(ert-deftest ejn-runtime-first-reconnect-defers-picker-until-build-success ()
+  "A cold reconnect does not start its registry picker before bootstrap."
+  (let (bootstrap-success picker-called ready)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--runtime-ready-p)
+               (lambda () ready))
+              ((symbol-function 'emacs-jupyter-notebook-runtime-ensure)
+               (lambda (_probe success _failure &optional _buffer)
+                 (setq bootstrap-success success)
+                 'runtime-waiter))
+              ((symbol-function 'emacs-jupyter-notebook--read-registry-entry-async)
+               (lambda (&rest _)
+                 (setq picker-called t)
+                 'picker-operation)))
+      (with-temp-buffer
+        (let ((context (emacs-jupyter-notebook-reconnect-remote-kernel)))
+          (should (eq (plist-get context :phase) 'runtime-build))
+          (should-not picker-called)
+          (setq ready t)
+          (funcall bootstrap-success)
+          (should picker-called)
+          (should-not emacs-jupyter-notebook--async-context))))))
+
+(ert-deftest ejn-runtime-first-evaluation-defers-client-lookup-until-build-success ()
+  "Cold evaluation acquisition starts its connection deadline after bootstrap."
+  (let (bootstrap-success registry-called ready)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--runtime-ready-p)
+               (lambda () ready))
+              ((symbol-function 'emacs-jupyter-notebook-runtime-ensure)
+               (lambda (_probe success _failure &optional _buffer)
+                 (setq bootstrap-success success)
+                 'runtime-waiter))
+              ((symbol-function 'emacs-jupyter-notebook-registry-read-async)
+               (lambda (&rest _)
+                 (setq registry-called t)
+                 'registry-operation)))
+      (with-temp-buffer
+        (setq buffer-file-name "/tmp/ejn-runtime-first-eval.py")
+        (emacs-jupyter-notebook--ensure-client-async #'ignore #'ignore)
+        (should (eq (plist-get emacs-jupyter-notebook--async-context :phase)
+                    'runtime-build))
+        (should-not registry-called)
+        (setq ready t)
+        (funcall bootstrap-success)
+        (should registry-called)
+        (should (eq (plist-get emacs-jupyter-notebook--async-context :phase)
+                    'registry-read))
+        (emacs-jupyter-notebook--cancel-async-context-locally
+         emacs-jupyter-notebook--async-context)
+        (setq emacs-jupyter-notebook--async-context nil)))))
+
 (defun ejn-ei11--write-executable (file contents)
   "Write executable FILE containing CONTENTS for an isolated EI11 fixture."
   (with-temp-file file
@@ -15079,7 +15159,8 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
         (progn
           (make-directory bin t)
           (ejn-ei11--write-executable program "#!/bin/sh\nexit 0\n")
-          (let ((emacs-jupyter-notebook-helper--module-directory root)
+          (let ((emacs-jupyter-notebook--runtime-directory nil)
+                (emacs-jupyter-notebook-helper--module-directory root)
                 (default-directory "/")
                 (exec-path nil))
             (should
@@ -15102,7 +15183,8 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
           (make-directory (file-name-directory program) t)
           (ejn-ei11--write-executable program "#!/bin/sh\nexit 0\n")
           (make-symbolic-link repo-module build-module)
-          (let ((emacs-jupyter-notebook-helper--module-directory
+          (let ((emacs-jupyter-notebook--runtime-directory nil)
+                (emacs-jupyter-notebook-helper--module-directory
                  (file-name-directory (file-truename build-module)))
                 (exec-path nil))
             (should
@@ -15123,7 +15205,8 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
           (make-directory module-dir t)
           (make-directory (file-name-directory program) t)
           (ejn-ei11--write-executable program "#!/bin/sh\nexit 0\n")
-          (let ((emacs-jupyter-notebook-helper--module-directory module-dir)
+          (let ((emacs-jupyter-notebook--runtime-directory nil)
+                (emacs-jupyter-notebook-helper--module-directory module-dir)
                 (default-directory "/")
                 (exec-path nil))
             (should
@@ -15135,14 +15218,15 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
 
 (ert-deftest ejn-ei11-helper-command-rejects-missing-or-malformed-configuration ()
   "Missing executables and malformed argv fail before process creation."
-  (let ((exec-path nil)
+  (let ((emacs-jupyter-notebook--runtime-directory nil)
+        (exec-path nil)
         (emacs-jupyter-notebook-helper--module-directory "/tmp/ejn-no-helper"))
     (let ((error-data
            (should-error
             (emacs-jupyter-notebook-helper-resolve-argv
              '("does-not-exist" "--protocol"))
             :type 'error)))
-      (should (string-match-p "nix build.*ejn-helper"
+      (should (string-match-p "automatic Nix build"
                               (error-message-string error-data)))
       (should (string-match-p "emacs-jupyter-notebook-helper-command"
                               (error-message-string error-data))))
@@ -15178,7 +15262,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
               (accept-process-output nil 0.02)))
           (should failure)
           (should (string-match-p "runtime dependenc" failure))
-          (should (string-match-p "nix build.*ejn-helper" failure))
+          (should (string-match-p "automatic Nix build" failure))
           (should (string-match-p "missing-runtime-dependency" stderr))
           (should (emacs-jupyter-notebook-helper-session-disposed session)))
       (when (and session
@@ -15207,7 +15291,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
     (should-not (emacs-jupyter-notebook-helper--hello-result-p session object))
     (emacs-jupyter-notebook-helper--handle-startup-object session object)
     (should (string-match-p "protocol version mismatch" failure))
-    (should (string-match-p "rebuild.*ejn-helper" failure))
+    (should (string-match-p "rebuild the matching helper" failure))
     (should (emacs-jupyter-notebook-helper-session-disposed session))))
 
 (ert-deftest ejn-ei11-readme-documents-helper-only-transport ()
@@ -15224,14 +15308,16 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
     (dolist (needle '("The supervised local Python helper is the only Jupyter transport"
                       "emacs-jupyter-notebook-helper-command"
                       "--protocol"
-                      "nix build .#ejn-helper"
-                      "./result/bin/ejn-helper --version"
+                      "nix build --no-link --print-out-paths .#default"
+                      "emacs-jupyter-notebook-auto-build-runtime"
+                      "EJN…build"
                       "x86_64-linux"
                       "aarch64-darwin"
                       "pip install"))
       (should (string-match-p (regexp-quote needle) readme)))
     (dolist (forbidden '("emacs-jupyter-notebook-backend 'legacy"
                          "emacs-jupyter-notebook-jupyter.el"
+                         "never performs an implicit `nix build`"
                          "(require 'emacs-jupyter)"))
       (should-not (string-match-p (regexp-quote forbidden) readme)))))
 
