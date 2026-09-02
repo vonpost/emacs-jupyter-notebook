@@ -683,20 +683,21 @@ The reply (or timeout) routes through `--heartbeat-on-reply' or
 `--heartbeat-on-miss', which run in the originating buffer only and only
 when the inflight token still matches (so late replies are ignored).
 
-W15-A: while the kernel is BUSY the probe is suspended entirely and the
-miss counter reset.  The probe is a shell-channel `kernel_info_request',
-and a busy kernel queues shell messages behind the running cell — silence
-is the EXPECTED state, not evidence of death.  Counting misses while busy
-flagged the tunnel dead ~45 s into any long-running cell (interval 20 s ×
-timeout 3 s × 2 misses), producing a false drop/reconnect cycle on every
-substantial ML training cell.  Transport death while busy is still caught
-by the tunnel process sentinel and the SSH ServerAlive keepalives; probing
-resumes on the first tick after the kernel reports non-busy."
+W15-A: while a user execution is active or the kernel reports BUSY, the probe
+is suspended entirely and the miss counter reset.  The active-execution guard
+closes the interval between local FIFO admission and receipt of Jupyter's
+`busy' status event.  The probe is a shell-channel `kernel_info_request', and
+a busy kernel queues shell messages behind the running cell — silence is the
+EXPECTED state, not evidence of death.  Transport death during execution is
+still caught by the tunnel process sentinel and SSH ServerAlive keepalives;
+probing resumes after the execution retires and the kernel reports non-busy."
   (cond
-   ((eq emacs-jupyter-notebook--kernel-status 'busy)
-    ;; Busy: expected shell silence — no probe, no misses (W15-A).  A probe
-    ;; may have started immediately before the busy status arrived; retire its
-    ;; local token so its queued reply/timeout cannot manufacture a miss.
+   ((or emacs-jupyter-notebook--execution-active-id
+        (eq emacs-jupyter-notebook--kernel-status 'busy))
+    ;; Active/busy: expected shell silence — no probe, no misses (W15-A).  A
+    ;; probe may have started immediately before execution admission or the
+    ;; busy status arrived; retire its local token so its queued reply/timeout
+    ;; cannot manufacture a miss.
     (when (timerp emacs-jupyter-notebook--heartbeat-timeout-timer)
       (cancel-timer emacs-jupyter-notebook--heartbeat-timeout-timer))
     (setq emacs-jupyter-notebook--heartbeat-timeout-timer nil
@@ -767,9 +768,11 @@ next evaluation through `--tunnel-reconnect'.
 W6.6: every miss writes a `heartbeat-miss' line to the global log buffer;
 crossing the misses-allowed threshold writes a `heartbeat-dead' line."
   (setq emacs-jupyter-notebook--heartbeat-inflight nil)
-  (if (eq emacs-jupyter-notebook--kernel-status 'busy)
-      ;; A status event can race a probe timeout.  Busy shell silence is not a
-      ;; transport failure, regardless of which callback won the timer race.
+  (if (or emacs-jupyter-notebook--execution-active-id
+          (eq emacs-jupyter-notebook--kernel-status 'busy))
+      ;; Execution admission or a status event can race a probe timeout.
+      ;; Expected shell silence is not a transport failure, regardless of
+      ;; which callback won the timer race.
       (setq emacs-jupyter-notebook--heartbeat-misses 0)
     (cl-incf emacs-jupyter-notebook--heartbeat-misses)
     (emacs-jupyter-notebook--log-append

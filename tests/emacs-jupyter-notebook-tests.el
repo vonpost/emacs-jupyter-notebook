@@ -5557,6 +5557,43 @@ into every long-running (training) cell."
       (should (= emacs-jupyter-notebook--heartbeat-misses 0))
       (should-not emacs-jupyter-notebook--tunnel-dead))))
 
+(ert-deftest ejn-w15-heartbeat-suspended-before-busy-status-arrives ()
+  "An admitted FIFO execution closes the pre-`busy' false-death window."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--client 'mock-client)
+          (emacs-jupyter-notebook--tunnel-dead nil)
+          (emacs-jupyter-notebook--kernel-status 'idle)
+          (emacs-jupyter-notebook--execution-active-id 7)
+          (emacs-jupyter-notebook--heartbeat-misses 1)
+          (timeout (run-at-time 600 nil #'ignore))
+          probed)
+      (unwind-protect
+          (progn
+            (setq emacs-jupyter-notebook--heartbeat-timeout-timer timeout
+                  emacs-jupyter-notebook--heartbeat-inflight 'pre-busy-probe)
+            (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-aux)
+                       (lambda (&rest _) (setq probed t))))
+              (emacs-jupyter-notebook--heartbeat-tick))
+            (should-not probed)
+            (should (= emacs-jupyter-notebook--heartbeat-misses 0))
+            (should-not emacs-jupyter-notebook--heartbeat-inflight)
+            (should-not emacs-jupyter-notebook--heartbeat-timeout-timer)
+            (should-not (memq timeout timer-list))
+            (should-not emacs-jupyter-notebook--tunnel-dead))
+        (when (timerp timeout) (cancel-timer timeout))))))
+
+(ert-deftest ejn-w15-heartbeat-timeout-racing-execution-admission-is-not-a-miss ()
+  "An already queued heartbeat timeout cannot retire admitted kernel work."
+  (with-temp-buffer
+    (let ((emacs-jupyter-notebook--kernel-status 'idle)
+          (emacs-jupyter-notebook--execution-active-id 8)
+          (emacs-jupyter-notebook--heartbeat-misses 1)
+          (emacs-jupyter-notebook--heartbeat-misses-allowed 2)
+          (emacs-jupyter-notebook--tunnel-dead nil))
+      (emacs-jupyter-notebook--heartbeat-on-miss)
+      (should (= emacs-jupyter-notebook--heartbeat-misses 0))
+      (should-not emacs-jupyter-notebook--tunnel-dead))))
+
 (ert-deftest ejn-w15-connect-timeout-busy-kernel-finalizes-busy ()
   "W15-B: kernel-info timeout on a RECONNECT + PID probe says alive →
 finalize as connected-BUSY: client installed, status busy, phase done,
