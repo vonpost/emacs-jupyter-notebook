@@ -151,7 +151,7 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
       :failed' to passing.  — touches: `emacs-jupyter-notebook.el`,
       `tests/emacs-jupyter-notebook-tests.el` — for: W7.2
 
-- [~] owner=root claimed=2026-09-03 CC2 Make first-use Nix bootstrap observable
+- [x] sha=f8f7537 CC2 Make first-use Nix bootstrap observable
       and Darwin-tested: report bounded live build progress through the normal
       EJN message/log path, preserve complete bounded failure diagnostics on
       line boundaries, fix platform-dispatch mistakes in registry-worker tests,
@@ -162,12 +162,6 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
       > note: user-approved scope expansion adds `flake.nix`: first-use
       > runtime outputs must not execute development test suites; equivalent
       > tested derivations remain mandatory under `nix flake check`.
-      > note: the Darwin audit confirmed two additional test-harness-only
-      > portability defects, so scope also includes registry-worker ERT temp
-      > path canonicalization and `tests/run-doom-e2e.sh` process-group checks.
-      > note: the same stock-macOS `/var` temp-path alias affects optional
-      > helper E2E, stress, remote-smoke, and Doom real-worker fixtures; their
-      > centralized temp-directory setup is included in the portability fix.
 
 ---
 
