@@ -19,7 +19,11 @@
 
 (defconst emacs-jupyter-notebook-runtime--hard-timeout 1800)
 (defconst emacs-jupyter-notebook-runtime--hard-output-bytes (* 1024 1024))
-(defconst emacs-jupyter-notebook-runtime--diagnostic-bytes 8192)
+(defconst emacs-jupyter-notebook-runtime--progress-line-chars 512)
+
+(defvar emacs-jupyter-notebook-runtime-progress-function nil
+  "Function called as (FUNCTION BUFFER LINE) for bounded Nix progress.
+Exactly one live waiter receives at most one sample per stderr callback.")
 
 (cl-defstruct (emacs-jupyter-notebook-runtime--waiter
                (:constructor emacs-jupyter-notebook-runtime--make-waiter))
@@ -28,7 +32,8 @@
 (cl-defstruct (emacs-jupyter-notebook-runtime--build
                (:constructor emacs-jupyter-notebook-runtime--make-build))
   token process stdout-buffer stderr-buffer stderr-process timer waiters
-  root started-at stdout-bytes stderr-bytes output-overflow terminal)
+  root started-at stdout-bytes stderr-bytes output-overflow terminal
+  stderr-closed last-progress-line)
 
 (defvar emacs-jupyter-notebook-runtime--build nil
   "The single in-flight local runtime build, or nil.")
@@ -157,24 +162,30 @@ login shell's Nix path is commonly absent from `exec-path'."
           (kill-buffer buffer)
         ((error quit) nil)))))
 
+(defun emacs-jupyter-notebook-runtime--decode-output (bytes)
+  "Decode bounded unibyte output BYTES into printable text."
+  (let ((text (condition-case nil
+                  (decode-coding-string bytes 'utf-8)
+                (error (decode-coding-string bytes 'binary)))))
+    (replace-regexp-in-string "[^[:print:]\n\t]" "?" text)))
+
+(defun emacs-jupyter-notebook-runtime--buffer-output (buffer)
+  "Return decoded bounded output retained in BUFFER, or an empty string."
+  (if (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (emacs-jupyter-notebook-runtime--decode-output (buffer-string)))
+    ""))
+
 (defun emacs-jupyter-notebook-runtime--diagnostic (build fallback)
-  "Return a bounded printable diagnostic for BUILD, or FALLBACK."
+  "Return BUILD's complete retained bounded stderr, or FALLBACK.
+The process filter already enforces the configured immutable output ceiling,
+so a second arbitrary tail cut here would only discard the beginning of the
+real error and could start the displayed result in the middle of a line."
   (condition-case nil
-      (let* ((buffer (emacs-jupyter-notebook-runtime--build-stderr-buffer build))
-             (bytes (if (buffer-live-p buffer)
-                        (with-current-buffer buffer (buffer-string))
-                      ""))
-             (bytes (if (> (string-bytes bytes)
-                           emacs-jupyter-notebook-runtime--diagnostic-bytes)
-                        (substring
-                         bytes (- (length bytes)
-                                  emacs-jupyter-notebook-runtime--diagnostic-bytes))
-                      bytes))
-             (text (condition-case nil
-                       (decode-coding-string bytes 'utf-8)
-                     (error (decode-coding-string bytes 'binary))))
-             (text (string-trim
-                    (replace-regexp-in-string "[^[:print:]\n\t]" "?" text))))
+      (let ((text
+             (string-trim
+              (emacs-jupyter-notebook-runtime--buffer-output
+               (emacs-jupyter-notebook-runtime--build-stderr-buffer build)))))
         (if (string-empty-p text) fallback text))
     ((error quit) fallback)))
 
@@ -234,31 +245,84 @@ login shell's Nix path is commonly absent from `exec-path'."
                (or (plist-get status :reason)
                    "Nix runtime output is missing a required executable")))))))))
 
+(defun emacs-jupyter-notebook-runtime--progress-text (output)
+  "Return a short printable progress sample from process OUTPUT."
+  (let* ((tail (if (> (length output) 2048)
+                   (substring output (- (length output) 2048))
+                 output))
+         (lines (split-string
+                 (emacs-jupyter-notebook-runtime--decode-output tail)
+                 "[\r\n]+" t "[[:space:]]+"))
+         (line (and lines (car (last lines)))))
+    (when line
+      (substring line 0
+                 (min (length line)
+                      emacs-jupyter-notebook-runtime--progress-line-chars)))))
+
+(defun emacs-jupyter-notebook-runtime--report-progress (build output)
+  "Report one short stderr OUTPUT sample through one live BUILD waiter."
+  (when-let* ((line (emacs-jupyter-notebook-runtime--progress-text output))
+              (waiter
+               (cl-find-if
+                #'emacs-jupyter-notebook-runtime--waiter-live-p
+                (emacs-jupyter-notebook-runtime--build-waiters build))))
+    (when (and (functionp emacs-jupyter-notebook-runtime-progress-function)
+               (not (equal
+                     line
+                     (emacs-jupyter-notebook-runtime--build-last-progress-line
+                      build))))
+      (setf (emacs-jupyter-notebook-runtime--build-last-progress-line build) line)
+      (condition-case nil
+          (funcall emacs-jupyter-notebook-runtime-progress-function
+                   (emacs-jupyter-notebook-runtime--waiter-buffer waiter) line)
+        ((error quit) nil)))))
+
+(defun emacs-jupyter-notebook-runtime--settle (build)
+  "Settle BUILD after both its main process and stderr pipe have closed."
+  (let ((process (emacs-jupyter-notebook-runtime--build-process build)))
+    (when (and (not (emacs-jupyter-notebook-runtime--build-terminal build))
+               (eq emacs-jupyter-notebook-runtime--build build)
+               (processp process)
+               (memq (process-status process) '(exit signal))
+               (emacs-jupyter-notebook-runtime--build-stderr-closed build))
+      (cond
+       ((emacs-jupyter-notebook-runtime--build-output-overflow build)
+        (emacs-jupyter-notebook-runtime--fail
+         build "Automatic Nix runtime build exceeded its output limit"))
+       ((and (eq (process-status process) 'exit)
+             (zerop (process-exit-status process)))
+        (emacs-jupyter-notebook-runtime--succeed build))
+       (t
+        (let ((fallback (format "process exited with status %s"
+                                (process-exit-status process))))
+          (emacs-jupyter-notebook-runtime--fail
+           build
+           (format "Automatic Nix runtime build failed: %s"
+                   (condition-case nil
+                       (emacs-jupyter-notebook-runtime--diagnostic
+                        build fallback)
+                     ((error quit) fallback))))))))))
+
 (defun emacs-jupyter-notebook-runtime--sentinel (build process _event)
-  "Settle BUILD when its exact PROCESS exits."
+  "Record BUILD's exact main PROCESS exit and await stderr EOF."
   (when (and (not (emacs-jupyter-notebook-runtime--build-terminal build))
              (eq emacs-jupyter-notebook-runtime--build build)
              (or (null (emacs-jupyter-notebook-runtime--build-process build))
                  (eq process (emacs-jupyter-notebook-runtime--build-process build)))
              (memq (process-status process) '(exit signal)))
     (setf (emacs-jupyter-notebook-runtime--build-process build) process)
-    (cond
-     ((emacs-jupyter-notebook-runtime--build-output-overflow build)
-      (emacs-jupyter-notebook-runtime--fail
-       build "Automatic Nix runtime build exceeded its output limit"))
-     ((and (eq (process-status process) 'exit)
-           (zerop (process-exit-status process)))
-      (emacs-jupyter-notebook-runtime--succeed build))
-     (t
-      (let ((fallback (format "process exited with status %s"
-                              (process-exit-status process))))
-        (emacs-jupyter-notebook-runtime--fail
-         build
-         (format
-          "Automatic Nix runtime build failed: %s"
-          (condition-case nil
-              (emacs-jupyter-notebook-runtime--diagnostic build fallback)
-            ((error quit) fallback)))))))))
+    (emacs-jupyter-notebook-runtime--settle build)))
+
+(defun emacs-jupyter-notebook-runtime--stderr-sentinel
+    (build process _event)
+  "Mark BUILD's exact stderr PROCESS drained after it closes."
+  (when (and (not (emacs-jupyter-notebook-runtime--build-terminal build))
+             (eq emacs-jupyter-notebook-runtime--build build)
+             (eq process
+                 (emacs-jupyter-notebook-runtime--build-stderr-process build))
+             (not (process-live-p process)))
+    (setf (emacs-jupyter-notebook-runtime--build-stderr-closed build) t)
+    (emacs-jupyter-notebook-runtime--settle build)))
 
 (defun emacs-jupyter-notebook-runtime--filter (build stream process output)
   "Append PROCESS OUTPUT to BUILD's STREAM within its immutable bound."
@@ -287,7 +351,9 @@ login shell's Nix path is commonly absent from `exec-path'."
           (when (buffer-live-p buffer)
             (with-current-buffer buffer
               (goto-char (point-max))
-              (insert output))))))))
+              (insert output))))
+        (unless stdout
+          (emacs-jupyter-notebook-runtime--report-progress build output))))))
 
 (defun emacs-jupyter-notebook-runtime--timeout-fired (build)
   "Fail BUILD only if it still owns the global build slot."
@@ -315,14 +381,22 @@ login shell's Nix path is commonly absent from `exec-path'."
      (t
       (let* ((stdout (generate-new-buffer " *ejn-runtime-build*"))
              (stderr (generate-new-buffer " *ejn-runtime-build stderr*"))
+             (command
+              (list nix "--extra-experimental-features" "nix-command flakes"
+                    "build" "--no-link" "--print-out-paths"
+                    "--print-build-logs" "--show-trace" ".#default"))
              (build (emacs-jupyter-notebook-runtime--make-build
                      :token (gensym "ejn-runtime-build-")
                      :stdout-buffer stdout :stderr-buffer stderr
-                     :waiters (list waiter) :root root :started-at (float-time)
-                     :stdout-bytes 0 :stderr-bytes 0)))
+                     :waiters (list waiter) :root root
+                     :started-at (float-time) :stdout-bytes 0 :stderr-bytes 0)))
         (with-current-buffer stdout (set-buffer-multibyte nil))
         (with-current-buffer stderr (set-buffer-multibyte nil))
         (setq emacs-jupyter-notebook-runtime--build build)
+        (setf (emacs-jupyter-notebook-runtime--build-timer build)
+              (run-at-time
+               (emacs-jupyter-notebook-runtime--timeout) nil
+               #'emacs-jupyter-notebook-runtime--timeout-fired build))
         (condition-case err
             (let* ((default-directory root)
                    (process
@@ -330,9 +404,7 @@ login shell's Nix path is commonly absent from `exec-path'."
                      :name "ejn-runtime-build"
                      :buffer stdout
                      :stderr stderr
-                     :command
-                     (list nix "--extra-experimental-features" "nix-command flakes"
-                           "build" "--no-link" "--print-out-paths" ".#default")
+                     :command command
                      :connection-type 'pipe :coding 'binary :noquery t
                      :filter (lambda (process output)
                                (emacs-jupyter-notebook-runtime--filter
@@ -342,19 +414,28 @@ login shell's Nix path is commonly absent from `exec-path'."
                                   build process event)))))
               (when (eq emacs-jupyter-notebook-runtime--build build)
                 (setf (emacs-jupyter-notebook-runtime--build-process build) process)
-                (when-let ((stderr-process (get-buffer-process stderr)))
-                  (set-process-sentinel stderr-process #'ignore)
-                  (set-process-filter
-                   stderr-process
-                   (lambda (process output)
-                     (emacs-jupyter-notebook-runtime--filter
-                      build 'stderr process output)))
-                  (setf (emacs-jupyter-notebook-runtime--build-stderr-process build)
-                        stderr-process))
-                (setf (emacs-jupyter-notebook-runtime--build-timer build)
-                      (run-at-time
-                       (emacs-jupyter-notebook-runtime--timeout) nil
-                       #'emacs-jupyter-notebook-runtime--timeout-fired build))))
+                (if-let ((stderr-process (get-buffer-process stderr)))
+                    (progn
+                      (setf (emacs-jupyter-notebook-runtime--build-stderr-process
+                             build)
+                            stderr-process)
+                      (set-process-filter
+                       stderr-process
+                       (lambda (process output)
+                         (emacs-jupyter-notebook-runtime--filter
+                          build 'stderr process output)))
+                      (set-process-sentinel
+                       stderr-process
+                       (lambda (process event)
+                         (emacs-jupyter-notebook-runtime--stderr-sentinel
+                          build process event)))
+                      (unless (process-live-p stderr-process)
+                        (emacs-jupyter-notebook-runtime--stderr-sentinel
+                         build stderr-process "already closed")))
+                  (setf (emacs-jupyter-notebook-runtime--build-stderr-closed
+                         build)
+                        t))
+                (emacs-jupyter-notebook-runtime--settle build)))
           (error
            (emacs-jupyter-notebook-runtime--fail
             build

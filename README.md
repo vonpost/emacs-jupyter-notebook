@@ -43,11 +43,20 @@ local runtime, EJN finds Nix and builds the repository's pinned `.#default`
 closure in a background process.  The mode line shows `EJN…build`; `C-c j x`
 cancels the caller.  Multiple EJN buffers share one build.
 
+Sampled Nix progress also appears in `*Messages*` and the bounded EJN log
+(`C-c j L`).  Doom's default modeline hides ordinary minor-mode lighters, so
+it will not show `EJN…build` unless your modeline is configured to render
+`minor-mode-alist`; use `*Messages*`, `C-c j L`, or `C-c j ?` as the portable
+progress indicators.
+
 The flake supports `x86_64-linux` and `aarch64-darwin`.  GUI Emacs does not
 always inherit the login shell's PATH on macOS, so EJN also checks the standard
 Nix profile and Homebrew locations directly.  A first build may download
 substitutes, but Emacs remains responsive and subsequent builds reuse the Nix
 store.
+
+The automatic `.#default` runtime build does not run the development test
+suites.  Maintainers run those explicitly with `nix flake check`.
 
 ## Basic Use
 
@@ -130,6 +139,16 @@ executable is missing, EJN asynchronously runs a single bounded
 source.  It resumes the original command only after both executables resolve.
 Build failure, excessive output, and timeout release every waiter so the next
 invocation can retry instead of remaining wedged.
+
+Build failures include the complete bounded stderr after its pipe closes.  To
+reproduce a build manually with uncapped terminal output, change to the package
+directory containing `flake.nix` (for Straight, usually
+`~/.config/emacs/.local/straight/repos/emacs-jupyter-notebook`) and run:
+
+```sh
+nix --extra-experimental-features 'nix-command flakes' \
+  build --no-link --print-out-paths --print-build-logs --show-trace '.#default'
+```
 
 Custom commands remain valid and are never silently replaced or built.  An
 absolute checkout path remains independent of a source buffer's
@@ -283,6 +302,7 @@ The mode-line lighter encodes the engine state at a glance. From highest precede
 | --- | --- |
 | ` EJN!` | tunnel flagged dead by the heartbeat or sentinel |
 | ` EJN✗` | the most recent async operation finished in `error` |
+| ` EJN…build` | first-use local Nix runtime build in flight |
 | ` EJN…launch` | async kernel launch in flight |
 | ` EJN…retrieve` | async connection-file retrieve in flight |
 | ` EJN…tunnel` | async SSH tunnel coming up |

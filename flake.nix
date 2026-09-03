@@ -20,12 +20,14 @@
             pname = "ejn-helper";
             version = "0.1.0";
             pyproject = true;
-            # Keep the repository root available during checks: helper tests
-            # import helper.tests and share fixtures with the Emacs tests.
-            src = ./.;
-            postUnpack = ''
-              sourceRoot="$sourceRoot/helper"
-            '';
+            src = pkgs.lib.fileset.toSource {
+              root = ./helper;
+              fileset = pkgs.lib.fileset.difference ./helper
+                (pkgs.lib.fileset.unions [
+                  ./helper/tests
+                  ./helper/integration_tests
+                ]);
+            };
 
             build-system = [ python.pkgs.setuptools ];
             dependencies = with python.pkgs; [
@@ -34,41 +36,25 @@
               pillow
             ];
 
-            # The Python builder runs this suite as an install check, where
-            # runtime dependencies are not guaranteed on the check-time
-            # module path.  Keep the real decoder boundary exercised there.
-            nativeCheckInputs = with python.pkgs; [ ipykernel pillow ];
-            doCheck = true;
-            checkPhase = ''
-              runHook preCheck
-              EJN_REQUIRE_PILLOW=1 \
-                PYTHONPATH=${python.pkgs.pillow}/${python.sitePackages}:$PWD/.. \
-                python -m unittest discover -s tests -p 'test_*.py'
-              runHook postCheck
-            '';
-            pythonImportsCheck = [ "ejn_helper" ];
+            # buildPythonApplication maps doCheck to its install-check phase.
+            # Runtime builds stay independent of the development suites; the
+            # checked variant below enables all test hooks for `nix flake check`.
+            doCheck = false;
+            dontUsePythonImportsCheck = true;
           };
           ejn-registry-worker = python.pkgs.buildPythonApplication {
             pname = "ejn-registry-worker";
             version = "0.1.0";
             pyproject = true;
-            src = ./registry_worker;
+            src = pkgs.lib.fileset.toSource {
+              root = ./registry_worker;
+              fileset = pkgs.lib.fileset.difference ./registry_worker
+                ./registry_worker/tests;
+            };
             build-system = [ python.pkgs.setuptools ];
 
-            doCheck = true;
-            checkPhase = ''
-              runHook preCheck
-              python -m unittest discover -s tests -p 'test_*.py'
-              runHook postCheck
-            '';
-            doInstallCheck = true;
-            installCheckPhase = ''
-              runHook preInstallCheck
-              response=$(printf '%s\n' '{}' | "$out/bin/ejn-registry-worker")
-              RESPONSE="$response" python -c 'import json, os; value = json.loads(os.environ["RESPONSE"]); assert value == {"v": 1, "ok": False, "error": {"code": "invalid-request", "message": "registry request has an invalid version"}}'
-              runHook postInstallCheck
-            '';
-            pythonImportsCheck = [ "ejn_registry_worker" ];
+            doCheck = false;
+            dontUsePythonImportsCheck = true;
           };
           ejn-runtime = pkgs.symlinkJoin {
             name = "emacs-jupyter-notebook-runtime";
@@ -82,6 +68,50 @@
         {
           inherit ejn-helper ejn-registry-worker ejn-runtime;
           default = ejn-runtime;
+        });
+
+      checks = forAllSystems (pkgs:
+        let
+          python = pkgs.python3;
+          packages = self.packages.${pkgs.stdenv.hostPlatform.system};
+          ejn-helper = packages.ejn-helper.overridePythonAttrs (_old: {
+            # The helper's architecture tests also inspect repository-level
+            # fixtures and Emacs sources, so checks use the full source tree.
+            src = ./.;
+            postUnpack = ''
+              sourceRoot="$sourceRoot/helper"
+            '';
+            nativeCheckInputs = with python.pkgs; [ ipykernel pillow ];
+            doCheck = true;
+            checkPhase = ''
+              runHook preCheck
+              EJN_REQUIRE_PILLOW=1 \
+                PYTHONPATH=${python.pkgs.pillow}/${python.sitePackages}:$PWD/.. \
+                python -m unittest discover -s tests -p 'test_*.py'
+              runHook postCheck
+            '';
+            dontUsePythonImportsCheck = false;
+            pythonImportsCheck = [ "ejn_helper" ];
+          });
+          ejn-registry-worker =
+            packages.ejn-registry-worker.overridePythonAttrs (_old: {
+              src = ./registry_worker;
+              # buildPythonApplication runs checkPhase after installation, so
+              # the unit suite and installed-command smoke test share it.
+              doCheck = true;
+              checkPhase = ''
+                runHook preCheck
+                python -m unittest discover -s tests -p 'test_*.py'
+                response=$(printf '%s\n' '{}' | "$out/bin/ejn-registry-worker")
+                RESPONSE="$response" python -c 'import json, os; value = json.loads(os.environ["RESPONSE"]); assert value == {"v": 1, "ok": False, "error": {"code": "invalid-request", "message": "registry request has an invalid version"}}'
+                runHook postCheck
+              '';
+              dontUsePythonImportsCheck = false;
+              pythonImportsCheck = [ "ejn_registry_worker" ];
+            });
+        in
+        {
+          inherit ejn-helper ejn-registry-worker;
         });
 
       apps = forAllSystems (pkgs: {

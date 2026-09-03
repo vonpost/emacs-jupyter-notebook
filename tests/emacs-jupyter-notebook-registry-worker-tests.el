@@ -39,7 +39,8 @@
 (cl-defmacro ejn-registry-worker-test-with-registry ((file) &body body)
   "Run BODY with FILE in a private temporary registry directory."
   (declare (indent 1) (debug ((symbolp) body)))
-  `(let* ((directory (make-temp-file "ejn-registry-worker-test-" t))
+  `(let* ((directory (file-truename
+                      (make-temp-file "ejn-registry-worker-test-" t)))
           (,file (expand-file-name "registry-v1.json" directory))
           (emacs-jupyter-notebook-registry-file ,file)
           (emacs-jupyter-notebook-registry-worker-command

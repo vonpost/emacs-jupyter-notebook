@@ -231,7 +231,8 @@
           (should
            (equal (cdr captured-command)
                   '("--extra-experimental-features" "nix-command flakes"
-                    "build" "--no-link" "--print-out-paths" ".#default")))
+                    "build" "--no-link" "--print-out-paths"
+                    "--print-build-logs" "--show-trace" ".#default")))
           (should (equal (car captured-command) "/bin/sh"))
           (should (equal captured-cwd temporary-file-directory)))))))
 
@@ -385,6 +386,7 @@
          (current-buffer))
         (let* ((build emacs-jupyter-notebook-runtime--build)
                (process (emacs-jupyter-notebook-runtime--build-process build)))
+          (setf (emacs-jupyter-notebook-runtime--build-stderr-closed build) t)
           (set-process-sentinel process #'ignore)
           (delete-process process)
           (cl-letf (((symbol-function 'emacs-jupyter-notebook-runtime--diagnostic)
@@ -430,6 +432,49 @@
           (emacs-jupyter-notebook-runtime--filter
            build 'stdout process (make-string 9 ?x)))
         (should (string-match-p "output limit" failure))))))
+
+(ert-deftest ejn-runtime-progress-is-short-and-sampled ()
+  "Nix progress reports only the latest bounded stderr sample."
+  (ejn-runtime-test--clean
+    (with-temp-buffer
+      (let (report)
+        (ejn-runtime-test--start-build
+         (lambda () (list :ready nil :buildable t)) nil
+         #'ignore #'ignore (current-buffer))
+        (let* ((build emacs-jupyter-notebook-runtime--build)
+               (stderr-process
+                (emacs-jupyter-notebook-runtime--build-stderr-process build)))
+          (let ((emacs-jupyter-notebook-runtime-progress-function
+                 (lambda (_buffer line) (setq report line))))
+            (emacs-jupyter-notebook-runtime--filter
+             build 'stderr stderr-process "copying one\ncopying two\n")
+            (should (equal report "copying two"))))))))
+
+(ert-deftest ejn-runtime-failure-waits-for-full-stderr ()
+  "Failure settlement preserves stderr beyond the old arbitrary tail cut."
+  (ejn-runtime-test--clean
+    (with-temp-buffer
+      (let ((long-line (concat "first: " (make-string 9000 ?x))) failure)
+        (ejn-runtime-test--start-build
+         (lambda () (list :ready nil :buildable t)) nil #'ignore
+         (lambda (reason) (setq failure reason))
+         (current-buffer))
+        (let* ((build emacs-jupyter-notebook-runtime--build)
+               (stderr-process
+                (emacs-jupyter-notebook-runtime--build-stderr-process build))
+               (process (emacs-jupyter-notebook-runtime--build-process build)))
+          (set-process-sentinel process #'ignore)
+          (set-process-sentinel stderr-process #'ignore)
+          (delete-process process)
+          (emacs-jupyter-notebook-runtime--sentinel build process "killed")
+          (should-not failure)
+          (emacs-jupyter-notebook-runtime--filter
+           build 'stderr stderr-process
+           (concat long-line "\nhttps://cache.nixos.org failed\n"))
+          (setf (emacs-jupyter-notebook-runtime--build-stderr-closed build) t)
+          (emacs-jupyter-notebook-runtime--settle build)
+          (should (string-match-p (regexp-quote long-line) failure))
+          (should (string-match-p "https://cache.nixos.org failed" failure)))))))
 
 (ert-deftest ejn-runtime-argv-and-paths-are-darwin-portable ()
   (let ((system-type 'darwin)

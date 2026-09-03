@@ -97,7 +97,11 @@ def _concurrent_replace(
 
 class RegistryWorkerTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.root = tempfile.mkdtemp(prefix="ejn-registry-worker-")
+        # macOS commonly spells its per-user temporary directory through the
+        # `/var' compatibility symlink.  The worker intentionally rejects
+        # registry paths that traverse symlinks, so exercise it through the
+        # physical local path instead of making the test fixture itself unsafe.
+        self.root = os.path.realpath(tempfile.mkdtemp(prefix="ejn-registry-worker-"))
         os.chmod(self.root, 0o700)
         self.path = os.path.join(self.root, "registry.json")
 
@@ -586,6 +590,8 @@ class RegistryWorkerTests(unittest.TestCase):
             b"/tmp/space tab\tslash\\",
         )
         with mock.patch.object(
+            worker_module.sys, "platform", "linux"
+        ), mock.patch.object(
             worker_module, "_linux_filesystem_type", return_value="nfs"
         ):
             result = self.call("read")
@@ -604,6 +610,8 @@ class RegistryWorkerTests(unittest.TestCase):
 
         for filesystem in ("tmpfs", "ramfs"):
             with mock.patch.object(
+                worker_module.sys, "platform", "linux"
+            ), mock.patch.object(
                 worker_module, "_linux_filesystem_type", return_value=filesystem
             ):
                 result = self.call("read")

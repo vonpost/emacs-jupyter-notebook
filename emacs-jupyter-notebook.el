@@ -2979,7 +2979,23 @@ W4.4 PID-probe sentinel already performs."
 (defun emacs-jupyter-notebook--runtime-build-failed (context reason)
   "Fail live bootstrap CONTEXT with bounded REASON."
   (when (emacs-jupyter-notebook--async-context-live-p context)
+    ;; Preserve the complete already-bounded failure before status reduces it
+    ;; to a short summary.
+    (emacs-jupyter-notebook--log-append 'runtime-build "%s" reason)
     (emacs-jupyter-notebook--async-fail context reason)))
+
+(defun emacs-jupyter-notebook--runtime-build-progress (buffer line)
+  "Publish one bounded Nix progress LINE on behalf of live BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (let ((context emacs-jupyter-notebook--async-context))
+        (when (and context
+                   (eq (plist-get context :phase) 'runtime-build)
+                   (emacs-jupyter-notebook--async-context-live-p context))
+          (emacs-jupyter-notebook--async-message context "Nix: %s" line))))))
+
+(setq emacs-jupyter-notebook-runtime-progress-function
+      #'emacs-jupyter-notebook--runtime-build-progress)
 
 (defun emacs-jupyter-notebook--with-runtime-ready (continuation error-callback)
   "Run CONTINUATION once the local helper runtime is ready.
