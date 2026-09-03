@@ -169,6 +169,16 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
       touches: `emacs-jupyter-notebook-result.el`,
       `emacs-jupyter-notebook-vars.el`, focused panel tests — for: W18/EI4D
 
+- [~] owner=root claimed=2026-09-03 CC4 Preserve the real helper transport
+      failure across JSON-null validation and bound reconnect flapping until
+      post-connect setup is stable. — touches: `emacs-jupyter-notebook-helper.el`,
+      `emacs-jupyter-notebook.el`, focused helper/reconnect tests — for: ET3/EI7/IR5
+
+- [~] owner=root claimed=2026-09-03 CC5 Fix the observed aarch64-Darwin image
+      preview and external-original verification failures without weakening
+      image bounds. — touches: helper thumbnail/verifier code,
+      `emacs-jupyter-notebook-result.el`, focused helper/panel tests — for: EI4D
+
 ---
 
 ## W1 — Lifecycle hooks & leak fixes
