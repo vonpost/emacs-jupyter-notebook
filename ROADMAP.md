@@ -179,7 +179,7 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
       remaining external-original verification failure. — touches: helper thumbnail/verifier code,
       `emacs-jupyter-notebook-result.el`, focused helper/panel tests — for: EI4D
 
-- [~] owner=root claimed=2026-09-03 CC6 Prevent large image output from
+- [x] owner=root claimed=2026-09-03 sha=00d66db CC6 Prevent large image output from
       manufacturing transport loss: suspend helper heartbeat failure counting
       during execution, omit matplotlib pickles unless the viewer is enabled,
       and retain a bounded transport-failure origin. — touches:
