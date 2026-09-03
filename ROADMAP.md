@@ -165,6 +165,9 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
       > note: the Darwin audit confirmed two additional test-harness-only
       > portability defects, so scope also includes registry-worker ERT temp
       > path canonicalization and `tests/run-doom-e2e.sh` process-group checks.
+      > note: the same stock-macOS `/var` temp-path alias affects optional
+      > helper E2E, stress, remote-smoke, and Doom real-worker fixtures; their
+      > centralized temp-directory setup is included in the portability fix.
 
 ---
 
