@@ -353,9 +353,10 @@ raise, the package's immutable lifetime ceiling."
 (defcustom emacs-jupyter-notebook-external-image-max-snapshots 4
   "Maximum pending and retained external image snapshots.
 Each snapshot may contain one original image up to the helper's artifact
-limit.  Reaching this bound rejects another open request until a pending job
-settles, a request is cancelled, or a retained snapshot expires.  This option
-may lower, but cannot raise, the package's immutable count ceiling."
+limit.  When sequential opens reach this bound, the oldest completed handoff
+is retired to make room.  A new open is rejected only when every slot belongs
+to a pending verification, which cannot be safely evicted.  This option may
+lower, but cannot raise, the package's immutable count ceiling."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 

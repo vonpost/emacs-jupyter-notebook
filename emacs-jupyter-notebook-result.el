@@ -3898,6 +3898,24 @@ the path."
     (when (eq (plist-get snapshot :panel) panel)
       (emacs-jupyter-notebook-panel--cleanup-external-image-snapshot snapshot))))
 
+(defun emacs-jupyter-notebook-panel--make-external-image-snapshot-room ()
+  "Evict oldest completed handoffs until one snapshot slot is available.
+Pending verifications are never evicted.  Return non-nil when a new verifier
+can start within the configured hard bound."
+  (let ((limit
+         (emacs-jupyter-notebook-panel--external-image-snapshot-budget)))
+    (when (> limit 0)
+      (while (and emacs-jupyter-notebook-panel--external-image-snapshots
+                  (>= (+ emacs-jupyter-notebook-panel--external-image-pending-count
+                         (length
+                          emacs-jupyter-notebook-panel--external-image-snapshots))
+                      limit))
+        (emacs-jupyter-notebook-panel--cleanup-external-image-snapshot
+         (car (last emacs-jupyter-notebook-panel--external-image-snapshots))))
+      (< (+ emacs-jupyter-notebook-panel--external-image-pending-count
+            (length emacs-jupyter-notebook-panel--external-image-snapshots))
+         limit))))
+
 (add-hook 'kill-emacs-hook
           #'emacs-jupyter-notebook-panel--cleanup-external-image-opens-on-exit)
 
@@ -3999,10 +4017,9 @@ A second invocation while its verifier is pending cancels that request."
                    (emacs-jupyter-notebook-panel--external-image-snapshot-budget)))
               (unless (> limit 0)
                 (user-error "External image snapshots are disabled"))
-              (when (>= (+ emacs-jupyter-notebook-panel--external-image-pending-count
-                           (length emacs-jupyter-notebook-panel--external-image-snapshots))
-                        limit)
-                (user-error "External image snapshot limit reached"))
+              (unless
+                  (emacs-jupyter-notebook-panel--make-external-image-snapshot-room)
+                (user-error "External image verification limit reached"))
               (let ((original
                      (emacs-jupyter-notebook-panel--original-for-external-open image))
                     (snapshot

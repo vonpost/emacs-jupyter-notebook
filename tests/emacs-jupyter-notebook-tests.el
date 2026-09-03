@@ -10709,6 +10709,32 @@ session does not pay an O(history) erase+reinsert on every stream flush."
     (should (= (emacs-jupyter-notebook-panel--external-image-snapshot-ttl)
                emacs-jupyter-notebook-panel--hard-external-image-snapshot-ttl))))
 
+(ert-deftest ejn-ei4d-completed-external-snapshots-evict-under-pressure ()
+  "Sequential image opens reuse completed snapshot capacity."
+  (let* ((oldest (list :file "oldest"))
+         (newest (list :file "newest"))
+         (emacs-jupyter-notebook-panel--external-image-snapshots
+          (list newest oldest))
+         (emacs-jupyter-notebook-panel--external-image-pending-count 0)
+         (emacs-jupyter-notebook-external-image-max-snapshots 2)
+         cleaned)
+    (cl-letf (((symbol-function
+                'emacs-jupyter-notebook-panel--cleanup-external-image-snapshot)
+               (lambda (snapshot)
+                 (push snapshot cleaned)
+                 (setq emacs-jupyter-notebook-panel--external-image-snapshots
+                       (delq snapshot
+                             emacs-jupyter-notebook-panel--external-image-snapshots)))))
+      (should (emacs-jupyter-notebook-panel--make-external-image-snapshot-room))
+      (should (equal cleaned (list oldest)))
+      (should (equal emacs-jupyter-notebook-panel--external-image-snapshots
+                     (list newest)))
+      ;; In-flight verifiers cannot be evicted or allowed beyond the bound.
+      (setq emacs-jupyter-notebook-panel--external-image-snapshots nil
+            emacs-jupyter-notebook-panel--external-image-pending-count 2)
+      (should-not
+       (emacs-jupyter-notebook-panel--make-external-image-snapshot-room)))))
+
 (ert-deftest ejn-ir3s-entry-and-panel-output-segments-are-hard-bounded ()
   "Tiny independent outputs cannot make structural panel work unbounded."
   (with-temp-buffer
