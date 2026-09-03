@@ -159,6 +159,9 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
       touches: `emacs-jupyter-notebook-runtime.el`,
       `emacs-jupyter-notebook.el`, `README.md`,
       `registry_worker/tests/test_worker.py`, runtime/registry tests — for: W20
+      > note: user-approved scope expansion adds `flake.nix`: first-use
+      > runtime outputs must not execute development test suites; equivalent
+      > tested derivations remain mandatory under `nix flake check`.
 
 ---
 
