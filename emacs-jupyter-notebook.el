@@ -34,9 +34,9 @@
 
 ;;; W8 — local interactive matplotlib viewer: remote formatter injection
 ;;
-;; The remote kernel stays HEADLESS.  On connect (and re-run on restart)
-;; Emacs injects a one-time, in-memory hook that makes every displayed
-;; `matplotlib.figure.Figure' ALSO emit a custom MIME
+;; The remote kernel stays HEADLESS.  When the pickle viewer is enabled,
+;; connect (and restart) injects a one-time, in-memory hook that makes every
+;; displayed `matplotlib.figure.Figure' ALSO emit a custom MIME
 ;; `application/x-ejn-mpl-pickle' (base64 of `pickle.dumps(fig)') ALONGSIDE
 ;; the normal `image/png'.  Nothing is written to the remote filesystem and
 ;; nothing is pip-installed: the snippet only needs matplotlib + stdlib,
@@ -116,7 +116,8 @@ if _ejn_ip is not None:
         pass
 "
   "In-memory Python snippet installing the W8 matplotlib pickle emitter.
-Injected via a silent `execute_request' on connect and restart.  Patches
+When the pickle viewer is enabled, this is injected via a silent
+`execute_request' on connect and restart.  Patches
 `matplotlib.figure.Figure._repr_mimebundle_' so every displayed figure
 carries a base64-encoded `pickle.dumps(fig)' under the custom MIME type
 `application/x-ejn-mpl-pickle', alongside the normal inline `image/png'.
@@ -1621,7 +1622,8 @@ never make Emacs appear hung.
           (1+ emacs-jupyter-notebook--execution-setup-epoch))
     (emacs-jupyter-notebook--execution-setup-send-next
      client emacs-jupyter-notebook--execution-setup-epoch
-     (append (list emacs-jupyter-notebook--viewer-formatter-snippet)
+     (append (when emacs-jupyter-notebook-enable-pickle-viewer
+               (list emacs-jupyter-notebook--viewer-formatter-snippet))
              (when (and (integerp emacs-jupyter-notebook-kernel-idle-timeout)
                         (> emacs-jupyter-notebook-kernel-idle-timeout 0))
                (list (format emacs-jupyter-notebook--kernel-idle-watchdog-snippet
@@ -6357,7 +6359,8 @@ SUFFIX describes the explicit terminal action in the result panel."
              (= epoch emacs-jupyter-notebook--execution-setup-epoch))
     (emacs-jupyter-notebook--execution-setup-send-next
      client epoch
-     (append (list emacs-jupyter-notebook--viewer-formatter-snippet)
+     (append (when emacs-jupyter-notebook-enable-pickle-viewer
+               (list emacs-jupyter-notebook--viewer-formatter-snippet))
              (when (and (integerp emacs-jupyter-notebook-kernel-idle-timeout)
                         (> emacs-jupyter-notebook-kernel-idle-timeout 0))
                (list (format emacs-jupyter-notebook--kernel-idle-watchdog-snippet

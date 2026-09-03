@@ -11440,6 +11440,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                      :reconnect-owner 'automatic))
            (client (emacs-jupyter-notebook-backend-session-create
                     nil (current-buffer)))
+           (emacs-jupyter-notebook-enable-pickle-viewer t)
            (timer (run-at-time 600 nil #'ignore)))
       (emacs-jupyter-notebook-backend-session-mark-attached client)
       (setq context (emacs-jupyter-notebook--async-put
@@ -11828,6 +11829,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
     (let* ((client (emacs-jupyter-notebook-backend-session-create nil (current-buffer)))
            (emacs-jupyter-notebook--client client)
            (emacs-jupyter-notebook-check-code-completeness nil)
+           (emacs-jupyter-notebook-enable-pickle-viewer t)
            (emacs-jupyter-notebook-kernel-idle-timeout 0)
            calls setup-success)
       (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-execute)
@@ -11856,6 +11858,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
     (let* ((client (ejn-test-backend-session 'helper t))
            (emacs-jupyter-notebook--client client)
            (emacs-jupyter-notebook-check-code-completeness nil)
+           (emacs-jupyter-notebook-enable-pickle-viewer t)
            (emacs-jupyter-notebook-kernel-idle-timeout 0)
            setup-success setup-failure user-sends)
       (setf (emacs-jupyter-notebook-backend-session-backend client) 'helper)
@@ -11895,6 +11898,27 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
         (should-not emacs-jupyter-notebook--execution-setup-pending)
         (should (= emacs-jupyter-notebook--reconnect-attempt 4))
         (should (= pumps 1))))))
+
+(ert-deftest ejn-cc6-matplotlib-pickle-setup-is-opt-in ()
+  "Default-disabled initial and restart setup omit the pickle formatter."
+  (let ((emacs-jupyter-notebook-enable-pickle-viewer nil)
+        (emacs-jupyter-notebook-kernel-idle-timeout 60)
+        initial restart)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook--execution-setup-send-next)
+               (lambda (_client _epoch snippets)
+                 (if initial (setq restart snippets) (setq initial snippets)))))
+      (with-temp-buffer
+        (setq emacs-jupyter-notebook--client 'client)
+        (emacs-jupyter-notebook--execution-start-setup 'client))
+      (with-temp-buffer
+        (setq emacs-jupyter-notebook--client 'client
+              emacs-jupyter-notebook--execution-setup-pending t
+              emacs-jupyter-notebook--execution-setup-epoch 9)
+        (emacs-jupyter-notebook--execution-restart-start-setup 'client 9)))
+    (let ((expected (list (format emacs-jupyter-notebook--kernel-idle-watchdog-snippet
+                                  60))))
+      (should (equal initial expected))
+      (should (equal restart expected)))))
 
 
 
@@ -12040,6 +12064,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
   (with-temp-buffer
     (let* ((client (ejn-test-backend-session 'helper t))
            (emacs-jupyter-notebook-check-code-completeness nil)
+           (emacs-jupyter-notebook-enable-pickle-viewer t)
            (emacs-jupyter-notebook-kernel-idle-timeout 0)
            setup-success calls)
       (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-client-async)

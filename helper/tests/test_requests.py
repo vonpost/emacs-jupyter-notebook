@@ -330,6 +330,8 @@ class BackendReaderTests(unittest.IsolatedAsyncioTestCase):
     async def test_channel_failure_finishes_each_pending_request_once(self):
         backend, _client = await self._backend()
         info_callbacks, execute_callbacks = [], []
+        origins = []
+        backend.set_transport_failure_callback(origins.append)
         backend.start("kernel_info", {}, lambda _event: None, info_callbacks.append)
         backend.start("execute", {"code": "x"}, lambda _event: None, execute_callbacks.append)
         await self.queues["iopub"].put(RuntimeError("channel failed"))
@@ -344,6 +346,7 @@ class BackendReaderTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertEqual(backend._pending, {})
         self.assertTrue(backend._transport_failed)
+        self.assertEqual(origins, ["channel-reader"])
 
     async def test_cancelling_one_request_leaves_other_request_and_readers_live(self):
         backend, _client = await self._backend()

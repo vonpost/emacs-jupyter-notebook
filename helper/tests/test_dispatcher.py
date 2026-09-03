@@ -351,9 +351,9 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
             def set_transport_failure_callback(self, callback):
                 self.transport_failure_callback = callback
 
-            def fail_transport(self):
+            def fail_transport(self, origin):
                 assert self.transport_failure_callback is not None
-                self.transport_failure_callback()
+                self.transport_failure_callback(origin)
 
         backend = FatalBackend(self.loop)
         responses = []
@@ -362,8 +362,8 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
             backend, responses.append, event_queue=queue, loop=self.loop
         )
         self.assertIsNotNone(backend.transport_failure_callback)
-        backend.fail_transport()
-        backend.fail_transport()
+        backend.fail_transport("heartbeat")
+        backend.fail_transport("channel-reader")
 
         events = decode_events(queue.drain())
         self.assertEqual(
@@ -377,7 +377,8 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
                     "request_id": None,
                     "data": {
                         "code": "transport-error",
-                        "message": "Jupyter transport lost",
+                        "message": "Jupyter heartbeat lost",
+                        "origin": "heartbeat",
                     },
                 }
             ],
@@ -395,7 +396,7 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
 
             def fail_transport(self):
                 assert self.transport_failure_callback is not None
-                self.transport_failure_callback()
+                self.transport_failure_callback("channel-reader")
 
         backend = FatalBackend(self.loop)
         responses = []
@@ -416,9 +417,16 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
 
         events = decode_events(queue.drain())
         self.assertEqual([item["event"] for item in events], ["transport_error"])
+        self.assertEqual(events[0]["data"]["origin"], "channel-reader")
+        self.assertEqual(
+            events[0]["data"]["message"], "Jupyter channel reader failed"
+        )
         matching = [item for item in responses if item["id"] == "active"]
         self.assertEqual(len(matching), 1)
         self.assertFalse(matching[0]["ok"])
+        self.assertEqual(
+            matching[0]["error"]["message"], "Jupyter channel reader failed"
+        )
         self.assertIs(matching[0]["error"]["admitted"], True)
 
     async def test_duplicate_backend_completion_emits_one_response(self):

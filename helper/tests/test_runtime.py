@@ -254,7 +254,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
             def fail_transport(self) -> None:
                 assert self.transport_failure_callback is not None
-                self.transport_failure_callback()
+                self.transport_failure_callback("channel-reader")
 
         reader, writer, backend = asyncio.StreamReader(), _Writer(), FatalBackend()
         runtime = ProtocolRuntime(reader, writer, backend=backend)

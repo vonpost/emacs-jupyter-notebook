@@ -11,7 +11,8 @@ import unittest
 from pathlib import Path
 from queue import Empty
 
-from ejn_helper.jupyter_backend import JupyterBackend
+from ejn_helper.jupyter_backend import JupyterBackend, _Pending
+from ejn_helper.requests import ExecutionState
 
 
 class LifecycleBackendTests(unittest.IsolatedAsyncioTestCase):
@@ -227,7 +228,7 @@ class LifecycleBackendTests(unittest.IsolatedAsyncioTestCase):
     async def test_transient_liveness_misses_recover_without_transport_failure(self):
         backend, client = await self._connected(deadline=0.05)
         observed = []
-        backend.set_transport_failure_callback(lambda: observed.append("lost"))
+        backend.set_transport_failure_callback(observed.append)
         responses = iter((False, True, OSError("transient heartbeat failure"), True))
         sampled = asyncio.Event()
         samples = 0
@@ -250,10 +251,27 @@ class LifecycleBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(backend._transport_failed)
         self.assertIs(backend.client, client)
 
+    async def test_liveness_misses_are_suspended_through_execution_output_drain(self):
+        backend, client = await self._connected(deadline=0.05)
+        observed = []
+        backend.set_transport_failure_callback(observed.append)
+        # Execution keeps this future unresolved until ordered output draining
+        # finishes, even after reply and idle have both arrived.
+        pending = _Pending(
+            asyncio.get_running_loop().create_future(), ExecutionState("execute-1")
+        )
+        backend._pending["execute-1"] = pending
+        client.alive = False
+        await asyncio.sleep(backend._heartbeat_interval * 4.5)
+
+        self.assertEqual(observed, [])
+        self.assertIs(backend.client, client)
+        pending.future.set_result({})
+
     async def test_idle_liveness_failure_notifies_once_without_a_request(self):
         backend, client = await self._connected(deadline=0.05)
         observed = []
-        backend.set_transport_failure_callback(lambda: observed.append("lost"))
+        backend.set_transport_failure_callback(observed.append)
         client.alive = False
 
         for _ in range(30):
@@ -261,12 +279,12 @@ class LifecycleBackendTests(unittest.IsolatedAsyncioTestCase):
                 break
             await asyncio.sleep(0.01)
 
-        self.assertEqual(observed, ["lost"])
+        self.assertEqual(observed, ["heartbeat"])
         self.assertTrue(backend._transport_failed)
         self.assertIsNone(backend.client)
         self.assertGreaterEqual(client.stopped, 1)
         await asyncio.sleep(0.08)
-        self.assertEqual(observed, ["lost"])
+        self.assertEqual(observed, ["heartbeat"])
 
     async def test_shutdown_requires_reply_and_terminal_liveness_then_retires_local_state(self):
         backend, client = await self._connected()
@@ -311,9 +329,12 @@ class LifecycleBackendTests(unittest.IsolatedAsyncioTestCase):
         await assert_retired(backend)
 
         backend, client = await self._connected()
+        observed = []
+        backend.set_transport_failure_callback(observed.append)
         client.send_error = OSError("send failed")
         _token, sent = await self._request(backend, "shutdown")
         self.assertEqual((await asyncio.wait_for(sent, 1)).error.code, "transport-error")
+        self.assertEqual(observed, ["channel-send"])
         await assert_retired(backend)
 
         backend, _client = await self._connected()

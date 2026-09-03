@@ -41,6 +41,9 @@ MAX_INPUT_VALUE_BYTES = 65_536
 INPUT_ID_BYTES = 16
 _DEADLINE_OPERATIONS = frozenset({"kernel_info"})
 _LIVENESS_FAILURE_THRESHOLD = 3
+_TRANSPORT_FAILURE_ORIGINS = frozenset(
+    {"heartbeat", "channel-reader", "channel-send"}
+)
 
 
 def _bounded_utf8_size(value: str, ceiling: int) -> int:
@@ -368,7 +371,8 @@ class JupyterBackend:
         self._retired_tasks: list[asyncio.Task] = []
         self._timed_out_tasks: set[asyncio.Task[None]] = set()
         self._transport_failed = False
-        self._transport_failure_callback: Callable[[], None] | None = None
+        self._transport_failure_callback: Callable[[str], None] | None = None
+        self._transport_failure_origin: str | None = None
         self._transport_failure_notified = False
         self._shutting_down = False
         self._shutdown_reply_received = False
@@ -392,13 +396,14 @@ class JupyterBackend:
         return self.operation_deadlines.get(operation, self.deadline)
 
     def set_transport_failure_callback(
-        self, callback: Callable[[], None] | None
+        self, callback: Callable[[str], None] | None
     ) -> None:
         """Install the one-shot local transport-failure observer.
 
         The dispatcher owns the protocol-visible consequence of a dead Jupyter
-        channel.  The backend merely reports that local fact; it never sends a
-        kernel control message or makes a kernel-lifetime decision here.
+        channel.  The backend reports only a fixed failure-origin label; it
+        never sends a kernel control message or makes a kernel-lifetime
+        decision here.
         """
         if callback is not None and not callable(callback):
             raise ValueError("transport failure callback must be callable")
@@ -418,7 +423,7 @@ class JupyterBackend:
             return
         self._transport_failure_notified = True
         try:
-            callback()
+            callback(self._transport_failure_origin or "channel-reader")
         except Exception:
             # The observer is local protocol plumbing.  Its failure must not
             # disrupt release of readers and pending operation futures.
@@ -625,6 +630,7 @@ class JupyterBackend:
         client.start_channels()
         self._channels_started = True
         self._transport_failed = False
+        self._transport_failure_origin = None
         # Attachment is local channel construction only.  A busy/black-holed
         # kernel must not stall it; the caller's bounded kernel_info request
         # owns readiness verification and can be cancelled independently.
@@ -744,7 +750,7 @@ class JupyterBackend:
         except Exception as exc:
             # A send failure makes its outcome ambiguous.  Do not attempt a
             # second control send, and release only the local transport.
-            self._fail_transport()
+            self._fail_transport("channel-send")
             raise BackendError("transport-error") from exc
         pending = _Pending(
             asyncio.get_running_loop().create_future(), reply_type=reply_type
@@ -804,7 +810,7 @@ class JupyterBackend:
             # trusted for this or any other correlated request.  Fail pending
             # work promptly; reconnect may create fresh local channels without
             # taking ownership of the remote kernel.
-            self._fail_transport()
+            self._fail_transport("channel-send")
             raise BackendError("transport-error") from None
         finally:
             # Python strings cannot be wiped, but drop our last direct reference
@@ -840,7 +846,7 @@ class JupyterBackend:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                self._fail_transport()
+                self._fail_transport("channel-reader")
                 return
             self._route(channel, message)
 
@@ -850,6 +856,9 @@ class JupyterBackend:
         while not self.closed and self._channels_started:
             try:
                 await asyncio.sleep(self._heartbeat_interval)
+                if self._execution_pending():
+                    consecutive_misses = 0
+                    continue
                 client = self.client
                 if client is None:
                     return
@@ -860,13 +869,23 @@ class JupyterBackend:
                 raise
             except Exception:
                 alive = False
+            if self._execution_pending():
+                consecutive_misses = 0
+                continue
             if alive:
                 consecutive_misses = 0
                 continue
             consecutive_misses += 1
             if consecutive_misses >= _LIVENESS_FAILURE_THRESHOLD:
-                self._fail_transport()
+                self._fail_transport("heartbeat")
                 return
+
+    def _execution_pending(self) -> bool:
+        """Whether execution or its ordered output drain still owns a request."""
+        return any(
+            pending.state is not None and not pending.future.done()
+            for pending in self._pending.values()
+        )
 
     def _route(self, channel: str, message: object) -> None:
         """Route exactly one message from its sole channel reader.
@@ -877,7 +896,7 @@ class JupyterBackend:
         and can steal unrelated control replies.
         """
         if not isinstance(message, Mapping):
-            self._fail_transport()
+            self._fail_transport("channel-reader")
             return
         parent = message.get("parent_header", {})
         if not isinstance(parent, Mapping):
@@ -1021,7 +1040,7 @@ class JupyterBackend:
                     input_id = candidate
                     break
             if input_id is None:
-                self._fail_transport()
+                self._fail_transport("channel-reader")
                 return
             prompt, password = _normalize_input_request(message.get("content"))
             pending.input_id = input_id
@@ -1132,7 +1151,9 @@ class JupyterBackend:
             if prompt is not None and prompt.pending is pending:
                 self._input_prompts.pop(input_id, None)
 
-    def _fail_transport(self) -> None:
+    def _fail_transport(self, origin: str) -> None:
+        if origin not in _TRANSPORT_FAILURE_ORIGINS:
+            raise ValueError("unknown transport failure origin")
         if self.closed or self._transport_failed:
             return
         if self._shutting_down and self._shutdown_reply_received:
@@ -1141,6 +1162,7 @@ class JupyterBackend:
             # terminal-liveness check and its final local teardown.
             return
         self._transport_failed = True
+        self._transport_failure_origin = origin
         self._notify_transport_failure()
         for pending in tuple(self._pending.values()):
             if not pending.future.done():

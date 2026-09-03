@@ -72,6 +72,11 @@ _SAFE_ERROR_MESSAGES = {
     "transport-error": "backend request failed",
     "busy": "request cannot run in the current state",
 }
+_TRANSPORT_FAILURE_MESSAGES = {
+    "heartbeat": "Jupyter heartbeat lost",
+    "channel-reader": "Jupyter channel reader failed",
+    "channel-send": "Jupyter channel send failed",
+}
 _CAPABILITIES = (
     "event-credit",
     "request-deadlines",
@@ -206,6 +211,7 @@ class Dispatcher:
         self.late_completions = 0
         self.late_events = 0
         self._transport_failure_reported = False
+        self._transport_failure_message: str | None = None
         register_transport_failure = getattr(
             backend, "set_transport_failure_callback", None
         )
@@ -216,7 +222,7 @@ class Dispatcher:
     def inflight_count(self) -> int:
         return len(self._inflight)
 
-    def _backend_transport_failed(self) -> None:
+    def _backend_transport_failed(self, origin: object) -> None:
         """Publish one uncorrelated fatal Jupyter-channel event.
 
         An attached backend can discover a dead channel while no EJN request is
@@ -228,6 +234,9 @@ class Dispatcher:
         """
         if self.closed or self._transport_failure_reported:
             return
+        if not isinstance(origin, str) or origin not in _TRANSPORT_FAILURE_MESSAGES:
+            origin = "channel-reader"
+        self._transport_failure_message = _TRANSPORT_FAILURE_MESSAGES[origin]
         self._transport_failure_reported = True
         self.connected = False
         try:
@@ -239,7 +248,8 @@ class Dispatcher:
                     "request_id": None,
                     "data": {
                         "code": "transport-error",
-                        "message": "Jupyter transport lost",
+                        "message": self._transport_failure_message,
+                        "origin": origin,
                     },
                 }
             )
@@ -639,7 +649,16 @@ class Dispatcher:
                     and item.error.code in _SAFE_ERROR_MESSAGES
                     else "transport-error"
                 )
-                self._finish_error(request_id, record, code)
+                self._finish_error(
+                    request_id,
+                    record,
+                    code,
+                    message=(
+                        self._transport_failure_message
+                        if code == "transport-error"
+                        else None
+                    ),
+                )
                 return
             if item.result is None or not isinstance(item.result, Mapping):
                 raise ValueError
@@ -661,13 +680,14 @@ class Dispatcher:
         record: _Inflight,
         code: str,
         *,
+        message: str | None = None,
         cancel: bool = False,
     ) -> None:
         self._finish(
             request_id,
             record,
             False,
-            {"code": code, "message": _safe_message(code)},
+            {"code": code, "message": message or _safe_message(code)},
             cancel=cancel,
         )
 
