@@ -1476,10 +1476,11 @@ automatic reconnect loop after local resources are gone."
         ;; queued sentinel must be unable to classify this retired tunnel.
         (ignore-errors (set-process-sentinel tunnel #'ignore))
         (ignore-errors (emacs-jupyter-notebook--async-delete-process tunnel)))
-      ;; This is the sole entry to a newly observed loss episode.  A retry
-      ;; attempt must retain its budget across its own local teardown, while a
-      ;; later loss after successful finalization starts fresh.
-      (emacs-jupyter-notebook--reset-auto-reconnect-episode)
+      ;; Cancel stale scheduling ownership without resetting the attempt
+      ;; counter.  Only a connection that survives post-connect setup proves
+      ;; this recovery episode ended; resetting here lets a flapping helper
+      ;; reconnect forever.
+      (emacs-jupyter-notebook--cancel-auto-reconnect)
       (setq emacs-jupyter-notebook--tunnel-dead t)
       (emacs-jupyter-notebook--remember-status-error reason)
       (emacs-jupyter-notebook--log-append 'transport "local transport lost: %s" reason)
@@ -1571,6 +1572,11 @@ never make Emacs appear hung.
           emacs-jupyter-notebook--execution-setup-pending nil)
     (when reason
       (emacs-jupyter-notebook--log-append 'setup "%s" reason))
+    ;; Installation alone is not stable: the helper can die while these setup
+    ;; requests are first crossing the transport.  Reset retry accounting only
+    ;; after that bounded setup sequence completes successfully.
+    (unless reason
+      (emacs-jupyter-notebook--reset-auto-reconnect-episode))
     (emacs-jupyter-notebook--execution-pump)))
 
 (defun emacs-jupyter-notebook--execution-setup-send-next (client epoch snippets)
@@ -1601,10 +1607,10 @@ never make Emacs appear hung.
                                                        reason)
                    (emacs-jupyter-notebook--execution-setup-send-next client epoch rest))))))
         (error
-         (emacs-jupyter-notebook--log-append 'setup
-                                             "cannot send silent setup request: %s"
-                                             (error-message-string err))
-         (emacs-jupyter-notebook--execution-setup-send-next client epoch rest))))))
+         (emacs-jupyter-notebook--execution-setup-finish
+          client epoch
+          (format "cannot send silent setup request: %s"
+                  (error-message-string err))))))))
 
 (defun emacs-jupyter-notebook--execution-start-setup (client)
   "Serialize formatter/watchdog setup before any user execution is sent."
@@ -2680,7 +2686,7 @@ outer tunnel-readiness deadline is waiting to run."
         emacs-jupyter-notebook--reconnect-force nil))
 
 (defun emacs-jupyter-notebook--reset-auto-reconnect-episode ()
-  "Reset retry accounting after a successful connection or a new loss.
+  "Reset retry accounting after a connection survives bounded setup.
 This deliberately does not touch the durable registry entry or remote kernel."
   (emacs-jupyter-notebook--cancel-auto-reconnect)
   (setq emacs-jupyter-notebook--reconnect-attempt 0
@@ -4230,7 +4236,6 @@ clobbering any newer attempt while re-issuing SCP against a killed kernel."
                       emacs-jupyter-notebook--tunnel-dead nil
                       emacs-jupyter-notebook--last-bounded-error nil
                       emacs-jupyter-notebook--kernel-status (if busy 'busy nil))
-                (emacs-jupyter-notebook--reset-auto-reconnect-episode)
                 (emacs-jupyter-notebook--heartbeat-start)
                 (if-let ((restart-epoch (plist-get context :restart-epoch)))
                     (emacs-jupyter-notebook--execution-restart-start-setup

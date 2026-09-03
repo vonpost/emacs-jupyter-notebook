@@ -400,6 +400,7 @@ class BackendReaderTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_awaitable_heartbeat_timeout_fails_once_and_reaps_cleanly(self):
         backend, client = await self._backend()
+        backend.operation_deadlines["kernel_info"] = 1.0
         callbacks = []
         backend.start("kernel_info", {}, lambda _event: None, callbacks.append)
         client.never_alive = True

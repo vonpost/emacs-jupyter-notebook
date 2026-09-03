@@ -22,15 +22,20 @@ class ThumbnailWorkerLimitTests(unittest.TestCase):
             ],
         )
 
-    def test_darwin_arm64_uses_bounded_pillow_headroom(self):
+    def test_darwin_arm64_uses_supported_resource_limits(self):
         with mock.patch.object(thumbnail_worker.sys, "platform", "darwin"), mock.patch.object(
             thumbnail_worker.platform, "machine", return_value="arm64"
         ), mock.patch.object(thumbnail_worker, "_set_limit") as set_limit:
             thumbnail_worker.apply_limits()
 
         self.assertEqual(
-            set_limit.call_args_list[-1],
-            mock.call("RLIMIT_AS", thumbnail_worker.EJN_DARWIN_ADDRESS_SPACE_LIMIT),
+            set_limit.call_args_list,
+            [
+                mock.call("RLIMIT_CPU", 3),
+                mock.call("RLIMIT_FSIZE", thumbnail_worker.EJN_MAX_PREVIEW_BYTES),
+                mock.call("RLIMIT_NOFILE", 16),
+                mock.call("RLIMIT_CORE", 0),
+            ],
         )
 
     def test_unsupported_platform_fails_before_setting_limits(self):

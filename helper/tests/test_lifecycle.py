@@ -224,6 +224,32 @@ class LifecycleBackendTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             JupyterBackend(operation_deadlines={"execute": 0.1})
 
+    async def test_transient_liveness_misses_recover_without_transport_failure(self):
+        backend, client = await self._connected(deadline=0.05)
+        observed = []
+        backend.set_transport_failure_callback(lambda: observed.append("lost"))
+        responses = iter((False, True, OSError("transient heartbeat failure"), True))
+        sampled = asyncio.Event()
+        samples = 0
+
+        def is_alive():
+            nonlocal samples
+            samples += 1
+            value = next(responses, True)
+            if samples == 4:
+                sampled.set()
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        client.is_alive = is_alive
+        await asyncio.wait_for(sampled.wait(), 1)
+        await asyncio.sleep(backend._heartbeat_interval * 1.5)
+
+        self.assertEqual(observed, [])
+        self.assertFalse(backend._transport_failed)
+        self.assertIs(backend.client, client)
+
     async def test_idle_liveness_failure_notifies_once_without_a_request(self):
         backend, client = await self._connected(deadline=0.05)
         observed = []

@@ -9386,10 +9386,10 @@ surfaces the error."
         (should err-seen)
         (should-not fresh-called)))))
 
-(ert-deftest ejn-w19-finalize-resets-reconnect-backoff ()
-  "W19: a successful connect resets the auto-reconnect backoff counter and
-clears the pending-reconnect timestamp, so the NEXT drop starts from the
-initial delay instead of inheriting this recovery's accumulated attempts."
+(ert-deftest ejn-w19-stable-setup-resets-reconnect-backoff ()
+  "W19: only completed post-connect setup resets reconnect accounting.
+A helper that dies between installation and setup completion is still part of
+the same recovery episode and must not regain an unlimited retry budget."
   (with-temp-buffer
     (let* ((entry (ejn-test-direct-entry
                    '(:profile "p" :session-id "s" :remote-host "h")))
@@ -9419,6 +9419,10 @@ initial delay instead of inheriting this recovery's accumulated attempts."
                (lambda () (eq (plist-get emacs-jupyter-notebook--async-context
                                          :phase)
                               'done))))
+      (should (= emacs-jupyter-notebook--reconnect-attempt 5))
+      (should emacs-jupyter-notebook--execution-setup-pending)
+      (emacs-jupyter-notebook--execution-setup-finish
+       session emacs-jupyter-notebook--execution-setup-epoch nil)
       (should (= emacs-jupyter-notebook--reconnect-attempt 0))
       (should-not emacs-jupyter-notebook--reconnect-exhausted)
       (should-not emacs-jupyter-notebook--reconnect-next-at)
@@ -9495,8 +9499,8 @@ initial delay instead of inheriting this recovery's accumulated attempts."
               (should-not emacs-jupyter-notebook--reconnect-timer))
           (emacs-jupyter-notebook--cancel-auto-reconnect))))))
 
-(ert-deftest ejn-reconnect-attempt-limit-resets-on-new-transport-loss ()
-  "A genuinely new loss starts a new retry episode; duplicate loss does not."
+(ert-deftest ejn-reconnect-attempt-limit-survives-unstable-transport-loss ()
+  "A loss before setup stability retains the current retry episode."
   (with-temp-buffer
     (let ((entry '(:profile "p" :session-id "s" :remote-host "h"))
           scheduled)
@@ -9504,7 +9508,7 @@ initial delay instead of inheriting this recovery's accumulated attempts."
             emacs-jupyter-notebook--client 'old-client
             emacs-jupyter-notebook--tunnel-dead nil
             emacs-jupyter-notebook--reconnect-attempt 7
-            emacs-jupyter-notebook--reconnect-exhausted t)
+            emacs-jupyter-notebook--reconnect-exhausted nil)
       (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-close-local)
                  (lambda (&rest _) nil))
                 ((symbol-function 'emacs-jupyter-notebook--heartbeat-cancel) #'ignore)
@@ -9515,7 +9519,7 @@ initial delay instead of inheriting this recovery's accumulated attempts."
                  (lambda () (setq scheduled t))))
         (emacs-jupyter-notebook--transport-lost "test loss" 'old-client nil))
       (should scheduled)
-      (should (= emacs-jupyter-notebook--reconnect-attempt 0))
+      (should (= emacs-jupyter-notebook--reconnect-attempt 7))
       (should-not emacs-jupyter-notebook--reconnect-exhausted)
       (should emacs-jupyter-notebook--tunnel-dead))))
 
@@ -9796,6 +9800,51 @@ opener function with the backing file path."
       (emacs-jupyter-notebook-panel--cleanup-external-image-opens-on-exit)
       (ignore-errors (delete-directory root t)))))
 
+(ert-deftest ejn-ei4d-external-verifier-surfaces-fixed-failure-reason ()
+  "A rejected original reports only its bounded verifier reason code."
+  (let* ((root (car (ejn-ei4-test--artifact-root)))
+         (original (ejn-ei4d-test--write-artifact
+                    root "adadadadadadadadadadadadadadadad" "original"))
+         (emacs-jupyter-notebook-panel--external-image-snapshots nil)
+         (emacs-jupyter-notebook-panel--external-image-pending-count 0)
+         (emacs-jupyter-notebook-panel--external-image-pending-cancels nil)
+         reported panel)
+    (unwind-protect
+        (progn
+          (set-file-modes root #o700)
+          (with-temp-buffer
+            (setq panel (ejn-panel-ensure (current-buffer)))
+            (let ((handle (ejn-panel-start-entry panel '("reason.py" . 1) "plot()")))
+              (should
+               (ejn-panel-set-published-bundle
+                handle
+                (ejn-ei4v-test--descriptor
+                 root original "image/png" "verify-reason")
+                nil nil))
+              (with-current-buffer panel
+                (emacs-jupyter-notebook-panel--render panel)
+                (goto-char
+                 (or (text-property-any
+                      (point-min) (point-max)
+                      'emacs-jupyter-notebook-segment-index 0)
+                     (ert-fail "image placeholder was not rendered")))
+                (let ((emacs-jupyter-notebook-panel-original-verify-function
+                       (lambda (_metadata _snapshot completion)
+                         (funcall completion 'original-file)
+                         #'ignore))
+                      (emacs-jupyter-notebook-panel-external-open-function
+                       (lambda (_file) (ert-fail "rejected image was opened"))))
+                  (cl-letf (((symbol-function 'message)
+                             (lambda (format-string &rest args)
+                               (setq reported (apply #'format format-string args)))))
+                    (emacs-jupyter-notebook-panel-open-image-externally))
+                  (should
+                   (equal reported
+                          "emacs-jupyter-notebook: image original failed verification (original-file)")))))))
+      (when (buffer-live-p panel) (kill-buffer panel))
+      (emacs-jupyter-notebook-panel--cleanup-external-image-opens-on-exit)
+      (ignore-errors (delete-directory root t)))))
+
 (ert-deftest ejn-ei4d-async-original-verifier-pins-and-snapshots-content ()
   "The real verifier bridges Emacs IDs and copies only exact pinned bytes."
   (let* ((root (car (ejn-ei4-test--artifact-root)))
@@ -9828,7 +9877,7 @@ opener function with the backing file path."
                          (accept-process-output nil 0.02))
                        (should done)
                        (prog1 (list valid snapshot)
-                         (unless valid
+                         (unless (eq valid t)
                            (emacs-jupyter-notebook-panel--cleanup-external-image-snapshot
                             snapshot))))))
                 (let* ((attrs (file-attributes file 'integer))
@@ -9852,7 +9901,7 @@ opener function with the backing file path."
                 (let ((coding-system-for-write 'no-conversion))
                   (write-region "mutated!" nil file nil 'silent))
                 (set-file-modes file #o600)
-                (should-not (car (verify)))))))
+                (should (eq (car (verify)) 'content-mismatch))))))
       (when (buffer-live-p panel) (kill-buffer panel))
       (ignore-errors (delete-directory root t)))))
 
@@ -11379,8 +11428,8 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                         emacs-jupyter-notebook--reconnect-timer)))
         (emacs-jupyter-notebook--cancel-auto-reconnect)))))
 
-(ert-deftest ejn-ir5-successful-reconnect-resets-all-retry-state ()
-  "Successful finalize clears retry count, deadline, timer, and token."
+(ert-deftest ejn-ir5-stable-reconnect-setup-resets-all-retry-state ()
+  "Completed setup clears retry count, deadline, timer, and token."
   (with-temp-buffer
     (let* ((entry (ejn-test-direct-entry
                    '(:profile "p" :session-id "s" :remote-host "h")))
@@ -11419,6 +11468,9 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                (lambda () (eq (plist-get emacs-jupyter-notebook--async-context
                                          :phase)
                               'done))))
+      (should (= emacs-jupyter-notebook--reconnect-attempt 4))
+      (emacs-jupyter-notebook--execution-setup-finish
+       client emacs-jupyter-notebook--execution-setup-epoch nil)
       (should (= emacs-jupyter-notebook--reconnect-attempt 0))
       (should-not emacs-jupyter-notebook--reconnect-next-at)
       (should-not emacs-jupyter-notebook--reconnect-schedule-token)
@@ -11823,6 +11875,26 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
         (should (equal user-sends '("user()")))
         (funcall setup-success 12 nil)
         (should (equal user-sends '("user()")))))))
+
+(ert-deftest ejn-cc4-synchronous-setup-send-failure-retains-reconnect-budget ()
+  "A failed first setup write cannot make a flapping reconnect look stable."
+  (with-temp-buffer
+    (let ((client 'new-client)
+          (pumps 0))
+      (setq emacs-jupyter-notebook--client client
+            emacs-jupyter-notebook--execution-setup-pending t
+            emacs-jupyter-notebook--execution-setup-epoch 7
+            emacs-jupyter-notebook--reconnect-attempt 4)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-execute)
+                 (lambda (&rest _) (error "helper write failed")))
+                ((symbol-function 'emacs-jupyter-notebook--log-append) #'ignore)
+                ((symbol-function 'emacs-jupyter-notebook--execution-pump)
+                 (lambda () (cl-incf pumps))))
+        (emacs-jupyter-notebook--execution-setup-send-next
+         client 7 '("setup"))
+        (should-not emacs-jupyter-notebook--execution-setup-pending)
+        (should (= emacs-jupyter-notebook--reconnect-attempt 4))
+        (should (= pumps 1))))))
 
 
 

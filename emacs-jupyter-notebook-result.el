@@ -3709,11 +3709,33 @@ cannot affect a later viewer process or its independently retained snapshot."
 (defconst emacs-jupyter-notebook-panel--original-verify-timeout 10
   "Maximum seconds allowed for one local original-file verification.")
 
+(defun emacs-jupyter-notebook-panel--original-verification-exit-reason (status)
+  "Return the bounded verifier reason symbol for process exit STATUS."
+  (or (alist-get status
+                '((2 . invalid-request)
+                  (3 . unsafe-path)
+                  (4 . original-root)
+                  (5 . snapshot-root)
+                  (6 . original-file)
+                  (7 . snapshot-create)
+                  (8 . copy-io)
+                  (9 . content-mismatch)
+                  (10 . final-identity)))
+      'verifier-failed))
+
+(defun emacs-jupyter-notebook-panel--original-verification-reason (result)
+  "Bound verifier callback RESULT to a safe public reason symbol."
+  (if (memq result '(invalid-request unsafe-path original-root snapshot-root
+                      original-file snapshot-create copy-io content-mismatch
+                      final-identity timeout verifier-failed))
+      result
+    'verifier-failed))
+
 (defun emacs-jupyter-notebook-panel--verify-original-async
     (original snapshot callback)
   "Verify ORIGINAL into SNAPSHOT asynchronously, then call CALLBACK.
-CALLBACK receives non-nil only after the exact verified bytes have been
-durably copied into SNAPSHOT.  Return a no-argument cancellation function."
+CALLBACK receives t after an exact durable copy, or a bounded failure-reason
+symbol.  Return a no-argument cancellation function."
   (let* ((python (and (stringp emacs-jupyter-notebook-local-python-command)
                       (if (file-name-absolute-p
                            emacs-jupyter-notebook-local-python-command)
@@ -3761,8 +3783,13 @@ durably copied into SNAPSHOT.  Return a no-argument cancellation function."
                :sentinel
                (lambda (current _event)
                  (unless (process-live-p current)
-                   (finish (and (eq (process-status current) 'exit)
-                                (= (process-exit-status current) 0)))))))
+                   (let ((status (and (eq (process-status current) 'exit)
+                                      (process-exit-status current))))
+                     (finish
+                      (if (and status (= status 0))
+                          t
+                        (emacs-jupyter-notebook-panel--original-verification-exit-reason
+                         status))))))))
         ;; The verifier is useful only while its hard deadline exists.  If
         ;; timer construction fails after process creation, retire that exact
         ;; child and settle the callback before propagating the setup error.
@@ -3773,7 +3800,7 @@ durably copied into SNAPSHOT.  Return a no-argument cancellation function."
               (setq timer
                     (run-at-time
                      emacs-jupyter-notebook-panel--original-verify-timeout nil
-                     (lambda () (finish nil))))
+                     (lambda () (finish 'timeout))))
             (error
              (finish nil)
              (signal (car err) (cdr err)))))
@@ -3785,7 +3812,7 @@ durably copied into SNAPSHOT.  Return a no-argument cancellation function."
 
 (defvar emacs-jupyter-notebook-panel-original-verify-function
   #'emacs-jupyter-notebook-panel--verify-original-async
-  "Function called with original, snapshot, and async boolean callback.
+  "Function called with original, snapshot, and async result callback.
 It returns a no-argument function which cancels the pending verification.")
 
 (defun emacs-jupyter-notebook-panel--release-original-open (image)
@@ -3932,7 +3959,7 @@ can start within the configured hard bound."
            (unless lease-released
              (setq lease-released t)
              (emacs-jupyter-notebook-panel--release-original-open image)))
-         (finish (valid &optional quiet)
+         (finish (result &optional quiet)
            (unless settled
              (setq settled t)
              (setq emacs-jupyter-notebook-panel--external-image-pending-cancels
@@ -3943,14 +3970,16 @@ can start within the configured hard bound."
              (when (eq (plist-get props :ejn-original-open-pending) token)
                (plist-put props :ejn-original-open-pending nil)
                (plist-put props :ejn-original-open-cancel nil))
-             (if (not valid)
+             (if (not (eq result t))
                  (progn
                    (emacs-jupyter-notebook-panel--cleanup-external-image-snapshot
                     snapshot)
                    (release-original)
                    (unless quiet
                      (message
-                      "emacs-jupyter-notebook: image original failed verification")))
+                      "emacs-jupyter-notebook: image original failed verification (%s)"
+                      (emacs-jupyter-notebook-panel--original-verification-reason
+                       result))))
                (condition-case err
                    (let ((registered
                           (emacs-jupyter-notebook-panel--register-external-image-snapshot

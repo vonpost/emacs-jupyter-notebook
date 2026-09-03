@@ -18,10 +18,6 @@ EJN_MAX_SOURCE_PIXELS = 4_194_304
 EJN_MAX_PREVIEW_DIMENSION = 1_024
 EJN_MAX_PREVIEW_BYTES = 4 * 1_024 * 1_024
 EJN_LINUX_ADDRESS_SPACE_LIMIT = 256 * 1_024 * 1_024
-# macOS's dyld shared cache and the native image libraries it maps leave a
-# substantially larger virtual-address baseline than Linux.  Keep decoding
-# bounded while leaving enough headroom for Pillow to load on Apple Silicon.
-EJN_DARWIN_ADDRESS_SPACE_LIMIT = 1_024 * 1_024 * 1_024
 
 
 def _supported_platform() -> bool:
@@ -29,15 +25,6 @@ def _supported_platform() -> bool:
     return (sys.platform.startswith("linux") and machine in {"x86_64", "amd64"}) or (
         sys.platform == "darwin" and machine in {"arm64", "aarch64"}
     )
-
-
-def _address_space_limit() -> int:
-    """Return the fixed virtual-address ceiling for the supported platform."""
-    if sys.platform.startswith("linux"):
-        return EJN_LINUX_ADDRESS_SPACE_LIMIT
-    if sys.platform == "darwin":
-        return EJN_DARWIN_ADDRESS_SPACE_LIMIT
-    raise RuntimeError("unsupported thumbnail-worker platform")
 
 
 def _set_limit(name: str, value: int) -> None:
@@ -61,7 +48,13 @@ def apply_limits() -> None:
     _set_limit("RLIMIT_FSIZE", EJN_MAX_PREVIEW_BYTES)
     _set_limit("RLIMIT_NOFILE", 16)
     _set_limit("RLIMIT_CORE", 0)
-    _set_limit("RLIMIT_AS", _address_space_limit())
+    # Darwin aliases RLIMIT_AS to its unsupported RSS limit; current macOS may
+    # reject attempts to set it with EINVAL.  Requiring it made every Apple
+    # Silicon preview fail before Pillow was imported.  The fixed source-pixel,
+    # input-byte, output-byte, CPU, descriptor, and wall-clock bounds remain in
+    # force there.  Linux provides a real address-space limit, so keep it.
+    if sys.platform.startswith("linux"):
+        _set_limit("RLIMIT_AS", EJN_LINUX_ADDRESS_SPACE_LIMIT)
 
 
 def _install_pinned_pillow_site() -> None:

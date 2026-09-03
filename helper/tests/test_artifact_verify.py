@@ -193,6 +193,27 @@ class ArtifactVerifyTests(unittest.TestCase):
         )
         self.assert_rejected(self.argv_for(size=-1))
 
+    def test_main_reports_fixed_bounded_failure_statuses(self) -> None:
+        """The parent can distinguish safe stages without receiving details."""
+        metadata = os.stat(self.path)
+        self.assertEqual(
+            artifact_verify.verification_status(
+                self.argv_for(file_inode=metadata.st_ino + 1)
+            ),
+            artifact_verify.STATUS_ORIGINAL_FILE,
+        )
+        with mock.patch.object(
+            artifact_verify.os, "fsync", side_effect=OSError("private detail")
+        ):
+            self.assertEqual(
+                artifact_verify.verification_status(self.argv_for()),
+                artifact_verify.STATUS_COPY_IO,
+            )
+        with mock.patch.object(sys, "argv", ["artifact_verify.py"]):
+            self.assertEqual(
+                artifact_verify.main(), artifact_verify.STATUS_INVALID_REQUEST
+            )
+
     def test_write_and_fsync_failures_remove_partial_snapshot(self) -> None:
         with mock.patch.object(artifact_verify.os, "write", side_effect=OSError("nope")):
             self.assertFalse(artifact_verify.verify(self.argv_for()))

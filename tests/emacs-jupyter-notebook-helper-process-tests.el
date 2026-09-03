@@ -968,6 +968,24 @@
       (ejn-et3--feed session (ejn-et3--event sequence))
       (should (ejn-et2--await (lambda () (emacs-jupyter-notebook-helper-session-disposed session)))))))
 
+(ert-deftest ejn-et3-transport-error-json-null-request-id-is-admitted ()
+  "A real wire JSON null identifies an uncorrelated transport failure."
+  (let (seen)
+    (ejn-et3--with-ready (session "normal")
+      (setf (emacs-jupyter-notebook-helper-session-event-callback session)
+            (lambda (_session event) (setq seen event)))
+      (ejn-et3--feed
+       session
+       (ejn-et3--object
+        "v" 1 "kind" "event" "seq" 1 "event" "transport_error"
+        "request_id" :null
+        "data" (ejn-et3--object "code" "transport-error"
+                                 "message" "Jupyter transport lost")))
+      (should (ejn-et2--await (lambda () (or seen failure))))
+      (should seen)
+      (should-not failure)
+      (should-not (emacs-jupyter-notebook-helper-session-disposed session)))))
+
 (ert-deftest ejn-et3-queue-and-raw-overflow-fail-through-the-drain ()
   (ejn-et3--with-ready (session "normal")
     (setf (emacs-jupyter-notebook-helper-session-event-queue-bytes session)

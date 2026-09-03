@@ -807,7 +807,8 @@ timer handle or sending a hello frame."
                  (member event emacs-jupyter-notebook-helper--event-names)
                  (hash-table-p (gethash "data" object))
                  (or (emacs-jupyter-notebook-helper--bounded-id-p request-id)
-                     (and (equal event "transport_error") (null request-id)))
+                     (and (equal event "transport_error")
+                          (or (null request-id) (eq request-id :null))))
                  (progn (setf (emacs-jupyter-notebook-helper-session-last-event-seq session) seq) t))))
          (_ nil))))
 

@@ -40,6 +40,7 @@ MAX_INPUT_PROMPT_BYTES = 4_096
 MAX_INPUT_VALUE_BYTES = 65_536
 INPUT_ID_BYTES = 16
 _DEADLINE_OPERATIONS = frozenset({"kernel_info"})
+_LIVENESS_FAILURE_THRESHOLD = 3
 
 
 def _bounded_utf8_size(value: str, ceiling: int) -> int:
@@ -845,6 +846,7 @@ class JupyterBackend:
 
     async def _liveness_monitor(self) -> None:
         """Bounded local heartbeat polling; it never owns the remote kernel."""
+        consecutive_misses = 0
         while not self.closed and self._channels_started:
             try:
                 await asyncio.sleep(self._heartbeat_interval)
@@ -854,12 +856,15 @@ class JupyterBackend:
                 alive = client.is_alive()
                 if inspect.isawaitable(alive):
                     alive = await asyncio.wait_for(alive, self._heartbeat_timeout)
-                if not alive:
-                    self._fail_transport()
-                    return
             except asyncio.CancelledError:
                 raise
             except Exception:
+                alive = False
+            if alive:
+                consecutive_misses = 0
+                continue
+            consecutive_misses += 1
+            if consecutive_misses >= _LIVENESS_FAILURE_THRESHOLD:
                 self._fail_transport()
                 return
 
