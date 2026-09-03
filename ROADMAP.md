@@ -162,6 +162,9 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
       > note: user-approved scope expansion adds `flake.nix`: first-use
       > runtime outputs must not execute development test suites; equivalent
       > tested derivations remain mandatory under `nix flake check`.
+      > note: the Darwin audit confirmed two additional test-harness-only
+      > portability defects, so scope also includes registry-worker ERT temp
+      > path canonicalization and `tests/run-doom-e2e.sh` process-group checks.
 
 ---
 
