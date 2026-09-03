@@ -151,6 +151,15 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
       :failed' to passing.  — touches: `emacs-jupyter-notebook.el`,
       `tests/emacs-jupyter-notebook-tests.el` — for: W7.2
 
+- [~] owner=root claimed=2026-09-03 CC2 Make first-use Nix bootstrap observable
+      and Darwin-tested: report bounded live build progress through the normal
+      EJN message/log path, preserve complete bounded failure diagnostics on
+      line boundaries, fix platform-dispatch mistakes in registry-worker tests,
+      and audit the remaining deterministic tests for Darwin-only failures. —
+      touches: `emacs-jupyter-notebook-runtime.el`,
+      `emacs-jupyter-notebook.el`, `README.md`,
+      `registry_worker/tests/test_worker.py`, runtime/registry tests — for: W20
+
 ---
 
 ## W1 — Lifecycle hooks & leak fixes
