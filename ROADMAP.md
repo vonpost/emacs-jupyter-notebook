@@ -163,7 +163,7 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
       > runtime outputs must not execute development test suites; equivalent
       > tested derivations remain mandatory under `nix flake check`.
 
-- [~] owner=root claimed=2026-09-03 CC3 Make external image snapshot bounds
+- [x] sha=8529816 CC3 Make external image snapshot bounds
       pressure-evict completed handoffs instead of rejecting ordinary
       sequential opens; pending verifications remain strictly bounded. —
       touches: `emacs-jupyter-notebook-result.el`,
