@@ -167,6 +167,12 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
   for: W21 V6 and macOS dogfood. Kernel lifetime and transport semantics stay
   unchanged; Qt dependency reduction is a separate packaging work item.
 
+- [~] owner=root claimed=2026-09-07 CC10 Remove the viewer's unnecessary
+  QtWebEngine dependency after the user's macOS source build failed.
+  — touches: flake and viewer packaging/binding imports/tests, installation
+  docs — for: W21 V2. Validate the Darwin derivation dependency graph excludes
+  QtWebEngine and retain one pinned Qt binding with local GUI checks.
+
 - [~] owner=root claimed=2026-09-06 CC8 User-approved early viewer cutover.
   Implement the usable experimental slice path before complete macOS/review
   polish. — touches: new inspect-manager Elisp, core setup/keymap/runtime,
