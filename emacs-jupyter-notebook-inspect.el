@@ -4,11 +4,13 @@
 (require 'subr-x)
 (require 'emacs-jupyter-notebook-runtime)
 (require 'emacs-jupyter-notebook-helper-protocol)
+(require 'emacs-jupyter-notebook-helper)
 (require 'emacs-jupyter-notebook-result)
 
 (declare-function emacs-jupyter-notebook--current-cell-key "emacs-jupyter-notebook")
 (declare-function emacs-jupyter-notebook-send-cell "emacs-jupyter-notebook")
 (declare-function emacs-jupyter-notebook--execution-record "emacs-jupyter-notebook" (id))
+(declare-function emacs-jupyter-notebook--log-append "emacs-jupyter-notebook" (phase format-string &rest args))
 
 (defcustom emacs-jupyter-notebook-inspector-command nil
   "Explicit local PyQtGraph viewer argv, or nil for the separate Nix output.
@@ -17,10 +19,39 @@ The manager appends --stdio. No command is installed on a remote system."
 
 (cl-defstruct (ejn-inspection (:constructor ejn-inspection-create))
   process stderr decoder ready closed pending active waiter timer drain raw raw-bytes
-  partial-timer counter owner cancels stderr-tail spawning build-owner)
+  partial-timer counter owner cancels stderr-tail spawning build-owner phase)
 
 (defvar emacs-jupyter-notebook-inspect--state nil)
 (defvar emacs-jupyter-notebook-inspect--watches nil)
+(defvar emacs-jupyter-notebook-inspect--last-message "Viewer has not been requested")
+
+(defun emacs-jupyter-notebook-inspect--report (state format-string &rest args)
+  "Report bounded, redacted viewer feedback to Messages and the EJN log."
+  (let* ((raw (apply #'format format-string args))
+         (text (emacs-jupyter-notebook-helper--truncate-utf8-bytes
+                (replace-regexp-in-string
+                 "[[:cntrl:]]" " "
+                 (emacs-jupyter-notebook-helper--redact-diagnostic-text
+                  (substring raw 0 (min 2048 (length raw)))) t t)
+                512))
+         (owner (and state (ejn-inspection-owner state))))
+    (setq emacs-jupyter-notebook-inspect--last-message text)
+    (message "EJN viewer: %s" text)
+    ;; Logging must not interfere with ownership/cleanup, including during exit.
+    (when (fboundp 'emacs-jupyter-notebook--log-append)
+      (ignore-errors
+        (with-current-buffer (if (buffer-live-p owner) owner (current-buffer))
+          (emacs-jupyter-notebook--log-append 'viewer "%s" text))))))
+
+;;;###autoload
+(defun emacs-jupyter-notebook-inspector-status ()
+  "Show the local viewer phase and most recent diagnostic, without any I/O."
+  (interactive)
+  (message "EJN viewer [%s]: %s"
+           (if emacs-jupyter-notebook-inspect--state
+               (or (ejn-inspection-phase emacs-jupyter-notebook-inspect--state) 'idle)
+             'stopped)
+           emacs-jupyter-notebook-inspect--last-message))
 
 (defun emacs-jupyter-notebook-inspect--object (&rest pairs)
   (let ((object (make-hash-table :test #'equal)))
@@ -39,7 +70,7 @@ The manager appends --stdio. No command is installed on a remote system."
 (defun emacs-jupyter-notebook-inspect--stop (state &optional reason)
   "Revoke this local viewer epoch before releasing any artifact handoffs."
   (unless (ejn-inspection-closed state)
-    (setf (ejn-inspection-closed state) t)
+    (setf (ejn-inspection-closed state) t (ejn-inspection-phase state) 'stopped)
     (when (eq state emacs-jupyter-notebook-inspect--state)
       (setq emacs-jupyter-notebook-inspect--state nil))
     (dolist (timer (list (ejn-inspection-timer state) (ejn-inspection-drain state)
@@ -62,10 +93,16 @@ The manager appends --stdio. No command is installed on a remote system."
     (setf (ejn-inspection-active state) nil (ejn-inspection-pending state) nil
           (ejn-inspection-raw state) nil)
     (when reason
-      (message "EJN viewer: %s%s" reason
-               (if (string-empty-p (or (ejn-inspection-stderr-tail state) "")) ""
-                 (format " — %.500s" (string-trim
-                                      (decode-coding-string (ejn-inspection-stderr-tail state) 'utf-8 t))))))))
+      (let ((tail (or (ejn-inspection-stderr-tail state) "")))
+        ;; A full rolling tail may begin inside a credential-bearing line.
+        ;; Omit that first line rather than logging a suffix without its key.
+        (when (>= (length tail) 8192)
+          (setq tail (if (string-match "\n" tail)
+                         (substring tail (match-end 0)) "")))
+        (emacs-jupyter-notebook-inspect--report
+         state "%s%s" reason
+         (if (string-empty-p tail) ""
+           (format " — %.500s" (string-trim (decode-coding-string tail 'utf-8 t)))))))))
 
 (defun emacs-jupyter-notebook-inspect--command ()
   (if emacs-jupyter-notebook-inspector-command
@@ -125,6 +162,8 @@ The manager appends --stdio. No command is installed on a remote system."
     (let* ((job (ejn-inspection-pending state))
            (id (format "open-%d" (cl-incf (ejn-inspection-counter state)))))
       (setf (ejn-inspection-pending state) nil (ejn-inspection-active state) job)
+      (setf (ejn-inspection-phase state) 'loading)
+      (emacs-jupyter-notebook-inspect--report state "Loading selected images")
       (plist-put job :id id)
       (condition-case err
           (progn
@@ -172,7 +211,11 @@ The manager appends --stdio. No command is installed on a remote system."
             (error "Viewer did not acknowledge snapshot ownership")))
         (emacs-jupyter-notebook-inspect--release (ejn-inspection-active state))
         (setf (ejn-inspection-active state) nil (ejn-inspection-timer state) nil)
-        (message "EJN viewer: %s" (if success "slice loaded" "image could not be loaded")))
+        (setf (ejn-inspection-phase state) 'ready)
+        (emacs-jupyter-notebook-inspect--report
+         state "%s" (if success "Slice loaded"
+                       (format "Image could not be loaded — %s"
+                               (gethash "code" (gethash "error" object))))))
       (emacs-jupyter-notebook-inspect--pump state))
      (t (error "Unexpected viewer response")))))
 
@@ -215,6 +258,8 @@ The manager appends --stdio. No command is installed on a remote system."
     (condition-case err
         (let ((command (emacs-jupyter-notebook-inspect--command)))
           (unless command (error "Viewer executable is unavailable after build"))
+          (setf (ejn-inspection-phase state) 'starting)
+          (emacs-jupyter-notebook-inspect--report state "Starting local viewer")
           (setf (ejn-inspection-stderr state)
                 (make-pipe-process
                  :name "ejn-inspector-stderr" :buffer nil :noquery t :coding 'binary
@@ -255,11 +300,27 @@ The manager appends --stdio. No command is installed on a remote system."
   "Inspect exact acquired LEASE asynchronously, taking ownership of its release.
 At most one handoff and one latest pending selection are retained."
   (unless (functionp (plist-get lease :release)) (error "Inspection requires an acquired artifact lease"))
+  ;; A stale waiter token must not swallow every later explicit Inspect.
+  ;; Revoke the old epoch before rebuilding so late callbacks cannot adopt it.
+  (when-let ((old emacs-jupyter-notebook-inspect--state))
+    (when (or (ejn-inspection-closed old)
+              (and (ejn-inspection-process old)
+                   (not (process-live-p (ejn-inspection-process old))))
+              (and (ejn-inspection-waiter old)
+                   (not (ejn-inspection-process old))
+                   (not (emacs-jupyter-notebook-runtime-waiter-active-p
+                         (ejn-inspection-waiter old) t))))
+      (emacs-jupyter-notebook-inspect--stop old "Recovering stale local viewer startup")
+      (when (eq old emacs-jupyter-notebook-inspect--state)
+        (setq emacs-jupyter-notebook-inspect--state nil))))
   (let* ((state (or emacs-jupyter-notebook-inspect--state
                     (setq emacs-jupyter-notebook-inspect--state
                           (ejn-inspection-create :decoder (ejn-helper-protocol-make-decoder 65536 65536)
                                                  :raw-bytes 0 :counter 0 :owner (current-buffer)))))
          (job (list :lease lease :focus (not no-focus) :owner (current-buffer))))
+    (setf (ejn-inspection-owner state)
+          (if (buffer-live-p (plist-get lease :source-buffer))
+              (plist-get lease :source-buffer) (current-buffer)))
     (emacs-jupyter-notebook-inspect--release (ejn-inspection-pending state))
     (setf (ejn-inspection-pending state) job)
     (add-hook 'kill-buffer-hook #'emacs-jupyter-notebook-inspect--owner-killed nil t)
@@ -268,15 +329,26 @@ At most one handoff and one latest pending selection are retained."
         (add-hook 'kill-buffer-hook #'emacs-jupyter-notebook-inspect--owner-killed nil t)))
     (condition-case err
      (if (ejn-inspection-process state)
-        (emacs-jupyter-notebook-inspect--pump state)
-      (unless (ejn-inspection-waiter state)
+         (progn
+           (emacs-jupyter-notebook-inspect--report
+            state "%s" (cond ((not (ejn-inspection-ready state)) "Waiting for viewer startup")
+                              ((ejn-inspection-active state) "Image selection queued")
+                              (t "Inspecting selected images")))
+           (emacs-jupyter-notebook-inspect--pump state))
+      (if (ejn-inspection-waiter state)
+          (emacs-jupyter-notebook-inspect--report state "Waiting for viewer build")
         ;; The build is shared by the current selection, not by the first
         ;; source that happened to trigger it. Superseding A with B must not
         ;; let killing A cancel B's still-live handoff.
         (setf (ejn-inspection-build-owner state)
               (generate-new-buffer " *ejn-inspector-build-owner*"))
-        (setf (ejn-inspection-waiter state)
-              (emacs-jupyter-notebook-runtime-ensure
+        (setf (ejn-inspection-phase state) 'building)
+        (emacs-jupyter-notebook-inspect--report
+         state "%s" (if (emacs-jupyter-notebook-inspect--command)
+                         "Using available local viewer"
+                       "Building local viewer via Nix (.#ejn-viewer)"))
+        (let ((token
+               (emacs-jupyter-notebook-runtime-ensure
                #'emacs-jupyter-notebook-inspect--probe
                (lambda ()
                  (setf (ejn-inspection-waiter state) nil)
@@ -284,7 +356,14 @@ At most one handoff and one latest pending selection are retained."
                  (when (buffer-live-p (ejn-inspection-build-owner state))
                    (kill-buffer (ejn-inspection-build-owner state))))
                (lambda (reason) (emacs-jupyter-notebook-inspect--stop state reason))
-               (ejn-inspection-build-owner state) t))))
+               (ejn-inspection-build-owner state) t
+               (lambda (_buffer line)
+                 (when (emacs-jupyter-notebook-inspect--live-p state)
+                   (emacs-jupyter-notebook-inspect--report state "Nix — %s" line))))))
+          ;; Ready/failure callbacks may fire before ensure returns.
+          (when (and (emacs-jupyter-notebook-inspect--live-p state)
+                     (not (ejn-inspection-process state)))
+            (setf (ejn-inspection-waiter state) token)))))
      ((error quit) (emacs-jupyter-notebook-inspect--stop state (error-message-string err))))
     state))
 

@@ -459,6 +459,56 @@
              build 'stderr stderr-process "copying one\ncopying two\n")
             (should (equal report "copying two"))))))))
 
+(defmacro ejn-runtime-test--with-progress (&rest body)
+  "Run BODY with a real bounded filter and redacted report capture."
+  (declare (indent 0) (debug t))
+  `(ejn-runtime-test--clean
+     (with-temp-buffer
+       (ejn-runtime-test--start-build
+        (lambda () (list :ready nil :buildable t)) nil
+        #'ignore #'ignore (current-buffer))
+       (let* ((build emacs-jupyter-notebook-runtime--build)
+              (stderr-process (emacs-jupyter-notebook-runtime--build-stderr-process build))
+              reports
+              (emacs-jupyter-notebook-runtime-progress-function
+               (lambda (_buffer line)
+                 ;; Same redactor used by viewer feedback: it cannot recover
+                 ;; a credential key that sampling discarded beforehand.
+                 (push (emacs-jupyter-notebook-helper--redact-diagnostic-text line) reports))))
+         ,@body))))
+
+(ert-deftest ejn-runtime-progress-omits-overlong-credential-line-before-redaction ()
+  (ejn-runtime-test--with-progress
+    (emacs-jupyter-notebook-runtime--filter
+     build 'stderr stderr-process (concat "token=" (make-string 5000 32) "fixture-credential\n"))
+    (should-not (cl-some (lambda (line) (string-match-p "fixture-credential" line)) reports))
+    (emacs-jupyter-notebook-runtime--filter build 'stderr stderr-process "copying safe output\n")
+    (should (equal (car reports) "copying safe output"))))
+
+(ert-deftest ejn-runtime-progress-keeps-credential-prefix-across-filter-chunks ()
+  (ejn-runtime-test--with-progress
+    (emacs-jupyter-notebook-runtime--filter build 'stderr stderr-process "token=")
+    (emacs-jupyter-notebook-runtime--filter build 'stderr stderr-process "fixture-split-credential\n")
+    (should-not (cl-some (lambda (line) (string-match-p "fixture-split-credential" line)) reports))
+    (should (string-match-p "REDACTED" (car reports)))))
+
+(ert-deftest ejn-runtime-progress-bounded-read-preserves-latest-line-and-deduplicates ()
+  (ejn-runtime-test--with-progress
+    (let ((reader (symbol-function 'buffer-substring-no-properties))
+          (stderr (emacs-jupyter-notebook-runtime--build-stderr-buffer build)))
+      (with-current-buffer stderr (insert (make-string 10000 ?x) "\n"))
+      (cl-letf (((symbol-function 'buffer-string)
+                 (lambda () (ert-fail "Unbounded whole-buffer progress copy")))
+                ((symbol-function 'buffer-substring-no-properties)
+                 (lambda (start end)
+                   (should (<= (- end start) 2048))
+                   (funcall reader start end))))
+        (emacs-jupyter-notebook-runtime--filter
+         build 'stderr stderr-process "copying one\ncopying latest\n")
+        (emacs-jupyter-notebook-runtime--filter
+         build 'stderr stderr-process "copying latest\n")))
+    (should (equal reports '("copying latest")))))
+
 (ert-deftest ejn-runtime-failure-waits-for-full-stderr ()
   "Failure settlement preserves stderr beyond the old arbitrary tail cut."
   (ejn-runtime-test--clean

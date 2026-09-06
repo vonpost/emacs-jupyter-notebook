@@ -27,7 +27,7 @@ Exactly one live waiter receives at most one sample per stderr callback.")
 
 (cl-defstruct (emacs-jupyter-notebook-runtime--waiter
                (:constructor emacs-jupyter-notebook-runtime--make-waiter))
-  token buffer probe callback failure viewer)
+  token buffer probe callback failure viewer progress)
 
 (cl-defstruct (emacs-jupyter-notebook-runtime--build
                (:constructor emacs-jupyter-notebook-runtime--make-build))
@@ -267,11 +267,19 @@ real error and could start the displayed result in the middle of a line."
                (or (plist-get status :reason)
                    "Nix runtime output is missing a required executable")))))))))
 
-(defun emacs-jupyter-notebook-runtime--progress-text (output)
-  "Return a short printable progress sample from process OUTPUT."
-  (let* ((tail (if (> (length output) 2048)
-                   (substring output (- (length output) 2048))
-                 output))
+(defun emacs-jupyter-notebook-runtime--progress-text (output &optional cut-first-line)
+  "Return a short printable sample from bounded accumulated OUTPUT.
+CUT-FIRST-LINE says OUTPUT starts mid-line.  Omit that line: a credential
+key may have preceded the retained suffix and cannot be redacted afterward."
+  (let* ((start (max 0 (- (length output) 2048)))
+         (cut (if (> start 0)
+                  (not (memq (aref output (1- start)) '(?\r ?\n)))
+                cut-first-line))
+         (tail (substring output start))
+         (tail (if cut
+                   (if (string-match "[\r\n]" tail)
+                       (substring tail (match-end 0)) "")
+                 tail))
          (lines (split-string
                  (emacs-jupyter-notebook-runtime--decode-output tail)
                  "[\r\n]+" t "[[:space:]]+"))
@@ -281,21 +289,36 @@ real error and could start the displayed result in the middle of a line."
                  (min (length line)
                       emacs-jupyter-notebook-runtime--progress-line-chars)))))
 
-(defun emacs-jupyter-notebook-runtime--report-progress (build output)
-  "Report one short stderr OUTPUT sample through one live BUILD waiter."
-  (when-let* ((line (emacs-jupyter-notebook-runtime--progress-text output))
+(defun emacs-jupyter-notebook-runtime--report-progress (build _output)
+  "Report one safe accumulated stderr sample through a live BUILD waiter.
+The filter has already appended its chunk to BUILD's bounded stderr buffer.
+Use that buffer, not the isolated chunk: credential keys can straddle chunks."
+  (when-let* ((stderr (emacs-jupyter-notebook-runtime--build-stderr-buffer build))
+              (line
+               (when (buffer-live-p stderr)
+                 (with-current-buffer stderr
+                   (save-restriction
+                     (widen)
+                     (let* ((end (point-max))
+                            (start (max (point-min) (- end 2048)))
+                            (cut (and (> start (point-min))
+                                      (not (memq (char-before start) '(?\r ?\n))))))
+                       (emacs-jupyter-notebook-runtime--progress-text
+                        (buffer-substring-no-properties start end) cut))))))
               (waiter
                (cl-find-if
                 #'emacs-jupyter-notebook-runtime--waiter-live-p
                 (emacs-jupyter-notebook-runtime--build-waiters build))))
-    (when (and (functionp emacs-jupyter-notebook-runtime-progress-function)
+    (when (and (functionp (or (emacs-jupyter-notebook-runtime--waiter-progress waiter)
+                             emacs-jupyter-notebook-runtime-progress-function))
                (not (equal
                      line
                      (emacs-jupyter-notebook-runtime--build-last-progress-line
                       build))))
       (setf (emacs-jupyter-notebook-runtime--build-last-progress-line build) line)
       (condition-case nil
-          (funcall emacs-jupyter-notebook-runtime-progress-function
+          (funcall (or (emacs-jupyter-notebook-runtime--waiter-progress waiter)
+                       emacs-jupyter-notebook-runtime-progress-function)
                    (emacs-jupyter-notebook-runtime--waiter-buffer waiter) line)
         ((error quit) nil)))))
 
@@ -487,12 +510,14 @@ real error and could start the displayed result in the middle of a line."
          (emacs-jupyter-notebook-runtime--call-waiter waiter nil reason))))))
 
 (defun emacs-jupyter-notebook-runtime-ensure
-    (probe callback failure &optional buffer viewer)
+    (probe callback failure &optional buffer viewer progress)
   "Ensure the bundled runtime according to PROBE, then call CALLBACK.
 PROBE returns a plist with `:ready', `:buildable', and optional `:reason'.
 FAILURE receives one bounded diagnostic.  BUFFER owns the returned waiter
 token and may cancel it without affecting waiters from other buffers.
-VIEWER requests the independently built GUI output, never the headless one."
+VIEWER requests the independently built GUI output, never the headless one.
+PROGRESS, when non-nil, receives (BUFFER LINE) instead of the global progress
+function.  It lets callers without a kernel bootstrap context report builds."
   (let* ((buffer (or buffer (current-buffer)))
          (status (emacs-jupyter-notebook-runtime--probe probe)))
     (cond
@@ -508,7 +533,7 @@ VIEWER requests the independently built GUI output, never the headless one."
              (build (symbol-value slot))
              (waiter (emacs-jupyter-notebook-runtime--make-waiter
                      :token (gensym "ejn-runtime-waiter-") :buffer buffer
-                     :viewer viewer
+                     :viewer viewer :progress progress
                      :probe probe :callback callback :failure failure)))
         (if (and build
                  (not (emacs-jupyter-notebook-runtime--build-terminal
@@ -528,6 +553,17 @@ VIEWER requests the independently built GUI output, never the headless one."
                            (emacs-jupyter-notebook-runtime--build-waiters
                             build)))
             (emacs-jupyter-notebook-runtime--waiter-token waiter))))))))
+
+(defun emacs-jupyter-notebook-runtime-waiter-active-p (token &optional viewer)
+  "Whether TOKEN still belongs to a live waiter in the selected build slot.
+This checks bookkeeping only; a live build retains its own bounded deadline."
+  (let ((build (symbol-value (emacs-jupyter-notebook-runtime--build-slot viewer))))
+    (and token build
+         (not (emacs-jupyter-notebook-runtime--build-terminal build))
+         (cl-some (lambda (waiter)
+                    (and (eq token (emacs-jupyter-notebook-runtime--waiter-token waiter))
+                         (emacs-jupyter-notebook-runtime--waiter-live-p waiter)))
+                  (emacs-jupyter-notebook-runtime--build-waiters build)))))
 
 (defun emacs-jupyter-notebook-runtime-cancel-waiter (token)
   "Cancel the waiter identified by TOKEN and stop an otherwise unused build."

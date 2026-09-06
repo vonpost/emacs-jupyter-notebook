@@ -74,13 +74,23 @@
             doCheck = false;
             dontUsePythonImportsCheck = true;
           };
+          # pyqtgraph declares PyQt6 as a build input for its own test suite.
+          # That pulls the Qt WebEngine stack into Darwin evaluation/builds,
+          # although the viewer uses PySide6 and never imports PyQt6.  The
+          # viewer disables pyqtgraph's upstream checks, so retain the same
+          # package with that unnecessary build-only binding removed.
+          pyqtgraph-viewer = python.pkgs.pyqtgraph.overridePythonAttrs (_old: {
+            buildInputs = [];
+            nativeCheckInputs = [];
+            doCheck = false;
+          });
           ejn-viewer = python.pkgs.buildPythonApplication {
             pname = "ejn-viewer";
             version = "0.1.0";
             pyproject = true;
             src = ./viewer;
             build-system = [ python.pkgs.setuptools ];
-            dependencies = with python.pkgs; [ numpy pyqtgraph pyside6 pillow ejn-array-protocol ];
+            dependencies = with python.pkgs; [ numpy pyqtgraph-viewer pyside6 pillow ejn-array-protocol ];
             nativeBuildInputs = [ pkgs.qt6Packages.wrapQtAppsHook ];
             buildInputs = [ pkgs.qt6Packages.qtbase ];
             # The Qt hook wraps the console script and carries platform

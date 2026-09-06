@@ -26,6 +26,26 @@ into the existing kernel. No remote installation or kernel restart is required.
 The Doom package recipe must include `array_protocol` alongside `helper`,
 `viewer`, `registry_worker` and the flake files.
 
+Inspection now reports each step to both `*Messages*` and the EJN log
+(`C-c j L`): building, waiting for an existing build, starting the viewer,
+loading images, and the final result. Nix progress is reported independently
+of the kernel connection status. `M-x emacs-jupyter-notebook-inspector-status`
+shows the current local viewer phase and last diagnostic without contacting
+the kernel. A subsequent Inspect recovers a stale local build token or dead
+viewer process; it never re-evaluates the source cell.
+
+The automatic build deadline is `emacs-jupyter-notebook-runtime-build-timeout`
+(default 600 seconds, maximum 1800). The separate 15-second viewer startup
+deadline begins only after the build completes. A terminal `nix run` is a
+separate operation and its progress does not establish that Emacs started a
+build. The package excludes PyQtGraph's unused PyQt6 test dependency, which
+otherwise pulls QtWebEngine through PyQt6's PDF support on macOS. It continues
+to use PySide6; no browser engine is required by the viewer.
+
+If a tunnel exits, the EJN transport log now includes its exit status or
+signal and a bounded, redacted stderr excerpt when available. Viewer startup
+failure itself does not request tunnel reconnection or terminate a kernel.
+
 Publish a mapping of selected 2D NumPy arrays with `ejn.view`, then use
 `C-c j I`, the panel's `[Inspect]` button, or `C-c j J` (evaluate-and-inspect).
 The latter opens the first numerical publication from that exact execution.

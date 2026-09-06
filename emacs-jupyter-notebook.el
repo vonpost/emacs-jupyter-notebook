@@ -2693,6 +2693,39 @@ outer tunnel-readiness deadline is waiting to run."
     (when (buffer-live-p buffer)
       (with-current-buffer buffer (buffer-string)))))
 
+(defun emacs-jupyter-notebook--tunnel-exit-diagnostic (process)
+  "Capture PROCESS exit status and a bounded, redacted stderr tail.
+Read at most 4096 characters before local teardown destroys its buffers.
+Drop a cut first line entirely: its missing prefix might name a credential."
+  (let* ((status (process-status process))
+         (code (process-exit-status process))
+         (prefix (format "SSH tunnel exited (%s %s)"
+                         (if (eq status 'signal) "signal" "exit status") code)))
+    (condition-case nil
+        (let* ((stderr (process-get process 'emacs-jupyter-notebook-stderr-buffer))
+               (tail
+                (when (buffer-live-p stderr)
+                  (with-current-buffer stderr
+                    (save-restriction
+                      (widen)
+                      (let* ((end (point-max))
+                             (start (max (point-min) (- end 4096)))
+                             (cut (and (> start (point-min))
+                                       (not (eq (char-before start) ?\n))))
+                             (text (buffer-substring-no-properties start end)))
+                        (when cut
+                          (setq text (if (string-match "\n" text)
+                                         (substring text (match-end 0)) "")))
+                        text))))))
+          (when tail
+            (setq tail (emacs-jupyter-notebook-helper--stderr-text tail)
+                  tail (emacs-jupyter-notebook-helper--redact-diagnostic-text tail)
+                  tail (string-trim (replace-regexp-in-string "[\n\t]+" " " tail))))
+          (emacs-jupyter-notebook--bounded-status-error
+           (if (or (null tail) (string-empty-p tail)) prefix
+             (concat prefix ": " tail))))
+      (error prefix))))
+
 (defun emacs-jupyter-notebook--install-tunnel-sentinel (process buffer)
   "Install a sentinel on PROCESS that marks the tunnel dead in BUFFER."
   (if (not (process-live-p process))
@@ -2704,7 +2737,7 @@ outer tunnel-readiness deadline is waiting to run."
           (with-current-buffer buffer
             (when (eq process emacs-jupyter-notebook--tunnel-process)
               (emacs-jupyter-notebook--transport-lost
-               "SSH tunnel exited" nil process)))))
+               (emacs-jupyter-notebook--tunnel-exit-diagnostic process) nil process)))))
     (set-process-sentinel
      process
      (lambda (proc _event)
@@ -2715,7 +2748,7 @@ outer tunnel-readiness deadline is waiting to run."
              ;; this old process must not classify or schedule anything.
              (when (eq proc emacs-jupyter-notebook--tunnel-process)
                (emacs-jupyter-notebook--transport-lost
-                "SSH tunnel exited" nil proc)))))))))
+                (emacs-jupyter-notebook--tunnel-exit-diagnostic proc) nil proc)))))))))
 
 (defun emacs-jupyter-notebook--cancel-auto-reconnect ()
   "Cancel this buffer's pending automatic reconnect timer."
