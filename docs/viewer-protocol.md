@@ -120,7 +120,7 @@ The injected code must be self-contained and not load files on the remote.
 | Viewer read/write per event-loop tick | 65,540 bytes; parsing/dispatch deferred |
 | Viewer header/partial-frame deadline | 5 seconds |
 | Viewer ready / load ACK deadline | 10 / 30 seconds, excluding Nix build time |
-| Viewer-owned snapshot disk | 512 MiB total; at most 16 groups |
+| Viewer-owned snapshot disk (future disk-backed storage) | 512 MiB total; at most 16 groups |
 | Active workspaces / visible planes | 4 / 4 per active workspace |
 | In-memory source arrays | 256 MiB; evict inactive unpinned views first |
 | ROI definitions / worker queue | 16 per workspace / one active + latest pending |
@@ -132,6 +132,13 @@ multiplied per workspace. Frozen pending snapshots are separately bounded by
 the workspace count and global snapshot budgets. Reserve disk for staging
 copies and installed snapshots together before copying. Memory reservations
 include all workspaces, outstanding workers and conversion/difference buffers.
+The experimental implementation uses independently owned read-only memory
+snapshots only: no disk copies, pins or frozen pending snapshots exist yet.
+It limits workspaces to four and accounts retained source samples plus
+estimated load/render buffers against 256 MiB. This is application admission
+accounting, not a guarantee about Qt/Python process RSS. Disk reservations
+and orphan cleanup apply only if disk-backed snapshots are implemented.
+
 Pinned snapshots count against budgets. Refuse admission/pinning when their
 retention prevents fitting the next group; never silently unpin. Account for
 candidate/baseline, difference planes, display conversion buffers, loading

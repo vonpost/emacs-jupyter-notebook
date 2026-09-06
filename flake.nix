@@ -34,6 +34,7 @@
               jupyter-client
               pyzmq
               pillow
+              ejn-array-protocol
             ];
 
             # buildPythonApplication maps doCheck to its install-check phase.
@@ -79,7 +80,7 @@
             pyproject = true;
             src = ./viewer;
             build-system = [ python.pkgs.setuptools ];
-            dependencies = with python.pkgs; [ numpy pyqtgraph pyside6 ejn-array-protocol ];
+            dependencies = with python.pkgs; [ numpy pyqtgraph pyside6 pillow ejn-array-protocol ];
             nativeBuildInputs = [ pkgs.qt6Packages.wrapQtAppsHook ];
             buildInputs = [ pkgs.qt6Packages.qtbase ];
             # The Qt hook wraps the console script and carries platform
@@ -109,7 +110,7 @@
             checkPhase = ''
               runHook preCheck
               EJN_REQUIRE_PILLOW=1 \
-                PYTHONPATH=${python.pkgs.pillow}/${python.sitePackages}:$PWD/.. \
+                PYTHONPATH=${python.pkgs.pillow}/${python.sitePackages}:$PWD/../array_protocol:$PWD/.. \
                 python -m unittest discover -s tests -p 'test_*.py'
               runHook postCheck
             '';
@@ -136,7 +137,8 @@
             doCheck = true;
             checkPhase = ''
               runHook preCheck
-              QT_QPA_PLATFORM=offscreen python -m unittest test_pyqtgraph_gui -v
+              QT_QPA_PLATFORM=offscreen python -m unittest \
+                test_pyqtgraph_gui test_workspace_gui test_snapshots test_ipc -v
               runHook postCheck
             '';
             dontUsePythonImportsCheck = false;

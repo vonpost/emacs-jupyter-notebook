@@ -9395,6 +9395,7 @@ the same recovery episode and must not regain an unlimited retry budget."
     (let* ((entry (ejn-test-direct-entry
                    '(:profile "p" :session-id "s" :remote-host "h")))
            (session (ejn-test-backend-session 'mock-client t))
+           (setup-success nil)
            (context (emacs-jupyter-notebook--async-new-context
                      :phase 'connect :entry entry :session-id "s"
                      :remote-ports (plist-get entry :remote-ports)
@@ -9410,20 +9411,28 @@ the same recovery episode and must not regain an unlimited retry budget."
                  #'ignore)
                 ((symbol-function 'emacs-jupyter-notebook--inject-idle-watchdog)
                  #'ignore)
+                ((symbol-function 'emacs-jupyter-notebook-backend-execute)
+                 (lambda (_client _code _options success _failure)
+                   (setq setup-success success)
+                   'setup-request))
                 ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
                  #'ejn-test-registry-replace-succeeds))
         (emacs-jupyter-notebook--async-connect-finalize
          context (current-buffer) entry
          '(:shell_port 1 :iopub_port 2 :stdin_port 3 :hb_port 4 :control_port 5)
-         "/tmp/local.json" session))
-      (should (ejn-test-await
-               (lambda () (eq (plist-get emacs-jupyter-notebook--async-context
-                                         :phase)
-                              'done))))
-      (should (= emacs-jupyter-notebook--reconnect-attempt 5))
-      (should emacs-jupyter-notebook--execution-setup-pending)
-      (emacs-jupyter-notebook--execution-setup-finish
-       session emacs-jupyter-notebook--execution-setup-epoch nil)
+         "/tmp/local.json" session)
+        ;; Registry promotion is deliberately deferred by the fixture.  Keep
+        ;; the backend stub installed while that callback reaches setup, so
+        ;; the first setup request remains pending instead of completing via
+        ;; the real helper transport.
+        (should (ejn-test-await
+                 (lambda () (eq (plist-get emacs-jupyter-notebook--async-context
+                                           :phase)
+                                'done))))
+        (should (= emacs-jupyter-notebook--reconnect-attempt 5))
+        (should emacs-jupyter-notebook--execution-setup-pending)
+        (should setup-success))
+      (funcall setup-success "setup-request" nil)
       (should (= emacs-jupyter-notebook--reconnect-attempt 0))
       (should-not emacs-jupyter-notebook--reconnect-exhausted)
       (should-not emacs-jupyter-notebook--reconnect-next-at)

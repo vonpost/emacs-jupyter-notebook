@@ -256,6 +256,19 @@ the panel's identity-bound leases or bounded crash pruning."
           (emacs-jupyter-notebook-helper-backend-state-artifact-identity state)
           :mime mime :original original :preview preview :display-id display-id)))
 
+(defun emacs-jupyter-notebook-helper-backend--array-publication
+    (state descriptor display-id)
+  "Validate numerical DESCRIPTOR without reading any samples on the UI thread."
+  (let* ((leaf (emacs-jupyter-notebook-helper-backend--artifact-leaf descriptor))
+         (manifest (gethash "manifest" descriptor)))
+    (unless (and (= (hash-table-count descriptor) 4)
+                 (ejn-helper-protocol-array-manifest-p manifest (plist-get leaf :size)))
+      (error "malformed helper numerical descriptor"))
+    (append leaf
+            (list :root (emacs-jupyter-notebook-helper-backend-state-artifact-dir state)
+                  :root-identity (emacs-jupyter-notebook-helper-backend-state-artifact-identity state)
+                  :manifest manifest :display-id display-id))))
+
 (defun emacs-jupyter-notebook-helper-backend--normalize-event (state event)
   "Translate one bounded helper EVENT into an EI1R event plist, or signal.
 No generic reducer is called here: the core validates the ledger/backend/
@@ -304,6 +317,9 @@ generation tuple before any presentation mutation.
               (update-value (gethash "update" data))
               (update-p (or (equal name "update_display_data")
                             (eq update-value t)))
+              (array-present (and (hash-table-p payload)
+                                  (not (eq (gethash "application/x-ejn-array-group" payload 'missing)
+                                           'missing))))
               (pickle-artifact (and (hash-table-p payload)
                                     (gethash "application/x-ejn-mpl-pickle" payload)))
               (image-mime (and (hash-table-p payload)
@@ -330,6 +346,15 @@ generation tuple before any presentation mutation.
                    (and image-mime (not (hash-table-p image-artifact))))
            (error "malformed helper artifact descriptor"))
          (cond
+          (array-present
+           (unless (= (hash-table-count payload) 1)
+             (error "numerical publication must be exclusive"))
+           (list :type type
+                 :data (list :ejn-published-array
+                             (emacs-jupyter-notebook-helper-backend--array-publication
+                              state (gethash "application/x-ejn-array-group" payload) display-id))
+                 :metadata metadata :transient transient :display-id display-id
+                 :require-display-id update-p))
           ((or pickle-artifact image-artifact)
            (let ((publication-data nil))
              (when image-artifact
@@ -374,7 +399,8 @@ generation tuple before any presentation mutation.
          (payload (and data (gethash "data" data))))
     (when (hash-table-p payload)
       (let (paths)
-        (dolist (mime '("application/x-ejn-mpl-pickle"
+        (dolist (mime '("application/x-ejn-array-group"
+                        "application/x-ejn-mpl-pickle"
                         "image/png" "image/jpeg" "image/gif" "image/webp"))
           (let ((artifact (gethash mime payload)))
             (when (hash-table-p artifact)

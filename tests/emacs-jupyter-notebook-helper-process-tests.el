@@ -1117,5 +1117,47 @@
                   (buffer-string))))
     (should-not (string-match-p "accept-process-output\\|sleep-for\\|registry-\\|jupyter-shutdown\\|cleanup-remote" source))))
 
+(ert-deftest ejn-et2-hello-capabilities-are-copied-and-session-local ()
+  (let* ((session-a (emacs-jupyter-notebook-helper--make-session
+                     :state 'starting :hello-id "hello-a"))
+         (session-b (emacs-jupyter-notebook-helper--make-session
+                     :state 'starting :hello-id "hello-b"))
+         (capabilities ["ping" "execute"])
+         (result (ejn-et3--object "version" 1 "helper_version" "test"
+                                  "capabilities" capabilities))
+         (response-a (ejn-et3--object "v" 1 "kind" "response" "id" "hello-a"
+                                      "ok" t "result" result)))
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper--send-credit)
+               (lambda (&rest _)))
+              ((symbol-function 'emacs-jupyter-notebook-helper--schedule-ping)
+               (lambda (&rest _))))
+      (emacs-jupyter-notebook-helper--handle-startup-object session-a response-a))
+    ;; Mutating the decoded response after admission must not mutate SESSION-A.
+    (aset capabilities 0 "changed")
+    (aset (aref capabilities 1) 0 ?X)
+    (should (equal (emacs-jupyter-notebook-helper-session-capabilities session-a)
+                   ["ping" "execute"]))
+    (should (emacs-jupyter-notebook-helper-session-capability-p session-a "ping"))
+    (should-not (emacs-jupyter-notebook-helper-session-capability-p session-a "missing"))
+    (should-not (emacs-jupyter-notebook-helper-session-capability-p session-b "ping"))))
+
+(ert-deftest ejn-et2-hello-capabilities-reject-malformed-absent-duplicate-and-overlimit ()
+  (should (emacs-jupyter-notebook-helper--valid-capabilities-p []))
+  (dolist (capabilities (list nil [""] [(make-string 65 ?x)] ["bad\u00e9"] [42]))
+    (should-not (emacs-jupyter-notebook-helper--valid-capabilities-p capabilities)))
+  (dolist (capabilities (list ["ping" "ping"] ["bad\ncap"]
+                              (make-vector 33 "x")))
+    (ejn-et2--with-session (session "silent")
+      (let* ((result (ejn-et3--object "version" 1 "helper_version" "test"
+                                      "capabilities" capabilities))
+             (response (ejn-et3--object
+                        "v" 1 "kind" "response"
+                        "id" (emacs-jupyter-notebook-helper-session-hello-id session)
+                        "ok" t "result" result)))
+        (ejn-et3--feed session response)
+        (should (ejn-et2--await (lambda () failure) 1))
+        (should-not ready)
+        (should (emacs-jupyter-notebook-helper-session-disposed session))))))
+
 (provide 'emacs-jupyter-notebook-helper-process-tests)
 ;;; emacs-jupyter-notebook-helper-process-tests.el ends here

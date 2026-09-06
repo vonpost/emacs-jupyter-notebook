@@ -96,20 +96,48 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 image.setLevels((center - width / 2.0, center + width / 2.0))
 
 
-def _nonblank(window: ViewerWindow) -> bool:
-    """Check that the image viewport contains painted, varying image data."""
-    image = window._graphics.grab().toImage().convertToFormat(QtGui.QImage.Format_RGB32)
-    if image.isNull():
-        return False
+def _image_variation(image: QtGui.QImage) -> bool:
+    """Require nontrivial content rather than a uniform white/black surface."""
     colors = set()
-    for y in range(0, image.height(), max(1, image.height() // 24)):
-        for x in range(0, image.width(), max(1, image.width() // 24)):
+    for y in range(0, image.height(), max(1, image.height() // 20)):
+        for x in range(0, image.width(), max(1, image.width() // 20)):
             color = image.pixelColor(x, y)
             colors.add((color.red(), color.green(), color.blue()))
     if len(colors) < 8:
         return False
     luminance = [0.2126 * r + 0.7152 * g + 0.0722 * b for r, g, b in colors]
     return max(luminance) - min(luminance) > 10.0
+
+
+def _pane_nonblank(window: ViewerWindow, index: int) -> bool:
+    """Check varying pixels inside one specific ImageItem's ViewBox."""
+    graphics = window._graphics
+    image = graphics.grab().toImage().convertToFormat(QtGui.QImage.Format_RGB32)
+    if image.isNull() or index >= len(window._views):
+        return False
+    rect = window._items[index].sceneBoundingRect().intersected(
+        window._views[index].sceneBoundingRect()).adjusted(5, 5, -5, -5)
+    top_left = graphics.mapFromScene(rect.topLeft())
+    bottom_right = graphics.mapFromScene(rect.bottomRight())
+    scale = image.devicePixelRatio()
+    x = max(0, round(top_left.x() * scale))
+    y = max(0, round(top_left.y() * scale))
+    right = min(image.width(), round(bottom_right.x() * scale))
+    bottom = min(image.height(), round(bottom_right.y() * scale))
+    if right <= x or bottom <= y:
+        return False
+    return _image_variation(image.copy(x, y, right - x, bottom - y))
+
+
+def _nonblank(window: ViewerWindow) -> bool:
+    """Check that every image viewport contains painted, varying image data."""
+    if getattr(window, "_views", None):
+        return all(_pane_nonblank(window, index)
+                   for index in range(len(window._views)))
+    image = window._graphics.grab().toImage().convertToFormat(QtGui.QImage.Format_RGB32)
+    if image.isNull():
+        return False
+    return _image_variation(image)
 
 
 def smoke_test(offscreen: bool = False) -> int:
@@ -125,6 +153,14 @@ def smoke_test(offscreen: bool = False) -> int:
     started = time.monotonic()
     evidence = {"platform": platform.system(), "qt_platform": app.platformName(),
                 "device_pixel_ratio": window.devicePixelRatioF(), "timed_out": False}
+    screen = window.screen()
+    evidence.update({"architecture": platform.machine(),
+                     "python_version": platform.python_version(),
+                     "qt_version": QtCore.qVersion(),
+                     "pyqtgraph_version": pg.__version__,
+                     "numpy_version": np.__version__,
+                     "screen_size": [screen.size().width(), screen.size().height()],
+                     "logical_dpi": round(screen.logicalDotsPerInch(), 2)})
 
     def finish():
         evidence["painted_after_reopen"] = _nonblank(window)
@@ -140,9 +176,54 @@ def smoke_test(offscreen: bool = False) -> int:
         QtCore.QTimer.singleShot(150, finish)
 
     def painted():
+        # Establish the canonical fit after the first layout pass; the initial
+        # constructor auto-range can precede the final widget aspect ratio.
+        window.fit_images()
+        app.processEvents()
         evidence["painted_before_resize"] = _nonblank(window)
+        evidence["painted_panes_before_resize"] = [
+            _pane_nonblank(window, index) for index in range(len(window._views))]
+        initial = [(view.viewRange()[0], view.viewRange()[1])
+                   for view in window._views]
+        evidence["initial_ranges"] = initial
+        for view, (x_range, y_range) in zip(window._views, initial):
+            x0, x1 = x_range
+            y0, y1 = y_range
+            view.setRange(xRange=(x0 + (x1 - x0) * .2,
+                                  x1 - (x1 - x0) * .2),
+                          yRange=(y0 + (y1 - y0) * .2,
+                                  y1 - (y1 - y0) * .2), padding=0)
         # Scheduled observation time, not a measured first-paint latency.
         evidence["paint_observed_ms"] = round((time.monotonic() - started) * 1000, 2)
+        QtCore.QTimer.singleShot(150, zoomed)
+
+    def zoomed():
+        current = [(view.viewRange()[0], view.viewRange()[1])
+                   for view in window._views]
+        initial = evidence["initial_ranges"]
+        def changed(old, new):
+            return max(abs(old[0][0] - new[0][0]),
+                       abs(old[0][1] - new[0][1]),
+                       abs(old[1][0] - new[1][0]),
+                       abs(old[1][1] - new[1][1])) > 1e-3
+        evidence["zoom_ranges_changed"] = all(
+            changed(old, new) for old, new in zip(initial, current))
+        evidence["painted_after_zoom"] = _nonblank(window)
+        window.fit_images()
+        QtCore.QTimer.singleShot(150, fit_checked)
+
+    def fit_checked():
+        current = [(view.viewRange()[0], view.viewRange()[1])
+                   for view in window._views]
+        initial = evidence["initial_ranges"]
+        def close(old, new):
+            return max(abs(old[0][0] - new[0][0]),
+                       abs(old[0][1] - new[0][1]),
+                       abs(old[1][0] - new[1][0]),
+                       abs(old[1][1] - new[1][1])) <= 1.0
+        evidence["fit_restored_ranges"] = all(
+            close(old, new) for old, new in zip(initial, current))
+        evidence["painted_after_fit"] = _nonblank(window)
         window.resize(840, 520)
         QtCore.QTimer.singleShot(150, resized)
 
@@ -161,7 +242,9 @@ def smoke_test(offscreen: bool = False) -> int:
     watchdog.stop()
     evidence["painted"] = all(evidence.get(key, False) for key in
                               ("painted_before_resize", "painted_after_resize",
-                               "painted_after_reopen", "closed"))
+                               "painted_after_reopen", "painted_after_zoom",
+                               "painted_after_fit", "zoom_ranges_changed",
+                               "fit_restored_ranges", "closed"))
     print(json.dumps(evidence, sort_keys=True))
     return 0 if evidence["painted"] and not evidence["timed_out"] else 1
 
@@ -169,13 +252,17 @@ def smoke_test(offscreen: bool = False) -> int:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Local EJN PyQtGraph viewer")
     parser.add_argument("--demo", action="store_true", help="show demo planes")
+    parser.add_argument("--stdio", action="store_true", help="serve bounded local Emacs control")
     parser.add_argument("--smoke-test", action="store_true", help="run a paint/resize smoke test")
     parser.add_argument("--offscreen", action="store_true", help="use Qt's offscreen platform for smoke tests")
     args = parser.parse_args(argv)
+    if args.stdio:
+        from .ipc import run
+        return run()
     if args.smoke_test:
         return smoke_test(args.offscreen)
     if not args.demo:
-        parser.error("one of --demo or --smoke-test is required")
+        parser.error("one of --demo, --smoke-test or --stdio is required")
     app = QtWidgets.QApplication(sys.argv if argv is None else [sys.argv[0], *argv])
     window = ViewerWindow(demo_planes())
     window.show()

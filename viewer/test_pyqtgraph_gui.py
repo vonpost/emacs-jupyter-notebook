@@ -22,6 +22,11 @@ class ViewerSmokeTest(unittest.TestCase):
                                 timeout=15)
         evidence = json.loads(result.stdout)
         self.assertTrue(evidence["painted"])
+        self.assertEqual(evidence["painted_panes_before_resize"], [True, True])
+        self.assertTrue(evidence["painted_after_zoom"])
+        self.assertTrue(evidence["zoom_ranges_changed"])
+        self.assertTrue(evidence["painted_after_fit"])
+        self.assertTrue(evidence["fit_restored_ranges"])
         self.assertTrue(evidence["closed"])
         self.assertTrue(evidence["painted_after_reopen"])
         self.assertFalse(evidence["timed_out"])
@@ -46,6 +51,25 @@ for color in ('white', 'black'):
 '''
         subprocess.run([sys.executable, "-c", code], check=True, timeout=15,
                        env=dict(os.environ, QT_QPA_PLATFORM="offscreen"))
+
+    def test_one_blank_image_pane_fails_at_high_dpi(self):
+        code = '''
+import numpy as np
+from PySide6 import QtWidgets
+from ejn_viewer.app import ViewerWindow, demo_planes, _nonblank
+app = QtWidgets.QApplication([])
+w = ViewerWindow(demo_planes())
+w.show()
+app.processEvents()
+assert _nonblank(w)
+w._items[1].setImage(np.zeros((72, 120)), autoLevels=False)
+app.processEvents()
+assert not _nonblank(w)
+w.close()
+'''
+        subprocess.run([sys.executable, "-c", code], check=True, timeout=15,
+                       env=dict(os.environ, QT_QPA_PLATFORM="offscreen",
+                                QT_SCALE_FACTOR="2"))
 
 
 if __name__ == "__main__":

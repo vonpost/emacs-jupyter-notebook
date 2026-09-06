@@ -35,6 +35,8 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'subr-x)
+(require 'button)
+(require 'emacs-jupyter-notebook-helper-protocol)
 (require 'emacs-jupyter-notebook-vars)
 (require 'emacs-jupyter-notebook-artifacts)
 
@@ -185,6 +187,24 @@ before a future implementation chooses to reuse entry ids.")
 
 (defvar-local emacs-jupyter-notebook-panel--retained-output-segments 0
   "Cached number of ordered output segments retained by this panel.")
+
+(defvar emacs-jupyter-notebook-panel--next-array-identity 0
+  "Process-local identity counter for numerical publications and workspaces.")
+
+(defvar-local emacs-jupyter-notebook--array-workspace-identity nil
+  "Stable source-buffer namespace for the numerical viewer.")
+
+(defvar emacs-jupyter-notebook-panel--array-handoff-count 0
+  "Number of outstanding numerical artifact handoff leases.")
+
+(defconst emacs-jupyter-notebook-panel--max-array-handoffs 8
+  "Global numerical handoff bound, including publications retired by panels.")
+
+(defvar ejn-panel-array-published-hook nil
+  "Hook run after a numerical publication is committed and retained.
+Functions receive its effective entry handle and exact local output ID.
+Consumers should schedule asynchronous inspection; hooks receive no lease.
+Rejected, immediately evicted, or omitted publications do not run this hook.")
 
 (defconst emacs-jupyter-notebook-panel--max-published-original-bytes 67108864
   "Maximum bytes retained for one compressed external-viewer original.")
@@ -1231,6 +1251,8 @@ CURRENT-LINE-P means TEXT belongs to the logical line after the last newline."
     (dolist (seg (plist-get entry :outputs))
       (cl-incf index)
       (pcase (car seg)
+        ('array
+         (emacs-jupyter-notebook-panel--insert-array (cdr seg) index))
         ('image
          (emacs-jupyter-notebook-panel--insert-image
           (cdr seg) index (member (cdr seg) inline-specs))
@@ -1424,6 +1446,18 @@ flags."
            (setq job (plist-put job :current-segments (cdr segments)))
            (setq job (plist-put job :segment-index (1+ index)))
            (pcase (car-safe segment)
+             ('array
+              (let ((bytes (+ 10 (string-bytes
+                                  (emacs-jupyter-notebook-panel--array-card
+                                   (cdr segment))))))
+                (if (> (+ text-budget bytes)
+                       emacs-jupyter-notebook-panel--sliced-render-max-text-bytes)
+                    (progn
+                      (setq job (plist-put job :current-segments segments))
+                      (setq job (plist-put job :segment-index index))
+                      (list :job job :blocked t))
+                  (emacs-jupyter-notebook-panel--insert-array (cdr segment) index)
+                  (list :job job :text-bytes bytes))))
              ('image
               (if image-used
                   ;; Restore the segment so the next timer callback sees it.
@@ -2121,7 +2155,7 @@ pickle follows the image's existing cross-entry target."
                        (emacs-jupyter-notebook-panel--published-image-bundle-spec
                         image))))
                (old-entry (ejn-panel-entry-snapshot effective))
-               old-images old-image-replaced old-pickle old-timer
+               old-images old-arrays old-image-replaced old-pickle old-timer
                dropped-image dropped-pickle segment-omitted
                replace-pickle-p new-entry committed)
           (when old-entry
@@ -2139,6 +2173,9 @@ pickle follows the image's existing cross-entry target."
                               (plist-get old-entry :outputs)))))
               (when pending-clear
                 (setq old-images (ejn-panel-entry-images old-entry))
+                (setq old-arrays (cl-remove-if-not
+                                  (lambda (seg) (eq (car seg) 'array))
+                                  (plist-get old-entry :outputs)))
                 (setq new
                       (emacs-jupyter-notebook-panel--entry-reset-output-accounting
                        new)))
@@ -2234,6 +2271,7 @@ pickle follows the image's existing cross-entry target."
               ;; validation or construction error above leaves these live.
               (dolist (old-image old-images)
                 (emacs-jupyter-notebook-panel--retire-image panel old-image))
+              (emacs-jupyter-notebook-panel--retire-outputs panel old-arrays)
               (when dropped-image
                 (emacs-jupyter-notebook-panel--retire-image panel dropped-image))
               (when dropped-pickle
@@ -2363,10 +2401,13 @@ removed, so a failed batch remains conservatively owned and retriable."
         (emacs-jupyter-notebook-panel--retire-original-if-released image)))))
 
 (defun emacs-jupyter-notebook-panel--retire-outputs (panel outputs)
-  "Retire every image spec in OUTPUTS owned by PANEL."
+  "Retire every image and numerical publication in OUTPUTS owned by PANEL."
   (dolist (seg outputs)
-    (when (eq (car seg) 'image)
-      (emacs-jupyter-notebook-panel--retire-image panel (cdr seg)))))
+    (pcase (car seg)
+      ('image (emacs-jupyter-notebook-panel--retire-image panel (cdr seg)))
+      ;; Numerical publications use the established confined binary lifetime
+      ;; lease machinery; they never use Emacs's native image decoder.
+      ('array (emacs-jupyter-notebook-panel--retire-pickle (cdr seg))))))
 
 (defun emacs-jupyter-notebook-panel--entry-text-bytes (entry)
   "Return the retained source and output text byte count for ENTRY."
@@ -2397,10 +2438,10 @@ removed, so a failed batch remains conservatively owned and retriable."
 (defun emacs-jupyter-notebook-panel--recompute-entry-artifact-bytes (entry)
   "Recompute ENTRY's artifact bytes for test introspection only."
   (+ (cl-loop for segment in (plist-get entry :outputs)
-              when (eq (car segment) 'image)
-              ;; Image segments are `(image . IMAGE-SPEC)', so the image
-              ;; symbol in IMAGE-SPEC precedes its property list.
-              sum (or (plist-get (cdr (cdr segment)) :ejn-artifact-bytes) 0))
+              sum (pcase (car segment)
+                    ('image (or (plist-get (cdr (cdr segment)) :ejn-artifact-bytes) 0))
+                    ('array (or (plist-get (cdr segment) :size) 0))
+                    (_ 0)))
      (let ((pickle (plist-get entry :mpl-pickle)))
        (or (plist-get pickle :size) 0))))
 
@@ -2526,6 +2567,10 @@ normal Emacs exit; it never consults source, registry, SSH, or kernel state."
           (let ((outputs (plist-get (cdr cell) :outputs)))
             (emacs-jupyter-notebook-panel--retire-outputs panel outputs)
             (dolist (segment outputs)
+              (when (eq (car segment) 'array)
+                (let ((artifact (cdr segment)))
+                  (push (cons artifact (> (or (plist-get artifact :leases) 0) 0))
+                        retired-publications)))
               (when (eq (car segment) 'image)
                 (let* ((image (cdr segment))
                        (props (cdr image)))
@@ -2876,6 +2921,7 @@ colours are preserved and uncoloured spans still get the fallback FACE."
   (pcase (car-safe segment)
     ('text (and (emacs-jupyter-notebook-panel--text-state-p (cdr segment))
                 (plist-get (cdr segment) :display-id)))
+    ('array (plist-get (cdr segment) :display-id))
     ('image (plist-get (cdr (cdr segment)) :ejn-display-id))))
 
 (defun emacs-jupyter-notebook-panel--display-target (panel display-id &optional kind)
@@ -4098,6 +4144,213 @@ matplotlib pickle artifact."
     (unless pickle
       (user-error "No interactive figure on this entry (no pickle artifact)"))
     (emacs-jupyter-notebook-open-figure-pickle-lease pickle)))
+
+;;; Numerical publications (W21)
+
+(declare-function emacs-jupyter-notebook-inspect-publication
+                  "emacs-jupyter-notebook" (lease))
+
+(defun emacs-jupyter-notebook-panel--array-card (artifact)
+  "Return bounded display text for ARTIFACT's validated manifest."
+  (let ((manifest (plist-get artifact :manifest)))
+    (concat
+     (format "Array %s · sample %s · full source resolution\n"
+             (gethash "key" manifest) (gethash "sample_id" manifest))
+     (mapconcat
+      (lambda (plane)
+        (let ((shape (gethash "shape" plane)))
+          (format "  %s  %s × %s  %s%s\n"
+                  (gethash "name" plane) (aref shape 0) (aref shape 1)
+                  (gethash "dtype" plane)
+                  (if-let ((units (gethash "units" plane)))
+                      (format "  %s" units) ""))))
+      (gethash "planes" manifest) ""))))
+
+(defun emacs-jupyter-notebook-panel--insert-array (artifact index)
+  "Insert ARTIFACT's card and an exact-publication Inspect action at INDEX."
+  (let ((start (point))
+        (text (emacs-jupyter-notebook-panel--array-card artifact))
+        (handle (plist-get artifact :entry-handle))
+        (output-id (plist-get artifact :output-id)))
+    (insert text)
+    (insert-text-button
+     "[Inspect]" 'follow-link t
+     'action (lambda (_button)
+               (let ((lease (ejn-panel-acquire-array handle output-id)))
+                 (unless lease (user-error "This numerical publication has retired"))
+                 (condition-case err
+                     (emacs-jupyter-notebook-inspect-publication lease)
+                   (error
+                    (funcall (plist-get lease :release))
+                    (signal (car err) (cdr err)))))))
+    (insert "\n")
+    (add-text-properties start (point)
+                         (list 'emacs-jupyter-notebook-segment-index index
+                               'emacs-jupyter-notebook-array-output-id output-id))
+    (+ (string-bytes text) 10)))
+
+(defun ejn-panel-set-published-array (handle publication &optional update-p)
+  "Admit one numerical PUBLICATION on HANDLE; return its effective handle.
+UPDATE-P targets the exact array display-id, including an earlier execution.
+Validate only local file identity and bounded helper manifest metadata; never
+read array bytes.  Nil means ownership was not accepted by this panel."
+  (when (ejn-panel-entry-live-p handle)
+    (let* ((panel (plist-get handle :panel))
+           (display-id (plist-get publication :display-id))
+           (target (and update-p display-id
+                        (emacs-jupyter-notebook-panel--display-target
+                         panel display-id 'array)))
+           (effective (if update-p (car-safe target) handle))
+           (manifest (plist-get publication :manifest)))
+      (when (and effective (ejn-panel-entry-live-p effective))
+        (unless (ejn-helper-protocol-array-manifest-p manifest (plist-get publication :size))
+          (error "Invalid numerical publication manifest"))
+        (unless (and (stringp (plist-get publication :path))
+                     (string-match-p
+                      "\\`ejn-artifact-[0-9a-f]\\{32\\}\\'"
+                      (file-name-nondirectory (plist-get publication :path))))
+          (error "Invalid numerical artifact name"))
+        (let* ((file-name-handler-alist nil)
+               (metadata
+                (with-current-buffer panel
+                  (emacs-jupyter-notebook-panel--published-artifact-metadata
+                   (plist-get publication :root) (plist-get publication :path)
+                   (plist-get publication :sha256) (plist-get publication :size)
+                   (plist-get publication :root-identity)
+                   emacs-jupyter-notebook-panel--max-published-original-bytes)))
+               (source (with-current-buffer panel
+                         emacs-jupyter-notebook-panel--source-buffer))
+               (workspace
+                (when (buffer-live-p source)
+                  (with-current-buffer source
+                    (or emacs-jupyter-notebook--array-workspace-identity
+                        (setq emacs-jupyter-notebook--array-workspace-identity
+                              (format "ejn-%d-%d" (emacs-pid)
+                                      (cl-incf emacs-jupyter-notebook-panel--next-array-identity)))))))
+               (output-id (cl-incf emacs-jupyter-notebook-panel--next-array-identity))
+               (artifact
+                (append metadata
+                        (list :manifest manifest :kind 'array-group
+                              :publication-id (gethash "publication_id" manifest)
+                              :output-id output-id :entry-handle effective
+                              :generation (plist-get effective :generation)
+                              :execution (format "%s/%s/%d" workspace
+                                                 (plist-get metadata :root-identity)
+                                                 (plist-get handle :id))
+                              :source-buffer source :cell-key (plist-get effective :cell-key)
+                              :workspace (format "%s/%s" workspace (gethash "key" manifest))
+                              :display-id display-id :leases 0 :retired nil :deleted nil)))
+               accepted)
+          ;; A mock callback or a filesystem handler must not resurrect a
+          ;; cleared entry during metadata admission.
+          (when (ejn-panel-entry-live-p effective)
+            (emacs-jupyter-notebook-panel--update-entry
+             effective
+             (lambda (entry)
+               (setq entry (emacs-jupyter-notebook-panel--entry-after-pending-clear
+                            panel entry))
+               (let ((segment (and target
+                                   (memq (cdr target) (plist-get entry :outputs))
+                                   (cdr target))))
+                 (cond
+                  (segment
+                   (emacs-jupyter-notebook-panel--retire-pickle (cdr segment))
+                   (setcdr segment artifact)
+                   (setq accepted t))
+                  ((emacs-jupyter-notebook-panel--entry-output-room-p entry)
+                   (setq entry (plist-put entry :outputs
+                                          (append (plist-get entry :outputs)
+                                                  (list (cons 'array artifact)))))
+                   (setq accepted t))
+                  (t
+                   ;; We accepted ownership even when bounded retention drops
+                   ;; this output; retire it ourselves and emit one marker.
+                   (emacs-jupyter-notebook-panel--retire-pickle artifact)
+                   (setq entry (emacs-jupyter-notebook-panel--entry-note-segment-omission entry))
+                   (setq accepted t)))
+                 (setq entry (plist-put entry :artifact-bytes
+                                        (emacs-jupyter-notebook-panel--recompute-entry-artifact-bytes entry)))
+                 entry))
+             t)
+            (emacs-jupyter-notebook-panel--enforce-retention-budgets panel)
+            (when (and accepted (ejn-panel-entry-live-p effective)
+                       (not (plist-get artifact :retired)))
+              ;; A consumer failure cannot undo committed artifact ownership
+              ;; or make the helper dispose an already-owned publication.
+              (condition-case err
+                  (run-hook-with-args 'ejn-panel-array-published-hook effective output-id)
+                (error
+                 (message "emacs-jupyter-notebook: numerical publication hook failed: %s"
+                          (error-message-string err))))))
+          (and accepted effective))))))
+
+(defun ejn-panel-acquire-array (handle &optional output-id)
+  "Acquire HANDLE's exact OUTPUT-ID, or its newest numerical publication.
+Return a metadata-only lease with an idempotent zero-argument :release callback.
+The callback must run after viewer acknowledgement, cancellation or failure."
+  (when (ejn-panel-entry-live-p handle)
+    (let* ((entry (ejn-panel-entry-snapshot handle))
+           (segment (cl-find-if
+                     (lambda (seg)
+                       (and (eq (car seg) 'array)
+                            (or (null output-id)
+                                (equal output-id (plist-get (cdr seg) :output-id)))))
+                     (reverse (plist-get entry :outputs))))
+           (artifact (cdr-safe segment)))
+      (when (and artifact (not (plist-get artifact :retired))
+                 (emacs-jupyter-notebook-panel--admitted-artifact-current-p
+                  artifact emacs-jupyter-notebook-panel--max-published-original-bytes))
+        (when (>= emacs-jupyter-notebook-panel--array-handoff-count
+                  emacs-jupyter-notebook-panel--max-array-handoffs)
+          (user-error "Numerical viewer handoff limit reached"))
+        (let ((released nil)
+              ;; Eviction can remove an entry before panel kill's deferred
+              ;; scan.  A bounded handoff therefore owns its own existing
+              ;; root capability lease, independently of that panel scan.
+              (handoff-capability
+               (emacs-jupyter-notebook-artifacts-capture
+                'helper (plist-get artifact :root) (plist-get artifact :root-identity))))
+          (unless handoff-capability
+            (user-error "Numerical publication ownership is unavailable"))
+          (cl-incf emacs-jupyter-notebook-panel--array-handoff-count)
+          (plist-put artifact :leases (1+ (plist-get artifact :leases)))
+          (append (copy-sequence artifact)
+                  (list :release
+                        (lambda ()
+                          (unless released
+                            (setq released t)
+                            (cl-decf emacs-jupyter-notebook-panel--array-handoff-count)
+                            (unwind-protect
+                                (progn
+                                  (unless (emacs-jupyter-notebook-artifacts-capability-valid-p
+                                           (plist-get artifact :artifact-capability))
+                                    (plist-put artifact :artifact-capability handoff-capability))
+                                  (ejn-panel-release-pickle artifact))
+                              (emacs-jupyter-notebook-artifacts-release handoff-capability)))))))))))
+
+(defun emacs-jupyter-notebook-panel-acquire-array-at-point ()
+  "Acquire the selected numerical output, or the newest array on its header."
+  (when (derived-mode-p 'emacs-jupyter-notebook-panel-mode)
+    (let ((id (emacs-jupyter-notebook-panel--entry-id-at-point)))
+      (when id
+        (let* ((entry (emacs-jupyter-notebook-panel--entry (current-buffer) id))
+               (handle (emacs-jupyter-notebook-panel--handle
+                        (current-buffer) id (plist-get entry :cell-key))))
+          (ejn-panel-acquire-array
+           handle (get-text-property (point) 'emacs-jupyter-notebook-array-output-id)))))))
+
+(defun emacs-jupyter-notebook-panel-acquire-array-for-cell (source-buffer cell-key)
+  "Acquire the newest array from CELL-KEY's latest execution only.
+A new execution without numerical output never falls back to an older result."
+  (when (and cell-key (buffer-live-p source-buffer))
+    (let ((panel (emacs-jupyter-notebook-panel-buffer source-buffer)))
+      (when (buffer-live-p panel)
+        (with-current-buffer panel
+          (when-let ((cell (cl-find-if
+                           (lambda (cell) (equal cell-key (plist-get (cdr cell) :cell-key)))
+                           (reverse emacs-jupyter-notebook-panel--entries))))
+            (ejn-panel-acquire-array
+             (emacs-jupyter-notebook-panel--handle panel (car cell) cell-key))))))))
 
 ;;; Panel cleanup (W2.9)
 

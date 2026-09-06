@@ -31,6 +31,7 @@
 (require 'emacs-jupyter-notebook-helper-protocol)
 (require 'emacs-jupyter-notebook-runtime)
 (require 'emacs-jupyter-notebook-viewer)
+(require 'emacs-jupyter-notebook-inspect)
 
 ;;; W8 — local interactive matplotlib viewer: remote formatter injection
 ;;
@@ -1161,7 +1162,8 @@ All command bindings live under `emacs-jupyter-notebook-prefix-key'
     (define-key map (kbd "l")    #'emacs-jupyter-notebook-clear-results)
     (define-key map (kbd "o")    #'emacs-jupyter-notebook-show-output-panel)
     (define-key map (kbd "t")    #'emacs-jupyter-notebook-toggle-panel-view)
-    (define-key map (kbd "I")    #'emacs-jupyter-notebook-open-figure-interactive)
+    (define-key map (kbd "I")    #'emacs-jupyter-notebook-inspect-images)
+    (define-key map (kbd "J")    #'emacs-jupyter-notebook-evaluate-and-inspect)
     (define-key map (kbd ".")    #'emacs-jupyter-notebook-inspect-at-point)
     (define-key map (kbd "TAB")  #'emacs-jupyter-notebook-complete-at-point)
     (define-key map (kbd "v")    #'emacs-jupyter-notebook-fetch-remote-log)
@@ -1636,6 +1638,19 @@ never make Emacs appear hung.
           (format "cannot send silent setup request: %s"
                   (error-message-string err))))))))
 
+(defun emacs-jupyter-notebook--array-publisher-setup-for-client (client)
+  "Return publisher setup only for CLIENT's exact negotiated helper session."
+  (let* ((state (and (emacs-jupyter-notebook-backend-session-p client)
+                     (emacs-jupyter-notebook-backend-session-data client)))
+         (helper (and (emacs-jupyter-notebook-helper-backend-state-p state)
+                      (emacs-jupyter-notebook-helper-backend-state-helper state))))
+    (when (emacs-jupyter-notebook-helper-session-capability-p helper "array-group-v1")
+      (condition-case err
+          (list (emacs-jupyter-notebook--array-publisher-setup-code))
+        (error (emacs-jupyter-notebook--log-append
+                'setup "Numerical publisher unavailable: %s" (error-message-string err))
+               nil)))))
+
 (defun emacs-jupyter-notebook--execution-start-setup (client)
   "Serialize formatter/watchdog setup before any user execution is sent."
   (when (and (eq client emacs-jupyter-notebook--client)
@@ -1645,7 +1660,8 @@ never make Emacs appear hung.
           (1+ emacs-jupyter-notebook--execution-setup-epoch))
     (emacs-jupyter-notebook--execution-setup-send-next
      client emacs-jupyter-notebook--execution-setup-epoch
-     (append (when emacs-jupyter-notebook-enable-pickle-viewer
+     (append (emacs-jupyter-notebook--array-publisher-setup-for-client client)
+             (when emacs-jupyter-notebook-enable-pickle-viewer
                (list emacs-jupyter-notebook--viewer-formatter-snippet))
              (when (and (integerp emacs-jupyter-notebook-kernel-idle-timeout)
                         (> emacs-jupyter-notebook-kernel-idle-timeout 0))
@@ -6382,7 +6398,8 @@ SUFFIX describes the explicit terminal action in the result panel."
              (= epoch emacs-jupyter-notebook--execution-setup-epoch))
     (emacs-jupyter-notebook--execution-setup-send-next
      client epoch
-     (append (when emacs-jupyter-notebook-enable-pickle-viewer
+     (append (emacs-jupyter-notebook--array-publisher-setup-for-client client)
+             (when emacs-jupyter-notebook-enable-pickle-viewer
                (list emacs-jupyter-notebook--viewer-formatter-snippet))
              (when (and (integerp emacs-jupyter-notebook-kernel-idle-timeout)
                         (> emacs-jupyter-notebook-kernel-idle-timeout 0))

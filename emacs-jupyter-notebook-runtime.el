@@ -27,16 +27,38 @@ Exactly one live waiter receives at most one sample per stderr callback.")
 
 (cl-defstruct (emacs-jupyter-notebook-runtime--waiter
                (:constructor emacs-jupyter-notebook-runtime--make-waiter))
-  token buffer probe callback failure)
+  token buffer probe callback failure viewer)
 
 (cl-defstruct (emacs-jupyter-notebook-runtime--build
                (:constructor emacs-jupyter-notebook-runtime--make-build))
   token process stdout-buffer stderr-buffer stderr-process timer waiters
   root started-at stdout-bytes stderr-bytes output-overflow terminal
-  stderr-closed last-progress-line)
+  stderr-closed last-progress-line viewer)
 
 (defvar emacs-jupyter-notebook-runtime--build nil
   "The single in-flight local runtime build, or nil.")
+
+(defvar emacs-jupyter-notebook-runtime--viewer-build nil
+  "The independently deduplicated local viewer build, or nil.")
+
+(defvar emacs-jupyter-notebook-runtime-viewer-directory nil
+  "Successful separate viewer output; never used as the headless runtime.")
+
+(defun emacs-jupyter-notebook-runtime--build-slot (viewer)
+  "Return the global build slot for VIEWER or the headless runtime."
+  (if viewer 'emacs-jupyter-notebook-runtime--viewer-build
+    'emacs-jupyter-notebook-runtime--build))
+
+(defun emacs-jupyter-notebook-runtime--current-build-p (build)
+  "Whether BUILD still owns its package-specific process generation."
+  (eq build (symbol-value (emacs-jupyter-notebook-runtime--build-slot
+                           (emacs-jupyter-notebook-runtime--build-viewer build)))))
+
+(defun emacs-jupyter-notebook-runtime--clear-current-build (build)
+  "Retire BUILD without touching another package's or generation's build."
+  (when (emacs-jupyter-notebook-runtime--current-build-p build)
+    (set (emacs-jupyter-notebook-runtime--build-slot
+          (emacs-jupyter-notebook-runtime--build-viewer build)) nil)))
 
 (defun emacs-jupyter-notebook-runtime--timeout ()
   "Return the bounded automatic build timeout."
@@ -193,8 +215,7 @@ real error and could start the displayed result in the middle of a line."
   "Fail BUILD once with bounded REASON and release all of its waiters."
   (unless (emacs-jupyter-notebook-runtime--build-terminal build)
     (setf (emacs-jupyter-notebook-runtime--build-terminal build) t)
-    (when (eq emacs-jupyter-notebook-runtime--build build)
-      (setq emacs-jupyter-notebook-runtime--build nil))
+    (emacs-jupyter-notebook-runtime--clear-current-build build)
     (let ((waiters (emacs-jupyter-notebook-runtime--build-waiters build)))
       (setf (emacs-jupyter-notebook-runtime--build-waiters build) nil)
       (unwind-protect
@@ -226,10 +247,11 @@ real error and could start the displayed result in the middle of a line."
     (if (not directory)
         (emacs-jupyter-notebook-runtime--fail
          build "Nix build succeeded but did not report one usable runtime output")
-      (setq emacs-jupyter-notebook--runtime-directory directory)
+      (if (emacs-jupyter-notebook-runtime--build-viewer build)
+          (setq emacs-jupyter-notebook-runtime-viewer-directory directory)
+        (setq emacs-jupyter-notebook--runtime-directory directory))
       (setf (emacs-jupyter-notebook-runtime--build-terminal build) t)
-      (when (eq emacs-jupyter-notebook-runtime--build build)
-        (setq emacs-jupyter-notebook-runtime--build nil))
+      (emacs-jupyter-notebook-runtime--clear-current-build build)
       (let ((waiters (emacs-jupyter-notebook-runtime--build-waiters build)))
         (setf (emacs-jupyter-notebook-runtime--build-waiters build) nil)
         (unwind-protect
@@ -281,7 +303,7 @@ real error and could start the displayed result in the middle of a line."
   "Settle BUILD after both its main process and stderr pipe have closed."
   (let ((process (emacs-jupyter-notebook-runtime--build-process build)))
     (when (and (not (emacs-jupyter-notebook-runtime--build-terminal build))
-               (eq emacs-jupyter-notebook-runtime--build build)
+               (emacs-jupyter-notebook-runtime--current-build-p build)
                (processp process)
                (memq (process-status process) '(exit signal))
                (emacs-jupyter-notebook-runtime--build-stderr-closed build))
@@ -306,7 +328,7 @@ real error and could start the displayed result in the middle of a line."
 (defun emacs-jupyter-notebook-runtime--sentinel (build process _event)
   "Record BUILD's exact main PROCESS exit and await stderr EOF."
   (when (and (not (emacs-jupyter-notebook-runtime--build-terminal build))
-             (eq emacs-jupyter-notebook-runtime--build build)
+             (emacs-jupyter-notebook-runtime--current-build-p build)
              (or (null (emacs-jupyter-notebook-runtime--build-process build))
                  (eq process (emacs-jupyter-notebook-runtime--build-process build)))
              (memq (process-status process) '(exit signal)))
@@ -317,7 +339,7 @@ real error and could start the displayed result in the middle of a line."
     (build process _event)
   "Mark BUILD's exact stderr PROCESS drained after it closes."
   (when (and (not (emacs-jupyter-notebook-runtime--build-terminal build))
-             (eq emacs-jupyter-notebook-runtime--build build)
+             (emacs-jupyter-notebook-runtime--current-build-p build)
              (eq process
                  (emacs-jupyter-notebook-runtime--build-stderr-process build))
              (not (process-live-p process)))
@@ -327,7 +349,7 @@ real error and could start the displayed result in the middle of a line."
 (defun emacs-jupyter-notebook-runtime--filter (build stream process output)
   "Append PROCESS OUTPUT to BUILD's STREAM within its immutable bound."
   (when (and (not (emacs-jupyter-notebook-runtime--build-terminal build))
-             (eq emacs-jupyter-notebook-runtime--build build))
+             (emacs-jupyter-notebook-runtime--current-build-p build))
     ;; Publish an exceptionally fast stdout child before an inline test double
     ;; or process callback can fail it.  The stderr pipe is never the owner.
     (when (and (eq stream 'stdout)
@@ -357,7 +379,7 @@ real error and could start the displayed result in the middle of a line."
 
 (defun emacs-jupyter-notebook-runtime--timeout-fired (build)
   "Fail BUILD only if it still owns the global build slot."
-  (when (and (eq emacs-jupyter-notebook-runtime--build build)
+  (when (and (emacs-jupyter-notebook-runtime--current-build-p build)
              (not (emacs-jupyter-notebook-runtime--build-terminal build)))
     (emacs-jupyter-notebook-runtime--fail
      build (format "Automatic Nix runtime build timed out after %.0f seconds"
@@ -384,15 +406,19 @@ real error and could start the displayed result in the middle of a line."
              (command
               (list nix "--extra-experimental-features" "nix-command flakes"
                     "build" "--no-link" "--print-out-paths"
-                    "--print-build-logs" "--show-trace" ".#default"))
+                    "--print-build-logs" "--show-trace"
+                    (if (emacs-jupyter-notebook-runtime--waiter-viewer waiter)
+                        ".#ejn-viewer" ".#default")))
              (build (emacs-jupyter-notebook-runtime--make-build
                      :token (gensym "ejn-runtime-build-")
+                     :viewer (emacs-jupyter-notebook-runtime--waiter-viewer waiter)
                      :stdout-buffer stdout :stderr-buffer stderr
                      :waiters (list waiter) :root root
                      :started-at (float-time) :stdout-bytes 0 :stderr-bytes 0)))
         (with-current-buffer stdout (set-buffer-multibyte nil))
         (with-current-buffer stderr (set-buffer-multibyte nil))
-        (setq emacs-jupyter-notebook-runtime--build build)
+        (set (emacs-jupyter-notebook-runtime--build-slot
+              (emacs-jupyter-notebook-runtime--build-viewer build)) build)
         (setf (emacs-jupyter-notebook-runtime--build-timer build)
               (run-at-time
                (emacs-jupyter-notebook-runtime--timeout) nil
@@ -412,7 +438,7 @@ real error and could start the displayed result in the middle of a line."
                      :sentinel (lambda (process event)
                                  (emacs-jupyter-notebook-runtime--sentinel
                                   build process event)))))
-              (when (eq emacs-jupyter-notebook-runtime--build build)
+              (when (emacs-jupyter-notebook-runtime--current-build-p build)
                 (setf (emacs-jupyter-notebook-runtime--build-process build) process)
                 (if-let ((stderr-process (get-buffer-process stderr)))
                     (progn
@@ -447,23 +473,26 @@ real error and could start the displayed result in the middle of a line."
   (condition-case err
       (emacs-jupyter-notebook-runtime--start-unguarded waiter)
     ((error quit)
-     (let ((reason
+     (let ((build (symbol-value (emacs-jupyter-notebook-runtime--build-slot
+                                (emacs-jupyter-notebook-runtime--waiter-viewer waiter))))
+           (reason
             (format "Could not inspect the bundled Nix runtime: %.1000s"
                     (error-message-string err))))
-       (if (and emacs-jupyter-notebook-runtime--build
+       (if (and build
                 (memq waiter
                       (emacs-jupyter-notebook-runtime--build-waiters
-                       emacs-jupyter-notebook-runtime--build)))
+                       build)))
            (emacs-jupyter-notebook-runtime--fail
-            emacs-jupyter-notebook-runtime--build reason)
+            build reason)
          (emacs-jupyter-notebook-runtime--call-waiter waiter nil reason))))))
 
 (defun emacs-jupyter-notebook-runtime-ensure
-    (probe callback failure &optional buffer)
+    (probe callback failure &optional buffer viewer)
   "Ensure the bundled runtime according to PROBE, then call CALLBACK.
 PROBE returns a plist with `:ready', `:buildable', and optional `:reason'.
 FAILURE receives one bounded diagnostic.  BUFFER owns the returned waiter
-token and may cancel it without affecting waiters from other buffers."
+token and may cancel it without affecting waiters from other buffers.
+VIEWER requests the independently built GUI output, never the headless one."
   (let* ((buffer (or buffer (current-buffer)))
          (status (emacs-jupyter-notebook-runtime--probe probe)))
     (cond
@@ -475,30 +504,36 @@ token and may cancel it without affecting waiters from other buffers."
                            "The configured local runtime cannot be resolved"))
       nil)
      (t
-      (let ((waiter (emacs-jupyter-notebook-runtime--make-waiter
+      (let* ((slot (emacs-jupyter-notebook-runtime--build-slot viewer))
+             (build (symbol-value slot))
+             (waiter (emacs-jupyter-notebook-runtime--make-waiter
                      :token (gensym "ejn-runtime-waiter-") :buffer buffer
+                     :viewer viewer
                      :probe probe :callback callback :failure failure)))
-        (if (and emacs-jupyter-notebook-runtime--build
+        (if (and build
                  (not (emacs-jupyter-notebook-runtime--build-terminal
-                       emacs-jupyter-notebook-runtime--build)))
+                       build)))
             (progn
               (setf (emacs-jupyter-notebook-runtime--build-waiters
-                     emacs-jupyter-notebook-runtime--build)
+                     build)
                     (append
                      (emacs-jupyter-notebook-runtime--build-waiters
-                      emacs-jupyter-notebook-runtime--build)
+                      build)
                      (list waiter)))
               (emacs-jupyter-notebook-runtime--waiter-token waiter))
           (emacs-jupyter-notebook-runtime--start waiter)
-          (when (and emacs-jupyter-notebook-runtime--build
+          (setq build (symbol-value slot))
+          (when (and build
                      (memq waiter
                            (emacs-jupyter-notebook-runtime--build-waiters
-                            emacs-jupyter-notebook-runtime--build)))
+                            build)))
             (emacs-jupyter-notebook-runtime--waiter-token waiter))))))))
 
 (defun emacs-jupyter-notebook-runtime-cancel-waiter (token)
   "Cancel the waiter identified by TOKEN and stop an otherwise unused build."
-  (when-let ((build emacs-jupyter-notebook-runtime--build))
+  (let ((changed nil))
+   (dolist (build (delq nil (list emacs-jupyter-notebook-runtime--build
+                                emacs-jupyter-notebook-runtime--viewer-build)))
     (let* ((old (emacs-jupyter-notebook-runtime--build-waiters build))
            (new (cl-remove token old
                            :key #'emacs-jupyter-notebook-runtime--waiter-token
@@ -506,11 +541,13 @@ token and may cancel it without affecting waiters from other buffers."
       (setf (emacs-jupyter-notebook-runtime--build-waiters build) new)
       (when (and (/= (length old) (length new)) (null new))
         (emacs-jupyter-notebook-runtime--fail build "Runtime build cancelled"))
-      (/= (length old) (length new)))))
+      (setq changed (or changed (/= (length old) (length new))))))
+   changed))
 
 (defun emacs-jupyter-notebook-runtime-shutdown ()
   "Stop the local runtime build, if any, without invoking buffer callbacks."
-  (when-let ((build emacs-jupyter-notebook-runtime--build))
+  (dolist (build (delq nil (list emacs-jupyter-notebook-runtime--build
+                               emacs-jupyter-notebook-runtime--viewer-build)))
     (setf (emacs-jupyter-notebook-runtime--build-waiters build) nil)
     (emacs-jupyter-notebook-runtime--fail build "Emacs is exiting")))
 

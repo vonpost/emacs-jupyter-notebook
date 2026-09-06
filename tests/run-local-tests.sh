@@ -72,8 +72,14 @@ run_with_deadline env TMPDIR="$RUN_TMPDIR" PYTHONPYCACHEPREFIX="$RUN_PYCACHE" \
   "$EMACS" -Q --batch -L "$ROOT" -L "$ROOT/tests" -L "$CODE_CELLS_DIR" \
   -l "$ROOT/tests/run-local-tests.el" -f ert-run-tests-batch-and-exit
 
+if [[ -d "$ROOT/array_protocol/tests" ]]; then
+  run_with_deadline env TMPDIR="$RUN_TMPDIR" PYTHONPATH="$ROOT/array_protocol" \
+    PYTHONPYCACHEPREFIX="$RUN_PYCACHE" \
+    "$PYTHON" -m unittest discover -s "$ROOT/array_protocol/tests" -p 'test_*.py'
+fi
+
 if [[ -d "$ROOT/helper/tests" ]]; then
-  run_with_deadline env TMPDIR="$RUN_TMPDIR" PYTHONPATH="$ROOT/helper" \
+  run_with_deadline env TMPDIR="$RUN_TMPDIR" PYTHONPATH="$ROOT/helper:$ROOT/array_protocol" \
     PYTHONPYCACHEPREFIX="$RUN_PYCACHE" \
     "$PYTHON" -m unittest discover -s "$ROOT/helper/tests" -p 'test_*.py'
 fi

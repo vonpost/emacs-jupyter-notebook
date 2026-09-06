@@ -10,15 +10,24 @@
   "Run BODY with the shared runtime state restored afterwards."
   (declare (indent 0) (debug body))
   `(let ((saved-build emacs-jupyter-notebook-runtime--build)
-         (saved-directory emacs-jupyter-notebook--runtime-directory))
+         (saved-viewer-build emacs-jupyter-notebook-runtime--viewer-build)
+         (saved-directory emacs-jupyter-notebook--runtime-directory)
+         (saved-viewer-directory emacs-jupyter-notebook-runtime-viewer-directory))
      (setq emacs-jupyter-notebook-runtime--build nil
+           emacs-jupyter-notebook-runtime--viewer-build nil
+           emacs-jupyter-notebook-runtime-viewer-directory nil
            emacs-jupyter-notebook--runtime-directory nil)
      (unwind-protect
          (progn ,@body)
        (when emacs-jupyter-notebook-runtime--build
          (emacs-jupyter-notebook-runtime--fail
           emacs-jupyter-notebook-runtime--build "test cleanup"))
+       (when emacs-jupyter-notebook-runtime--viewer-build
+         (emacs-jupyter-notebook-runtime--fail
+          emacs-jupyter-notebook-runtime--viewer-build "test cleanup"))
        (setq emacs-jupyter-notebook-runtime--build saved-build
+             emacs-jupyter-notebook-runtime--viewer-build saved-viewer-build
+             emacs-jupyter-notebook-runtime-viewer-directory saved-viewer-directory
              emacs-jupyter-notebook--runtime-directory saved-directory)
        (dolist (buffer (buffer-list))
          (when (string-match-p "\\*ejn-runtime-build" (buffer-name buffer))
@@ -511,6 +520,61 @@
                  (lambda (path) (equal path expected))))
         (should (equal (emacs-jupyter-notebook-runtime--nix-program)
                        expected))))))
+
+(ert-deftest ejn-runtime-headless-and-viewer-builds-are-independent ()
+  (ejn-runtime-test--clean
+    (let ((real (symbol-function 'make-process)) commands)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-runtime--package-root)
+                 (lambda () temporary-file-directory))
+                ((symbol-function 'emacs-jupyter-notebook-runtime--nix-program)
+                 (lambda () "/bin/sh"))
+                ((symbol-function 'make-process)
+                 (lambda (&rest args)
+                   (push (plist-get args :command) commands)
+                   (setq args (plist-put args :command
+                                          (list "/bin/sh" "-c" "sleep 30")))
+                   (apply real args))))
+        (with-temp-buffer
+          (emacs-jupyter-notebook-runtime-ensure
+           (lambda () (list :ready nil :buildable t)) #'ignore #'ignore nil nil)
+          (emacs-jupyter-notebook-runtime-ensure
+           (lambda () (list :ready nil :buildable t)) #'ignore #'ignore nil t))
+        (should emacs-jupyter-notebook-runtime--build)
+        (should emacs-jupyter-notebook-runtime--viewer-build)
+        (let ((targets (mapcar (lambda (command) (car (last command))) commands)))
+          (should (member ".#default" targets))
+          (should (member ".#ejn-viewer" targets)))))))
+
+(ert-deftest ejn-runtime-viewer-same-target-deduplicates-and-cancel-isolated ()
+  (ejn-runtime-test--clean
+    (let ((real (symbol-function 'make-process)) (calls 0))
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-runtime--package-root)
+                 (lambda () temporary-file-directory))
+                ((symbol-function 'emacs-jupyter-notebook-runtime--nix-program)
+                 (lambda () "/bin/sh"))
+                ((symbol-function 'make-process)
+                 (lambda (&rest args)
+                   (cl-incf calls)
+                   (setq args (plist-put args :command
+                                          (list "/bin/sh" "-c" "sleep 30")))
+                   (apply real args))))
+        (let ((probe (lambda () (list :ready nil :buildable t)))
+              (a (generate-new-buffer " *ejn-runtime-viewer-a*"))
+              (b (generate-new-buffer " *ejn-runtime-viewer-b*"))
+              token-a token-b)
+          (unwind-protect
+              (progn
+                (setq token-a (emacs-jupyter-notebook-runtime-ensure
+                               probe #'ignore #'ignore a t))
+                (setq token-b (emacs-jupyter-notebook-runtime-ensure
+                               probe #'ignore #'ignore b t))
+                (should (= calls 1))
+                (should (emacs-jupyter-notebook-runtime-cancel-waiter token-a))
+                (should emacs-jupyter-notebook-runtime--viewer-build)
+                (should (emacs-jupyter-notebook-runtime-cancel-waiter token-b))
+                (should-not emacs-jupyter-notebook-runtime--viewer-build))
+            (when (buffer-live-p a) (kill-buffer a))
+            (when (buffer-live-p b) (kill-buffer b))))))))
 
 (provide 'emacs-jupyter-notebook-runtime-tests)
 

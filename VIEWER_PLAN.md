@@ -52,7 +52,7 @@ polygon ROIs, and durable review collections follow the first release.
 
 ### Explicit slice publication
 
-Python surface (publisher implemented in V3; automatic setup waits for V6):
+Python surface (publisher and automatic capability-gated setup implemented):
 
 ```python
 ejn.view(
@@ -182,6 +182,39 @@ Reconnect/restart invalidates remote handles without relabeling cached data
 as fresh. Never replay user code to reconstruct missing output.
 
 ## Milestones and execution ledger
+
+### Experimental slice-path checkpoint — 2026-09-06
+
+The source-to-viewer numerical path is implemented. `C-c j I` and numerical
+panel cards inspect a retained output; `C-c j J` tracks the first numerical
+publication from the exact execution after point moves. Capability-gated,
+acknowledged setup injects `ejn.view` without remote files or installations.
+The separate Nix viewer starts asynchronously over bounded framed stdio.
+
+The helper validates/spools lossless groups off its event loop. Emacs handles
+only bounded metadata, with per-output identities and handoff leases. The
+viewer verifies and copies selected groups into read-only **memory**, not a
+disk snapshot store: there are no snapshot files to orphan-clean. Loaded
+images outlive panel/source cleanup, and EOF reaps only the local viewer.
+The four-workspace/256 MiB admission accounting includes retained samples and
+estimated load/render buffers, but is not a process RSS guarantee.
+
+The initial GUI has named row-major panes, compatible linked zoom/pan, fit,
+pixel readout and window level/width. V5-V7 remain partial: ordinary raster
+output selection, follow/freeze, return-to-source, linked cursors/magnifiers,
+native-device-pixel mode and full responsiveness evidence remain open.
+V8/V9 (pinned baseline/diffs/ROIs) have not been implemented. The legacy path
+still exists under its old explicit command/panel `v`; it is not a fallback
+from the new keys. V10 deletion is still open.
+
+Evidence: canonical source-only tests pass (957 ERT, 4 codec, 236 helper,
+25 registry, 12 stress). The separate Nix viewer check passes 26 GUI/snapshot/
+IPC tests. Opt-in real local-kernel→helper→viewer and Emacs→packaged-viewer
+integrations pass; the latter passes with both offscreen Qt and the actual
+Linux display and verifies snapshot survival and unchanged source bytes.
+Linux demo paint/zoom/resize/reopen checks also pass; actual macOS/Retina
+rendering and native-resolution acceptance remain open. See
+`docs/viewer-installation.md` for usage and current transfer limits.
 
 Use `ROADMAP.md`'s claim/done protocol. This document's creation does not claim
 implementation. Read `AGENTS.md`, `LEARNINGS.md`, both existing plans, and this

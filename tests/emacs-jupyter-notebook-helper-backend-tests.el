@@ -1345,6 +1345,40 @@ DISPOSALS receives local-only disposal reasons."
       (emacs-jupyter-notebook-helper-backend--dispose state "test cleanup")
       (when (file-directory-p root) (delete-directory root t)))))
 
+(ert-deftest ejn-v4-rejected-numerical-publication-is-disposed ()
+  "Numerical leaves join the same confined rollback path as existing images."
+  (let* ((capability (emacs-jupyter-notebook-artifacts-create 'helper))
+         (root (emacs-jupyter-notebook-artifacts-capability-root capability))
+         (state (emacs-jupyter-notebook-helper-backend--make-state
+                 :artifact-dir root :artifact-capability capability
+                 :artifact-identity
+                 (emacs-jupyter-notebook-artifacts-capability-root-identity capability)
+                 :emit #'ignore)))
+    (unwind-protect
+        (dolist (name '("ejn-artifact-00000000000000000000000000000001" "unrelated"))
+          (let* ((path (expand-file-name name root))
+                 (event (ejn-ei2-test--object
+                         "event" "display_data" "request_id" "wire"
+                         "data" (ejn-ei2-test--object
+                                 "data" (ejn-ei2-test--object
+                                         "application/x-ejn-array-group"
+                                         (ejn-ei2-test--object
+                                          "path" path "bytes" 4
+                                          "sha256" (make-string 64 ?a)
+                                          "manifest" :false))
+                                 "metadata" (ejn-ei2-test--object)))))
+            (with-temp-file path (insert "data"))
+            (set-file-modes path #o600)
+            (should (equal
+                     (emacs-jupyter-notebook-helper-backend--raw-publication-paths event)
+                     (list path)))
+            (should-error
+             (emacs-jupyter-notebook-helper-backend--deliver-mapped-event
+              state "wire" '(:ledger-id 1 :backend-request-id 11) event))
+            (should (eq (file-exists-p path) (equal name "unrelated")))))
+      (emacs-jupyter-notebook-helper-backend--dispose state "test cleanup")
+      (when (file-directory-p root) (delete-directory root t)))))
+
 (ert-deftest ejn-ei4-retired-wire-events-never-reenter-early-buffer ()
   "Late events for a tombstoned helper ID consume no pending-event capacity."
   (let* ((capability (emacs-jupyter-notebook-artifacts-create 'helper))

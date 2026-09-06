@@ -47,7 +47,7 @@ class PublisherTests(unittest.TestCase):
         with mock.patch("IPython.display.display") as emit:
             result = namespace["ejn"].view(planes, sample_id="sample", key="k",
                                             grid_id="aligned", units="HU")
-        self.assertEqual(result["v"], 1)
+        self.assertIsNone(result)
         bundle = emit.call_args.args[0]
         blob = base64.b64decode(bundle["application/x-ejn-array-group"], validate=True)
         self.assertEqual(blob[:8], b"EJNARR01")

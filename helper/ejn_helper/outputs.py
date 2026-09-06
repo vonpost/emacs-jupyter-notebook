@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
 
+from ejn_array import MIME as ARRAY_MIME
+
 from .artifacts import ArtifactError, ArtifactStore, PublishedArtifact
 from .image_metadata import EJN_MAX_IMAGE_PIXELS
 from .backend import BackendEvent
@@ -35,6 +37,7 @@ EJN_MAX_METADATA_ITEMS = 32
 EJN_MAX_METADATA_DEPTH = 2
 _MARKER_BYTES = 128
 _ARTIFACT_MIMES = (
+    ARRAY_MIME,
     "application/x-ejn-mpl-pickle",
     "image/png",
     "image/jpeg",
@@ -451,6 +454,19 @@ class OutputNormalizer:
                 safe_content["execution_count"] = count
         artifacts: dict[str, str] = {}
         image_added = False
+        # Presence is authoritative, even when malformed: numerical output
+        # never falls back to a raster/pickle from the same publication.
+        if ARRAY_MIME in data:
+            payload = data[ARRAY_MIME]
+            if not isinstance(payload, str) or not payload:
+                return None, 0, 0, "invalid numerical artifact"
+            if len(payload) > EJN_MAX_ARTIFACT_ENCODED_BYTES:
+                return None, 0, 0, "artifact exceeds the byte limit"
+            if not payload.isascii():
+                return None, 0, 0, "invalid numerical artifact"
+            safe_content["data"] = {ARRAY_MIME: payload}
+            return ({"msg_type": message_type, "content": safe_content},
+                    retained + len(payload), len(payload), None)
         # A rich figure may carry its thumbnail and interactive pickle.  Keep
         # exactly those two bounded payloads in one job so their publication
         # leases transfer or roll back atomically at delivery.
@@ -961,7 +977,9 @@ class OutputNormalizer:
                 if not isinstance(payload, str):
                     raise ArtifactError("artifact unavailable")
                 image_mime = mime.startswith("image/")
-                if image_mime and attachment_state.image_max_pixels:
+                if mime == ARRAY_MIME:
+                    future = self._executor.submit(store.make_array, payload)
+                elif image_mime and attachment_state.image_max_pixels:
                     future = self._executor.submit(
                         store.make_image,
                         payload,
@@ -973,7 +991,16 @@ class OutputNormalizer:
                 self._store_futures.add(future)
                 future.add_done_callback(self._store_futures.discard)
                 result = await self._await_store_future(future)
-                if image_mime:
+                if mime == ARRAY_MIME:
+                    artifact = result.original
+                    published.append(artifact)
+                    descriptor = {
+                        "path": str(artifact.path),
+                        "bytes": artifact.byte_count,
+                        "sha256": artifact.sha256,
+                        "manifest": result.manifest,
+                    }
+                elif image_mime:
                     if attachment_state.image_max_pixels:
                         original = result.original
                         preview = result.preview

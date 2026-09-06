@@ -45,7 +45,8 @@
   priority-queue priority-tail priority-queue-bytes drain-timer pending-failure
   ping-id ping-timer late-responses last-event-seq control-sent control-acked control-timer
   wire-sequence protocol-version stderr-pending stderr-pending-bytes stderr-drain-timer
-  stderr-overflowed stderr-overflow-notice startup-exit-timer startup-diagnostic)
+  stderr-overflowed stderr-overflow-notice startup-exit-timer startup-diagnostic
+  capabilities)
 
 (defvar-local emacs-jupyter-notebook--helper-session nil
   "The local helper session currently owned by this source buffer.")
@@ -659,7 +660,9 @@ local deadline or transport failure; ERROR is then a short local reason."
 
 (defun emacs-jupyter-notebook-helper--hello-result-p (session object)
   "Validate the one response permitted during SESSION startup."
-  (let ((result (gethash "result" object)))
+  (let* ((result (gethash "result" object))
+         (capabilities (and (hash-table-p result)
+                            (gethash "capabilities" result))))
     (and (hash-table-p object)
          (integerp (gethash "v" object))
          (= (gethash "v" object) ejn-helper-protocol-version)
@@ -670,7 +673,35 @@ local deadline or transport failure; ERROR is then a short local reason."
          (integerp (gethash "version" result))
          (= (gethash "version" result) ejn-helper-protocol-version)
          (stringp (gethash "helper_version" result))
-         (vectorp (gethash "capabilities" result)))))
+         (emacs-jupyter-notebook-helper--valid-capabilities-p capabilities))))
+
+(defun emacs-jupyter-notebook-helper--valid-capabilities-p (capabilities)
+  "Return non-nil for a bounded, duplicate-free ASCII capability vector."
+  (and (vectorp capabilities)
+       (<= (length capabilities) 32)
+       (let ((seen (make-hash-table :test 'equal)) (valid t) (index 0))
+         (while (and valid (< index (length capabilities)))
+           (let ((capability (aref capabilities index)))
+             (if (and (stringp capability)
+                      (> (length capability) 0)
+                      (<= (length capability) 64)
+                      (not (gethash capability seen))
+                      (cl-loop for character across capability
+                               always (and (>= character 32)
+                                           (<= character 126))))
+                 (puthash capability t seen)
+               (setq valid nil)))
+           (setq index (1+ index)))
+         valid)))
+
+(defun emacs-jupyter-notebook-helper-session-capability-p (session capability)
+  "Return non-nil when SESSION's negotiated capabilities contain CAPABILITY."
+  (and (emacs-jupyter-notebook-helper-session-p session)
+       (not (emacs-jupyter-notebook-helper-session-disposed session))
+       (stringp capability)
+       (member capability
+               (append (emacs-jupyter-notebook-helper-session-capabilities session)
+                       nil))))
 
 (defun emacs-jupyter-notebook-helper--hello-failure-reason (session object)
   "Return a fixed reason for one strictly recognized invalid hello OBJECT."
@@ -758,7 +789,13 @@ timer handle or sending a hello frame."
         (setf (emacs-jupyter-notebook-helper-session-hello-timer session) nil
               (emacs-jupyter-notebook-helper-session-state session) 'ready
               (emacs-jupyter-notebook-helper-session-protocol-version session)
-              ejn-helper-protocol-version)
+              ejn-helper-protocol-version
+              (emacs-jupyter-notebook-helper-session-capabilities session)
+              (apply #'vector
+                     (mapcar #'copy-sequence
+                             (append (gethash "capabilities"
+                                              (gethash "result" object))
+                                     nil))))
         (emacs-jupyter-notebook-helper--send-credit
          session emacs-jupyter-notebook-helper--initial-event-credit)
         (emacs-jupyter-notebook-helper--schedule-ping session)
@@ -1181,6 +1218,7 @@ This never sends a protocol operation and never affects any durable state."
       (emacs-jupyter-notebook-helper--cancel-timer control-timer)
       (emacs-jupyter-notebook-helper--fail-pending-requests session reason)
       (setf (emacs-jupyter-notebook-helper-session-requests session) nil
+            (emacs-jupyter-notebook-helper-session-capabilities session) nil
             (emacs-jupyter-notebook-helper-session-raw-chunks session) nil
             (emacs-jupyter-notebook-helper-session-raw-tail session) nil
             (emacs-jupyter-notebook-helper-session-raw-bytes session) 0

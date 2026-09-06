@@ -19,7 +19,7 @@ Add the package and its bundled runtime sources to `packages.el`:
 (package! emacs-jupyter-notebook
   :recipe (:host github
            :repo "vonpost/emacs-jupyter-notebook"
-           :files ("*.el" "viewer" "helper" "registry_worker"
+           :files ("*.el" "viewer" "helper" "registry_worker" "array_protocol"
                    "flake.nix" "flake.lock")))
 ```
 
@@ -203,7 +203,8 @@ All commands live under a single prefix, `emacs-jupyter-notebook-prefix-key` (de
 | `C-c j L` | `show-log-buffer` |
 | `C-c j o` | `show-output-panel` |
 | `C-c j t` | `toggle-panel-view` (latest ↔ history) |
-| `C-c j I` | `open-figure-interactive` (open the current cell's figure in the local viewer) |
+| `C-c j I` | `inspect-images` (inspect the current cell's numerical publication) |
+| `C-c j J` | `evaluate-and-inspect` (evaluate and open that execution's first numerical publication) |
 | `C-c j .` | `inspect-at-point` |
 | `C-c j TAB` | `complete-at-point` (capf usually handles it) |
 | `C-c j v` | `fetch-remote-log` |
@@ -251,7 +252,51 @@ Sliced line-height rendering remains available through `emacs-jupyter-notebook-p
 
 Toggle the view inside the panel with `H`, or globally with `C-c j t`. `q` buries the panel. `RET` anywhere in an entry jumps to its originating cell. `n` / `p` step between entries. A cell's text and figures interleave in arrival order, like a notebook — printing and plotting in the same cell shows both. Inline previews use zoom keys (`+`, `-`, `=`). `o` opens any stored PNG/JPEG image externally; `v` remains the matplotlib-pickle interactive viewer command (see below). Under evil (Doom/Spacemacs) the panel uses emacs state so all of these single-key commands work as listed.
 
-## Interactive matplotlib viewer
+## Numerical slice viewer (experimental)
+
+Publish only the slices you need from a NumPy-equipped Python kernel:
+
+```python
+# %% inspect reconstruction
+ejn.view(
+    {"reference": reference[z], "prediction": prediction[z]},
+    key="reconstruction",
+    sample_id=f"{case_id}/slice-{z}",
+    grid_id="aligned-reconstruction",  # declare correspondence, not just equal shapes
+    units="HU",                      # only if values are calibrated HU
+)
+```
+
+EJN injects `ejn` in memory during connection setup. Reconnect after updating
+the package; no kernel restart or remote viewer installation is needed. A
+pre-existing user-owned `ejn` binding is not overwritten.
+
+Use `C-c j J` to evaluate and inspect, or `C-c j I` to inspect the latest
+numerical output for the current cell. Each numerical output also has an
+`[Inspect]` button in the panel. Moving point while evaluation runs does not
+change the evaluate-and-inspect target.
+
+The separate local PyQtGraph window displays up to four named planes with
+zoom/pan, `F` to fit, pixel-value readout, and window level/width controls.
+Declared compatible grids share zoom/pan. Values and byte order are retained
+losslessly; whole volumes stay remote. After loading, these controls need no
+network requests. Clearing the panel does not delete the displayed snapshot.
+
+The viewer builds asynchronously from the pinned `.#ejn-viewer` Nix output on
+first use. It adds no Qt dependency to ordinary kernel work. See
+[viewer setup and limits](docs/viewer-installation.md) for manual setup and
+verification.
+
+This is the first working replacement path, not the completed comparison
+workspace. Pinned previous evaluations, diffs/blink, linked magnifiers,
+native-device-pixel mode, ROI mean/SD, and follow/freeze are still tracked in
+[the viewer roadmap](VIEWER_PLAN.md). Actual macOS rendering remains unverified.
+
+## Legacy matplotlib viewer (pending removal)
+
+The old opt-in pickle viewer is still present while its removal is tracked in
+V10. It is not used by `C-c j I` or `C-c j J`, and is not a fallback for the
+new numerical viewer. The following describes only that legacy path.
 
 Medical-imaging and array-heavy work needs a real interactive figure — pixel-value-under-cursor readout, zoom/pan, and linked-subplot crop — not just a static PNG thumbnail. `emacs-jupyter-notebook` provides one **without installing anything on any remote**.
 
@@ -259,7 +304,7 @@ Medical-imaging and array-heavy work needs a real interactive figure — pixel-v
 
 The remote kernel stays completely headless (inline / Agg). On connect (and again after `restart-kernel`) EJN sends a silent, in-memory IPython display-formatter setup request with `store_history` off; it creates no panel entry and writes nothing to the remote filesystem. Each displayed `matplotlib.figure.Figure` then carries the custom pickle MIME alongside its normal image. The local helper decodes both MIME payloads outside Emacs, enforces byte/pixel limits, and publishes identity-bound local artifact descriptors. Base64 image and pickle strings never enter the Emacs Lisp heap. There is no per-remote provisioning.
 
-Emacs renders only the helper's bounded canonical preview and retains the original-image and pickle descriptors on the panel entry. When you open a figure interactively (`C-c j I` on a cell, or `v` on a panel plot entry), Emacs hands the confined pickle descriptor to a persistent **local** viewer process over a Unix-domain socket. The viewer verifies the pinned artifact, unpickles the figure in its own process, reattaches a GUI canvas, installs the enhancements, and shows the window:
+Emacs renders only the helper's bounded canonical preview and retains the original-image and pickle descriptors on the panel entry. The legacy `open-figure-interactive` command, or `v` on a panel plot entry, hands the confined pickle descriptor to a persistent **local** viewer process over a Unix-domain socket. The viewer verifies the pinned artifact, unpickles the figure in its own process, reattaches a GUI canvas, installs the enhancements, and shows the window:
 
 - **Hover readout**: over an `imshow` image the coordinate readout shows integer `row`/`col` and the pixel `value` under the cursor.
 - **Linked zoom/pan**: zooming or panning one `imshow` subplot crops all sibling `imshow` subplots to the same limits.

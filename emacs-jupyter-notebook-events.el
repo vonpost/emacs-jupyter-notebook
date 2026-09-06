@@ -194,7 +194,11 @@ and `:password'; and truncation has optional `:text'."
                (not (and (eq mode 'update-display)
                          require-display-id
                          (null display-id))))
-      (let ((publication (plist-get data :ejn-published-image))
+      (if-let ((array (plist-get data :ejn-published-array)))
+          (condition-case nil
+              (ejn-panel-set-published-array handle array (eq mode 'update-display))
+            (error nil))
+        (let ((publication (plist-get data :ejn-published-image))
             (pickle (plist-get data :ejn-published-pickle)))
         (if (or publication pickle)
             (when-let ((effective-handle
@@ -223,14 +227,19 @@ and `:password'; and truncation has optional `:text'."
               (let ((text (ansi-color-apply rendered)))
                 (if display-id
                     (ejn-panel-update-display-text handle text display-id)
-                  (ejn-panel-replace-text handle text))))
+                  (if (and (eq mode 'result)
+                           (cl-find 'array
+                                    (plist-get (ejn-panel-entry-snapshot handle) :outputs)
+                                    :key #'car))
+                      (ejn-panel-append-text handle text)
+                    (ejn-panel-replace-text handle text)))))
              (t
               (let ((text (ansi-color-apply rendered)))
                 (if display-id
                     (ejn-panel-set-display-text handle text display-id)
                   (ejn-panel-append-text handle text))))))
           ;; Non-publication rendering has no transfer lease to acknowledge.
-          t))))
+          t)))))
 
 (defun emacs-jupyter-notebook-events--schedule-input (context prompt password)
   "Schedule, rather than perform, the minibuffer input requested by EVENT.
@@ -311,6 +320,7 @@ transport callback itself remains safe."
               ;; accepts it.  Do not turn an unknown display-id or stale handle
               ;; into successful local admission.
               (when (or (plist-get (plist-get action :data) :ejn-published-image)
+                        (plist-get (plist-get action :data) :ejn-published-array)
                         (plist-get (plist-get action :data) :ejn-published-pickle))
                 (setq publication-admitted (and publication-admitted applied))))
             (when (plist-get action :result-seen)

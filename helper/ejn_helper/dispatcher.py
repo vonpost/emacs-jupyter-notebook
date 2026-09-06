@@ -81,6 +81,7 @@ _CAPABILITIES = (
     "event-credit",
     "request-deadlines",
     "artifact-spooling",
+    "array-group-v1",
     "local-close",
 )
 

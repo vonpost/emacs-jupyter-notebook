@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO
 
+from ejn_array import ArrayFormatError, read_manifest
+
 from .image_metadata import (
     EJN_IMAGE_HEADER_SCAN_BYTES,
     EJN_MAX_IMAGE_PIXELS,
@@ -85,6 +87,14 @@ class PublishedImage:
     preview: PublishedArtifact | None
     width: int | None = None
     height: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedArray:
+    """One store-owned numerical group and its bounded validated header."""
+
+    original: PublishedArtifact
+    manifest: dict
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,6 +430,34 @@ class ArtifactStore:
                 except OSError:
                     pass
             raise
+
+    def make_array(self, payload: str) -> PublishedArray:
+        """Spool and validate a numerical group in the sole artifact worker.
+
+        Validation never allocates plane arrays. Rollback is owned here until
+        a successful return transfers the exact publication to the caller.
+        """
+        original = self.store_base64(payload)
+        fd: int | None = None
+        try:
+            fd = self._validate_published_fd(original)
+            before = os.fstat(fd)
+            # The file object borrows the already pinned fd.
+            with os.fdopen(fd, "rb", closefd=False) as stream:
+                manifest, _offset = read_manifest(stream, before.st_size)
+            after = os.fstat(fd)
+            if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                    after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                raise ArtifactDataError("numerical artifact changed during validation")
+            return PublishedArray(original, manifest)
+        except Exception as exc:
+            self.discard(original)
+            if isinstance(exc, ArrayFormatError):
+                raise ArtifactDataError("invalid numerical artifact") from exc
+            raise
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     def make_image(self, payload: str, mime: str, *, max_source_pixels: int = EJN_MAX_IMAGE_PIXELS) -> PublishedImage:
         """Publish PAYLOAD and, when safe, attach one constrained PPM preview.

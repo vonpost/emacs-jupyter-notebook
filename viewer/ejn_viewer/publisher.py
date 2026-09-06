@@ -97,7 +97,7 @@ def _view(planes, *, key="default", sample_id=None, grid_id=None, units=None):
     summary = "EJN array group %s: %d plane(s), sample %s" % (key, count, sample_id)
     display({_MIME: base64.b64encode(payload).decode("ascii"),
              "text/plain": summary}, raw=True)
-    return header
+    return None
 
 
 def install(namespace):

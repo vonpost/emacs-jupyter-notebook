@@ -7,6 +7,7 @@ name = "ejn-viewer"
 version = "0.1.0"
 description = "Local PySide6 and PyQtGraph slice viewer for emacs-jupyter-notebook"
 requires-python = ">=3.10"
+dependencies = ["ejn-array-protocol==0.1.0", "numpy>=2,<3", "pyqtgraph>=0.14,<0.15", "PySide6>=6,<7", "Pillow>=10,<13"]
 
 [project.scripts]
 ejn-viewer = "ejn_viewer.__main__:main"

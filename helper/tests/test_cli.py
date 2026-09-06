@@ -38,7 +38,8 @@ class CliTests(unittest.TestCase):
     def run_cli(self, *args, extra_pythonpath=(), input_text=None):
         merged = os.environ.copy()
         merged["PYTHONPATH"] = os.pathsep.join(
-            [*(str(path) for path in extra_pythonpath), str(HELPER_ROOT)]
+            [*(str(path) for path in extra_pythonpath), str(HELPER_ROOT),
+             str(HELPER_ROOT.parent / "array_protocol")]
         )
         return subprocess.run(
             [sys.executable, "-m", "ejn_helper", *args],
@@ -87,7 +88,8 @@ class CliTests(unittest.TestCase):
 
     def test_protocol_subprocess_golden_hello_ping_transcript(self):
         environment = os.environ.copy()
-        environment["PYTHONPATH"] = str(HELPER_ROOT)
+        environment["PYTHONPATH"] = os.pathsep.join(
+            [str(HELPER_ROOT), str(HELPER_ROOT.parent / "array_protocol")])
         transcript = (
             encode(
                 {"v": 1, "kind": "request", "id": "hello-1", "op": "hello", "params": {"versions": [1]}},
@@ -152,7 +154,8 @@ class CliTests(unittest.TestCase):
 
     def test_protocol_sigterm_silent_peer_exits_without_protocol_garbage(self):
         environment = os.environ.copy()
-        environment["PYTHONPATH"] = str(HELPER_ROOT)
+        environment["PYTHONPATH"] = os.pathsep.join(
+            [str(HELPER_ROOT), str(HELPER_ROOT.parent / "array_protocol")])
         process = subprocess.Popen(
             [sys.executable, "-m", "ejn_helper", "--protocol"],
             cwd=HELPER_ROOT,
