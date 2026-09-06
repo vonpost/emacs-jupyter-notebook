@@ -159,6 +159,14 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
+- [~] owner=root claimed=2026-09-07 CC9 Diagnose and repair silent inspection
+  startup. Visible bounded viewer phases and Nix progress, stale waiter recovery,
+  and a cold-start card-to-build-to-launch regression; preserve bounded SSH
+  exit status/stderr before local teardown. — touches: inspect/runtime/core
+  Elisp, focused inspector/runtime/tunnel tests, viewer installation docs —
+  for: W21 V6 and macOS dogfood. Kernel lifetime and transport semantics stay
+  unchanged; Qt dependency reduction is a separate packaging work item.
+
 - [~] owner=root claimed=2026-09-06 CC8 User-approved early viewer cutover.
   Implement the usable experimental slice path before complete macOS/review
   polish. — touches: new inspect-manager Elisp, core setup/keymap/runtime,
