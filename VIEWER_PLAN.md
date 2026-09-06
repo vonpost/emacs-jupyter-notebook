@@ -183,14 +183,14 @@ remain historical. A row's checkboxes mean landed work, not proposed design.
 
 ### M1 — Contracts and an actual working window
 
-- [~] owner=root claimed=2026-09-06 **V1 Specify numerical publication and viewer contracts.** Depends:
+- [x] sha=60c2297 **V1 Specify numerical publication and viewer contracts.** Depends:
   W20 complete. Files: this plan, new `docs/viewer-protocol.md`,
   `docs/helper-protocol-v1.md`, `HELPER_TRANSPORT_PLAN.md`. Define API,
   dtypes, identities, group completion, snapshot ownership, ACK/error states,
   and all count/byte/deadline limits. Record helper protocol version/capability
   changes; existing v1's image/pickle contract cannot implicitly admit arrays.
   Gate: contract vectors, explicit budget table, and architecture review.
-- [ ] **V2 Package and prove the PyQtGraph window.** Depends: V1.
+- [~] owner=nix_viewer_research claimed=2026-09-06 **V2 Package and prove the PyQtGraph window.** Depends: V1.
   Files: new viewer GUI/application modules and graphical tests, local package
   metadata, `flake.nix`, `flake.lock` if needed, installation docs. Add
   `.#ejn-viewer` package/app with PyQtGraph, one Qt binding, and the required
@@ -204,7 +204,7 @@ remain historical. A row's checkboxes mean landed work, not proposed design.
 
 ### M2 — Slice publication and source-to-viewer integration
 
-- [ ] **V3 Publish bounded planes from a real kernel.** Depends: V1.
+- [~] owner=root claimed=2026-09-06 **V3 Publish bounded planes from a real kernel.** Depends: V1.
   Files: new viewer publisher module and `viewer/test_publisher_kernel.py`,
   core Elisp setup and focused tests. Inject via acknowledged serialized
   setup; explicit MIME emission. Gate: test-owned local ipykernel with inline
