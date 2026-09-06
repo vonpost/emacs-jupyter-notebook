@@ -136,6 +136,24 @@ These are binding for every workstream. Update only by appending a new entry.
   `clean-orphaned-kernels`, `retry-fresh-kernel`, and `restart-kernel`, plus the
   separately approved in-kernel idle watchdog.
 
+- **2026-09-06 / Replace the matplotlib viewer with a slice-based PyQtGraph
+  comparison viewer (W21).** The user selected a lightweight local viewer
+  for full-resolution side-by-side images, linked zoom, window level/width,
+  differences, previous-evaluation comparison, and ROI mean/SD measurements.
+  Explicitly publish selected numerical planes first; whole volumes stay
+  remote. Local interaction operates on losslessly retained samples. W21
+  supersedes W8's matplotlib-pickle/GUI-backend design at cutover, preserving
+  Emacs ownership of the local viewer, headless remotes, zero remote install,
+  the supervised helper boundary, and clean source files. No compatibility
+  aliases or fallback pickle viewer. Implementation and later on-demand
+  slice work are tracked in `VIEWER_PLAN.md`.
+- **2026-09-06 / Nix packages the W21 local viewer.** The user has Nix on
+  both macOS and Linux and authorized building the replacement with it.
+  Ship PyQtGraph and one Qt binding in a separate pinned viewer output;
+  reuse bounded asynchronous first-use setup without adding GUI dependencies
+  to ordinary helper/registry startup. Validate actual graphical rendering
+  on both systems in addition to package builds.
+
 ## Cross-cutting changes
 
 Use this section to claim ownership of changes that span workstream file
@@ -1532,6 +1550,27 @@ subplot crops all siblings, killing Emacs reaps the viewer.
       so popup navigation/dismissal commands (`corfu-next', `company-abort',
       ...) no longer match and cannot schedule a request; regression test
       extended to pin that.
+
+---
+
+## W21 — Slice-based PyQtGraph comparison viewer
+
+Depends on: W20 (complete). Status: implementation started; see V-row claims.
+The authoritative row ledger, file scopes, dependencies, fidelity contracts,
+and acceptance gates live in [VIEWER_PLAN.md](VIEWER_PLAN.md). Claim V-rows
+there; do not duplicate implementation status here.
+
+| Milestone | Rows | User-visible outcome |
+| --- | --- | --- |
+| M1 — Contracts and working window | V1-V2 | Packaged viewer demonstrably renders on macOS and Linux |
+| M2 — Slice publication and integration | V3-V6 | Inspect selected full-resolution planes from a source cell |
+| M3 — Comparison and measurements | V7-V9 | Linked views, window/level, differences, pinned prior result, ROI mean/SD |
+| M4 — Cutover and verification | V10-V11 | Retire the pickle viewer and validate the complete workflow |
+| M5 — Later extensions | V12-V14 | Remote slice browsing, exact crops for huge planes, saved reviews |
+
+M1-M4 constitute the first release. Numerical arrays never enter the Emacs
+heap; cached inspection requires no network round trips. Later remote fetches
+must account for a busy kernel and cannot imply concurrent training access.
 
 ---
 

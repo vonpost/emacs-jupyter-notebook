@@ -7,6 +7,14 @@ be given one narrow row at a time.  Do not assign an agent "implement W20".
 The helper is local.  It connects to the existing `127.0.0.1` SSH forwards.
 It is not installed on the remote and it never owns the remote kernel process.
 
+W20 is complete. The planned W21 numerical-slice viewer extension is tracked
+in [VIEWER_PLAN.md](VIEWER_PLAN.md), indexed by `ROADMAP.md`. Its V1 row must
+explicitly specify any helper protocol version/capability and numerical
+artifact changes before implementation. The image/pickle contract below is
+the historical W20 baseline, not implicit permission to send arrays or raise
+limits. W21 preserves this document's supervision, flow-control, async and
+remote-kernel lifetime constraints.
+
 ## Why this work exists
 
 The retired in-process adapter could enter synchronous `emacs-jupyter` ZMQ
