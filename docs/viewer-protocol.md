@@ -62,6 +62,8 @@ byte order; supported dtype strings are `|u1`, `|i1`, `<u2`, `>u2`, `<i2`,
 `>i2`, `<u4`, `>u4`, `<i4`, `>i4`, `<f4`, `>f4`, `<f8`, `>f8`.
 No bool, object, structured, complex, float16 or int64/uint64 arrays in v1;
 reject unsupported types explicitly, without automatic casts.
+Masked arrays are rejected because v1 has no mask payload; their hidden
+backing values must never silently become measurement samples.
 
 Offsets start at zero and are exactly contiguous in plane order, with no
 overlap, holes or unused tail. `nbytes == rows * columns * dtype.itemsize`.

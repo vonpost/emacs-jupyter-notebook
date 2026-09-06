@@ -207,7 +207,10 @@ remain historical. A row's checkboxes mean landed work, not proposed design.
 - [~] owner=root claimed=2026-09-06 **V3 Publish bounded planes from a real kernel.** Depends: V1.
   Files: new viewer publisher module and `viewer/test_publisher_kernel.py`,
   core Elisp setup and focused tests. Inject via acknowledged serialized
-  setup; explicit MIME emission. Gate: test-owned local ipykernel with inline
+  setup; explicit MIME emission. V3 supplies and tests the bounded setup-code
+  provider; production queue/capability wiring belongs to V6 after V4's
+  helper admission (no premature injection or circular V3/V4 dependency).
+  Gate: test-owned local ipykernel with inline
   matplotlib active, import-and-publish in one cell, selected-slice-only
   fixtures, dtype/shape fidelity, namespace conflict, dependency failure,
   restart/reconnect setup and rejection before expensive materialization.

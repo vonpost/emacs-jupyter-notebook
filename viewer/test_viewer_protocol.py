@@ -2,6 +2,7 @@
 
 import contextlib
 import hashlib
+import importlib.util
 import json
 import os
 import pickle
@@ -14,8 +15,12 @@ import time
 import unittest
 from unittest import mock
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import ejn_viewer
+# Explicitly test the legacy script until V10 removes it; the replacement
+# package intentionally has the same public application name.
+_spec = importlib.util.spec_from_file_location(
+    "legacy_viewer", os.path.join(os.path.dirname(__file__), "ejn_viewer.py"))
+ejn_viewer = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(ejn_viewer)
 
 
 class ConfinedPickleTests(unittest.TestCase):

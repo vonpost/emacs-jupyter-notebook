@@ -508,6 +508,29 @@ figure or the local viewer is unavailable."
        "No interactive figure for this cell; run a cell that displays a matplotlib figure first"))
     (emacs-jupyter-notebook-open-figure-pickle-lease pickle)))
 
+(defconst emacs-jupyter-notebook--publisher-source-file
+  (expand-file-name
+   "viewer/ejn_viewer/publisher.py"
+   (file-name-directory (file-truename (or load-file-name buffer-file-name))))
+  "Bundled self-contained numerical publisher, injected without remote files.")
+
+(defun emacs-jupyter-notebook--array-publisher-setup-code ()
+  "Return bounded Python setup code for the numerical slice publisher.
+The caller must have negotiated the helper's array-group-v1 capability before
+adding this to the acknowledged serial setup queue.  The isolated namespace
+keeps implementation imports out of user globals; only install's public ejn
+binding is added, and a user-owned binding must never be overwritten."
+  (let ((source
+         (with-temp-buffer
+           (insert-file-contents emacs-jupyter-notebook--publisher-source-file
+                                 nil 0 32769)
+           (when (> (buffer-size) 32768)
+             (error "Bundled array publisher exceeds setup code limit"))
+           (buffer-string))))
+    (format
+     "(lambda ns: (exec(compile(%s, '<ejn-publisher>', 'exec'), ns), ns['install'](globals()))[1])({})\n"
+     (json-serialize source))))
+
 (defvar-local emacs-jupyter-notebook--saved-imenu-create-index-function nil
   "Previous buffer-local value of `imenu-create-index-function'.")
 

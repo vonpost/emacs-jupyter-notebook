@@ -64,9 +64,32 @@
               test -x "$out/bin/ejn-registry-worker"
             '';
           };
+          ejn-array-protocol = python.pkgs.buildPythonPackage {
+            pname = "ejn-array-protocol";
+            version = "0.1.0";
+            pyproject = true;
+            src = ./array_protocol;
+            build-system = [ python.pkgs.setuptools ];
+            doCheck = false;
+            dontUsePythonImportsCheck = true;
+          };
+          ejn-viewer = python.pkgs.buildPythonApplication {
+            pname = "ejn-viewer";
+            version = "0.1.0";
+            pyproject = true;
+            src = ./viewer;
+            build-system = [ python.pkgs.setuptools ];
+            dependencies = with python.pkgs; [ numpy pyqtgraph pyside6 ejn-array-protocol ];
+            nativeBuildInputs = [ pkgs.qt6Packages.wrapQtAppsHook ];
+            buildInputs = [ pkgs.qt6Packages.qtbase ];
+            # The Qt hook wraps the console script and carries platform
+            # plugins/resources with the PySide6 closure.
+            doCheck = false;
+            dontUsePythonImportsCheck = true;
+          };
         in
         {
-          inherit ejn-helper ejn-registry-worker ejn-runtime;
+          inherit ejn-helper ejn-registry-worker ejn-runtime ejn-array-protocol ejn-viewer;
           default = ejn-runtime;
         });
 
@@ -109,9 +132,33 @@
               dontUsePythonImportsCheck = false;
               pythonImportsCheck = [ "ejn_registry_worker" ];
             });
+          ejn-viewer = packages.ejn-viewer.overridePythonAttrs (_old: {
+            doCheck = true;
+            checkPhase = ''
+              runHook preCheck
+              QT_QPA_PLATFORM=offscreen python -m unittest test_pyqtgraph_gui -v
+              runHook postCheck
+            '';
+            dontUsePythonImportsCheck = false;
+            pythonImportsCheck = [ "ejn_viewer" ];
+          });
+          ejn-array-protocol = packages.ejn-array-protocol.overridePythonAttrs (_old: {
+            src = ./.;
+            postUnpack = ''
+              sourceRoot="$sourceRoot/array_protocol"
+            '';
+            doCheck = true;
+            checkPhase = ''
+              runHook preCheck
+              PYTHONPATH=. python -m unittest discover -s tests -p 'test_*.py'
+              runHook postCheck
+            '';
+            dontUsePythonImportsCheck = false;
+            pythonImportsCheck = [ "ejn_array" ];
+          });
         in
         {
-          inherit ejn-helper ejn-registry-worker;
+          inherit ejn-helper ejn-registry-worker ejn-array-protocol ejn-viewer;
         });
 
       apps = forAllSystems (pkgs: {
@@ -124,6 +171,11 @@
           type = "app";
           program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.ejn-registry-worker}/bin/ejn-registry-worker";
           meta.description = "Run one transactional EJN registry operation";
+        };
+        ejn-viewer = {
+          type = "app";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.ejn-viewer}/bin/ejn-viewer";
+          meta.description = "Run the local EJN PyQtGraph viewer";
         };
         default = self.apps.${pkgs.stdenv.hostPlatform.system}.ejn-helper;
       });

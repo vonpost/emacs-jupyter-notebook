@@ -7919,8 +7919,9 @@ and returns nil for a bogus command."
                      (call-process-region
                       (point-min) (point-max) python t t nil "-c"
                       (concat
-                       "import json, os, sys; "
-                       "sys.path.insert(0, sys.argv[1]); import ejn_viewer; "
+                       "import importlib.util, json, os, sys; "
+                       "spec=importlib.util.spec_from_file_location('legacy_viewer', os.path.join(sys.argv[1], 'ejn_viewer.py')); "
+                       "ejn_viewer=importlib.util.module_from_spec(spec); spec.loader.exec_module(ejn_viewer); "
                        "r=json.load(sys.stdin); "
                        "fd=ejn_viewer.open_confined_pickle("
                        "r['root'],r['path'],r['root_identity'],"

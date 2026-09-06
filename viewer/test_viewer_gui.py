@@ -23,8 +23,17 @@ Run it under the viewer's nix closure:
 import os
 import pickle
 import hashlib
+import importlib.util
 import sys
 import tempfile
+
+
+def _legacy_viewer():
+    spec = importlib.util.spec_from_file_location(
+        "legacy_viewer", os.path.join(os.path.dirname(__file__), "ejn_viewer.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _skip(reason):
@@ -35,7 +44,7 @@ def _skip(reason):
 def _security_checks():
     """Run confined pickle protocol checks without a GUI or matplotlib."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    import ejn_viewer
+    ejn_viewer = _legacy_viewer()
 
     with tempfile.TemporaryDirectory(prefix="ejn-viewer-test-") as root:
         os.chmod(root, 0o700)
@@ -111,7 +120,7 @@ def main():
     path1 = make_pickle(0)
     path2 = make_pickle(1)
 
-    import ejn_viewer
+    ejn_viewer = _legacy_viewer()
 
     # Select and validate the Tk backend exactly as the viewer does.
     backend = ejn_viewer._select_backend("tk")
