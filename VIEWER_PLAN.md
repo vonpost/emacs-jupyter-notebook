@@ -44,7 +44,7 @@ polygon ROIs, and durable review collections follow the first release.
 
 ### Explicit slice publication
 
-Proposed Python surface (finalize in V1; not implemented):
+Python surface (publisher implemented in V3; automatic setup waits for V6):
 
 ```python
 ejn.view(
@@ -201,10 +201,12 @@ remain historical. A row's checkboxes mean landed work, not proposed design.
   painted window, resize, zoom, close/reopen on actual macOS and Linux
   displays, with versions, hardware, scaling and timings recorded. Offscreen
   tests or Darwin derivation evaluation cannot satisfy the macOS gate.
+  Implementation: `8856a65` provides the Nix package and demo shell; Linux
+  build/offscreen checks pass. Actual macOS graphical acceptance remains open.
 
 ### M2 — Slice publication and source-to-viewer integration
 
-- [~] owner=root claimed=2026-09-06 **V3 Publish bounded planes from a real kernel.** Depends: V1.
+- [x] sha=8856a65 **V3 Publish bounded planes from a real kernel.** Depends: V1.
   Files: new viewer publisher module and `viewer/test_publisher_kernel.py`,
   core Elisp setup and focused tests. Inject via acknowledged serialized
   setup; explicit MIME emission. V3 supplies and tests the bounded setup-code
@@ -214,7 +216,11 @@ remain historical. A row's checkboxes mean landed work, not proposed design.
   matplotlib active, import-and-publish in one cell, selected-slice-only
   fixtures, dtype/shape fidelity, namespace conflict, dependency failure,
   restart/reconnect setup and rejection before expensive materialization.
-- [ ] **V4 Admit numerical artifacts through the helper.** Depends: V3.
+  Verification: seven publisher tests including a real local ipykernel with
+  inline matplotlib, reinjection/restart and unavailable dependencies; exact
+  Emacs-generated setup also executed twice in a local kernel. Source-only
+  regression: 913 ERT, 224 helper, 25 registry and 12 stress tests passed.
+- [~] owner=root claimed=2026-09-06 **V4 Admit numerical artifacts through the helper.** Depends: V3.
   Files: helper outputs/artifacts/requests/dispatcher and new numerical
   validation module, helper unit/integration tests, Elisp helper protocol and
   focused protocol tests. Implement V1's negotiated contract and bounded
