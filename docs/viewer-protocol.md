@@ -11,6 +11,9 @@ connect. A missing capability disables the numerical path with a clear
 message; no fallback serialization. No existing frame/artifact limit is
 raised. A numerical group is one additional supported MIME/artifact type:
 `application/x-ejn-array-group`. Its content format has its own version 1.
+Hello capabilities are a vector of at most 32 distinct nonempty printable
+ASCII tokens, each at most 64 characters. Unknown well-formed tokens are
+retained for feature negotiation; absence is not inferred from a version.
 
 The remote publisher emits a single base64 string under this MIME through
 IPython `display(..., raw=True)`, with a short `text/plain` summary. It does
@@ -19,7 +22,7 @@ and spools the group in its bounded artifact worker. Only a JSON artifact descri
 and bounded manifest summary cross helper stdout; the array bytes never do.
 
 The local viewer is a separate PySide6/PyQtGraph process, launched as
-`ejn-viewer --socket PATH` from the pinned Nix output. It has no Jupyter,
+`ejn-viewer --stdio` from the pinned Nix output. It has no Jupyter,
 SSH, remote-file, kernel-lifecycle, or arbitrary-code-execution interface.
 
 ## Numerical group file
@@ -175,7 +178,10 @@ and required-field types; optional envelope extension fields may be ignored.
 
 ### Local control channel
 
-Reuse length-prefixed bounded JSON, independently versioned as viewer v1.
+Reuse length-prefixed bounded JSON over the Emacs-owned stdin/stdout pipes,
+independently versioned as viewer v1. Diagnostics use stderr only. This local
+pipe replaces the originally proposed socket; EOF revokes the entire epoch
+and exits the viewer. No socket discovery or reconnect/resend is required.
 Request: `{"v":1,"id":"r-1","op":"open","params":{...}}`.
 Operations: `hello`, `open`, `cancel`, `focus`, `close_workspace`, `ping`, `close`.
 Replies have the same id, `ok` boolean and bounded `result` or

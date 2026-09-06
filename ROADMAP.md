@@ -159,6 +159,15 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
+- [~] owner=root claimed=2026-09-06 CC8 User-approved early viewer cutover.
+  Implement the usable experimental slice path before complete macOS/review
+  polish. — touches: new inspect-manager Elisp, core setup/keymap/runtime,
+  helper descriptor adapter, events/result per-output ownership, viewer IPC,
+  snapshot and GUI modules/tests, viewer contract docs — for: W21 V4-V7/V10.
+  Use the same bounded length framing over an Emacs-owned stdio pipe instead
+  of a Unix socket: no second connection/retry lifecycle or socket files.
+  Pipe close revokes the connection epoch; process supervision remains local.
+
 - [~] owner=root claimed=2026-09-06 CC7 Share the numerical group validator
   between publisher verification, helper admission and local viewer without
   pulling GUI dependencies into the helper. — touches: new `array_protocol/`

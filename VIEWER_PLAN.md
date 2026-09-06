@@ -5,6 +5,14 @@ This is the execution ledger for the viewer replacement agreed with the user.
 `ROADMAP.md` remains the project index; `HELPER_TRANSPORT_PLAN.md` describes
 the existing helper boundary that this work must preserve.
 
+User priority update (2026-09-06): the existing interactive viewer is already
+broken for the user's workflows. Ship and switch to an experimental replacement
+early; macOS graphical sign-off and complete comparison/ROI polish must not
+block the first usable source-to-viewer path. Fidelity, bounded work, source
+cleanliness and kernel-lifetime constraints remain binding. V5/V6 and isolated
+V7 components may proceed together under the ownership assignments below;
+full acceptance checkboxes still require their recorded tests.
+
 ## Outcome and release scope
 
 Evaluate a local source cell against a remote kernel and inspect selected
@@ -201,6 +209,8 @@ remain historical. A row's checkboxes mean landed work, not proposed design.
   painted window, resize, zoom, close/reopen on actual macOS and Linux
   displays, with versions, hardware, scaling and timings recorded. Offscreen
   tests or Darwin derivation evaluation cannot satisfy the macOS gate.
+  Per the user priority update, macOS evidence is a release-verification item,
+  not a prerequisite for experimental V6 integration or switching commands.
   Implementation: `8856a65` provides the Nix package and demo shell; Linux
   build/offscreen checks pass. Actual macOS graphical acceptance remains open.
 
@@ -227,14 +237,14 @@ remain historical. A row's checkboxes mean landed work, not proposed design.
   workers. Gate: malformed lengths/dtypes/shapes, decompression expansion,
   group truncation, worker failure, heartbeat/credit pressure, and no array
   bytes in helper stdout descriptors. Do not raise hard limits implicitly.
-- [ ] **V5 Establish per-output identity and snapshot ownership.** Depends:
+- [~] owner=root claimed=2026-09-06 **V5 Establish per-output identity and snapshot ownership.** Depends:
   V4. Files: Elisp events/result/artifacts, new local snapshot-store module,
   focused panel/artifact tests. Bind each preview/original/array to its exact
   member and publication; replace the single-figure-per-execution assumption.
   Gate: multi-image cells, interleaved updates, clear-output, independent
   snapshot retention on panel kill, orphan cleanup, finite budgets, stale
   generations, and unchanged source bytes/modification state.
-- [ ] **V6 Wire inspect and evaluate-and-inspect.** Depends: V2, V5.
+- [~] owner=root claimed=2026-09-06 **V6 Wire inspect and evaluate-and-inspect.** Depends: V2, V5.
   Files: viewer manager/core/vars Elisp, viewer IPC module, focused ERT/process
   tests, `emacs-jupyter-notebook-runtime.el` and runtime tests. Reuse the
   bounded asynchronous Nix bootstrap pattern for the separate viewer output:
@@ -249,7 +259,7 @@ remain historical. A row's checkboxes mean landed work, not proposed design.
 
 ### M3 — Comparison and measurements, required for the first release
 
-- [ ] **V7 Build side-by-side and linked magnified views.** Depends: V6.
+- [~] owner=root claimed=2026-09-06 **V7 Build side-by-side and linked magnified views.** Depends: V6.
   Files: viewer layout/image/interaction modules and tests. Named panes,
   compatible linked/independent crop/cursor, fit/native scale, interpolation,
   local window level/width. Gate: asymmetric orientation fixtures, Retina and
@@ -269,8 +279,9 @@ remain historical. A row's checkboxes mean landed work, not proposed design.
 
 ### M4 — Cutover and release verification
 
-- [ ] **V10 Remove the matplotlib-pickle viewer.** Depends: V9 and V2's
-  real macOS/Linux evidence. Files: legacy viewer/formatter and tests,
+- [ ] **V10 Remove the matplotlib-pickle viewer.** Depends: experimental V6.
+  The user explicitly permits early replacement before V9/macOS acceptance.
+  Files: legacy viewer/formatter and tests,
   core/events/result/vars/viewer Elisp, helper pickle MIME branches/tests,
   README and package metadata. Delete obsolete backend switching, pickle
   emission/loading, settings and commands; no aliases or fallback selector.
