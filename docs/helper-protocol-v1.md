@@ -223,6 +223,16 @@ rejected, then actual size is checked. Base64 never crosses the transport,
 logs, panel, or stdout. Emacs rejects paths outside its directory; Emacs
 owns retention/deletion and helper exit does not delete published files.
 
+## W21 numerical extension
+
+The `array-group-v1` capability and `application/x-ejn-array-group` artifact
+are specified in [viewer-protocol.md](viewer-protocol.md). This is an additive
+capability within helper envelope v1; do not enable publisher injection until
+the helper advertises it. Existing framing, decoded-artifact, worker, credit
+and lifetime limits are unchanged. Numerical base64 stays between kernel and
+helper; Emacs receives only verified local descriptors and bounded metadata.
+W21 V3-V6 implement this contract; this declaration alone does not enable it.
+
 ## Fixture use
 
 The fixture contains named complete vectors plus deterministic `recipe`

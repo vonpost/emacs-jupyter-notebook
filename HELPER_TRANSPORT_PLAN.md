@@ -15,6 +15,12 @@ the historical W20 baseline, not implicit permission to send arrays or raise
 limits. W21 preserves this document's supervision, flow-control, async and
 remote-kernel lifetime constraints.
 
+V1 contract decision (2026-09-06): retain helper envelope v1 and add the
+negotiated `array-group-v1` capability, with numerical artifact file format
+version 1 as specified in `docs/viewer-protocol.md`. No existing hard limit
+is raised. Capability advertisement and production admission land in V4;
+publisher setup is enabled only with that capability during V6 integration.
+
 ## Why this work exists
 
 The retired in-process adapter could enter synchronous `emacs-jupyter` ZMQ
