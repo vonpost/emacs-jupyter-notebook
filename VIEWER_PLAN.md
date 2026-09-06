@@ -185,7 +185,7 @@ as fresh. Never replay user code to reconstruct missing output.
 
 ### Experimental slice-path checkpoint — 2026-09-06
 
-The source-to-viewer numerical path is implemented. `C-c j I` and numerical
+The source-to-viewer numerical path landed in `ba8280d`. `C-c j I` and numerical
 panel cards inspect a retained output; `C-c j J` tracks the first numerical
 publication from the exact execution after point moves. Capability-gated,
 acknowledged setup injects `ejn.view` without remote files or installations.
@@ -263,13 +263,20 @@ remain historical. A row's checkboxes mean landed work, not proposed design.
   inline matplotlib, reinjection/restart and unavailable dependencies; exact
   Emacs-generated setup also executed twice in a local kernel. Source-only
   regression: 913 ERT, 224 helper, 25 registry and 12 stress tests passed.
-- [~] owner=root claimed=2026-09-06 **V4 Admit numerical artifacts through the helper.** Depends: V3.
+- [x] sha=ba8280d **V4 Admit numerical artifacts through the helper.** Depends: V3.
   Files: helper outputs/artifacts/requests/dispatcher and new numerical
   validation module, helper unit/integration tests, Elisp helper protocol and
   focused protocol tests. Implement V1's negotiated contract and bounded
   workers. Gate: malformed lengths/dtypes/shapes, decompression expansion,
   group truncation, worker failure, heartbeat/credit pressure, and no array
   bytes in helper stdout descriptors. Do not raise hard limits implicitly.
+  Verification: 12 focused numerical helper tests cover strict manifests,
+  immutable publication cleanup, credit/cancellation/retirement and ping while
+  the sole worker is blocked. The real local kernel→helper→viewer test proves
+  big-endian/strided selected-plane fidelity and kernel survival after local
+  helper/viewer closure. Codec, helper, viewer and headless runtime Nix outputs
+  and their selected package checks build successfully. V1 admits no compressed
+  encoding, so decompression expansion is rejected rather than implemented.
 - [~] owner=root claimed=2026-09-06 **V5 Establish per-output identity and snapshot ownership.** Depends:
   V4. Files: Elisp events/result/artifacts, new local snapshot-store module,
   focused panel/artifact tests. Bind each preview/original/array to its exact

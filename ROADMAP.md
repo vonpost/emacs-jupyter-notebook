@@ -168,7 +168,7 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
   of a Unix socket: no second connection/retry lifecycle or socket files.
   Pipe close revokes the connection epoch; process supervision remains local.
 
-- [~] owner=root claimed=2026-09-06 CC7 Share the numerical group validator
+- [x] sha=ba8280d CC7 Share the numerical group validator
   between publisher verification, helper admission and local viewer without
   pulling GUI dependencies into the helper. — touches: new `array_protocol/`
   package and tests, `flake.nix`, helper/viewer packaging and local test paths;
