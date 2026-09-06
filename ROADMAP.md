@@ -159,6 +159,12 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
+- [~] owner=root claimed=2026-09-06 CC7 Share the numerical group validator
+  between publisher verification, helper admission and local viewer without
+  pulling GUI dependencies into the helper. — touches: new `array_protocol/`
+  package and tests, `flake.nix`, helper/viewer packaging and local test paths;
+  helper capability capture for staged publisher setup — for: W21 V3-V6.
+
 - [x] sha=b60239f CC1 `--async-retrieve-attempt' leaked the prior SCP process's stdout/stderr
       buffers on every retry — it overwrote `:scp-process' without disposing
       the old process first, so a failed retrieve with N attempts leaked 2·(N-1)
