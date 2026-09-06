@@ -159,7 +159,7 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
-- [~] owner=root claimed=2026-09-07 CC9 Diagnose and repair silent inspection
+- [x] sha=dd53c22 CC9 Diagnose and repair silent inspection
   startup. Visible bounded viewer phases and Nix progress, stale waiter recovery,
   and a cold-start card-to-build-to-launch regression; preserve bounded SSH
   exit status/stderr before local teardown. — touches: inspect/runtime/core
@@ -172,6 +172,10 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
   — touches: flake and viewer packaging/binding imports/tests, installation
   docs — for: W21 V2. Validate the Darwin derivation dependency graph excludes
   QtWebEngine and retain one pinned Qt binding with local GUI checks.
+  Packaging change landed in `dd53c22`; recursive Darwin dependency check
+  passes and detects the old input's WebEngine chain. Actual rebuilt GUI
+  acceptance remains open under V2; the Linux package-check dependency build
+  could not complete in this environment and is not counted as a pass.
 
 - [~] owner=root claimed=2026-09-06 CC8 User-approved early viewer cutover.
   Implement the usable experimental slice path before complete macOS/review

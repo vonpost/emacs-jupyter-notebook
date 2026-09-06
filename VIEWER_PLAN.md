@@ -185,7 +185,8 @@ as fresh. Never replay user code to reconstruct missing output.
 
 ### macOS startup follow-up — 2026-09-07
 
-CC9 adds explicit viewer phase messages, per-waiter Nix progress independent
+`dd53c22` lands the CC9/CC10 changes below. CC9 adds explicit viewer phase
+messages, per-waiter Nix progress independent
 of the kernel bootstrap context, a local `inspector-status` command, stale
 waiter/dead-process recovery on the next Inspect, and bounded SSH exit details.
 The cold-start regression activates the real panel card, holds a test Nix
