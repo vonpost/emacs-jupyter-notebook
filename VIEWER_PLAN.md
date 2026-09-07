@@ -183,6 +183,33 @@ as fresh. Never replay user code to reconstruct missing output.
 
 ## Milestones and execution ledger
 
+### Navigation follow-up — 2026-09-07 (CC11)
+
+Replaced separate X/Y links with guarded, bidirectional center/scale updates.
+Each pane derives its visible bounds from its own geometry; pan and resize
+after navigation preserve magnification, including on prediction-originated
+input. Resize notifications expose only the settled camera, not ViewBox's
+intermediate aspect correction. Compatible snapshot replacement retains the
+camera; incompatible grids remain independent. Closing/replacing a workspace
+disconnects its navigation groups. The pixel readout cannot expand the window.
+
+Native macOS/Wayland pinch zooms around the pointer. Two-finger wheel events
+pan with Qt's supplied direction; identified touchpads without pixel deltas
+use angle deltas for pan. Ordinary mouse wheels still zoom, and left drag
+still pans. All operations use the already-loaded numerical samples locally.
+
+Regression evidence: the old default layout emits scales 0.40853 → 0.43642 →
+0.40853 in one pan; the new test checks every intermediate notification.
+Old code also fails the pinch and trackpad-pan tests. The viewer suite passes
+37 tests with PyQtGraph 0.14.0 / Qt 6.11.1 in an isolated wheel environment;
+15 workspace tests pass with 2× logical scaling and on the actual Linux X11
+display. Linux paint/zoom/fit/resize/reopen smoke passes. These are source/GUI
+checks, not a new Nix package build or a physical macOS gesture sign-off.
+Canonical source verification remains 974 ERT, 4 codec, 236 helper (3 optional
+dependency skips), 25 registry and 12 stress tests. V7 remains partial for the
+other features in its row. The previously reported Nix build-output limit is
+separate unfinished work, not addressed by this navigation change.
+
 ### macOS startup follow-up — 2026-09-07
 
 `dd53c22` lands the CC9/CC10 changes below. CC9 adds explicit viewer phase

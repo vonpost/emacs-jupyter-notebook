@@ -18,6 +18,8 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from .navigation import ImageGraphicsWidget, ImageViewBox
+
 
 def demo_planes() -> Mapping[str, np.ndarray]:
     """Return asymmetric row-major test planes with distinct extents."""
@@ -53,7 +55,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         controls.addStretch(1)
         layout.addLayout(controls)
 
-        self._graphics = pg.GraphicsLayoutWidget(central)
+        self._graphics = ImageGraphicsWidget(central)
         layout.addWidget(self._graphics, 1)
         self.setCentralWidget(central)
 
@@ -62,7 +64,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
             raise ValueError("at least one plane is required")
         for index, name in enumerate(names):
             self._graphics.addLabel(name, row=0, col=index)
-            view = self._graphics.addViewBox(row=1, col=index, lockAspect=True)
+            view = ImageViewBox()
+            self._graphics.addItem(view, row=1, col=index)
             view.setMenuEnabled(False)
             image = pg.ImageItem(self._planes[name], axisOrder="row-major")
             view.addItem(image)

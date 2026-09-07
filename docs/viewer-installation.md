@@ -51,9 +51,23 @@ Publish a mapping of selected 2D NumPy arrays with `ejn.view`, then use
 The latter opens the first numerical publication from that exact execution.
 Ordinary evaluation does not automatically replace an open workspace.
 
-Current controls: scroll to zoom, drag to pan, `F` to fit, hover for source
-pixel values, and edit level/width. Pan/zoom link only for matching, explicitly
-declared grids. There is no native-device-pixel mode yet, so fit/zoom alone
+Current controls: pinch to zoom around the pointer, two-finger scroll to pan,
+mouse wheel to zoom, drag to pan, `F` to fit, hover for source pixel values,
+and edit level/width. Native pinch uses Qt's macOS/Wayland gesture events;
+platforms that do not deliver these events retain mouse-wheel zoom. Touchpad
+scrolling uses pixel deltas when available, with an angle-delta fallback for
+devices identified as touchpads. System natural-scrolling direction is retained.
+Pan/zoom link only for matching, explicitly declared grids. Linked panes share
+image center and magnification, including when navigating from a prediction.
+Panning and resizing after navigation retain magnification; narrower panes
+show less of the image rather than changing its scale. `F` fits all linked
+images at a common scale. Navigation never requests new data from the remote.
+
+After updating the package, restart Emacs and Inspect again to use the updated
+viewer build; an already-running viewer still has its old code loaded. Reconnect
+to the existing kernel rather than restarting it.
+
+There is no native-device-pixel mode yet, so fit/zoom alone
 must not be taken as a validated Retina resolution test. Rendering disables
 automatic downsampling; the original numerical samples remain unchanged.
 
@@ -95,3 +109,5 @@ V2 has been visibly exercised on Linux (`DISPLAY=:0`, with a paint/resize/
 close smoke result). macOS graphical rendering has not yet been run in this
 environment; the `aarch64-darwin` derivation is evaluated by the flake and
 still requires an actual macOS display run before the V2 gate is complete.
+The user has since confirmed a working macOS viewer window; native gesture
+feel and Retina pixel fidelity still require checks on that machine.

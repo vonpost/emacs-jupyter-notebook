@@ -9,6 +9,8 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
+from .navigation import ImageGraphicsWidget, ImageViewBox, NavigationGroup, camera
+
 
 MAX_LEVEL_SAMPLE = 65_536
 
@@ -49,9 +51,9 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self._items: dict[str, pg.ImageItem] = {}
         self._views: dict[str, pg.ViewBox] = {}
         self._metadata: dict[str, dict] = {}
-        self._ranges: dict[str, tuple] = {}
         self._levels: dict[str, tuple[float, float]] = {}
         self._linked = False
+        self._navigation_groups = []
 
         central = QtWidgets.QWidget(self)
         outer = QtWidgets.QVBoxLayout(central)
@@ -66,12 +68,14 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self.width.setDecimals(6)
         self.width.setPrefix("Width ")
         self.readout = QtWidgets.QLabel("Pixel: —", central)
+        self.readout.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                                   QtWidgets.QSizePolicy.Policy.Preferred)
         controls.addWidget(self.fit_button)
         controls.addWidget(self.level)
         controls.addWidget(self.width)
         controls.addWidget(self.readout, 1)
         outer.addLayout(controls)
-        self.graphics = pg.GraphicsLayoutWidget(central)
+        self.graphics = ImageGraphicsWidget(central)
         outer.addWidget(self.graphics, 1)
         self.setCentralWidget(central)
         self.fit_button.clicked.connect(self.fit)
@@ -113,8 +117,10 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
                                 == tuple(getattr(planes[name], "shape", ()))
                                 and _spatial_key(old_meta[name]) == _spatial_key(new_meta[name])
                                 for name in new_names))
-        if self._views:
-            self._ranges = {name: view.viewRange() for name, view in self._views.items()}
+        cameras = {name: camera(view) for name, view in self._views.items()}
+        for group in self._navigation_groups:
+            group.dispose()
+        self._navigation_groups.clear()
         if self._items:
             self._levels = {name: tuple(item.getLevels()) for name, item in self._items.items()}
         for item in self._items.values():
@@ -135,8 +141,8 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         for index, name in enumerate(names):
             row, col = divmod(index, 2)
             self.graphics.addLabel(name, row=row * 2, col=col)
-            view = self.graphics.addViewBox(row=row * 2 + 1, col=col,
-                                            lockAspect=True)
+            view = ImageViewBox()
+            self.graphics.addItem(view, row=row * 2 + 1, col=col)
             view.setMenuEnabled(False)
             initial_levels = (global_low, global_high) if numerical else (0.0, 255.0)
             item = pg.ImageItem(self._planes[name], axisOrder="row-major",
@@ -147,16 +153,15 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             self._views[name] = view
             self._items[name] = item
             self._levels[name] = initial_levels
-            if preserve and name in self._ranges:
-                view.setRange(xRange=self._ranges[name][0], yRange=self._ranges[name][1],
-                              padding=0)
             if preserve and name in self._levels:
                 item.setLevels(self._levels[name])
         self._linked = self._linkable(names)
-        if self._linked and names:
-            for name in names[1:]:
-                self._views[name].setXLink(self._views[names[0]])
-                self._views[name].setYLink(self._views[names[0]])
+        groups = [names] if self._linked else [[name] for name in names]
+        for members in groups:
+            group = NavigationGroup([self._views[name] for name in members])
+            self._navigation_groups.append(group)
+            if preserve:
+                group.restore(cameras[members[0]])
         if names:
             low, high = self._items[names[0]].getLevels()
             if preserve:
@@ -196,8 +201,8 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             item.setLevels((center - width / 2.0, center + width / 2.0))
 
     def fit(self) -> None:
-        for view in self._views.values():
-            view.autoRange()
+        for group in self._navigation_groups:
+            group.fit()
 
     def _mouse_moved(self, position) -> None:
         for name, view in self._views.items():
@@ -225,5 +230,8 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:
+        for group in self._navigation_groups:
+            group.dispose()
+        self._navigation_groups.clear()
         self.closed.emit()
         super().closeEvent(event)
