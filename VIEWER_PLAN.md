@@ -185,7 +185,7 @@ as fresh. Never replay user code to reconstruct missing output.
 
 ### Navigation follow-up — 2026-09-07 (CC11)
 
-Replaced separate X/Y links with guarded, bidirectional center/scale updates.
+`ee4a974` replaced separate X/Y links with guarded, bidirectional center/scale updates.
 Each pane derives its visible bounds from its own geometry; pan and resize
 after navigation preserve magnification, including on prediction-originated
 input. Resize notifications expose only the settled camera, not ViewBox's

@@ -159,7 +159,7 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
-- [~] owner=root claimed=2026-09-07 CC11 Stable linked image navigation and
+- [x] sha=ee4a974 CC11 Stable linked image navigation and
   native trackpad gestures. — touches: viewer interaction/workspace/demo
   modules, viewer GUI tests, installation docs — for: W21 V7 macOS dogfood.
   Implement pinch zoom, two-finger pan and mouse-wheel zoom; synchronize image
