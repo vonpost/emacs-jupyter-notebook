@@ -21,6 +21,13 @@ version 1 as specified in `docs/viewer-protocol.md`. No existing hard limit
 is raised. Capability advertisement and production admission land in V4;
 publisher setup is enabled only with that capability during V6 integration.
 
+CC13 extension (2026-09-07): the `variables` auxiliary operation adds bounded
+Python name/type/shape/dtype metadata through silent, history-free
+`user_expressions` on the existing client/router. It emits no output events,
+reads no array samples, skips known busy execution and has an auxiliary
+deadline. Envelope v1 and all frame/queue ceilings remain unchanged; the exact
+request/reply limits are recorded in `docs/helper-protocol-v1.md`.
+
 ## Why this work exists
 
 The retired in-process adapter could enter synchronous `emacs-jupyter` ZMQ

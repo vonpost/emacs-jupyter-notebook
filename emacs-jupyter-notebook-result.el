@@ -25,7 +25,7 @@
 ;; An entry HANDLE is a plist:
 ;;   (:panel PANEL :id N :generation N :cell-key KEY)
 ;;
-;; A KEY for cell-bound evaluation is a cons of (file-name . line-start-pos)
+;; A KEY for cell-bound evaluation is a cons of (file-name . stable-cell-id)
 ;; produced by the source buffer's cell tracking.  Region/paragraph/defun
 ;; evaluation uses KEY = nil; those entries flow only to the history-log
 ;; view.
@@ -39,6 +39,7 @@
 (require 'emacs-jupyter-notebook-helper-protocol)
 (require 'emacs-jupyter-notebook-vars)
 (require 'emacs-jupyter-notebook-artifacts)
+(require 'emacs-jupyter-notebook-cell)
 
 (defconst emacs-jupyter-notebook-result--load-file
   (or load-file-name buffer-file-name)
@@ -118,6 +119,12 @@ Each entry plist supports:
   :pickle-open-timer TIMER-or-nil
   :pickle-open-token TOKEN-or-nil
   :pending-clear BOOL")
+
+(defvar-local emacs-jupyter-notebook-panel--hidden-cells nil
+  "Hash table of cell keys whose output bodies are hidden in this panel.")
+
+(defvar-local emacs-jupyter-notebook-panel--restore-entry-id nil
+  "Entry whose header should regain point after an output visibility toggle.")
 
 (defvar-local emacs-jupyter-notebook-panel--next-id 0
   "Monotonic id counter for new entries.")
@@ -343,6 +350,8 @@ mistaking an arbitrary user-created image plist for a helper publication.")
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "q") #'emacs-jupyter-notebook-panel-quit)
     (define-key map (kbd "H") #'emacs-jupyter-notebook-panel-toggle-view)
+    (define-key map (kbd "TAB") #'emacs-jupyter-notebook-toggle-cell-output)
+    (define-key map (kbd "<tab>") #'emacs-jupyter-notebook-toggle-cell-output)
     (define-key map (kbd "RET") #'emacs-jupyter-notebook-panel-visit-source)
     (define-key map (kbd "n") #'emacs-jupyter-notebook-panel-next-entry)
     (define-key map (kbd "p") #'emacs-jupyter-notebook-panel-previous-entry)
@@ -374,8 +383,14 @@ history-log view appends every evaluation in time order."
 ;; line motions — so toggle/zoom/open-figure silently never ran.  Put the
 ;; panel in emacs state so its keymap works exactly as designed.
 (declare-function evil-set-initial-state "evil-core" (mode state))
+(declare-function evil-define-key* "evil-core" (state keymap key def &rest bindings))
 (with-eval-after-load 'evil
-  (evil-set-initial-state 'emacs-jupyter-notebook-panel-mode 'emacs))
+  (evil-set-initial-state 'emacs-jupyter-notebook-panel-mode 'emacs)
+  ;; Honor an explicit switch to normal/motion state as well as Doom's
+  ;; special-buffer state preferences without affecting insert-state TAB.
+  (evil-define-key* '(normal motion) emacs-jupyter-notebook-panel-mode-map
+    (kbd "TAB") #'emacs-jupyter-notebook-toggle-cell-output
+    (kbd "<tab>") #'emacs-jupyter-notebook-toggle-cell-output))
 
 (defun emacs-jupyter-notebook-panel--on-kill ()
   "Release timers, cached images, and private files owned by this panel."
@@ -748,6 +763,7 @@ no source-buffer marker is registered, e.g. in tests)."
 (defun emacs-jupyter-notebook-panel--image-specs (entries)
   "Return image specs in ENTRIES in their display order."
   (cl-loop for entry in entries
+           unless (plist-get entry :hidden)
            append (cl-loop for seg in (plist-get entry :outputs)
                            when (eq (car seg) 'image)
                            collect (cdr seg))))
@@ -995,7 +1011,8 @@ configured inline previews; placeholder images never call `image-size'."
                       ('outcome-unknown "outcome unknown")
                       (_ (format "%s" status)))))
         (propertize
-         (format "[%s] %s [%s] %s\n" count ts status-s title)
+         (format "[%s] %s [%s] %s%s\n" count ts status-s title
+                 (if (plist-get entry :hidden) " [outputs hidden]" ""))
          'face 'emacs-jupyter-notebook-result-header-face
          'emacs-jupyter-notebook-entry-id (plist-get entry :id)
          'emacs-jupyter-notebook-cell-key (plist-get entry :cell-key))))))
@@ -1248,7 +1265,7 @@ CURRENT-LINE-P means TEXT belongs to the logical line after the last newline."
   "Insert ENTRY, materializing only images present in INLINE-SPECS."
   (insert (emacs-jupyter-notebook-panel--format-header entry))
   (let ((index -1))
-    (dolist (seg (plist-get entry :outputs))
+    (dolist (seg (unless (plist-get entry :hidden) (plist-get entry :outputs)))
       (cl-incf index)
       (pcase (car seg)
         ('array
@@ -1286,7 +1303,8 @@ it so the caller can use the bounded full renderer instead."
          (index (1- (length segments)))
          (segment (car (last segments)))
          (state (and segment (cdr segment))))
-    (when (and (eq (car-safe segment) 'text)
+    (when (and (not (plist-get entry :hidden))
+               (eq (car-safe segment) 'text)
                (emacs-jupyter-notebook-panel--text-state-p state)
                (plist-get state :pending)
                (or (null max-bytes)
@@ -1433,7 +1451,8 @@ flags."
            (setq job (plist-put job :remaining-entries (cdr remaining)))
            (setq job (plist-put job :current-entry entry))
            (setq job (plist-put job :current-segments
-                                (plist-get entry :outputs)))
+                                (unless (plist-get entry :hidden)
+                                  (plist-get entry :outputs))))
            (setq job (plist-put job :segment-index 0))
            (list :job (plist-put job :phase 'segments))))))
     ('segments
@@ -1571,7 +1590,8 @@ flags."
                 (cl-incf emacs-jupyter-notebook-panel--render-count)
                 (if (eq emacs-jupyter-notebook-panel--view 'history)
                     (goto-char (point-max))
-                  (goto-char (point-min))))
+                  (goto-char (point-min)))
+                (emacs-jupyter-notebook-panel--restore-entry-point))
             (emacs-jupyter-notebook-panel--sliced-render-arm panel token)))))))
 
 (defun emacs-jupyter-notebook-panel--start-sliced-render (panel)
@@ -1704,7 +1724,8 @@ entry is visible; latest-per-cell view goes to the top."
          entry emacs-jupyter-notebook-panel--inline-image-specs))
       (if (eq emacs-jupyter-notebook-panel--view 'history)
           (goto-char (point-max))
-        (goto-char (point-min))))))
+        (goto-char (point-min)))
+      (emacs-jupyter-notebook-panel--restore-entry-point))))
 
 ;;; Public API
 
@@ -2625,6 +2646,8 @@ normal Emacs exit; it never consults source, registry, SSH, or kernel state."
     (with-current-buffer panel
       (emacs-jupyter-notebook-panel--retire-all-artifacts panel)
       (setq emacs-jupyter-notebook-panel--entries nil)
+      (setq emacs-jupyter-notebook-panel--hidden-cells nil)
+      (setq emacs-jupyter-notebook-panel--restore-entry-id nil)
       (setq emacs-jupyter-notebook-panel--retained-text-bytes 0
             emacs-jupyter-notebook-panel--retained-artifact-bytes 0
             emacs-jupyter-notebook-panel--retained-output-segments 0)
@@ -2648,6 +2671,10 @@ state appears in place."
     (let* ((id (cl-incf emacs-jupyter-notebook-panel--next-id))
            (entry (list :id id
                         :cell-key cell-key
+                        :hidden (and cell-key
+                                     emacs-jupyter-notebook-panel--hidden-cells
+                                     (gethash cell-key
+                                              emacs-jupyter-notebook-panel--hidden-cells))
                         :code (or code "")
                         :status 'running
                         :exec-count "*"
@@ -2662,13 +2689,17 @@ state appears in place."
                         :pickle-open-timer nil
                         :pickle-open-token nil
                         :pending-clear nil)))
-      (setq emacs-jupyter-notebook-panel--entries
-            (append emacs-jupyter-notebook-panel--entries
-                    (list (cons id entry))))
-      (cl-incf emacs-jupyter-notebook-panel--retained-text-bytes
-               (plist-get entry :retained-text-bytes))
-      (emacs-jupyter-notebook-panel--enforce-retention-budgets panel)
-      (emacs-jupyter-notebook-panel--schedule-render panel nil t)
+      ;; A queued execution may reach dispatch after its cell was deleted.
+      ;; Return an inert handle so late output cannot acquire a new entry.
+      (unless (emacs-jupyter-notebook--cell-key-retired-p
+               cell-key emacs-jupyter-notebook-panel--source-buffer)
+        (setq emacs-jupyter-notebook-panel--entries
+              (append emacs-jupyter-notebook-panel--entries
+                      (list (cons id entry))))
+        (cl-incf emacs-jupyter-notebook-panel--retained-text-bytes
+                 (plist-get entry :retained-text-bytes))
+        (emacs-jupyter-notebook-panel--enforce-retention-budgets panel)
+        (emacs-jupyter-notebook-panel--schedule-render panel nil t))
       (emacs-jupyter-notebook-panel--handle panel id cell-key))))
 
 (defun emacs-jupyter-notebook--apply-carriage-returns (text)
@@ -3268,6 +3299,157 @@ and text are untouched.  A non-positive limit retains zero pickle artifacts."
 (defvar-local emacs-jupyter-notebook--cell-key-next-id 0
   "Next integer id to allocate for an observed cell line in this buffer.")
 
+(defvar-local emacs-jupyter-notebook--cell-key-kinds nil
+  "Hash table mapping cell IDs to `explicit' or `implicit' boundaries.")
+
+(defvar-local emacs-jupyter-notebook--cell-deleted-ids nil
+  "Cell IDs whose original boundary is removed by the current change.")
+
+(defvar emacs-jupyter-notebook--cell-moving-p nil
+  "Non-nil during an explicit cell move that transposes its markers intact.")
+
+(defvar emacs-jupyter-notebook--fringe-overlays)
+
+(defun emacs-jupyter-notebook--cell-key-retired-p (key &optional source)
+  "Return non-nil if KEY was allocated and retired in SOURCE or this buffer.
+Never reuse an allocated ID, even after mode disable.  The monotonic counter
+and live marker table therefore reject late callbacks without tombstones."
+  (when (buffer-live-p (or source (current-buffer)))
+    (with-current-buffer (or source (current-buffer))
+      (let* ((id (cdr-safe key))
+             (marker (and emacs-jupyter-notebook--cell-key-markers
+                          (gethash id emacs-jupyter-notebook--cell-key-markers))))
+        (and (integerp id) (> id 0)
+             (<= id emacs-jupyter-notebook--cell-key-next-id)
+             (not (and (markerp marker)
+                       (eq (marker-buffer marker) (current-buffer)))))))))
+
+(defun emacs-jupyter-notebook--cell-retire-ids (ids)
+  "Retire source cell IDS, their indicators, and all their panel entries.
+Only local presentation state is released.  Pending executions may finish in
+the kernel, but their handles and cell identities can no longer show output."
+  (when ids
+    (let ((retired (make-hash-table :test 'eql))
+          (panel (emacs-jupyter-notebook-panel-buffer (current-buffer))))
+      (dolist (id ids)
+        (puthash id t retired)
+        (when-let ((marker (and emacs-jupyter-notebook--cell-key-markers
+                               (gethash id emacs-jupyter-notebook--cell-key-markers))))
+          (set-marker marker nil)
+          (remhash id emacs-jupyter-notebook--cell-key-markers))
+        (when emacs-jupyter-notebook--cell-key-kinds
+          (remhash id emacs-jupyter-notebook--cell-key-kinds)))
+      (setq emacs-jupyter-notebook--fringe-overlays
+            (cl-delete-if
+             (lambda (cell)
+               (when (gethash (cdr (car cell)) retired)
+                 (delete-overlay (cdr cell))
+                 t))
+             emacs-jupyter-notebook--fringe-overlays))
+      (when panel
+        (with-current-buffer panel
+          ;; Invalidate the sliced renderer before it can publish a snapshot
+          ;; containing retired entries.  Use the existing retirement path so
+          ;; artifact leases, timers, and byte/segment accounting stay exact.
+          (emacs-jupyter-notebook-panel--invalidate-structure panel)
+          (dolist (cell (copy-sequence emacs-jupyter-notebook-panel--entries))
+            (when (gethash (cdr (plist-get (cdr cell) :cell-key)) retired)
+              (emacs-jupyter-notebook-panel--retire-entry panel cell)))
+          (when emacs-jupyter-notebook-panel--hidden-cells
+            (let (keys)
+              (maphash (lambda (key _hidden)
+                         (when (gethash (cdr key) retired) (push key keys)))
+                       emacs-jupyter-notebook-panel--hidden-cells)
+              (dolist (key keys)
+                (remhash key emacs-jupyter-notebook-panel--hidden-cells)))))))))
+
+(defun emacs-jupyter-notebook--cell-before-change (beg end)
+  "Remember boundaries wholly removed by the source change at BEG..END.
+Markers alone cannot detect deletion: Emacs collapses a removed marker onto
+the next cell, which would incorrectly inherit the removed cell's identity."
+  (setq emacs-jupyter-notebook--cell-deleted-ids nil)
+  (when (and (not emacs-jupyter-notebook--cell-moving-p)
+             (< beg end) emacs-jupyter-notebook--cell-key-markers)
+    (save-restriction
+      (widen)
+      (save-excursion
+        (save-match-data
+          (maphash
+           (lambda (id marker)
+             (when (eq (marker-buffer marker) (current-buffer))
+               (goto-char marker)
+               (let* ((start (point))
+                      (kind (gethash id emacs-jupyter-notebook--cell-key-kinds))
+                      (boundary-end
+                       (if (eq kind 'explicit)
+                           (and (looking-at code-cells-boundary-regexp)
+                                (match-end 0))
+                         ;; The leading cell has no marker line.  Its whole
+                         ;; original extent must be removed to retire it.
+                         (or (and (re-search-forward code-cells-boundary-regexp nil t)
+                                  (match-beginning 0))
+                             (point-max)))))
+                 (when (and boundary-end (<= beg start) (>= end boundary-end))
+                   (push id emacs-jupyter-notebook--cell-deleted-ids)))))
+           emacs-jupyter-notebook--cell-key-markers))))))
+
+(defun emacs-jupyter-notebook--cell-after-change (&rest _change)
+  "Retire deleted or invalid boundaries after a source edit.
+Normalize surviving anchors, preserving IDs when text is inserted above.
+An explicit boundary merged into the preceding line is no longer a cell.
+Ambiguous duplicate anchors are retired together instead of reassociated."
+  (when emacs-jupyter-notebook--cell-key-markers
+    (emacs-jupyter-notebook--cell-retire-ids
+     (prog1 emacs-jupyter-notebook--cell-deleted-ids
+       (setq emacs-jupyter-notebook--cell-deleted-ids nil)))
+    (let ((positions (make-hash-table :test 'eql))
+          invalid)
+      (save-restriction
+        (widen)
+        (save-excursion
+          (save-match-data
+            (maphash
+             (lambda (id marker)
+               (let ((anchor (and (eq (marker-buffer marker) (current-buffer))
+                                  (marker-position marker)))
+                     position)
+                 (when anchor
+                   (goto-char anchor)
+                   (if (eq (gethash id emacs-jupyter-notebook--cell-key-kinds) 'explicit)
+                       (progn
+                         (beginning-of-line)
+                         (when (and (looking-at code-cells-boundary-regexp)
+                                    (< anchor (match-end 0)))
+                           (setq position (point))))
+                     (goto-char (point-min))
+                     (unless (or (looking-at-p code-cells-boundary-regexp)
+                                 (re-search-forward code-cells-boundary-regexp anchor t))
+                       (setq position (point-min)))))
+                 (if position
+                     (progn
+                       (set-marker marker position)
+                       (puthash position (cons id (gethash position positions)) positions))
+                   (push id invalid))))
+             emacs-jupyter-notebook--cell-key-markers))))
+      (maphash (lambda (_position ids)
+                 (when (cdr ids) (setq invalid (append ids invalid))))
+               positions)
+      (emacs-jupyter-notebook--cell-retire-ids invalid))))
+
+(defun emacs-jupyter-notebook-cell-tracking-enable ()
+  "Track source-cell deletion using buffer-local change hooks."
+  (add-hook 'before-change-functions #'emacs-jupyter-notebook--cell-before-change nil t)
+  (add-hook 'after-change-functions #'emacs-jupyter-notebook--cell-after-change nil t))
+
+(defun emacs-jupyter-notebook-cell-tracking-disable ()
+  "Remove cell tracking and retire its disposable output identities."
+  (remove-hook 'before-change-functions #'emacs-jupyter-notebook--cell-before-change t)
+  (remove-hook 'after-change-functions #'emacs-jupyter-notebook--cell-after-change t)
+  (setq emacs-jupyter-notebook--cell-deleted-ids nil)
+  (when emacs-jupyter-notebook--cell-key-markers
+    (emacs-jupyter-notebook--cell-retire-ids
+     (hash-table-keys emacs-jupyter-notebook--cell-key-markers))))
+
 (defun emacs-jupyter-notebook--cell-key-for (position)
   "Return a cell key for the cell whose marker line begins at POSITION.
 The returned key is `(FILE-NAME . ID)' where ID is stable across edits to
@@ -3276,6 +3458,8 @@ above it yields an `equal' key."
   (unless emacs-jupyter-notebook--cell-key-markers
     (setq emacs-jupyter-notebook--cell-key-markers
           (make-hash-table :test 'eq)))
+  (unless emacs-jupyter-notebook--cell-key-kinds
+    (setq emacs-jupyter-notebook--cell-key-kinds (make-hash-table :test 'eql)))
   (let* ((file (or (buffer-file-name) (buffer-name)))
          (line-start (save-excursion
                        (goto-char (max (point-min)
@@ -3293,10 +3477,63 @@ above it yields an `equal' key."
       (setq existing-id (cl-incf emacs-jupyter-notebook--cell-key-next-id))
       (let ((m (copy-marker line-start t)))
         (set-marker-insertion-type m t)
-        (puthash existing-id m emacs-jupyter-notebook--cell-key-markers)))
+        (puthash existing-id m emacs-jupyter-notebook--cell-key-markers)
+        (puthash existing-id
+                 (save-excursion
+                   (goto-char line-start)
+                   (if (looking-at-p code-cells-boundary-regexp) 'explicit 'implicit))
+                 emacs-jupyter-notebook--cell-key-kinds)))
     (cons file existing-id)))
 
 ;;; View toggle / navigation (W2.3, W2.6)
+
+(defun emacs-jupyter-notebook-panel--restore-entry-point ()
+  "Return point to the toggled entry after rebuilding this panel's layout."
+  (when emacs-jupyter-notebook-panel--restore-entry-id
+    (when-let ((bounds (emacs-jupyter-notebook-panel--entry-bounds
+                       emacs-jupyter-notebook-panel--restore-entry-id)))
+      (goto-char (car bounds)))
+    (setq emacs-jupyter-notebook-panel--restore-entry-id nil)))
+
+(defun emacs-jupyter-notebook-toggle-cell-output ()
+  "Hide or show output for the source cell or panel entry at point.
+Cell output visibility is shared by its entries in latest and history views.
+Region evaluations in history can be toggled individually.  Hidden output
+continues to be retained and updated; only the header remains visible."
+  (interactive)
+  (let* ((in-panel (derived-mode-p 'emacs-jupyter-notebook-panel-mode))
+         (panel (if in-panel (current-buffer)
+                  (emacs-jupyter-notebook-panel-buffer (current-buffer))))
+         (id (and in-panel (emacs-jupyter-notebook-panel--entry-id-at-point)))
+         (key (unless in-panel
+                (emacs-jupyter-notebook--cell-key-for
+                 (car (emacs-jupyter-notebook-cell-full-bounds))))))
+    (unless panel (user-error "This cell has no output"))
+    (with-current-buffer panel
+      (let* ((entry (if in-panel
+                        (emacs-jupyter-notebook-panel--entry panel id)
+                      (cdr (cl-find-if
+                            (lambda (cell) (equal key (plist-get (cdr cell) :cell-key)))
+                            (reverse emacs-jupyter-notebook-panel--entries)))))
+             (key (if in-panel (plist-get entry :cell-key) key))
+             (hidden (not (plist-get entry :hidden))))
+        (unless entry (user-error "No output entry at point"))
+        (when in-panel
+          (setq emacs-jupyter-notebook-panel--restore-entry-id id))
+        (when key
+          (unless emacs-jupyter-notebook-panel--hidden-cells
+            (setq emacs-jupyter-notebook-panel--hidden-cells
+                  (make-hash-table :test 'equal)))
+          (if hidden (puthash key t emacs-jupyter-notebook-panel--hidden-cells)
+            (remhash key emacs-jupyter-notebook-panel--hidden-cells)))
+        (dolist (cell emacs-jupyter-notebook-panel--entries)
+          (when (if key (equal key (plist-get (cdr cell) :cell-key))
+                  (eq (car cell) id))
+            (setcdr cell (plist-put (cdr cell) :hidden hidden))))
+        ;; Hiding can demote images and free another entry's preview slot.
+        ;; Cancel any in-progress sliced render and recompute admission.
+        (emacs-jupyter-notebook-panel--invalidate-structure panel)
+        (message "Cell outputs %s" (if hidden "hidden" "shown"))))))
 
 (defun emacs-jupyter-notebook-panel-toggle-view ()
   "Toggle the panel between latest-per-cell and history-log views."
@@ -3483,7 +3720,8 @@ The cell key id is resolved against the buffer-local marker table so the
 indicator follows the cell even after edits above it.  If no marker is
 registered for the id and the cdr is a plain integer, that integer is
 treated as a literal buffer position (test convenience)."
-  (when (and cell-key (buffer-live-p (current-buffer)))
+  (when (and cell-key (buffer-live-p (current-buffer))
+             (not (emacs-jupyter-notebook--cell-key-retired-p cell-key)))
     (let* ((id (cdr cell-key))
            (existing (cdr (assoc cell-key
                                  emacs-jupyter-notebook--fringe-overlays)))

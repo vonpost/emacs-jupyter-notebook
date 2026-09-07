@@ -13,6 +13,7 @@ from PySide6 import QtCore, QtWidgets
 
 from .snapshots import load_snapshot
 from .workspace import WorkspaceWindow
+from .analysis_worker import AnalysisWorker
 
 MAX_FRAME = 65536
 MAX_MEMORY = 256 * 1024 * 1024
@@ -80,6 +81,7 @@ class PipeServer(QtCore.QObject):
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ejn-snapshot")
         self.active = None
         self.pending = None
+        self.analysis = AnalysisWorker(self, admit=lambda extra: self.memory_used() + extra <= MAX_MEMORY)
         self.finished = deque(maxlen=128)
         self.negotiated = False
         self.closed = False
@@ -225,7 +227,7 @@ class PipeServer(QtCore.QObject):
     def start(self, job):
         params = job["params"]
         workspace = params["workspace"]
-        retained = sum(snapshot_charge(window._snapshot) for window in self.windows.values())
+        retained = self.memory_used()
         # Two source buffers may overlap at chunk-join time. Raster decoding
         # additionally reserves three worst-case RGBA planes before allocation.
         reserve = 2 * params["artifact"]["size"]
@@ -236,6 +238,7 @@ class PipeServer(QtCore.QObject):
             self.reply(job["id"], error="viewer-budget-exceeded")
             return
         self.active = job
+        job["reserve"] = reserve
         future = self.executor.submit(load_snapshot, params)
         def finished(completed):
             if not self.closed:
@@ -252,7 +255,11 @@ class PipeServer(QtCore.QObject):
             if self.closed or job["cancelled"] or self.active is not job:
                 return
             snapshot = future.result()
-            retained = sum(snapshot_charge(window._snapshot) for window in self.windows.values())
+            # Loading allocations are now owned by SNAPSHOT. Replacing this
+            # reservation with its actual charge still includes analysis jobs
+            # retaining an older publication and displayed difference buffers.
+            job["reserve"] = 0
+            retained = self.memory_used()
             if retained + snapshot_charge(snapshot) > MAX_MEMORY:
                 self.reply(job["id"], error="viewer-budget-exceeded")
                 return
@@ -261,7 +268,7 @@ class PipeServer(QtCore.QObject):
                 self.reply(job["id"], error="stale-generation")
                 return
             if window is None:
-                window = WorkspaceWindow()
+                window = WorkspaceWindow(analysis_worker=self.analysis)
                 window.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
                 window.closed.connect(lambda key=snapshot.workspace: self.workspace_closed(key))
                 self.windows[snapshot.workspace] = window
@@ -283,6 +290,13 @@ class PipeServer(QtCore.QObject):
             if not self.closed and self.pending:
                 pending, self.pending = self.pending, None
                 self.start(pending)
+
+    def memory_used(self):
+        """Conservative application allocations, including worker references."""
+        return (sum(snapshot_charge(window._snapshot) + window.analysis_bytes
+                    for window in self.windows.values() if window._snapshot is not None)
+                + self.analysis.reserved
+                + (self.active.get("reserve", 0) if self.active is not None else 0))
 
     def workspace_closed(self, key):
         self.windows.pop(key, None)
@@ -306,6 +320,7 @@ class PipeServer(QtCore.QObject):
         self.pending = None
         for window in list(self.windows.values()):
             window.close()
+        self.analysis.shutdown()
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.app.quit()
 

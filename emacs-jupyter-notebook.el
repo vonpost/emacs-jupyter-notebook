@@ -32,6 +32,7 @@
 (require 'emacs-jupyter-notebook-runtime)
 (require 'emacs-jupyter-notebook-viewer)
 (require 'emacs-jupyter-notebook-inspect)
+(require 'emacs-jupyter-notebook-variables)
 
 ;;; W8 — local interactive matplotlib viewer: remote formatter injection
 ;;
@@ -1162,6 +1163,9 @@ All command bindings live under `emacs-jupyter-notebook-prefix-key'
     (define-key map (kbd "l")    #'emacs-jupyter-notebook-clear-results)
     (define-key map (kbd "o")    #'emacs-jupyter-notebook-show-output-panel)
     (define-key map (kbd "t")    #'emacs-jupyter-notebook-toggle-panel-view)
+    (define-key map (kbd "h")    #'emacs-jupyter-notebook-toggle-cell-output)
+    (define-key map (kbd "V")    #'emacs-jupyter-notebook-list-variables)
+    (define-key map (kbd "i")    #'emacs-jupyter-notebook-inspect-variable)
     (define-key map (kbd "I")    #'emacs-jupyter-notebook-inspect-images)
     (define-key map (kbd "J")    #'emacs-jupyter-notebook-evaluate-and-inspect)
     (define-key map (kbd ".")    #'emacs-jupyter-notebook-inspect-at-point)
@@ -1191,6 +1195,14 @@ Bound under `emacs-jupyter-notebook-prefix-key' in
   "Keymap for `emacs-jupyter-notebook-mode'.
 A single prefix (`emacs-jupyter-notebook-prefix-key', default `C-c j')
 hosts the entire command surface.  See `emacs-jupyter-notebook-prefix-map'.")
+
+(declare-function evil-define-minor-mode-key "evil-core"
+                  (state mode key def &rest bindings))
+(with-eval-after-load 'evil
+  (evil-define-minor-mode-key
+   'normal 'emacs-jupyter-notebook-mode
+   (kbd "TAB") #'emacs-jupyter-notebook-toggle-cell-output
+   (kbd "<tab>") #'emacs-jupyter-notebook-toggle-cell-output))
 
 (defun emacs-jupyter-notebook--cancel-async-context-locally (context)
   "Cancel CONTEXT's in-flight local processes, timers, and temp files.
@@ -1487,6 +1499,7 @@ automatic reconnect loop after local resources are gone."
       (emacs-jupyter-notebook--execution-mark-transport-lost client)
       (emacs-jupyter-notebook--heartbeat-cancel)
       (emacs-jupyter-notebook--completion-cancel-idle-timer)
+      (emacs-jupyter-notebook-variables-invalidate)
       (cl-incf emacs-jupyter-notebook--inspect-request-id)
       ;; Clear ownership before closing/deleting.  Either action may invoke a
       ;; synchronous sentinel/callback; those stale callbacks then fail their
@@ -1783,6 +1796,7 @@ executes."
     (when (emacs-jupyter-notebook--management-active-p)
       (emacs-jupyter-notebook--cancel-management-operation)))
   (ignore-errors (emacs-jupyter-notebook--clear-buffer-timers))
+  (ignore-errors (emacs-jupyter-notebook-variables-invalidate))
   (ignore-errors (emacs-jupyter-notebook--heartbeat-cancel))
   (ignore-errors (emacs-jupyter-notebook--cancel-auto-reconnect))
   (ignore-errors
@@ -1869,6 +1883,8 @@ panel's own kill-buffer-hook only cancels its flush timer)."
   (if emacs-jupyter-notebook-mode
       (progn
         (code-cells-mode 1)
+        (emacs-jupyter-notebook-cell-tracking-enable)
+        (emacs-jupyter-notebook-variables-setup)
         (add-hook 'completion-at-point-functions
                   #'emacs-jupyter-notebook-completion-at-point nil t)
         (add-hook 'after-change-functions
@@ -1878,6 +1894,8 @@ panel's own kill-buffer-hook only cancels its flush timer)."
         (emacs-jupyter-notebook--enable-imenu)
         (emacs-jupyter-notebook--completion-start-idle-timer))
     (code-cells-mode -1)
+    (emacs-jupyter-notebook-cell-tracking-disable)
+    (emacs-jupyter-notebook-variables-teardown)
     (remove-hook 'completion-at-point-functions
                  #'emacs-jupyter-notebook-completion-at-point t)
     (remove-hook 'after-change-functions
@@ -1964,7 +1982,8 @@ only the fringe indicators need clearing on a structural cell edit."
   "Move the current cell up ARG cells and clear stale output overlays."
   (interactive "p")
   (emacs-jupyter-notebook--clear-all-cell-artifacts)
-  (code-cells-move-cell-up (or arg 1))
+  (let ((emacs-jupyter-notebook--cell-moving-p t))
+    (code-cells-move-cell-up (or arg 1)))
   (when-let ((panel (emacs-jupyter-notebook-panel-buffer (current-buffer))))
     (emacs-jupyter-notebook-panel--invalidate-structure panel))
   (emacs-jupyter-notebook-cell-goto-code-start))
@@ -1973,7 +1992,8 @@ only the fringe indicators need clearing on a structural cell edit."
   "Move the current cell down ARG cells and clear stale output overlays."
   (interactive "p")
   (emacs-jupyter-notebook--clear-all-cell-artifacts)
-  (code-cells-move-cell-down (or arg 1))
+  (let ((emacs-jupyter-notebook--cell-moving-p t))
+    (code-cells-move-cell-down (or arg 1)))
   (when-let ((panel (emacs-jupyter-notebook-panel-buffer (current-buffer))))
     (emacs-jupyter-notebook-panel--invalidate-structure panel))
   (emacs-jupyter-notebook-cell-goto-code-start))
@@ -5411,28 +5431,9 @@ in-flight invalidation contract."
 ;;; Evaluation
 
 (defun emacs-jupyter-notebook--current-cell-key ()
-  "Return the cell key for the current cell, or nil if no marker exists.
-Cells without a `# %%' marker (i.e., whole-buffer evaluation in marker-less
-files) return nil so they flow only to the history-log view."
-  (save-excursion
-    (let* ((bounds (emacs-jupyter-notebook-cell-bounds))
-           (beg (car bounds)))
-      ;; Bounds start at the cell body; the marker line begins just before.
-      ;; Walk back to the marker line, if any.
-      (goto-char beg)
-      (cond
-       ((and (> beg (point-min))
-             (save-excursion
-               (goto-char beg)
-               (forward-line -1)
-               (looking-at code-cells-boundary-regexp)))
-        (forward-line -1)
-        (emacs-jupyter-notebook--cell-key-for (line-beginning-position)))
-       ((save-excursion
-          (goto-char (point-min))
-          (looking-at code-cells-boundary-regexp))
-        (emacs-jupyter-notebook--cell-key-for (point-min)))
-       (t nil)))))
+  "Return a stable key for the current explicit or implicit source cell."
+  (emacs-jupyter-notebook--cell-key-for
+   (car (emacs-jupyter-notebook-cell-full-bounds))))
 
 (defun emacs-jupyter-notebook--execution-dispatch (record)
   "Arm RECORD's timeout before admitting its execute request."
@@ -5634,6 +5635,7 @@ files) return nil so they flow only to the history-log view."
   "Store RECORD and finish it once both terminal signals are present."
   (emacs-jupyter-notebook--execution-put record)
   (when (and (plist-get record :reply-seen) (plist-get record :idle-seen))
+    (emacs-jupyter-notebook-variables-invalidate)
     (emacs-jupyter-notebook--execution-finish
      record (if (or (plist-get record :timed-out)
                     (eq (plist-get record :state) 'cancelling))
@@ -5743,6 +5745,7 @@ returns is boundedly staged until its generic backend id can be validated."
                        :terminal nil :timer nil :start-profile start-profile
                        :announce-start announce-start))
          (modified (buffer-modified-p)))
+    (emacs-jupyter-notebook-variables-invalidate)
     (emacs-jupyter-notebook-panel--display panel)
     (ejn-panel-set-entry-status handle 'queued)
     (when cell-key (emacs-jupyter-notebook-fringe-set cell-key 'queued))

@@ -69,7 +69,7 @@ wire delivery.  Values therefore increase strictly in observed wire order,
 including when a priority event bypasses ordinary output blocked on credit.
 
 Allowed operations are: `hello`, `ping`, `grant_event_credit`, `connect`,
-`kernel_info`, `execute`, `complete`, `inspect`, `is_complete`,
+`kernel_info`, `execute`, `complete`, `inspect`, `variables`, `is_complete`,
 `input_reply`, `interrupt`, `shutdown`, and `close`.
 
 Allowed events are: `stream`, `display_data`, `execute_result`,
@@ -151,6 +151,25 @@ non-negative integer. `connect` requires absolute `connection_file` and
 execution's string `request_id`, its exact 32-character lowercase-hex
 `input_id`, and a UTF-8 `value` of at most 65536 bytes. The no-parameter
 operations use `{}`.
+
+`variables` requires `names` (null for the public namespace, or 1–200 unique
+Python identifiers of at most 128 UTF-8 bytes) and integer `limit` (1–200).
+It reads metadata through an empty, silent, history-free Python
+`execute_request` with `user_expressions`, using the existing channel router.
+It never creates execution output entries, reads array samples, traverses
+custom properties, imports tensor frameworks, or interrupts a busy kernel.
+The helper rejects inspection while a known execution or metadata request is
+pending; other busy-kernel races use the ordinary auxiliary deadline.
+
+Success returns `variables` and boolean `truncated`. Each variable has `name`,
+`type`, nullable `dtype`, and `shape` (null when unavailable, an empty array
+for a scalar, otherwise at most 32 non-negative integer dimensions ≤2^53−1).
+Names, types and dtype strings are bounded to 128 UTF-8 bytes. The metadata
+JSON is capped at 40000 bytes, with at most 200 rows and a bounded namespace
+scan. NumPy arrays, exact PyTorch tensors, and memoryviews expose metadata;
+unknown objects expose their actual type only. No value representation or
+rich MIME is returned. This additive operation retains envelope v1 and all
+existing frame/queue limits; helper and Elisp are updated together.
 
 Responses require string `id` and boolean `ok`; success has an object
 `result`, failure has a short safe `error` with string `code` and `message`

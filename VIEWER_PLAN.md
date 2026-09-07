@@ -15,6 +15,14 @@ full acceptance checkboxes still require their recorded tests.
 
 ## Outcome and release scope
 
+2026-09-07 / CC14 implements the user's requested comparison/measurement
+subset on the experimental workspace: signed/absolute differences, compatible
+grid/unit checks, up to 16 linked rectangles/ellipses, finite-sample mean and
+population SD, and a bounded local analysis worker with stale-result fencing.
+These controls have local numerical/GUI tests and a real Linux xcb rendering
+smoke. Pinned previous evaluations/blink, magnifiers and complete macOS/Retina
+acceptance remain open; this checkpoint does not close V7–V11 as a whole.
+
 Evaluate a local source cell against a remote kernel and inspect selected
 full-resolution slices in one persistent local comparison window. Keep a
 previous evaluation pinned while the candidate updates, without losing the

@@ -40,6 +40,7 @@ VALID_PARAMS = {
     "execute": {"code": "1 + 1"},
     "complete": {"code": "pri", "cursor_pos": 3},
     "inspect": {"code": "print", "cursor_pos": 5, "detail_level": 0},
+    "variables": {"names": ["image"], "limit": 1},
     "is_complete": {"code": "x = 1"},
     "input_reply": {
         "request_id": "exec-1",

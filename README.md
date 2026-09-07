@@ -179,7 +179,10 @@ falls back to a compatibility transport.
 
 ## Keymap
 
-All commands live under a single prefix, `emacs-jupyter-notebook-prefix-key` (default `C-c j`). The prefix is read once at load time; rebind by `setq`-ing the var before loading the package, or by binding `emacs-jupyter-notebook-prefix-map` under your own prefix.
+Commands live under `emacs-jupyter-notebook-prefix-key` (default `C-c j`).
+Evil normal-state `TAB` also folds the current cell's output. The prefix is read
+once at load time; rebind by setting the variable before loading the package,
+or bind `emacs-jupyter-notebook-prefix-map` under your own prefix.
 
 ### Top-level commands
 
@@ -203,6 +206,9 @@ All commands live under a single prefix, `emacs-jupyter-notebook-prefix-key` (de
 | `C-c j L` | `show-log-buffer` |
 | `C-c j o` | `show-output-panel` |
 | `C-c j t` | `toggle-panel-view` (latest ↔ history) |
+| `C-c j h` | `toggle-cell-output` (hide/show the current cell's output) |
+| `C-c j i` | `inspect-variable` (type, shape and dtype at point) |
+| `C-c j V` | `list-variables` (kernel variable table) |
 | `C-c j I` | `inspect-images` (inspect the current cell's numerical publication) |
 | `C-c j J` | `evaluate-and-inspect` (evaluate and open that execution's first numerical publication) |
 | `C-c j .` | `inspect-at-point` |
@@ -240,6 +246,18 @@ All commands live under a single prefix, `emacs-jupyter-notebook-prefix-key` (de
 The secondary surfaces — `send-region`, `send-paragraph`, `send-defun`, `send-buffer` — have no cell key. Their output flows only into the panel's history-log view; they do not participate in latest-per-cell replacement. `send-paragraph` uses `mark-paragraph` semantics. `send-defun` uses `beginning-of-defun` / `end-of-defun`. `send-buffer` asks for confirmation because it commonly involves a lot of code.
 
 ## Output panel
+
+Deleting a source cell removes its output from both panel views and releases
+its local artifacts. Late replies cannot recreate the deleted entry. Inserting
+text above a cell or moving it with the cell commands preserves its identity.
+Undoing a deletion does not restore discarded output; evaluate the cell again.
+
+Press `TAB` in Evil normal state in the source buffer to hide/show that cell's
+output. In the output pane, `TAB` toggles the entry at point, including in Evil
+normal and motion states. `C-c j h` provides the same source command without
+Evil. A header remains visible while output is hidden; incoming output and
+later evaluations retain the visibility setting. This does not change source
+text or insert-state indentation.
 
 Evaluation output never appears in the source buffer. A dedicated side panel (`*ejn: <buffer>*`) opens on the first evaluation and renders results there. The panel has two views:
 
@@ -355,6 +373,30 @@ The mode-line lighter encodes the engine state at a glance. From highest precede
 | ` EJN*` | the kernel is busy executing a request |
 | ` EJN✓` | client connected and the kernel is idle |
 | ` EJN` | no client and nothing in flight |
+
+## Variable inspection
+
+With the notebook mode enabled and a Python kernel connected, pause on a
+variable name to see its type, array shape and dtype in Eldoc's echo area:
+`image: numpy.ndarray  shape=(128, 64)  dtype=float32`. The variable must
+already exist in the kernel. No `.shape` source cell or array transfer is
+needed. `C-c j i` explicitly inspects the variable at point or prompts for a
+simple name; `C-c j .` remains the kernel's general documentation inspector.
+
+`C-c j V` opens the variable table. Use `g` to refresh, `RET` to inspect a row,
+and `q` to close it; these keys also work under Doom/Evil. The list is bounded
+to 200 public variables. Evaluating code invalidates cached metadata and marks
+the table for refresh. Requests skip busy kernels and expire asynchronously.
+
+NumPy arrays (including subclasses), ordinary PyTorch tensors and memoryviews
+expose shapes/dtypes without copying samples. Other objects show their type;
+custom properties and representations are not called. Only simple names are
+looked up automatically, excluding comments, strings and attribute expressions.
+Set `emacs-jupyter-notebook-variable-eldoc` to nil to disable automatic lookup;
+`emacs-jupyter-notebook-variable-cache-seconds` and
+`emacs-jupyter-notebook-variable-list-limit` control its bounded cache/list.
+Update the local helper together with the Elisp and reconnect to use this new
+metadata operation.
 
 ## Completion
 

@@ -11,6 +11,7 @@ BackendOperation: TypeAlias = Literal[
     "execute",
     "complete",
     "inspect",
+    "variables",
     "is_complete",
     "input_reply",
     "interrupt",

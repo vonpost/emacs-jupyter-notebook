@@ -18,6 +18,7 @@ from typing import Callable, Mapping
 from .backend import BackendCompletion, BackendError, BackendEvent
 from .outputs import OutputAttachment, OutputNormalizer
 from .requests import ExecutionState
+from .variables import build_variables_expression, normalize_variables_reply
 
 
 _LOOPBACK = {"127.0.0.1", "::1"}
@@ -189,6 +190,8 @@ def _bounded_value(value: object, budget: _AuxBudget, depth: int) -> object:
 
 def _normalize_auxiliary(operation: str | None, content: Mapping[str, object]) -> dict:
     """Validate and cap one shell auxiliary reply before it reaches EJN."""
+    if operation == "variables":
+        return normalize_variables_reply(content)
     budget = _AuxBudget()
     if operation == "kernel_info":
         result = _bounded_value(content, budget, 0)
@@ -556,6 +559,8 @@ class JupyterBackend:
                 result = await self._kernel_info()
             elif operation in {"complete", "inspect", "is_complete"}:
                 result = await self._auxiliary(operation, params)
+            elif operation == "variables":
+                result = await self._variables(params)
             elif operation == "execute":
                 result = await self._execute(params, event_callback)
             elif operation == "input_reply":
@@ -683,6 +688,34 @@ class JupyterBackend:
             asyncio.get_running_loop().create_future(),
             reply_type=reply_type,
             auxiliary=operation,
+        )
+        self._register_pending(message_id, pending)
+        try:
+            return await pending.future
+        finally:
+            self._unregister_pending(message_id, pending)
+
+    async def _variables(self, params: Mapping[str, object]) -> dict:
+        """Read bounded metadata through the sole router, without output/history.
+
+        Do not enqueue automatic inspection behind an admitted user execution
+        or duplicate metadata request. The frontend also gates on busy/setup
+        state; an independently busy remote kernel can still defer this request
+        until its ordinary auxiliary deadline. No timeout interrupts the kernel.
+        """
+        self._ensure_connected()
+        assert self.client is not None
+        expression = build_variables_expression(params)
+        if any(p.state is not None or p.auxiliary == "variables"
+               for p in self._pending.values()):
+            raise BackendError("busy")
+        message_id = self.client.execute(
+            "", silent=True, store_history=False, allow_stdin=False,
+            user_expressions={"ejn_variables": expression},
+        )
+        pending = _Pending(
+            asyncio.get_running_loop().create_future(),
+            reply_type="execute_reply", auxiliary="variables",
         )
         self._register_pending(message_id, pending)
         try:

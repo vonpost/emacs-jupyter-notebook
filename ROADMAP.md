@@ -168,6 +168,10 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
   and automatic array shape/type lookup at point without a user evaluation.
   — touches: new variables Elisp and focused tests, core integration, README.
   Shared-checkout implementation delegated to variable_inspection.
+  > note: root also integrates the bounded `variables` helper auxiliary
+  > operation, protocol documentation/vectors and adapter tests. The frontend
+  > uses a silent empty-code user-expressions request through the existing
+  > single channel router; no variable values or array data enter Emacs.
 
 - [~] owner=root claimed=2026-09-07 CC14 Extend the experimental numerical
   viewer with compatible-image differences and selectable ROI mean/population
@@ -175,6 +179,7 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
   viewer docs. User-requested V8/V9 subset may proceed on the existing V7
   workspace; full V7-V11 release/platform acceptance remains separate.
   Shared-checkout implementation delegated to viewer_analysis.
+  > note: scope includes viewer IPC memory accounting and flake test wiring.
 
 - [x] sha=ee4a974 CC11 Stable linked image navigation and
   native trackpad gestures. — touches: viewer interaction/workspace/demo
@@ -1638,8 +1643,9 @@ must account for a busy kernel and cannot imply concurrent training access.
 - **Multi-buffer sharing one kernel.** Registry refcount + buffer set per
   session-id + tunnel-share. Requires reconsidering W1.1's kill-buffer-hook
   to refcount instead of unconditionally tearing down.
-- **Variable explorer.** `*ejn vars*` side buffer polling `user_expressions`.
-  Nice-to-have only.
+- **Variable values beyond metadata.** CC13 adds asynchronous shape/type/dtype
+  Eldoc and a variable table. Value previews and deeper object traversal remain
+  future work; the current metadata path never reads array samples or repr.
 - **Jupyter runtime niceties beyond the W1–W7 set.** Richer MIME, stdin
   prompts polish, is-complete checks, etc.
 

@@ -51,6 +51,39 @@ Publish a mapping of selected 2D NumPy arrays with `ejn.view`, then use
 The latter opens the first numerical publication from that exact execution.
 Ordinary evaluation does not automatically replace an open workspace.
 
+For quantitative comparison, publish corresponding planes with their sample,
+grid and intensity units:
+
+```python
+ejn.view({"reference": reference[z], "candidate": candidate[z]},
+         key="comparison", sample_id=f"case-1/slice-{z}",
+         grid_id="reconstruction-grid", units="intensity")
+```
+
+Use the viewer's Reference and Candidate selectors and choose **Signed
+difference** (`candidate − reference`) or **Absolute difference**. If neither
+plane declares grids or units, the checkboxes let you explicitly declare
+matching grids and common units. Conflicting metadata cannot be overridden.
+Differences use float64 arithmetic, preserving negative differences of
+unsigned images, with a separate display range. Non-finite or overflowing
+differences become unavailable pixels.
+
+Choose an ROI pane and click **Rectangle ROI** or **Ellipse ROI**. Drag its
+body to move it and its handle to resize it. ROIs appear on corresponding
+panes, including the difference. The table shows mean, population SD
+(`ddof=0`), finite pixel count and excluded non-finite count for each pane.
+Select a named ROI to remove it. Up to 16 ROIs are retained, including across
+compatible reruns of the same sample/grid.
+
+Measurements use original samples and source pixel centers, independently of
+zoom or window/level. Rectangles include their left/top edges and exclude
+right/bottom edges; ellipses include centers on their boundary. Selections
+are clipped to each plane. Empty/all-non-finite selections show unavailable
+statistics, and one finite pixel has SD zero. Arithmetic uses float64 with
+stable block accumulation. RGB/rendered images do not offer these quantitative
+controls. Difference/statistics work is debounced and runs in a bounded local
+worker; it makes no requests to the kernel.
+
 Current controls: pinch to zoom around the pointer, two-finger scroll to pan,
 mouse wheel to zoom, drag to pan, `F` to fit, hover for source pixel values,
 and edit level/width. Native pinch uses Qt's macOS/Wayland gesture events;
@@ -88,7 +121,12 @@ there are no snapshot files to recover or orphan-clean. The application admits
 at most four workspaces against a 256 MiB accounting budget including source
 and estimated display/load buffers; Qt/Python overhead is additional.
 
-Pinned baselines, diffs/blink, magnifiers, ROI statistics, follow/freeze,
+Differences are limited to 32 MiB of float64 samples; source images, derived
+displays, pending loads and analysis scratch share the viewer's 256 MiB
+accounting budget. Over-budget requests report an error and leave the source
+samples intact.
+
+Pinned baselines, blink, magnifiers, follow/freeze,
 native-pixel verification, and routing ordinary PNG/JPEG outputs into this
 viewer are unfinished. PNG/JPEG originals still open with the panel's `o`.
 See [VIEWER_PLAN.md](../VIEWER_PLAN.md) for the full release gates.

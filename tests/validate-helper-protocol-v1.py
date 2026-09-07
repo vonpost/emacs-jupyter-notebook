@@ -5,7 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "helper-protocol-v1.json"
-OPS = {"hello", "ping", "grant_event_credit", "connect", "kernel_info", "execute", "complete", "inspect", "is_complete", "input_reply", "interrupt", "shutdown", "close"}
+OPS = {"hello", "ping", "grant_event_credit", "connect", "kernel_info", "execute", "complete", "inspect", "variables", "is_complete", "input_reply", "interrupt", "shutdown", "close"}
 EVENTS = {"stream", "display_data", "execute_result", "clear_output", "status", "execute_reply", "input_request", "transport_error", "output_truncated"}
 ERRORS = {"invalid-request", "invalid-event", "unsupported", "timeout", "protocol-error", "frame-too-large", "credit-exhausted", "transport-error", "busy"}
 NO_PARAMS = {"ping", "kernel_info", "interrupt", "shutdown", "close"}
@@ -54,6 +54,13 @@ def check_object(v, obj):
         if obj["op"] == "execute" and not isinstance(p.get("code"), str): fail(v["name"] + ": execute code must be string")
         if obj["op"] in {"complete", "inspect"} and (not isinstance(p.get("code"), str) or not integer(p.get("cursor_pos"))): fail(v["name"] + ": invalid code/cursor")
         if obj["op"] == "inspect" and not integer(p.get("detail_level")): fail(v["name"] + ": invalid detail level")
+        if obj["op"] == "variables":
+            names, limit = p.get("names"), p.get("limit")
+            if (set(p) != {"names", "limit"} or not integer(limit) or not 1 <= limit <= 200
+                or (names is not None and (not isinstance(names, list) or not 1 <= len(names) <= 200
+                    or any(not isinstance(n, str) or not n.isidentifier() or len(n.encode('utf-8')) > 128 for n in names)
+                    or len(set(names)) != len(names)))):
+                fail(v["name"] + ": invalid variables selection")
         if obj["op"] == "is_complete" and not isinstance(p.get("code"), str): fail(v["name"] + ": is_complete code must be string")
         if obj["op"] == "input_reply" and (set(p) != {"request_id", "input_id", "value"} or not isinstance(p.get("request_id"), str) or not isinstance(p.get("value"), str) or not valid_input_id(p.get("input_id")) or utf8_size(p["value"], 65536) > 65536): fail(v["name"] + ": invalid input reply")
         if obj["op"] == "connect" and (not isinstance(p.get("connection_file"), str) or not isinstance(p.get("artifact_dir"), str) or not os.path.isabs(p["connection_file"]) or not os.path.isabs(p["artifact_dir"])): fail(v["name"] + ": invalid connect paths")

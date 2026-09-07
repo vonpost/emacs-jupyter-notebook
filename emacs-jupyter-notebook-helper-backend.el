@@ -899,6 +899,10 @@ core can retain an attached helper for the existing PID busy arbitration.
        (eq (car operation) 'aux)
        (eq (cdr operation) 'kernel-info)))
 
+(defun emacs-jupyter-notebook-helper-backend--variables-operation-p (operation)
+  "Return non-nil for a bounded variable metadata request."
+  (equal operation '(aux . variables)))
+
 (defun emacs-jupyter-notebook-helper-backend--interrupt-operation-p (operation)
   "Return non-nil for the sole admitted helper interrupt control operation."
   (and (consp operation) (eq (car operation) 'control)
@@ -927,6 +931,10 @@ core can retain an attached helper for the existing PID busy arbitration.
      "detail_level" (or (plist-get payload :detail) 0)))
    ((emacs-jupyter-notebook-helper-backend--kernel-info-operation-p operation)
     (emacs-jupyter-notebook-helper-backend--make-object))
+   ((emacs-jupyter-notebook-helper-backend--variables-operation-p operation)
+    (emacs-jupyter-notebook-helper-backend--make-object
+     "names" (or (plist-get payload :names) :null)
+     "limit" (or (plist-get payload :limit) 200)))
    ((or (emacs-jupyter-notebook-helper-backend--interrupt-operation-p operation)
         (emacs-jupyter-notebook-helper-backend--shutdown-operation-p operation))
     (unless (null payload)
@@ -984,6 +992,43 @@ core can retain an attached helper for the existing PID busy arbitration.
         (error "helper inspect returned an invalid text result"))
       (list :found (eq found t)
             :data (if text (list :text/plain text) nil)))))
+
+(defun emacs-jupyter-notebook-helper-backend--variables-result (result)
+  "Validate bounded variable metadata RESULT and preserve scalar shapes."
+  (let ((rows (and (hash-table-p result) (gethash "variables" result)))
+        (truncated (and (hash-table-p result) (gethash "truncated" result))))
+    (unless (and (hash-table-p result) (= (hash-table-count result) 2)
+                 (vectorp rows) (<= (length rows) 200)
+                 (memq truncated '(t :false)))
+      (error "helper variables returned an invalid result"))
+    (list
+     :variables
+     (mapcar
+      (lambda (row)
+        (unless (and (hash-table-p row) (= (hash-table-count row) 4)
+                     (cl-every (lambda (key)
+                                 (let ((value (gethash key row)))
+                                   (and (stringp value) (> (length value) 0)
+                                        (<= (string-bytes value) 128)
+                                        (not (string-match-p "[[:cntrl:]]" value)))))
+                               '("name" "type")))
+          (error "helper variables returned an invalid row"))
+        (let ((shape (gethash "shape" row 'missing))
+              (dtype (gethash "dtype" row 'missing)))
+          (unless (and (or (eq shape :null)
+                           (and (vectorp shape) (<= (length shape) 32)
+                                (cl-every (lambda (n)
+                                            (and (integerp n) (<= 0 n 9007199254740991)))
+                                          shape)))
+                       (or (eq dtype :null)
+                           (and (stringp dtype) (<= (string-bytes dtype) 128)
+                                (not (string-match-p "[[:cntrl:]]" dtype)))))
+            (error "helper variables returned invalid shape or dtype"))
+          (list :name (gethash "name" row) :type (gethash "type" row)
+                :shape (unless (eq shape :null) shape)
+                :dtype (unless (eq dtype :null) dtype))))
+      rows)
+     :truncated (eq truncated t))))
 
 (defun emacs-jupyter-notebook-helper-backend--input-payload-object (payload)
   "Translate an EI5 input PAYLOAD into its exact helper prompt lease.
@@ -1103,6 +1148,7 @@ validates both values before it can send the Jupyter stdin reply."
                    (eq operation 'input)
                    (emacs-jupyter-notebook-helper-backend--complete-operation-p operation)
                    (emacs-jupyter-notebook-helper-backend--inspect-operation-p operation)
+                   (emacs-jupyter-notebook-helper-backend--variables-operation-p operation)
                    (emacs-jupyter-notebook-helper-backend--is-complete-operation-p operation)
                    (emacs-jupyter-notebook-helper-backend--kernel-info-operation-p operation)
                    (emacs-jupyter-notebook-helper-backend--interrupt-operation-p operation)
@@ -1123,6 +1169,8 @@ validates both values before it can send the Jupyter stdin reply."
                  "complete")
                 ((emacs-jupyter-notebook-helper-backend--inspect-operation-p operation)
                  "inspect")
+                ((emacs-jupyter-notebook-helper-backend--variables-operation-p operation)
+                 "variables")
                 ((emacs-jupyter-notebook-helper-backend--is-complete-operation-p operation)
                  "is_complete")
                 ((emacs-jupyter-notebook-helper-backend--interrupt-operation-p operation)
@@ -1166,6 +1214,14 @@ validates both values before it can send the Jupyter stdin reply."
               (condition-case err
                   (funcall success
                            (emacs-jupyter-notebook-helper-backend--inspect-result result))
+                (error
+                 (emacs-jupyter-notebook-helper-backend--protocol-failure
+                  state failure (error-message-string err))))))
+           ((emacs-jupyter-notebook-helper-backend--variables-operation-p operation)
+            (lambda (result)
+              (condition-case err
+                  (funcall success
+                           (emacs-jupyter-notebook-helper-backend--variables-result result))
                 (error
                  (emacs-jupyter-notebook-helper-backend--protocol-failure
                   state failure (error-message-string err))))))

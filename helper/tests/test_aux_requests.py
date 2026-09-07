@@ -47,7 +47,9 @@ class AuxiliaryRequestTests(unittest.IsolatedAsyncioTestCase):
             def complete(self, _code, _cursor): return self._id("complete")
             def inspect(self, _code, _cursor, _detail=0): return self._id("inspect")
             def is_complete(self, _code): return self._id("is-complete")
-            def execute(self, _code): return self._id("execute")
+            def execute(self, code, **kwargs):
+                self.last_execute = (code, kwargs)
+                return self._id("execute")
 
         for name in self.queues:
             async def getter(self, timeout, name=name):
@@ -117,6 +119,45 @@ class AuxiliaryRequestTests(unittest.IsolatedAsyncioTestCase):
         }))
         await asyncio.sleep(0)
         self.assertEqual(self.backend._pending, {})
+
+    async def test_variables_are_silent_metadata_without_iopub_events(self):
+        future = await self._request("variables", {"names": ["image"], "limit": 1})
+        msg_id = await self._request_id("variables")
+        code, options = self.backend.client.last_execute
+        self.assertEqual(code, "")
+        self.assertIs(options["silent"], True)
+        self.assertIs(options["store_history"], False)
+        self.assertIs(options["allow_stdin"], False)
+        self.assertIn("ejn_variables", options["user_expressions"])
+        rows = {"variables": [{"name": "image", "type": "numpy.ndarray",
+                               "shape": [2, 3], "dtype": "uint16"}], "truncated": False}
+        content = {"status": "ok", "user_expressions": {"ejn_variables": {
+            "status": "ok", "data": {"text/plain": repr(json.dumps(rows))}}}}
+        await self.queues["shell"].put(self._message(msg_id, "execute_reply", content))
+        result = await asyncio.wait_for(future, 1)
+        self.assertIsNone(result.error)
+        self.assertEqual(result.result, rows)
+        self.assertEqual(self.backend._pending, {})
+
+    async def test_variables_do_not_queue_behind_admitted_execution(self):
+        execution = await self._request("execute", {"code": "long_running()"})
+        await asyncio.sleep(0)
+        future = await self._request("variables", {"names": None, "limit": 200})
+        result = await asyncio.wait_for(future, 1)
+        self.assertEqual(result.error.code, "busy")
+        self.assertEqual(self.backend.client.last_execute, ("long_running()", {}))
+        self.assertFalse(execution.done())
+
+    async def test_variables_timeout_releases_pending_without_interrupt(self):
+        future = await self._request("variables", {"names": ["image"], "limit": 1})
+        msg_id = await self._request_id("variables")
+        result = await asyncio.wait_for(future, 1)
+        self.assertEqual(result.error.code, "timeout")
+        self.assertEqual(self.backend._pending, {})
+        self.assertFalse(self.backend.closed)
+        await self.queues["shell"].put(self._message(msg_id, "execute_reply", {"status": "ok"}))
+        await asyncio.sleep(0)
+        self.assertFalse(self.backend.closed)
 
     async def test_malformed_replies_fail_without_leaking_data(self):
         cases = [

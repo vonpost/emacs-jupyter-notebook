@@ -15,6 +15,7 @@
     {"name":"op-execute","kind":"frame","object":{"v":1,"kind":"request","id":"op-exec","op":"execute","params":{"code":"1+1"}}},
     {"name":"op-complete","kind":"frame","object":{"v":1,"kind":"request","id":"op-complete","op":"complete","params":{"code":"pri","cursor_pos":3}}},
     {"name":"op-inspect","kind":"frame","object":{"v":1,"kind":"request","id":"op-inspect","op":"inspect","params":{"code":"print","cursor_pos":5,"detail_level":0}}},
+    {"name":"op-variables","kind":"frame","object":{"v":1,"kind":"request","id":"op-variables","op":"variables","params":{"names":["image"],"limit":1}}},
     {"name":"op-is-complete","kind":"frame","object":{"v":1,"kind":"request","id":"op-is-complete","op":"is_complete","params":{"code":"x = 1"}}},
     {"name":"op-input-reply","kind":"frame","object":{"v":1,"kind":"request","id":"op-input","op":"input_reply","params":{"request_id":"exec-1","input_id":"0123456789abcdef0123456789abcdef","value":"yes"}}},
     {"name":"op-interrupt","kind":"frame","object":{"v":1,"kind":"request","id":"op-interrupt","op":"interrupt","params":{}}},

@@ -41,6 +41,7 @@ _BACKEND_OPERATIONS = frozenset(
         "execute",
         "complete",
         "inspect",
+        "variables",
         "is_complete",
         "input_reply",
         "interrupt",
@@ -400,6 +401,17 @@ class Dispatcher:
         if operation in {"execute", "is_complete"}:
             _exact_fields(params, frozenset({"code"}))
             return {"code": Dispatcher._validate_code(params["code"])}
+        if operation == "variables":
+            _exact_fields(params, frozenset({"names", "limit"}))
+            names, limit = params["names"], params["limit"]
+            if (type(limit) is not int or not 1 <= limit <= 200
+                    or (names is not None and (
+                        not isinstance(names, list) or not 1 <= len(names) <= 200
+                        or any(not isinstance(name, str) or not name.isidentifier()
+                               or len(name.encode("utf-8")) > 128 for name in names)
+                        or len(set(names)) != len(names)))):
+                raise _RequestError("invalid-request", "invalid variable metadata selection")
+            return {"names": names, "limit": limit}
         if operation in {"complete", "inspect"}:
             optional = (
                 frozenset({"detail_level"})

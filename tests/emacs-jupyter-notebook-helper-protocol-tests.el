@@ -181,12 +181,12 @@
       (should (cl-loop for actual in decoded
                        for expected in (cl-subseq small-objects 0 3)
                        always (ejn-et1-equal actual expected))))
-    (should (= (length vectors) 50))
-    (should (= (gethash "frame" kind-counts) 36))
+    (should (= (length vectors) 51))
+    (should (= (gethash "frame" kind-counts) 37))
     (should (= (gethash "recipe" kind-counts) 3))
     (should (= (gethash "recipe-error" kind-counts) 3))
     (should (= (gethash "raw-error" kind-counts) 8))
-    (should (= valid-count 39))))
+    (should (= valid-count 40))))
 
 (ert-deftest ejn-et1-boundaries-and-state ()
   (let ((decoder (ejn-helper-protocol-make-decoder 100)))
