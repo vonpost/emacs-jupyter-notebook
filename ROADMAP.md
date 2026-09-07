@@ -159,6 +159,23 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
+- [~] owner=root claimed=2026-09-07 CC12 Retire outputs when their source cell
+  is deleted and toggle per-cell output visibility from source/panel with
+  normal-state Evil Tab. — touches: result/cell/core Elisp, focused ERT, README.
+  Shared-checkout implementation delegated to output_cells; root integrates.
+
+- [~] owner=root claimed=2026-09-07 CC13 Add asynchronous variable inspection
+  and automatic array shape/type lookup at point without a user evaluation.
+  — touches: new variables Elisp and focused tests, core integration, README.
+  Shared-checkout implementation delegated to variable_inspection.
+
+- [~] owner=root claimed=2026-09-07 CC14 Extend the experimental numerical
+  viewer with compatible-image differences and selectable ROI mean/population
+  SD statistics. — touches: viewer workspace/new numerical modules and tests,
+  viewer docs. User-requested V8/V9 subset may proceed on the existing V7
+  workspace; full V7-V11 release/platform acceptance remains separate.
+  Shared-checkout implementation delegated to viewer_analysis.
+
 - [x] sha=ee4a974 CC11 Stable linked image navigation and
   native trackpad gestures. — touches: viewer interaction/workspace/demo
   modules, viewer GUI tests, installation docs — for: W21 V7 macOS dogfood.
