@@ -28,6 +28,13 @@ reads no array samples, skips known busy execution and has an auxiliary
 deadline. Envelope v1 and all frame/queue ceilings remain unchanged; the exact
 request/reply limits are recorded in `docs/helper-protocol-v1.md`.
 
+CC16/CC18 extension (2026-09-09): explicit variable-plane inspection reuses
+the existing execute/event/artifact path and FIFO. An optional boolean
+`store_history` on execute allows generated inspection code to avoid user
+history. The injected publisher validates names, dimensions, axes and indices
+before materializing only the selected plane. Envelope v1, capability leases
+and every existing bound remain unchanged.
+
 ## Why this work exists
 
 The retired in-process adapter could enter synchronous `emacs-jupyter` ZMQ

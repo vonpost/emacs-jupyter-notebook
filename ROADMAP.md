@@ -159,6 +159,31 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
+- [~] owner=root claimed=2026-09-09 CC15 Implement the user-approved UX
+  improvements: source-following output navigation, descriptive/stale/timed
+  headers and folded summaries. — touches: result Elisp, focused ERT.
+  Shared-checkout implementation delegated to output_cells; root integrates
+  core hooks. Agents do not commit or edit shared ledgers.
+
+- [~] owner=root claimed=2026-09-09 CC16 Make variable metadata a live
+  dashboard with favorites/change highlights/stale state and direct bounded
+  array-plane viewing, including axis and index selection. — touches:
+  variables Elisp, publisher, focused tests; root owns core/helper integration.
+  Shared-checkout implementation delegated to variable_inspection.
+
+- [~] owner=root claimed=2026-09-09 CC17 Add pinned-reference/follow/freeze/
+  blink viewer workflow, drag/named/movable/copyable ROI measurements and
+  linked sample crosshair with magnification. — touches: viewer modules and
+  tests except publisher; delegated to viewer_analysis. User authorizes these
+  V8/V9 and V12 subsets on the existing workspace; full platform gates remain.
+
+- [~] owner=root claimed=2026-09-09 CC18 Integrate the seven requested UX
+  improvements with context-sensitive Inspect and discoverable action menus.
+  — touches: core/inspect/helper adapter and protocol, docs/integration tests.
+  Direct variable viewing uses the existing execution FIFO and numerical
+  artifact pipeline, with history disabled for generated inspection requests.
+  No source edits, array bytes in Emacs, frame increases, or user-code replay.
+
 - [x] sha=26280f0 CC12 Retire outputs when their source cell
   is deleted and toggle per-cell output visibility from source/panel with
   normal-state Evil Tab. — touches: result/cell/core Elisp, focused ERT, README.
