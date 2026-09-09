@@ -7831,7 +7831,7 @@ and returns nil for a bogus command."
     (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-live-p) (lambda () t))
               ((symbol-function 'make-network-process)
                (lambda (&rest args) (setq network-args args) fake))
-              ((symbol-function 'process-send-string) (lambda (_ string) (setq sent string)))
+              ((symbol-function 'emacs-jupyter-notebook-process-send) (lambda (_ string) (setq sent string)))
               ((symbol-function 'delete-process) (lambda (&rest _) nil))
               ((symbol-function 'run-at-time)
                (lambda (&rest args)
@@ -7902,7 +7902,7 @@ and returns nil for a bogus command."
                                (make-pipe-process
                                 :name "ejn-w8-real-identity-send"
                                 :buffer nil :noquery t))))
-                      ((symbol-function 'process-send-string)
+                      ((symbol-function 'emacs-jupyter-notebook-process-send)
                        (lambda (_process wire) (setq sent wire)))
                       ((symbol-function 'run-at-time)
                        (lambda (&rest _)
@@ -7943,7 +7943,7 @@ and returns nil for a bogus command."
     (unwind-protect
         (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-live-p) (lambda () t))
                   ((symbol-function 'make-network-process) (lambda (&rest _) fake))
-                  ((symbol-function 'process-send-string)
+                  ((symbol-function 'emacs-jupyter-notebook-process-send)
                    (lambda (_ string) (setq sent string)))
                   ((symbol-function 'delete-process) (lambda (&rest _) nil))
                   ((symbol-function 'run-at-time)
@@ -7981,7 +7981,7 @@ and returns nil for a bogus command."
     (unwind-protect
         (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-live-p) (lambda () t))
                   ((symbol-function 'make-network-process) (lambda (&rest _) fake))
-                  ((symbol-function 'process-send-string) (lambda (&rest _) nil))
+                  ((symbol-function 'emacs-jupyter-notebook-process-send) (lambda (&rest _) nil))
                   ((symbol-function 'delete-process)
                    (lambda (process &rest args)
                      (push process deleted)
@@ -8018,7 +8018,7 @@ and returns nil for a bogus command."
     (unwind-protect
         (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-live-p) (lambda () t))
                   ((symbol-function 'make-network-process) (lambda (&rest _) fake))
-                  ((symbol-function 'process-send-string)
+                  ((symbol-function 'emacs-jupyter-notebook-process-send)
                    (lambda (_ string) (setq sent string)))
                   ((symbol-function 'delete-process) (lambda (&rest _) nil))
                   ((symbol-function 'run-at-time)
@@ -8059,7 +8059,7 @@ and returns nil for a bogus command."
         (cl-letf (((symbol-function 'emacs-jupyter-notebook-viewer-live-p) (lambda () t))
                   ((symbol-function 'make-network-process)
                    (lambda (&rest _) fake-a))
-                  ((symbol-function 'process-send-string)
+                  ((symbol-function 'emacs-jupyter-notebook-process-send)
                    (lambda (_conn _string)
                      (cl-incf send-count)
                      (error "send failed")))
@@ -8107,7 +8107,7 @@ and returns nil for a bogus command."
                        (setq conn
                              (make-pipe-process
                               :name "ejn-w8-connect" :buffer nil :noquery t)))))
-                  ((symbol-function 'process-send-string)
+                  ((symbol-function 'emacs-jupyter-notebook-process-send)
                    (lambda (_conn string) (setq sent string)))
                   ((symbol-function 'delete-process) (lambda (&rest _) nil))
                   ((symbol-function 'run-at-time)
@@ -8156,7 +8156,7 @@ and returns nil for a bogus command."
                 (if (= connect-count 1)
                     (error "socket not ready")
                   fake)))
-             ((symbol-function 'process-send-string)
+             ((symbol-function 'emacs-jupyter-notebook-process-send)
               (lambda (_process wire) (setq sent wire)))
              ((symbol-function 'delete-process) (lambda (&rest _) nil))
              ((symbol-function 'run-at-time)
@@ -8197,7 +8197,7 @@ and returns nil for a bogus command."
         (cl-letf
             (((symbol-function 'emacs-jupyter-notebook-viewer-live-p) (lambda () t))
              ((symbol-function 'make-network-process) (lambda (&rest _) fake))
-             ((symbol-function 'process-send-string)
+             ((symbol-function 'emacs-jupyter-notebook-process-send)
               (lambda (_process wire) (setq sent wire)))
              ((symbol-function 'delete-process) (lambda (&rest _) nil))
              ((symbol-function 'run-at-time)
@@ -8701,8 +8701,10 @@ alive/unknown ones; the dead ghost is removed from the registry too."
                  ;; Pick the first (only surviving) choice.
                  (caar collection))))
       (with-temp-buffer
-        (emacs-jupyter-notebook--read-registry-entry-async
-         (lambda (entry) (setq selected entry)))
+        (save-window-excursion
+          (set-window-buffer (selected-window) (current-buffer))
+          (emacs-jupyter-notebook--read-registry-entry-async
+           (lambda (entry) (setq selected entry)))
           (should (ejn-test-await (lambda () selected)))
           ;; Only the live entry survived and was selectable.
           (should (equal selected live))
@@ -8710,7 +8712,7 @@ alive/unknown ones; the dead ghost is removed from the registry too."
           (should (string-match-p "live" (caar offered)))
           ;; The dead ghost was pruned through its exact observed revision.
           (should (equal pruned (list dead)))
-          (should (equal current (list live)))))))
+          (should (equal current (list live))))))))
 
 (ert-deftest ejn-w11-prune-dead-kernels-preserves-concurrent-addition ()
   "Async explicit pruning must not discard an entry added during its probe."
@@ -8806,16 +8808,18 @@ alive/unknown ones; the dead ghost is removed from the registry too."
                  (setq offered collection)
                  (caar collection))))
       (with-temp-buffer
-        (emacs-jupyter-notebook--read-registry-entry-async
-         (lambda (entry) (setq selected entry)))
-        (should (ejn-test-await (lambda () callback)))
-        (setq current (list dead added))
-        (funcall callback (list (cons (car probed) 'dead)) nil)
-        (should (ejn-test-await (lambda () selected)))
-        (should (equal pruned (list dead)))
-        (should (equal current (list added)))
-        (should (= (length offered) 1))
-        (should (equal selected added))))))
+        (save-window-excursion
+          (set-window-buffer (selected-window) (current-buffer))
+          (emacs-jupyter-notebook--read-registry-entry-async
+           (lambda (entry) (setq selected entry)))
+          (should (ejn-test-await (lambda () callback)))
+          (setq current (list dead added))
+          (funcall callback (list (cons (car probed) 'dead)) nil)
+          (should (ejn-test-await (lambda () selected)))
+          (should (equal pruned (list dead)))
+          (should (equal current (list added)))
+          (should (= (length offered) 1))
+          (should (equal selected added)))))))
 
 (ert-deftest ejn-w11-picker-prune-preserves-concurrent-same-key-refresh ()
   "Reconnect picker must offer a same-key entry refreshed during its probe."
@@ -8847,16 +8851,18 @@ alive/unknown ones; the dead ghost is removed from the registry too."
                  (setq offered collection)
                  (caar collection))))
       (with-temp-buffer
-        (emacs-jupyter-notebook--read-registry-entry-async
-         (lambda (entry) (setq selected entry)))
-        (should (ejn-test-await (lambda () callback)))
-        (setq current (list refreshed))
-        (funcall callback (list (cons (car probed) 'dead)) nil)
-        (should (ejn-test-await (lambda () selected)))
-        (should (equal pruned (list dead)))
-        (should (equal current (list refreshed)))
-        (should (= (length offered) 1))
-        (should (equal selected refreshed))))))
+        (save-window-excursion
+          (set-window-buffer (selected-window) (current-buffer))
+          (emacs-jupyter-notebook--read-registry-entry-async
+           (lambda (entry) (setq selected entry)))
+          (should (ejn-test-await (lambda () callback)))
+          (setq current (list refreshed))
+          (funcall callback (list (cons (car probed) 'dead)) nil)
+          (should (ejn-test-await (lambda () selected)))
+          (should (equal pruned (list dead)))
+          (should (equal current (list refreshed)))
+          (should (= (length offered) 1))
+          (should (equal selected refreshed)))))))
 
 ;;; W19 — reconnect robustness
 
@@ -9351,7 +9357,11 @@ left to run shutdown + start by hand."
                (lambda (callback) (funcall callback entry)))
               ((symbol-function 'emacs-jupyter-notebook--begin-reconnect)
                (lambda (_entry _cb error-cb &optional _owner)
-                 (funcall error-cb '(:error-kind kernel-dead) "dead")))
+                 (setq emacs-jupyter-notebook--async-context
+                       (emacs-jupyter-notebook--async-new-context
+                        :phase 'error :error-kind 'kernel-dead
+                        :origin-buffer (current-buffer)))
+                 (funcall error-cb emacs-jupyter-notebook--async-context "dead")))
               ;; `called-interactively-p' with kind `interactive' is nil in
               ;; batch by design; stub it to model a real user invocation.
               ((symbol-function 'called-interactively-p) (lambda (&rest _) t))
@@ -9359,8 +9369,12 @@ left to run shutdown + start by hand."
               ((symbol-function 'emacs-jupyter-notebook-retry-fresh-kernel)
                (lambda (profile) (setq fresh-profile profile))))
       (with-temp-buffer
-        (call-interactively #'emacs-jupyter-notebook-reconnect-remote-kernel)
-        (should (equal fresh-profile "prod"))))))
+        (save-window-excursion
+          (set-window-buffer (selected-window) (current-buffer))
+          (call-interactively #'emacs-jupyter-notebook-reconnect-remote-kernel)
+          (should-not fresh-profile)
+          (should (ejn-test-await (lambda () fresh-profile)))
+          (should (equal fresh-profile "prod")))))))
 
 (ert-deftest ejn-w19-reconnect-kernel-dead-no-prompt-for-lisp-callers ()
   "W19: the fresh-start offer is gated on a genuine interactive invocation —
@@ -14418,7 +14432,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                                    (make-pipe-process
                                     :name "ejn-ei4v-reap-send"
                                     :buffer nil :noquery t))))
-                          ((symbol-function 'process-send-string) #'ignore)
+                          ((symbol-function 'emacs-jupyter-notebook-process-send) #'ignore)
                           ((symbol-function 'run-at-time)
                            (lambda (&rest _)
                              (setq timer (timer-create))
@@ -14528,7 +14542,7 @@ TERMINAL is `timeout' or `cancelled'.  Return the disposed process."
                                       :name "ejn-test-viewer-send"
                                       :buffer nil
                                       :noquery t))))
-                            ((symbol-function 'process-send-string)
+                            ((symbol-function 'emacs-jupyter-notebook-process-send)
                              (lambda (_proc string)
                                (setq sent string)))
                             ((symbol-function 'emacs-jupyter-notebook-viewer--log)

@@ -19,6 +19,7 @@
 (require 'json)
 (require 'subr-x)
 (require 'emacs-jupyter-notebook-vars)
+(require 'emacs-jupyter-notebook-process)
 
 (defconst emacs-jupyter-notebook-registry--protocol-version 1)
 (defconst emacs-jupyter-notebook-registry--hard-request-bytes (* 64 1024))
@@ -1022,8 +1023,21 @@ the transaction completion boundary."
                            (setq pending-terminal (cons worker event)))))))
               (setf (emacs-jupyter-notebook-registry-operation-process operation) process
                     (emacs-jupyter-notebook-registry-operation-stderr-process operation) stderr)
-              (process-send-string process payload)
-              (process-send-eof process)
+              ;; The deadline must exist before a possibly blocked pipe write.
+              (let ((timer (run-at-time
+                            (min remaining (emacs-jupyter-notebook-registry--request-timeout))
+                            nil #'emacs-jupyter-notebook-registry--attempt-timeout
+                            operation process)))
+                (if (and (emacs-jupyter-notebook-registry--operation-active-p operation)
+                         (eq process (emacs-jupyter-notebook-registry-operation-process operation)))
+                    (setf (emacs-jupyter-notebook-registry-operation-attempt-timer operation) timer)
+                  (emacs-jupyter-notebook-registry--cancel-timer timer)))
+              (when (and (emacs-jupyter-notebook-registry--operation-active-p operation)
+                         (eq process (emacs-jupyter-notebook-registry-operation-process operation)))
+                (emacs-jupyter-notebook-process-send process payload)
+                (when (and (emacs-jupyter-notebook-registry--operation-active-p operation)
+                           (eq process (emacs-jupyter-notebook-registry-operation-process operation)))
+                  (process-send-eof process)))
               (setq setup-complete t)
               (cond
                (pending-terminal
@@ -1034,16 +1048,7 @@ the transaction completion boundary."
                          (emacs-jupyter-notebook-registry-operation-process operation))
                      (not (process-live-p process)))
                 (emacs-jupyter-notebook-registry--sentinel
-                 operation process "terminated during registry worker startup"))
-               ((and (emacs-jupyter-notebook-registry--operation-active-p operation)
-                     (eq process
-                         (emacs-jupyter-notebook-registry-operation-process operation)))
-                (setf (emacs-jupyter-notebook-registry-operation-attempt-timer operation)
-                      (run-at-time
-                       (min remaining
-                            (emacs-jupyter-notebook-registry--request-timeout))
-                       nil #'emacs-jupyter-notebook-registry--attempt-timeout
-                       operation process)))))
+                 operation process "terminated during registry worker startup"))))
           (error
            (let ((sent-p
                   (emacs-jupyter-notebook-registry-operation-process operation)))

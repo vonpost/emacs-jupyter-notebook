@@ -15,6 +15,13 @@
 (require 'cl-lib)
 (require 'code-cells)
 
+(defvar-local emacs-jupyter-notebook-cell--bounds-cache nil
+  "Last complete cell bounds and the source context in which they were scanned.")
+
+(defconst emacs-jupyter-notebook-cell--automatic-scan-limit 1048576
+  "Maximum source characters scanned by automatic follow/edit-label hooks.
+Explicit cell commands and exact deletion tracking still work in larger files.")
+
 (defun emacs-jupyter-notebook-cell-bounds ()
   "Return the current cell code bounds as (BEG . END).
 Delegates to `code-cells--bounds' with NO-HEADER non-nil so that
@@ -23,9 +30,23 @@ cell marker lines are excluded from the returned code bounds."
     (cons beg end)))
 
 (defun emacs-jupyter-notebook-cell-full-bounds ()
-  "Return the current cell bounds as (BEG . END), including the marker line."
-  (pcase-let ((`(,beg ,end) (code-cells--bounds 1 nil nil)))
-    (cons beg end)))
+  "Return current cell bounds as (BEG . END), including the marker line.
+Reuse the current cell's scan while text, restriction, and boundary syntax
+remain unchanged.  Source-follow hooks run on every command, including small
+point motions, and must not repeatedly scan a multi-megabyte cell."
+  (let* ((context (list (buffer-chars-modified-tick) (point-min) (point-max)
+                        code-cells-boundary-regexp (syntax-table)))
+         (cached emacs-jupyter-notebook-cell--bounds-cache)
+         (bounds (cdr cached)))
+    (if (and (equal context (car cached)) bounds
+             (<= (car bounds) (point))
+             (or (< (point) (cdr bounds))
+                 (= (point) (cdr bounds) (point-max))))
+        (cons (car bounds) (cdr bounds))
+      (pcase-let ((`(,beg ,end) (code-cells--bounds 1 nil nil)))
+        (setq emacs-jupyter-notebook-cell--bounds-cache
+              (cons context (cons beg end)))
+        (cons beg end)))))
 
 (defun emacs-jupyter-notebook-cell-code-start (&optional position)
   "Return the code start for the cell at POSITION or point."

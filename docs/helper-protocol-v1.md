@@ -230,8 +230,9 @@ event queue pressure drops bounded ordinary stream/result output for the
 affected request, with exactly one `output_truncated` marker guaranteed. Only
 priority queue exhaustion is fatal; priority and terminal events are never
 dropped. The process filter drains at most 16
-frames or 262144 payload bytes per invocation, then schedules a zero-delay
-continuation. Its raw accumulator is bounded to 1 MiB. A partial frame has a
+frames or 262144 payload bytes per invocation, then schedules a 1 ms
+continuation so input can run between batches. Its raw accumulator is bounded
+to 1 MiB. A partial frame has a
 5-second deadline and maps to `protocol-error`. Helper pings are answered by
 the local asyncio control loop without touching Jupyter.
 

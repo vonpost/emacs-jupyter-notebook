@@ -12,6 +12,7 @@
 (require 'subr-x)
 (require 'emacs-jupyter-notebook-vars)
 (require 'emacs-jupyter-notebook-helper-protocol)
+(require 'emacs-jupyter-notebook-process)
 
 (defconst emacs-jupyter-notebook-helper--hard-timeout 300)
 (defconst emacs-jupyter-notebook-helper--hard-stderr-bytes 1048576)
@@ -21,6 +22,8 @@
 (defconst emacs-jupyter-notebook-helper--max-response-frame 65536)
 (defconst emacs-jupyter-notebook-helper--filter-max-frames 16)
 (defconst emacs-jupyter-notebook-helper--filter-max-payload-bytes 262144)
+(defconst emacs-jupyter-notebook-helper--continuation-delay 0.001
+  "Positive delay giving keyboard dispatch a turn between bounded batches.")
 (defconst emacs-jupyter-notebook-helper--max-late-responses 64)
 (defconst emacs-jupyter-notebook-helper--stderr-pending-max-bytes 65536)
 (defconst emacs-jupyter-notebook-helper--stderr-log-max-bytes 4096)
@@ -355,7 +358,8 @@ logging error can never retain a secret-bearing process chunk."
   "Schedule one owned, deferred stderr drain for SESSION."
   (unless (timerp (emacs-jupyter-notebook-helper-session-stderr-drain-timer session))
     (setf (emacs-jupyter-notebook-helper-session-stderr-drain-timer session)
-          (run-at-time 0 nil #'emacs-jupyter-notebook-helper--stderr-drain session))))
+          (run-at-time emacs-jupyter-notebook-helper--continuation-delay nil
+                       #'emacs-jupyter-notebook-helper--stderr-drain session))))
 
 (defun emacs-jupyter-notebook-helper--stderr-enqueue (session bytes)
   "Boundedly enqueue stderr BYTES for deferred redaction and logging.
@@ -501,7 +505,8 @@ retaining only its tail could separate a credential value from its label."
   (unless (or (emacs-jupyter-notebook-helper-session-disposed session)
               (timerp (emacs-jupyter-notebook-helper-session-drain-timer session)))
     (setf (emacs-jupyter-notebook-helper-session-drain-timer session)
-          (run-at-time 0 nil #'emacs-jupyter-notebook-helper--drain session))))
+          (run-at-time emacs-jupyter-notebook-helper--continuation-delay nil
+                       #'emacs-jupyter-notebook-helper--drain session))))
 
 (defun emacs-jupyter-notebook-helper--queue-failure (session reason)
   "Defer local failure of SESSION until its scheduled drain.
@@ -523,7 +528,7 @@ This is used by the process filter so it never runs user callbacks."
       (puthash "id" id envelope)
       (puthash "op" op envelope)
       (puthash "params" params envelope)
-      (process-send-string
+      (emacs-jupyter-notebook-process-send
        process
        (ejn-helper-protocol-encode envelope ejn-helper-protocol-max-to-helper-frame)))))
 
@@ -765,9 +770,9 @@ timer handle or sending a hello frame."
     (puthash "id" (emacs-jupyter-notebook-helper-session-hello-id session) hello)
     (puthash "op" "hello" hello)
     (puthash "params" params hello)
-    (process-send-string process
-                         (ejn-helper-protocol-encode
-                          hello ejn-helper-protocol-max-to-helper-frame))))
+    (emacs-jupyter-notebook-process-send
+     process (ejn-helper-protocol-encode
+              hello ejn-helper-protocol-max-to-helper-frame))))
 
 (defun emacs-jupyter-notebook-helper--fail (session reason)
   "Fail SESSION once, releasing only its local resources."
@@ -931,7 +936,8 @@ timer handle or sending a hello frame."
   (unless (or (emacs-jupyter-notebook-helper-session-disposed session)
               (timerp (emacs-jupyter-notebook-helper-session-decode-timer session)))
     (setf (emacs-jupyter-notebook-helper-session-decode-timer session)
-          (run-at-time 0 nil #'emacs-jupyter-notebook-helper--decode-continuation session))))
+          (run-at-time emacs-jupyter-notebook-helper--continuation-delay nil
+                       #'emacs-jupyter-notebook-helper--decode-continuation session))))
 
 (defun emacs-jupyter-notebook-helper--decode-continuation (session)
   "Continue bounded decode work outside a process-filter invocation."
@@ -947,8 +953,7 @@ timer handle or sending a hello frame."
         (while (and (emacs-jupyter-notebook-helper-session-raw-chunks session)
                     (< frames emacs-jupyter-notebook-helper--filter-max-frames)
                     (not (emacs-jupyter-notebook-helper-session-pending-failure session))
-                    (or (emacs-jupyter-notebook-helper-session-decode-remaining session)
-                        (< payload-bytes emacs-jupyter-notebook-helper--filter-max-payload-bytes)))
+                    (< payload-bytes emacs-jupyter-notebook-helper--filter-max-payload-bytes))
           (if (null (emacs-jupyter-notebook-helper-session-decode-remaining session))
               (let* ((prefix (or (emacs-jupyter-notebook-helper-session-decode-prefix session) ""))
                      (piece (emacs-jupyter-notebook-helper--raw-take session (- 4 (length prefix))))
@@ -966,7 +971,6 @@ timer handle or sending a hello frame."
                           (emacs-jupyter-notebook-helper-session-decode-wire-size session) (+ payload 4)))))
             (let* ((remaining (emacs-jupyter-notebook-helper-session-decode-remaining session))
                    (room (- emacs-jupyter-notebook-helper--filter-max-payload-bytes payload-bytes)))
-              (when (<= room 0) (cl-return))
               (let* ((piece (emacs-jupyter-notebook-helper--raw-take session (min remaining room)))
                      (amount (length piece))
                      (objects (ejn-helper-protocol-decoder-feed decoder piece)))

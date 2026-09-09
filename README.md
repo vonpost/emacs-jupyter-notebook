@@ -445,6 +445,15 @@ Frontend integration:
 - **Company**: when `company-mode` is on and no popup is open, the reply path kicks `company-manual-begin` so the popup picks up the fresh candidates.
 - **Cape** and similar capf composers: just include `emacs-jupyter-notebook-completion-at-point` in your `completion-at-point-functions` (the minor mode does this for you).
 
+Late replies only open completion UI while the source buffer is still selected
+and no minibuffer is active. Reconnect, missing-host, array-axis and kernel-input
+prompts wait for their originating buffer, so background work cannot take over
+M-x or a file picker. Quitting a deferred prompt retires that interaction.
+
+See the [responsiveness review](docs/hang-review-2026-09-09.md) for tested hang
+scenarios and instructions for capturing a backtrace when the minibuffer itself
+is unresponsive.
+
 Tuning:
 
 - `emacs-jupyter-notebook-completion-idle` — seconds of typing pause before an async request fires. Lower values feel snappier; higher values hammer the kernel less during fast typing.

@@ -1,0 +1,167 @@
+;;; emacs-jupyter-notebook-panel-hang-tests.el --- Panel responsiveness regressions -*- lexical-binding: t; -*-
+
+(require 'ert)
+(require 'cl-lib)
+(require 'emacs-jupyter-notebook-result)
+
+(defvar emacs-jupyter-notebook-artifacts--prune-process)
+(defvar emacs-jupyter-notebook-artifacts--prune-timer)
+
+(ert-deftest ejn-panel-hang-startup-prune-is-supervised-and-never-scans-in-emacs ()
+  (let ((emacs-jupyter-notebook-artifacts--startup-pruned nil)
+        (emacs-jupyter-notebook-artifacts--prune-process nil)
+        (emacs-jupyter-notebook-artifacts--prune-timer nil)
+        command watchdog synchronous-prune deleted cancelled)
+    (cl-letf (((symbol-function 'emacs-jupyter-notebook-artifacts-prune-stale)
+               (lambda () (setq synchronous-prune t)))
+              ((symbol-function 'make-process)
+               (lambda (&rest args)
+                 (setq command (plist-get args :command)) 'pruner))
+              ((symbol-function 'run-at-time)
+               (lambda (seconds repeat callback &rest args)
+                 (should (and (numberp seconds) (> seconds 0) (<= seconds 30)))
+                 (should-not repeat)
+                 (setq watchdog (cons callback args)) 'prune-timer))
+              ((symbol-function 'timerp) (lambda (value) (eq value 'prune-timer)))
+              ((symbol-function 'cancel-timer) (lambda (timer) (push timer cancelled)))
+              ((symbol-function 'processp) (lambda (value) (eq value 'pruner)))
+              ((symbol-function 'process-live-p) (lambda (_process) t))
+              ((symbol-function 'delete-process) (lambda (process) (push process deleted))))
+      (emacs-jupyter-notebook-artifacts--prune-once)
+      (should-not synchronous-prune)
+      (should (equal (seq-take (cdr command) 2) '("-Q" "--batch")))
+      (should (eq emacs-jupyter-notebook-artifacts--prune-process 'pruner))
+      (should watchdog)
+      (emacs-jupyter-notebook-artifacts--prune-once)
+      (apply (car watchdog) (cdr watchdog))
+      (should (equal deleted '(pruner)))
+      (should (equal cancelled '(prune-timer)))
+      (should-not emacs-jupyter-notebook-artifacts--prune-process)
+      (should-not emacs-jupyter-notebook-artifacts--prune-timer)
+      (apply (car watchdog) (cdr watchdog))
+      (should (equal deleted '(pruner))))))
+
+(ert-deftest ejn-panel-hang-prune-watchdog-setup-failure-reaps-child ()
+  (let ((emacs-jupyter-notebook-artifacts--startup-pruned nil)
+        (emacs-jupyter-notebook-artifacts--prune-process nil)
+        (emacs-jupyter-notebook-artifacts--prune-timer nil)
+        deleted)
+    (cl-letf (((symbol-function 'make-process) (lambda (&rest _) 'pruner))
+              ((symbol-function 'run-at-time) (lambda (&rest _) (error "no timer")))
+              ((symbol-function 'processp) (lambda (value) (eq value 'pruner)))
+              ((symbol-function 'process-live-p) (lambda (_process) t))
+              ((symbol-function 'delete-process) (lambda (process) (push process deleted))))
+      (emacs-jupyter-notebook-artifacts--prune-once)
+      (should (equal deleted '(pruner)))
+      (should-not emacs-jupyter-notebook-artifacts--prune-process)
+      (should-not emacs-jupyter-notebook-artifacts--prune-timer))))
+
+(ert-deftest ejn-panel-hang-follow-does-not-allocate-unevaluated-cell-identities ()
+  (save-window-excursion
+    (with-temp-buffer
+      (python-mode)
+      (dotimes (_ 100) (insert "# %%\nx = 1\n"))
+      (let ((source (current-buffer))
+            (panel (ejn-panel-ensure (current-buffer))))
+        (unwind-protect
+            (progn
+              (switch-to-buffer source)
+              (display-buffer panel)
+              (goto-char (point-min))
+              (dotimes (_ 100)
+                (emacs-jupyter-notebook-panel--source-post-command t)
+                (forward-line 2))
+              (should (= emacs-jupyter-notebook--cell-key-next-id 0)))
+          (when (buffer-live-p panel) (kill-buffer panel)))))))
+
+(ert-deftest ejn-panel-hang-cell-bounds-reuses-current-cell-scan ()
+  (with-temp-buffer
+    (python-mode)
+    (insert "# %% first\na = 1\nb = 2\n# %% second\nc = 3\n")
+    (goto-char 13)
+    (let ((calls 0) (original (symbol-function 'code-cells--bounds)))
+      (cl-letf (((symbol-function 'code-cells--bounds)
+                 (lambda (&rest args) (cl-incf calls) (apply original args))))
+        (let ((bounds (emacs-jupyter-notebook-cell-full-bounds)))
+          (forward-char 1)
+          (should (equal bounds (emacs-jupyter-notebook-cell-full-bounds)))
+          (should (= calls 1))
+          (insert "x")
+          (should (= (cdr (emacs-jupyter-notebook-cell-full-bounds))
+                     (1+ (cdr bounds))))
+          (should (= calls 2))
+          (goto-char (point-max))
+          (should (> (car (emacs-jupyter-notebook-cell-full-bounds)) (car bounds)))
+          (save-restriction
+            (narrow-to-region 13 18)
+            (goto-char 14)
+            (should (equal (emacs-jupyter-notebook-cell-full-bounds) '(13 . 18)))))))))
+
+(ert-deftest ejn-panel-hang-large-source-editing-skips-scans-but-retires-deleted-cells ()
+  (save-window-excursion
+    (with-temp-buffer
+      (python-mode)
+      (insert "# %% first\n" (make-string (* 2 1024 1024) ?x) "\n")
+      (let* ((second-start (point))
+             (_ (insert "# %% second\n2\n"))
+             (first (emacs-jupyter-notebook--cell-key-for (point-min)))
+             (second (emacs-jupyter-notebook--cell-key-for second-start))
+             (source (current-buffer))
+             (panel (ejn-panel-ensure source))
+             (one (ejn-panel-start-entry panel first "first"))
+             (two (ejn-panel-start-entry panel second "second")))
+        (emacs-jupyter-notebook-cell-tracking-enable)
+        (unwind-protect
+            (cl-letf (((symbol-function 'emacs-jupyter-notebook-cell-full-bounds)
+                       (lambda () (ert-fail "Automatic full source scan"))))
+              (switch-to-buffer source)
+              (display-buffer panel)
+              (goto-char 12)
+              (emacs-jupyter-notebook-panel--source-post-command)
+              (dotimes (_ 10) (insert "z"))
+              (should (ejn-panel-entry-live-p one))
+              (should (ejn-panel-entry-live-p two))
+              (delete-region (point-min) 6)
+              (should-not (ejn-panel-entry-live-p one))
+              (should (ejn-panel-entry-live-p two)))
+          (emacs-jupyter-notebook-cell-tracking-disable)
+          (when (buffer-live-p panel) (kill-buffer panel)))))))
+
+(ert-deftest ejn-panel-hang-native-preview-bounds-scaled-surface-and-slice-count ()
+  (let* ((image (list 'image :type 'pbm :file "/tmp/unused"
+                      :ejn-publication-root "/tmp/unused-root"
+                      :ejn-preview (list :file "/tmp/unused" :width 800 :height 800)
+                      :scale (expt 1.2 100)))
+         (native (emacs-jupyter-notebook-panel--native-preview-spec image))
+         (scale (plist-get (cdr native) :scale)))
+    (should (<= (* 800 scale) 2048))
+    (cl-letf (((symbol-function 'frame-char-height) (lambda (&rest _) 1)))
+      (should (<= (emacs-jupyter-notebook-panel--trusted-preview-slice-rows image) 256)))))
+
+(ert-deftest ejn-panel-hang-repeated-zoom-keeps-retained-image-bounded ()
+  (with-temp-buffer
+    (let* ((panel (ejn-panel-ensure (current-buffer)))
+           (handle (ejn-panel-start-entry panel '("test.py" . 1) "plot")))
+      (unwind-protect
+          (progn
+            (ejn-panel-set-image handle
+                                 '(image :type png :scale 1.0
+                                         :ejn-preview (:width 800 :height 800)))
+            (emacs-jupyter-notebook-panel-flush-now panel)
+            (with-current-buffer panel
+              (goto-char (car (emacs-jupyter-notebook-panel--entry-bounds
+                               (plist-get handle :id))))
+              (dotimes (_ 100) (emacs-jupyter-notebook-panel-image-zoom-in)))
+            (let ((image (car (ejn-panel-entry-images handle))))
+              (should (<= (* 800 (plist-get (cdr image) :scale)) 2048))))
+        (when (buffer-live-p panel) (kill-buffer panel))))))
+
+(ert-deftest ejn-panel-hang-output-does-not-wrap-pathological-lines ()
+  (with-temp-buffer
+    (emacs-jupyter-notebook-panel-mode)
+    (should truncate-lines)
+    (should-not bidi-display-reordering)
+    (when (boundp 'bidi-inhibit-bpa) (should bidi-inhibit-bpa))))
+
+(provide 'emacs-jupyter-notebook-panel-hang-tests)
+;;; emacs-jupyter-notebook-panel-hang-tests.el ends here

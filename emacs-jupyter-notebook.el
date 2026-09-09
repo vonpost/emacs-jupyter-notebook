@@ -20,6 +20,7 @@
 (require 'ansi-color)
 (require 'json)
 (require 'emacs-jupyter-notebook-vars)
+(require 'emacs-jupyter-notebook-ui)
 (require 'emacs-jupyter-notebook-cell)
 (require 'emacs-jupyter-notebook-registry)
 (require 'emacs-jupyter-notebook-connection)
@@ -1203,6 +1204,8 @@ Bound under `emacs-jupyter-notebook-prefix-key' in
 A single prefix (`emacs-jupyter-notebook-prefix-key', default `C-c j')
 hosts the entire command surface.  See `emacs-jupyter-notebook-prefix-map'.")
 
+(defvar evil-visual-beginning)
+(defvar evil-visual-end)
 (declare-function evil-define-minor-mode-key "evil-core"
                   (state mode key def &rest bindings))
 (with-eval-after-load 'evil
@@ -1807,6 +1810,7 @@ executes."
   (ignore-errors (emacs-jupyter-notebook--clear-buffer-timers))
   (ignore-errors (emacs-jupyter-notebook-variables-invalidate))
   (ignore-errors (emacs-jupyter-notebook--heartbeat-cancel))
+  (ignore-errors (emacs-jupyter-notebook-ui-cancel))
   (ignore-errors (emacs-jupyter-notebook--cancel-auto-reconnect))
   (ignore-errors
     (when emacs-jupyter-notebook--client
@@ -1905,6 +1909,7 @@ panel's own kill-buffer-hook only cancels its flush timer)."
     (code-cells-mode -1)
     (emacs-jupyter-notebook-cell-tracking-disable)
     (emacs-jupyter-notebook-variables-teardown)
+    (emacs-jupyter-notebook-ui-cancel)
     (remove-hook 'completion-at-point-functions
                  #'emacs-jupyter-notebook-completion-at-point t)
     (remove-hook 'after-change-functions
@@ -2581,17 +2586,24 @@ completion or `cancelled'.  Failed/timed-out hosts are classified `unknown'."
         (error "No registry entry selected"))))
 
 (defun emacs-jupyter-notebook--registry-picker-finish (token callback entries)
-  "Finish TOKEN and invoke CALLBACK with a user-selected entry from ENTRIES."
+  "Defer TOKEN's picker until its source buffer owns the minibuffer."
   (when (emacs-jupyter-notebook--management-active-p token)
-    (emacs-jupyter-notebook--management-finish token)
     (if (null entries)
-        (message "emacs-jupyter-notebook: all registered kernels are dead")
-      (condition-case err
-          (funcall callback (emacs-jupyter-notebook--choose-registry-entry entries))
-        (quit nil)
-        (error
-         (message "emacs-jupyter-notebook: picker failed: %s"
-                  (error-message-string err)))))))
+        (progn
+          (emacs-jupyter-notebook--management-finish token)
+          (message "emacs-jupyter-notebook: all registered kernels are dead"))
+      (emacs-jupyter-notebook-ui-defer
+       (current-buffer)
+       (lambda () (emacs-jupyter-notebook--management-active-p token))
+       (lambda ()
+         (unwind-protect
+             (let ((selected
+                    (emacs-jupyter-notebook--choose-registry-entry entries)))
+               (when (emacs-jupyter-notebook--management-active-p token)
+                 (emacs-jupyter-notebook--management-finish token)
+                 (funcall callback selected)))
+           (emacs-jupyter-notebook--management-finish token)))
+       nil 'registry-picker))))
 
 (defun emacs-jupyter-notebook--read-registry-entry-async (callback)
   "Read, probe, revision-prune, and choose a registry entry asynchronously."
@@ -5137,38 +5149,37 @@ Never sends a request and never blocks."
       (emacs-jupyter-notebook--completion-result-from-reply reply))))
 
 (defun emacs-jupyter-notebook--completion-refresh-ui ()
-  "Push freshly-cached candidates to the active completion frontend.
-Behavior (W3.7):
-- If `company-mode' is on and no popup is yet open, kick
-  `company-manual-begin' so company picks up the fresh cache.
-- If no completion popup is active, drive `completion-in-region'
-  directly with the cached result (covers explicit `complete-at-point'
-  invocations and the vanilla path).
-- If `completion-in-region-mode' is already active (Corfu, vertico,
-  consult-completion-in-region, etc.) do nothing: there is no
-  cross-version programmatic way to force the popup to re-fetch capf
-  candidates.  The next user keystroke causes capf to be re-invoked
-  naturally and the popup picks up the new cache then."
-  ;; Justification for the missing Corfu hook: `corfu--exhibit' only
-  ;; redisplays current corfu state; it does not refresh candidates from
-  ;; would stay empty.  We instead rely on the fallback path: when the
-  ;; cache fills, the next user keystroke causes capf to be re-invoked
-  ;; naturally and the popup picks up the new candidates.  For the
-  ;; explicit-completion case (no popup yet active) we drive
-  ;; `completion-in-region' directly.
-  (cond
-   ((and (bound-and-true-p company-mode)
-         (not (bound-and-true-p company-candidates))
-         (fboundp 'company-manual-begin))
-    (funcall 'company-manual-begin))
-   ((not (bound-and-true-p completion-in-region-mode))
-    (let ((result (emacs-jupyter-notebook--completion-result)))
-      (when result
-        ;; capf return shape is `(START END COLLECTION . CAPF-PROPS)'
-        ;; where CAPF-PROPS include `:exclusive', `:annotation-function',
-        ;; etc.  `completion-in-region' does NOT accept those trailing
-        ;; keywords, so strip them before calling.
+  "Offer cached completion only when the source buffer still owns input.
+Late replies must not enter Consult/Vertico or Company from another buffer
+or interrupt an existing minibuffer.  Cached candidates remain available
+for the next explicit completion or frontend refresh."
+  (when (emacs-jupyter-notebook-ui-available-p (current-buffer))
+    (cond
+     ((and (bound-and-true-p company-mode)
+           (not (bound-and-true-p company-candidates))
+           (fboundp 'company-manual-begin))
+      (funcall 'company-manual-begin))
+     ((not (bound-and-true-p completion-in-region-mode))
+      (when-let ((result (emacs-jupyter-notebook--completion-result)))
         (apply #'completion-in-region (seq-take result 3)))))))
+
+(defun emacs-jupyter-notebook--completion-present
+    (buffer client request-id context &optional explicit)
+  "Present cached completion after unwinding the reply's process callback.
+Abandon popup delivery if the user moves to another buffer or minibuffer."
+  (when (emacs-jupyter-notebook-ui-available-p buffer)
+    (emacs-jupyter-notebook-ui-defer
+     buffer
+     (lambda ()
+       (and (emacs-jupyter-notebook-ui-available-p buffer)
+            (eq client emacs-jupyter-notebook--client)
+            (= request-id emacs-jupyter-notebook--completion-request-counter)
+            (emacs-jupyter-notebook--completion-context-current-p context)))
+     (lambda ()
+       (if (and explicit (not (emacs-jupyter-notebook--completion-result)))
+           (message "No completions")
+         (emacs-jupyter-notebook--completion-refresh-ui)))
+     nil 'completion)))
 
 (defun emacs-jupyter-notebook--completion-on-reply
     (buffer client key request-id show-results context-snapshot reply _error)
@@ -5193,7 +5204,8 @@ being cached for the original context after the user moved away from it
                     context-snapshot))
           (emacs-jupyter-notebook--completion-cache-put key reply)
           (when show-results
-            (emacs-jupyter-notebook--completion-refresh-ui)))))))
+            (emacs-jupyter-notebook--completion-present
+             buffer client request-id context-snapshot)))))))
 
 (defun emacs-jupyter-notebook--request-completion (&optional show-results)
   "Fire an async completion request for point.
@@ -5338,11 +5350,8 @@ and reports `No completions' rather than doing nothing."
                         (emacs-jupyter-notebook--completion-context-current-p
                          context))
                (emacs-jupyter-notebook--completion-cache-put key reply)
-               (let ((result (emacs-jupyter-notebook--completion-result-from-reply
-                              reply)))
-                 (if (and result (nth 2 result) (> (length (nth 2 result)) 0))
-                     (apply #'completion-in-region (seq-take result 3))
-                   (message "No completions")))))))
+               (emacs-jupyter-notebook--completion-present
+                buffer client request-id context t)))))
        #'ignore))))
 
 (defun emacs-jupyter-notebook-complete-at-point ()
@@ -6054,16 +6063,59 @@ revision-checked lifecycle callbacks."
       (setq buffer-read-only t))
     (display-buffer buf)))
 
+(defun emacs-jupyter-notebook--start-remote-kernel-prompt-host
+    (profile-name callback error-callback preflight-context)
+  "Defer missing host input for an admitted PROFILE-NAME start.
+Reuse PREFLIGHT-CONTEXT when supplied.  Otherwise establish a cancellable,
+bounded context before yielding; no local transport is replaced until input
+returns and the exact context has been revalidated."
+  (emacs-jupyter-notebook--ensure-selected-backend)
+  (let ((context
+         (or preflight-context
+             (emacs-jupyter-notebook--async-new-context
+              :phase 'host-input :origin-buffer (current-buffer)
+              :callback callback :error-callback error-callback :owns-kernel nil))))
+    (setq emacs-jupyter-notebook--async-context context)
+    (setq context (emacs-jupyter-notebook--async-put context :phase 'host-input))
+    (unless preflight-context
+      (setq context (emacs-jupyter-notebook--async-arm-overall-timeout context)))
+    (when (emacs-jupyter-notebook--async-context-live-p context)
+      (condition-case err
+          (emacs-jupyter-notebook-ui-defer
+           (current-buffer)
+           (lambda () (emacs-jupyter-notebook--async-context-live-p context))
+           (lambda ()
+             (condition-case input-error
+                 (let ((profile (emacs-jupyter-notebook--read-host-profile profile-name)))
+                   (when (emacs-jupyter-notebook--async-context-live-p context)
+                     (emacs-jupyter-notebook--start-remote-kernel-admitted
+                      profile-name nil nil context profile)))
+               (quit
+                (when (emacs-jupyter-notebook--async-context-live-p context)
+                  (emacs-jupyter-notebook--cancel-async-operation
+                   context "Remote host input cancelled")))
+               (error
+                (when (emacs-jupyter-notebook--async-context-live-p context)
+                  (emacs-jupyter-notebook--async-fail
+                   context (error-message-string input-error))))))
+           nil 'start-host)
+        (error
+         (when (emacs-jupyter-notebook--async-context-live-p context)
+           (emacs-jupyter-notebook--async-fail
+            context (error-message-string err))))))
+    context))
+
 ;;;###autoload
 (defun emacs-jupyter-notebook--start-remote-kernel-admitted
-    (profile-name &optional callback error-callback preflight-context)
+    (profile-name &optional callback error-callback preflight-context resolved-profile)
   "Start PROFILE-NAME after a proven-empty registry lookup.
 
 CALLBACK and ERROR-CALLBACK are used only when this function creates its own
 start context.  PREFLIGHT-CONTEXT, when non-nil, is the still-live lookup
 context created by `emacs-jupyter-notebook-start-remote-kernel'.  Reusing it
 preserves one overall deadline, its guarded registry owner, and the caller's
-callbacks; it also makes a second registry read impossible.
+callbacks; it also makes a second registry read impossible.  RESOLVED-PROFILE
+is supplied only by the deferred host-input continuation.
 
 This is intentionally private.  Public callers must use the durable registry
 preflight in `emacs-jupyter-notebook-start-remote-kernel' unless they have
@@ -6071,53 +6123,59 @@ already proved that the current file has no registered session."
   (when (or (null preflight-context)
             (emacs-jupyter-notebook--async-context-live-p preflight-context))
     (condition-case err
-        (progn
-          ;; A registry row for this file was just proved absent.  It is now
-          ;; safe to discard client-less LOCAL debris.  Temporarily unhook the
-          ;; preflight context: the general local disposer is deliberately
-          ;; allowed to cancel any current context, while this one must retain
-          ;; its one bounded deadline and callback identity.
-          (when preflight-context
-            (let ((saved-context emacs-jupyter-notebook--async-context))
-              (unwind-protect
-                  (progn
-                    (setq emacs-jupyter-notebook--async-context nil)
-                    (emacs-jupyter-notebook--ensure-clean-before-start))
-                (when (buffer-live-p (plist-get preflight-context :origin-buffer))
-                  (setq emacs-jupyter-notebook--async-context saved-context)))))
-          (unless preflight-context
-            (emacs-jupyter-notebook--ensure-clean-before-start))
-          (emacs-jupyter-notebook--ensure-selected-backend)
-          (let* ((profile (emacs-jupyter-notebook--read-host-profile profile-name))
-                 (session-id (emacs-jupyter-notebook--new-session-id
-                              (file-name-base buffer-file-name)))
-                 (resolution (emacs-jupyter-notebook-ssh-build-kernelspec-resolution
-                              profile session-id))
-                 (entry (list :profile (plist-get profile :profile)
-                              :remote-host (emacs-jupyter-notebook-ssh-destination profile)
-                              :remote-cwd (plist-get profile :remote-cwd)
-                              :kernelspec (plist-get profile :kernelspec)
-                              :remote-pid nil
-                              :created-at (emacs-jupyter-notebook--timestamp)
-                              :tunnel-ports nil
-                              :display-name
-                              (format "%s:%s"
-                                      (emacs-jupyter-notebook-ssh-destination profile)
-                                      (plist-get profile :kernelspec))
-                              :session-id session-id
-                              :local-file (expand-file-name buffer-file-name)))
-                 (context
-                  (or preflight-context
-                      (emacs-jupyter-notebook--async-start-context
-                       profile entry session-id resolution callback error-callback))))
-            (when preflight-context
-              (setq context (emacs-jupyter-notebook--async-put context :phase 'resolve))
-              (setq context (emacs-jupyter-notebook--async-put context :profile profile))
-              (setq context (emacs-jupyter-notebook--async-put context :entry entry))
-              (setq context (emacs-jupyter-notebook--async-put context :session-id session-id))
-              (setq context (emacs-jupyter-notebook--async-put context :resolution resolution))
-              (setq context (emacs-jupyter-notebook--async-put context :owns-kernel t)))
-            (emacs-jupyter-notebook--async-resolve-kernelspec context)))
+        (let ((profile (or resolved-profile
+                           (emacs-jupyter-notebook-ssh-profile profile-name))))
+          (if (not (or (plist-get profile :host) (plist-get profile :remote-host)))
+              (emacs-jupyter-notebook--start-remote-kernel-prompt-host
+               profile-name callback error-callback preflight-context)
+            (progn
+              ;; A registry row for this file was just proved absent.  It is now
+              ;; safe to discard client-less LOCAL debris.  Temporarily unhook the
+              ;; preflight context: the general local disposer is deliberately
+              ;; allowed to cancel any current context, while this one must retain
+              ;; its one bounded deadline and callback identity.
+              (when preflight-context
+		(let ((saved-context emacs-jupyter-notebook--async-context))
+		  (unwind-protect
+                      (progn
+			(setq emacs-jupyter-notebook--async-context nil)
+			(emacs-jupyter-notebook--ensure-clean-before-start))
+                    (when (buffer-live-p (plist-get preflight-context :origin-buffer))
+                      (setq emacs-jupyter-notebook--async-context saved-context)))))
+              (unless preflight-context
+		(emacs-jupyter-notebook--ensure-clean-before-start))
+              (emacs-jupyter-notebook--ensure-selected-backend)
+              (let* ((profile (or resolved-profile
+				  (emacs-jupyter-notebook--read-host-profile profile-name)))
+                     (session-id (emacs-jupyter-notebook--new-session-id
+				  (file-name-base buffer-file-name)))
+                     (resolution (emacs-jupyter-notebook-ssh-build-kernelspec-resolution
+				  profile session-id))
+                     (entry (list :profile (plist-get profile :profile)
+				  :remote-host (emacs-jupyter-notebook-ssh-destination profile)
+				  :remote-cwd (plist-get profile :remote-cwd)
+				  :kernelspec (plist-get profile :kernelspec)
+				  :remote-pid nil
+				  :created-at (emacs-jupyter-notebook--timestamp)
+				  :tunnel-ports nil
+				  :display-name
+				  (format "%s:%s"
+					  (emacs-jupyter-notebook-ssh-destination profile)
+					  (plist-get profile :kernelspec))
+				  :session-id session-id
+				  :local-file (expand-file-name buffer-file-name)))
+                     (context
+                      (or preflight-context
+			  (emacs-jupyter-notebook--async-start-context
+			   profile entry session-id resolution callback error-callback))))
+		(when preflight-context
+		  (setq context (emacs-jupyter-notebook--async-put context :phase 'resolve))
+		  (setq context (emacs-jupyter-notebook--async-put context :profile profile))
+		  (setq context (emacs-jupyter-notebook--async-put context :entry entry))
+		  (setq context (emacs-jupyter-notebook--async-put context :session-id session-id))
+		  (setq context (emacs-jupyter-notebook--async-put context :resolution resolution))
+		  (setq context (emacs-jupyter-notebook--async-put context :owns-kernel t)))
+		(emacs-jupyter-notebook--async-resolve-kernelspec context)))))
       (error
        (if preflight-context
            (emacs-jupyter-notebook--async-fail
@@ -6247,12 +6305,22 @@ OWNER identifies an `explicit', `evaluation', or `automatic' initiator."
          (funcall error-callback context error-data))
        (when (and interactivep
                   (memq (plist-get context :error-kind)
-                        '(kernel-dead kernel-mismatch))
-                  (y-or-n-p
-                   (concat
-                    "The registered kernel is gone (possibly after its idle "
-                    "timeout); start a fresh kernel on the same profile? ")))
-         (emacs-jupyter-notebook-retry-fresh-kernel profile-name)))
+                        '(kernel-dead kernel-mismatch)))
+         (let ((source (current-buffer)))
+           (emacs-jupyter-notebook-ui-defer
+            source
+            (lambda ()
+              (and (eq context emacs-jupyter-notebook--async-context)
+                   (not (emacs-jupyter-notebook--async-in-progress-p))))
+            (lambda ()
+              (when (and
+                     (y-or-n-p
+                      (concat "The registered kernel is gone; "
+                              "start a fresh kernel on the same profile? "))
+                     (eq context emacs-jupyter-notebook--async-context)
+                     (not (emacs-jupyter-notebook--async-in-progress-p)))
+                (emacs-jupyter-notebook-retry-fresh-kernel profile-name)))
+            nil 'reconnect-recovery))))
      (or owner 'explicit))))
 
 (defun emacs-jupyter-notebook--reconnect-remote-kernel-ready

@@ -130,7 +130,7 @@ Each subscription coalesces publications into a single pending timer.")
         :buildable (null emacs-jupyter-notebook-inspector-command)))
 
 (defun emacs-jupyter-notebook-inspect--send (state id op params)
-  (process-send-string
+  (emacs-jupyter-notebook-process-send
    (ejn-inspection-process state)
    (ejn-helper-protocol-encode
     (emacs-jupyter-notebook-inspect--object "v" 1 "id" id "op" op "params" params)

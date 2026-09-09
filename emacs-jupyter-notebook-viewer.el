@@ -33,6 +33,7 @@
 (require 'json)
 (require 'subr-x)
 (require 'emacs-jupyter-notebook-vars)
+(require 'emacs-jupyter-notebook-process)
 
 (declare-function emacs-jupyter-notebook--log-append
                   "emacs-jupyter-notebook" (phase format-string &rest args))
@@ -682,7 +683,7 @@ readable without hunting for the log buffer."
                 ;; Never send a hand-off frame after that outcome.
                 (when (and (emacs-jupyter-notebook-viewer--transaction-live-p state token)
                            (eq (plist-get state :connection) conn))
-                  (process-send-string
+                  (emacs-jupyter-notebook-process-send
                    conn
                    (concat (json-encode
                             `((id . ,request-id)

@@ -1773,39 +1773,41 @@ DISPOSALS receives local-only disposal reasons."
 
 (ert-deftest ejn-ei5-stdin-prompts-defer-and-clear-passwords ()
   "Normal, password, and quit replies leave the filter turn without prompting."
-  (dolist (case '((normal nil "answer") (password t "secret") (quit nil quit)))
-    (let ((source (generate-new-buffer " *ejn-ei5-input*")) seen secret)
-      (unwind-protect
-          (with-current-buffer source
-            (let ((session 'helper-session)
-                  (emacs-jupyter-notebook--client 'helper-session))
-              (setq secret (copy-sequence (if (eq (nth 2 case) 'quit)
-                                              "" (nth 2 case))))
-              (cl-letf (((symbol-function 'emacs-jupyter-notebook--execution-input-current-p)
-                         (lambda (_id) t))
-                        ((symbol-function 'emacs-jupyter-notebook-backend-input)
-                         (lambda (_client lease value &rest _)
-                           (setq seen (list lease (copy-sequence value)))))
-                        ((symbol-function 'read-string)
-                         (lambda (_prompt)
-                           (if (eq (nth 2 case) 'quit) (signal 'quit nil) secret)))
-                        ((symbol-function 'read-passwd)
-                         (lambda (_prompt) secret)))
-                (emacs-jupyter-notebook-events--schedule-input
-                 (list :buffer source :request-id nil
-                       :input-reply (emacs-jupyter-notebook--helper-input-reply
-                                     session 1 "wire" (make-string 32 ?a)))
-                 "Prompt: " (nth 1 case))
-                (should-not seen)
-                ;; Drain from another buffer: the lease closure must re-enter
-                ;; SOURCE rather than reading arbitrary buffer-local state.
-                (with-temp-buffer (ejn-ei2-test--run-timers))
-                (should (equal (caar seen) "wire"))
-                (should (equal (cadr seen)
-                               (if (eq (nth 2 case) 'quit) "" (nth 2 case))))
-                (when (nth 1 case)
-                  (should-not (equal secret "secret"))))))
-        (when (buffer-live-p source) (kill-buffer source))))))
+  (save-window-excursion
+    (dolist (case '((normal nil "answer") (password t "secret") (quit nil quit)))
+      (let ((source (generate-new-buffer " *ejn-ei5-input*")) seen secret)
+        (unwind-protect
+            (with-current-buffer source
+              (set-window-buffer (selected-window) source)
+              (let ((session 'helper-session)
+                    (emacs-jupyter-notebook--client 'helper-session))
+                (setq secret (copy-sequence (if (eq (nth 2 case) 'quit)
+                                                "" (nth 2 case))))
+                (cl-letf (((symbol-function 'emacs-jupyter-notebook--execution-input-current-p)
+                           (lambda (_id) t))
+                          ((symbol-function 'emacs-jupyter-notebook-backend-input)
+                           (lambda (_client lease value &rest _)
+                             (setq seen (list lease (copy-sequence value)))))
+                          ((symbol-function 'read-string)
+                           (lambda (_prompt)
+                             (if (eq (nth 2 case) 'quit) (signal 'quit nil) secret)))
+                          ((symbol-function 'read-passwd)
+                           (lambda (_prompt) secret)))
+                         (emacs-jupyter-notebook-events--schedule-input
+                          (list :buffer source :request-id nil
+                                :input-reply (emacs-jupyter-notebook--helper-input-reply
+                                              session 1 "wire" (make-string 32 ?a)))
+                          "Prompt: " (nth 1 case))
+                         (should-not seen)
+                         ;; Drain from another buffer: the lease closure must re-enter
+                         ;; SOURCE rather than reading arbitrary buffer-local state.
+                         (with-temp-buffer (accept-process-output nil 0.15))
+                         (should (equal (caar seen) "wire"))
+                         (should (equal (cadr seen)
+                                        (if (eq (nth 2 case) 'quit) "" (nth 2 case))))
+                         (when (nth 1 case)
+                           (should-not (equal secret "secret"))))))
+          (when (buffer-live-p source) (kill-buffer source)))))))
 
 (ert-deftest ejn-ei5-helper-complete-inspect-real-replies-and-deadlines ()
   "The fake helper exercises successful, malformed, and bounded aux replies."
@@ -2022,28 +2024,32 @@ DISPOSALS receives local-only disposal reasons."
 
 (ert-deftest ejn-ei5-explicit-completion-drops-late-context-replies ()
   "Explicit completion accepts only the newest reply for the live context."
-  (with-temp-buffer
-    (python-mode)
-    (insert "# %%\nobj.pri\n")
-    (goto-char (point-min))
-    (search-forward "pri")
-    (let ((emacs-jupyter-notebook-mode t)
-          (emacs-jupyter-notebook--client 'client-a)
-          callbacks refreshes)
-      (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-aux)
-                (lambda (_client _operation _payload success _failure)
-                   (push success callbacks)))
-                ((symbol-function 'completion-in-region)
-                 (lambda (&rest _) (setq refreshes (1+ (or refreshes 0))))))
-        (emacs-jupyter-notebook--complete-explicit-now)
-        (emacs-jupyter-notebook--complete-explicit-now)
-        (let ((newest (car callbacks)) (older (cadr callbacks)))
-          (funcall older 1
-                   '(:matches ("old") :cursor_start 0 :cursor_end 3))
-          (should-not refreshes)
-          (funcall newest 2
-                   '(:matches ("new") :cursor_start 0 :cursor_end 3))
-          (should (= refreshes 1)))))))
+  (save-window-excursion
+    (with-temp-buffer
+      (set-window-buffer (selected-window) (current-buffer))
+      (python-mode)
+      (insert "# %%\nobj.pri\n")
+      (goto-char (point-min))
+      (search-forward "pri")
+      (let ((emacs-jupyter-notebook-mode t)
+            (emacs-jupyter-notebook--client 'client-a)
+            callbacks refreshes)
+        (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-aux)
+                   (lambda (_client _operation _payload success _failure)
+                     (push success callbacks)))
+                  ((symbol-function 'completion-in-region)
+                   (lambda (&rest _) (setq refreshes (1+ (or refreshes 0))))))
+                 (emacs-jupyter-notebook--complete-explicit-now)
+                 (emacs-jupyter-notebook--complete-explicit-now)
+                 (let ((newest (car callbacks)) (older (cadr callbacks)))
+                   (funcall older 1
+                            '(:matches ("old") :cursor_start 0 :cursor_end 3))
+                   (should-not refreshes)
+                   (funcall newest 2
+                            '(:matches ("new") :cursor_start 0 :cursor_end 3))
+                   (should-not refreshes)
+                   (accept-process-output nil 0.15)
+                   (should (= refreshes 1))))))))
 
 (ert-deftest ejn-ei5-explicit-completion-drops-moved-edited-and-replaced-context ()
   "Explicit completion replies are no-ops after point, text, or client changes."
@@ -2147,85 +2153,87 @@ DISPOSALS receives local-only disposal reasons."
 
 (ert-deftest ejn-ei5-helper-input-event-replies-after-filter-with-exact-lease ()
   "Mapped helper stdin events prompt later and send one exact input_reply."
-  (dolist (case '((nil "answer") (t "password-canary") (nil quit)))
-    (with-temp-buffer
-      (python-mode)
-      (insert "# %%\ninput()\n")
-      (let* ((session (emacs-jupyter-notebook-backend-session-create
+  (save-window-excursion
+    (dolist (case '((nil "answer") (t "password-canary") (nil quit)))
+      (with-temp-buffer
+        (set-window-buffer (selected-window) (current-buffer))
+        (python-mode)
+        (insert "# %%\ninput()\n")
+        (let* ((session (emacs-jupyter-notebook-backend-session-create
                          nil (current-buffer)))
-             (state (emacs-jupyter-notebook-helper-backend--make-state
-                     :helper 'fake))
-             (panel (ejn-panel-ensure (current-buffer)))
-             (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
-             (generation (plist-get handle :generation))
-             (input-id (make-string 32 ?a))
-             (requests nil)
-             (prompted nil)
-             (secret (copy-sequence (if (eq (cadr case) 'quit)
-                                        "" (cadr case)))))
-        (setf (emacs-jupyter-notebook-backend-session-data session) state
-              (emacs-jupyter-notebook-helper-backend-state-emit state)
-              (lambda (event)
-                (emacs-jupyter-notebook--backend-event session event)))
-        ;; These values must be actual buffer-local state: the deferred event
-        ;; timer runs after the dynamic extent that admitted the helper event.
-        (setq emacs-jupyter-notebook--client session
-              emacs-jupyter-notebook-mode t
-              emacs-jupyter-notebook--execution-active-id 1
-              emacs-jupyter-notebook--execution-queue '(1)
-              emacs-jupyter-notebook--execution-ledger
-              (make-hash-table :test #'eql))
-        (let (messages)
-          (emacs-jupyter-notebook--execution-put
-           (list :id 1 :state 'dispatched :backend-request-id 9
-                 :generation generation :panel-entry handle))
-          (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper-request)
-                     (lambda (_helper operation params callback &rest _keys)
-                       (let ((snapshot (copy-hash-table params)))
-                         ;; The real supervisor serializes synchronously before
-                         ;; the UI unwind clears its password string.
-                         (when-let ((value (gethash "value" snapshot)))
-                           (puthash "value" (copy-sequence value) snapshot))
-                         (push (list operation snapshot) requests))
-                       (funcall callback 'fake
-                                (ejn-ei2-test--response
-                                (ejn-ei2-test--object "accepted" t)) nil)
-                       "input-reply-wire"))
-                    ((symbol-function 'read-string)
-                     (lambda (_prompt) (setq prompted t)
-                       (if (eq (cadr case) 'quit)
-                           (signal 'quit nil)
-                         secret)))
-                    ((symbol-function 'read-passwd)
-                     (lambda (_prompt) (setq prompted t) secret))
-                    ((symbol-function 'message)
-                     (lambda (format-string &rest args)
-                       (push (apply #'format format-string args) messages)))
-                    ((symbol-function 'emacs-jupyter-notebook--log-append)
-                     (lambda (format-string &rest args)
-                       (push (apply #'format format-string args) messages))))
-            (should
-             (emacs-jupyter-notebook-helper-backend--deliver-mapped-event
-              state "wire-execute"
-              (list :ledger-id 1 :backend-request-id 9 :panel-generation generation)
-              (ejn-ei2-test--object
-               "event" "input_request" "request_id" "wire-execute"
-               "data" (ejn-ei2-test--object
-                        "input_id" input-id "prompt" "Prompt: "
-                        "password" (if (car case) t :false)))))
-            ;; The helper process callback/filter turn never enters a prompt.
-            (should-not prompted)
-            (ejn-ei2-test--run-timers)
-            (should prompted)
-            (should (= (length requests) 1))
-            (should (equal (caar requests) "input_reply"))
-            (should (equal (gethash "request_id" (cadar requests))
-                           "wire-execute"))
-            (should (equal (gethash "input_id" (cadar requests)) input-id))
-            (should (equal (gethash "value" (cadar requests))
-                           (if (eq (cadr case) 'quit) "" (cadr case))))
-            (dolist (message messages)
-              (should-not (string-match-p "password-canary" message)))))))))
+               (state (emacs-jupyter-notebook-helper-backend--make-state
+                       :helper 'fake))
+               (panel (ejn-panel-ensure (current-buffer)))
+               (handle (ejn-panel-start-entry panel '("x.py" . 1) ""))
+               (generation (plist-get handle :generation))
+               (input-id (make-string 32 ?a))
+               (requests nil)
+               (prompted nil)
+               (secret (copy-sequence (if (eq (cadr case) 'quit)
+                                          "" (cadr case)))))
+          (setf (emacs-jupyter-notebook-backend-session-data session) state
+                (emacs-jupyter-notebook-helper-backend-state-emit state)
+                (lambda (event)
+                  (emacs-jupyter-notebook--backend-event session event)))
+          ;; These values must be actual buffer-local state: the deferred event
+          ;; timer runs after the dynamic extent that admitted the helper event.
+          (setq emacs-jupyter-notebook--client session
+                emacs-jupyter-notebook-mode t
+                emacs-jupyter-notebook--execution-active-id 1
+                emacs-jupyter-notebook--execution-queue '(1)
+                emacs-jupyter-notebook--execution-ledger
+                (make-hash-table :test #'eql))
+          (let (messages)
+            (emacs-jupyter-notebook--execution-put
+             (list :id 1 :state 'dispatched :backend-request-id 9
+                   :generation generation :panel-entry handle))
+            (cl-letf (((symbol-function 'emacs-jupyter-notebook-helper-request)
+                       (lambda (_helper operation params callback &rest _keys)
+                         (let ((snapshot (copy-hash-table params)))
+                           ;; The real supervisor serializes synchronously before
+                           ;; the UI unwind clears its password string.
+                           (when-let ((value (gethash "value" snapshot)))
+                             (puthash "value" (copy-sequence value) snapshot))
+                           (push (list operation snapshot) requests))
+                         (funcall callback 'fake
+                                  (ejn-ei2-test--response
+                                   (ejn-ei2-test--object "accepted" t)) nil)
+                         "input-reply-wire"))
+                      ((symbol-function 'read-string)
+                       (lambda (_prompt) (setq prompted t)
+                         (if (eq (cadr case) 'quit)
+                             (signal 'quit nil)
+                           secret)))
+                      ((symbol-function 'read-passwd)
+                       (lambda (_prompt) (setq prompted t) secret))
+                      ((symbol-function 'message)
+                       (lambda (format-string &rest args)
+                         (push (apply #'format format-string args) messages)))
+                      ((symbol-function 'emacs-jupyter-notebook--log-append)
+                       (lambda (format-string &rest args)
+                         (push (apply #'format format-string args) messages))))
+                     (should
+                      (emacs-jupyter-notebook-helper-backend--deliver-mapped-event
+                       state "wire-execute"
+                       (list :ledger-id 1 :backend-request-id 9 :panel-generation generation)
+                       (ejn-ei2-test--object
+                        "event" "input_request" "request_id" "wire-execute"
+                        "data" (ejn-ei2-test--object
+                                "input_id" input-id "prompt" "Prompt: "
+                                "password" (if (car case) t :false)))))
+                     ;; The helper process callback/filter turn never enters a prompt.
+                     (should-not prompted)
+                     (accept-process-output nil 0.15)
+                     (should prompted)
+                     (should (= (length requests) 1))
+                     (should (equal (caar requests) "input_reply"))
+                     (should (equal (gethash "request_id" (cadar requests))
+                                    "wire-execute"))
+                     (should (equal (gethash "input_id" (cadar requests)) input-id))
+                     (should (equal (gethash "value" (cadar requests))
+                                    (if (eq (cadr case) 'quit) "" (cadr case))))
+                     (dolist (message messages)
+                       (should-not (string-match-p "password-canary" message))))))))))
 
 (ert-deftest ejn-ei5-helper-input-reply-rejects-stale-and-duplicate-leases ()
   "A stale or already-consumed stdin lease must not send another request."

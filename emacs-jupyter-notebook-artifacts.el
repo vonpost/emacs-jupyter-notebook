@@ -37,7 +37,16 @@ non-numeric value disables pruning rather than widening deletion authority."
   lease lease-identity)
 
 (defvar emacs-jupyter-notebook-artifacts--startup-pruned nil
-  "Non-nil after this Emacs has performed its bounded startup prune.")
+  "Non-nil after this Emacs has attempted its asynchronous startup prune.")
+
+(defconst emacs-jupyter-notebook-artifacts--load-file
+  (or load-file-name buffer-file-name)
+  "Artifact module to load in the isolated local prune process.")
+
+(defvar emacs-jupyter-notebook-artifacts--prune-process nil
+  "The sole local startup-prune child, independent of kernel lifetime.")
+(defvar emacs-jupyter-notebook-artifacts--prune-timer nil
+  "Hard watchdog for the local startup-prune child.")
 
 (defun emacs-jupyter-notebook-artifacts--kind-prefix (kind)
   "Return the strict root prefix for artifact KIND, or nil."
@@ -350,11 +359,60 @@ ACQUIRE-LEASE is the internal sentinel `:no-lease'."
                   cap))))))
     (error nil)))
 
+(defun emacs-jupyter-notebook-artifacts--cancel-prune ()
+  "Retire the exact local prune child and its watchdog, never a kernel."
+  (let ((process emacs-jupyter-notebook-artifacts--prune-process)
+        (timer emacs-jupyter-notebook-artifacts--prune-timer))
+    (setq emacs-jupyter-notebook-artifacts--prune-process nil
+          emacs-jupyter-notebook-artifacts--prune-timer nil)
+    (when (timerp timer) (cancel-timer timer))
+    (when (and (processp process) (process-live-p process))
+      (ignore-errors (delete-process process)))))
+
+(add-hook 'kill-emacs-hook #'emacs-jupyter-notebook-artifacts--cancel-prune)
+
 (defun emacs-jupyter-notebook-artifacts--prune-once ()
-  "Run the bounded local startup prune once, never during module load."
+  "Prune stale roots once in a supervised local child, never during load.
+Directory enumeration, inode checks and bulk deletion all run outside the
+interactive Emacs.  A crashed prior session may leave arbitrarily many roots
+or leaves; root-count caps alone cannot bound that filesystem work."
   (unless emacs-jupyter-notebook-artifacts--startup-pruned
     (setq emacs-jupyter-notebook-artifacts--startup-pruned t)
-    (ignore-errors (emacs-jupyter-notebook-artifacts-prune-stale))))
+    (when (and (numberp emacs-jupyter-notebook-artifact-stale-age)
+               (> emacs-jupyter-notebook-artifact-stale-age 0))
+      (condition-case nil
+          (let* ((file-name-handler-alist nil)
+                 (default-directory temporary-file-directory)
+                 (module emacs-jupyter-notebook-artifacts--load-file)
+                 (directory (file-name-directory module))
+                 (executable (expand-file-name invocation-name invocation-directory))
+                 (form `(let ((temporary-file-directory ,temporary-file-directory)
+                              (emacs-jupyter-notebook-artifact-stale-age
+                               ,emacs-jupyter-notebook-artifact-stale-age))
+                          (emacs-jupyter-notebook-artifacts-prune-stale)))
+                 (process
+                  (make-process
+                   :name "ejn-artifact-prune" :buffer nil :noquery t
+                   :connection-type 'pipe :coding 'utf-8-unix
+                   :command (list executable "-Q" "--batch" "-L" directory
+                                  "-l" module "--eval" (prin1-to-string form))
+                   :filter #'ignore
+                   :sentinel
+                   (lambda (child _event)
+                     (when (and (eq child emacs-jupyter-notebook-artifacts--prune-process)
+                                (memq (process-status child) '(exit signal failed closed)))
+                       (emacs-jupyter-notebook-artifacts--cancel-prune))))))
+            (setq emacs-jupyter-notebook-artifacts--prune-process process)
+            (setq emacs-jupyter-notebook-artifacts--prune-timer
+                  (run-at-time
+                   30 nil
+                   (lambda ()
+                     (when (eq process emacs-jupyter-notebook-artifacts--prune-process)
+                       (emacs-jupyter-notebook-artifacts--cancel-prune)))))
+            ;; A very fast failure may settle while make-process is returning.
+            (unless (process-live-p process)
+              (emacs-jupyter-notebook-artifacts--cancel-prune)))
+        (error (emacs-jupyter-notebook-artifacts--cancel-prune))))))
 
 (defun emacs-jupyter-notebook-artifacts--cleanup-created-root
     (kind parent parent-identity root root-identity marker-identity)

@@ -14,6 +14,7 @@
 (require 'subr-x)
 (require 'ansi-color)
 (require 'emacs-jupyter-notebook-result)
+(require 'emacs-jupyter-notebook-ui)
 
 (defvar emacs-jupyter-notebook--kernel-status nil)
 (declare-function emacs-jupyter-notebook--execution-current-p
@@ -242,26 +243,25 @@ and `:password'; and truncation has optional `:text'."
           t)))))
 
 (defun emacs-jupyter-notebook-events--schedule-input (context prompt password)
-  "Schedule, rather than perform, the minibuffer input requested by EVENT.
-The timer rechecks request identity before prompt/reply so a retired source
-buffer or superseded execution cannot receive an input reply."
-  (let ((thunk
-         (lambda ()
-           (when (let ((buffer (plist-get context :buffer))
-                       (request-id (plist-get context :request-id)))
-                   (and (buffer-live-p buffer)
-                        (with-current-buffer buffer
-                          (or (null request-id)
-                              (emacs-jupyter-notebook--execution-input-current-p
-                               request-id)))))
-             (let ((value (condition-case nil
-                              (if password (read-passwd prompt) (read-string prompt))
-                            (quit ""))))
-               (unwind-protect
-                   (when-let ((reply (plist-get context :input-reply)))
-                     (funcall reply value))
-                 (when password (clear-string value))))))))
-    (run-at-time 0 nil thunk)))
+  "Read kernel input only when the originating buffer owns the minibuffer."
+  (let* ((source (plist-get context :buffer))
+         (request-id (plist-get context :request-id))
+         (current-p
+          (lambda ()
+            (or (null request-id)
+                (emacs-jupyter-notebook--execution-input-current-p request-id)))))
+    (emacs-jupyter-notebook-ui-defer
+     source current-p
+     (lambda ()
+       (let ((value (condition-case nil
+                        (if password (read-passwd prompt) (read-string prompt))
+                      (quit ""))))
+         (unwind-protect
+             (when (funcall current-p)
+               (when-let ((reply (plist-get context :input-reply)))
+                 (funcall reply value)))
+           (when password (clear-string value)))))
+     nil 'kernel-input)))
 
 (defun emacs-jupyter-notebook-events--apply (context action)
   "Apply one reduced ACTION for CONTEXT in its owner buffer."

@@ -251,6 +251,12 @@ private artifact file is created.")
 (defconst emacs-jupyter-notebook-panel--hard-image-pixels 4194304
   "Immutable helper protocol pixel ceiling for native image previews.")
 
+(defconst emacs-jupyter-notebook-panel--hard-rendered-image-dimension 2048
+  "Maximum scaled preview width or height handed to native redisplay.")
+
+(defconst emacs-jupyter-notebook-panel--hard-image-slice-rows 256
+  "Maximum display rows inserted synchronously for one preview.")
+
 (defconst emacs-jupyter-notebook-panel--hard-inline-images 32
   "Immutable ceiling on native image specs materialized by one panel view.")
 
@@ -397,7 +403,12 @@ The latest-per-cell view shows the most recent output for each
 evaluated cell, keyed by the cell's `# %%' marker location.  The
 history-log view appends every evaluation in time order."
   (setq buffer-read-only t)
-  (setq truncate-lines nil)
+  ;; Text retention and sliced insertion do not bound redisplay's line layout.
+  ;; A single long repr/stream must not wrap or run bidi paragraph analysis
+  ;; every time a minibuffer frontend changes window geometry.
+  (setq-local truncate-lines t)
+  (setq-local bidi-display-reordering nil)
+  (setq-local bidi-inhibit-bpa t)
   (setq header-line-format
         '(:eval (cond (emacs-jupyter-notebook-panel--follow-paused
                        "Reading output · f: follow source · a: actions")
@@ -664,13 +675,19 @@ visible immediately.  A pending render performs the reveal when it completes."
 
 (defun emacs-jupyter-notebook-panel--source-post-command (&optional force)
   "Reveal the current source cell after crossing its boundary.
-FORCE permits an explicit reveal while a panel or action menu is selected."
+FORCE permits an explicit reveal while a panel or action menu is selected.
+Automatic following skips large sources to bound work during ordinary editing."
   (when (and (or force emacs-jupyter-notebook-panel-follow-source)
+             (or force (<= (buffer-size) emacs-jupyter-notebook-cell--automatic-scan-limit))
              (or force (eq (window-buffer (selected-window)) (current-buffer))))
     (when-let ((panel (emacs-jupyter-notebook-panel-buffer (current-buffer))))
       (when (get-buffer-window panel t)
-        (let ((key (emacs-jupyter-notebook--cell-key-for
-                    (car (emacs-jupyter-notebook-cell-full-bounds)))))
+        (let* ((start (car (emacs-jupyter-notebook-cell-full-bounds)))
+               ;; Following an unevaluated cell needs no durable output ID.
+               ;; Allocating one here made each subsequent edit walk every
+               ;; cell the user had merely navigated through.
+               (key (or (emacs-jupyter-notebook--cell-key-for start t)
+                        (cons :unevaluated start))))
           (when (or force (not (equal key emacs-jupyter-notebook-panel--last-source-cell)))
             (setq emacs-jupyter-notebook-panel--last-source-cell key)
             (with-current-buffer panel
@@ -1032,6 +1049,24 @@ redisplay performs no file stat or content read on Emacs's UI thread."
                    (eq checked preview))
                (error nil)))))))
 
+(defun emacs-jupyter-notebook-panel--bounded-image-scale (image scale)
+  "Return positive SCALE bounded by IMAGE's rendered dimensions.
+Published previews carry trusted dimensions; direct batch-only specs use a
+fixed scale ceiling.  Invalid, infinite, and excessive scales cannot enlarge
+native surfaces or make image slicing allocate an unbounded list."
+  (let* ((preview (plist-get (cdr image) :ejn-preview))
+         (width (plist-get preview :width))
+         (height (plist-get preview :height))
+         (limit (if (and (integerp width) (> width 0)
+                         (integerp height) (> height 0))
+                    (min 8.0
+                         (/ (float emacs-jupyter-notebook-panel--hard-rendered-image-dimension)
+                            (max width height)))
+                  8.0)))
+    (if (and (numberp scale) (> scale 0))
+        (min limit (max 0.05 scale))
+      (min limit 1.0))))
+
 (defun emacs-jupyter-notebook-panel--native-preview-spec (image)
   "Return IMAGE's minimal native preview spec, with no original metadata.
 Helper image records intentionally retain their compressed original for `o'.
@@ -1046,7 +1081,8 @@ path because they do not carry helper publication fields."
           (append
            (list 'image :type 'pbm :file (plist-get preview :file))
            (when (plist-member props :scale)
-             (list :scale (plist-get props :scale)))
+             (list :scale (emacs-jupyter-notebook-panel--bounded-image-scale
+                           image (plist-get props :scale))))
            (when (plist-member props :max-width)
              (list :max-width (plist-get props :max-width)))
            (when (plist-member props :max-height)
@@ -1062,7 +1098,7 @@ therefore decline slicing rather than synchronously asking a native decoder."
          (width (and (listp preview) (plist-get preview :width)))
          (height (and (listp preview) (plist-get preview :height)))
          (raw-scale (and props (plist-get props :scale)))
-         (scale (if (and (numberp raw-scale) (> raw-scale 0)) raw-scale 1.0))
+         (scale (emacs-jupyter-notebook-panel--bounded-image-scale image raw-scale))
          (max-width (and props (plist-get props :max-width)))
          (max-height (and props (plist-get props :max-height)))
          (rendered-width (and (integerp width) (* width scale)))
@@ -1076,7 +1112,8 @@ therefore decline slicing rather than synchronously asking a native decoder."
       (when (and (numberp max-height) (> max-height 0))
         (setq ratio (min ratio (/ max-height (float rendered-height)))))
       (let ((char-height (max 1 (or (frame-char-height) 1))))
-        (max 1 (ceiling (* rendered-height ratio) char-height))))))
+        (min emacs-jupyter-notebook-panel--hard-image-slice-rows
+             (max 1 (ceiling (* rendered-height ratio) char-height)))))))
 
 (defun emacs-jupyter-notebook-panel--inline-image-admitted-p (image)
   "Return non-nil when IMAGE is a cheap candidate for bounded inline preview.
@@ -3795,6 +3832,10 @@ the next cell, which would incorrectly inherit the removed cell's identity."
   (setq emacs-jupyter-notebook--cell-touched-ids nil)
   (when (and (not emacs-jupyter-notebook--cell-moving-p)
              emacs-jupyter-notebook--cell-key-markers
+             ;; Edited-since-run labels are optional presentation metadata.
+             ;; Do not scan a huge cell on every keystroke to update them.
+             ;; The deletion/identity checks below always remain active.
+             (<= (buffer-size) emacs-jupyter-notebook-cell--automatic-scan-limit)
              (emacs-jupyter-notebook-panel-buffer (current-buffer)))
     (save-restriction
       (widen)
@@ -3826,14 +3867,20 @@ the next cell, which would incorrectly inherit the removed cell's identity."
                (let* ((start (point))
                       (kind (gethash id emacs-jupyter-notebook--cell-key-kinds))
                       (boundary-end
-                       (if (eq kind 'explicit)
-                           (and (looking-at code-cells-boundary-regexp)
-                                (match-end 0))
-                         ;; The leading cell has no marker line.  Its whole
-                         ;; original extent must be removed to retire it.
-                         (or (and (re-search-forward code-cells-boundary-regexp nil t)
-                                  (match-beginning 0))
-                             (point-max)))))
+                       (when (<= beg start end)
+                         (if (eq kind 'explicit)
+                             (and (looking-at code-cells-boundary-regexp)
+                                  (match-end 0))
+                           ;; Search only the actual deletion.  A body edit
+                           ;; must not scan the whole implicit leading cell.
+                           (or (and (re-search-forward code-cells-boundary-regexp end t)
+                                    (match-beginning 0))
+                               (save-excursion
+                                 (goto-char end)
+                                 (beginning-of-line)
+                                 (and (looking-at-p code-cells-boundary-regexp)
+                                      (point)))
+                               (and (= end (point-max)) end))))))
                  (when (and boundary-end (<= beg start) (>= end boundary-end))
                    (push id emacs-jupyter-notebook--cell-deleted-ids)))))
            emacs-jupyter-notebook--cell-key-markers))))))
@@ -3916,15 +3963,16 @@ Ambiguous duplicate anchors are retired together instead of reassociated."
     (emacs-jupyter-notebook--cell-retire-ids
      (hash-table-keys emacs-jupyter-notebook--cell-key-markers))))
 
-(defun emacs-jupyter-notebook--cell-key-for (position)
+(defun emacs-jupyter-notebook--cell-key-for (position &optional no-create)
   "Return a cell key for the cell whose marker line begins at POSITION.
 The returned key is `(FILE-NAME . ID)' where ID is stable across edits to
 this buffer: re-evaluating the same cell after inserting or deleting text
-above it yields an `equal' key."
-  (unless emacs-jupyter-notebook--cell-key-markers
+above it yields an `equal' key.  With NO-CREATE return nil for an unobserved
+cell without allocating its marker or identity."
+  (unless (or no-create emacs-jupyter-notebook--cell-key-markers)
     (setq emacs-jupyter-notebook--cell-key-markers
           (make-hash-table :test 'eq)))
-  (unless emacs-jupyter-notebook--cell-key-kinds
+  (unless (or no-create emacs-jupyter-notebook--cell-key-kinds)
     (setq emacs-jupyter-notebook--cell-key-kinds (make-hash-table :test 'eql)))
   (let* ((file (or (buffer-file-name) (buffer-name)))
          (line-start (save-excursion
@@ -3932,14 +3980,15 @@ above it yields an `equal' key."
                                        (min (point-max) position)))
                        (line-beginning-position)))
          (existing-id nil))
-    (maphash (lambda (id marker)
-               (when (and (null existing-id)
-                          (markerp marker)
-                          (eq (marker-buffer marker) (current-buffer))
-                          (= (marker-position marker) line-start))
-                 (setq existing-id id)))
-             emacs-jupyter-notebook--cell-key-markers)
-    (unless existing-id
+    (when emacs-jupyter-notebook--cell-key-markers
+      (maphash (lambda (id marker)
+                 (when (and (null existing-id)
+                            (markerp marker)
+                            (eq (marker-buffer marker) (current-buffer))
+                            (= (marker-position marker) line-start))
+                   (setq existing-id id)))
+               emacs-jupyter-notebook--cell-key-markers))
+    (unless (or no-create existing-id)
       (setq existing-id (cl-incf emacs-jupyter-notebook--cell-key-next-id))
       (let ((m (copy-marker line-start t)))
         (set-marker-insertion-type m t)
@@ -3949,7 +3998,7 @@ above it yields an `equal' key."
                    (goto-char line-start)
                    (if (looking-at-p code-cells-boundary-regexp) 'explicit 'implicit))
                  emacs-jupyter-notebook--cell-key-kinds)))
-    (cons file existing-id)))
+    (when existing-id (cons file existing-id))))
 
 ;;; View toggle / navigation (W2.3, W2.6)
 
@@ -4077,7 +4126,8 @@ Also coerces a non-numeric `:scale' (Emacs 29+ reports the symbol
         (user-error "Image is retained for external viewing only"))
       (let* ((raw (plist-get (cdr image) :scale))
              (scale (if (numberp raw) raw 1.0))
-             (new-scale (max 0.05 (* scale factor)))
+             (new-scale (emacs-jupyter-notebook-panel--bounded-image-scale
+                         image (* scale factor)))
              (props (cl-loop for (k v) on (cdr image) by #'cddr
                              unless (memq k '(:scale :max-width :max-height))
                              collect k and collect v))

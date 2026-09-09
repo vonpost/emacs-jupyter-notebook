@@ -609,33 +609,35 @@
 
 (ert-deftest ejn-ei1r-clear-wait-and-input-are-deferred-and-owned ()
   "Clear wait survives, and input never reads/replies in the callback turn."
-  (with-temp-buffer
-    (let* ((source (current-buffer))
-           (panel (ejn-panel-ensure source))
-           (handle (ejn-panel-start-entry panel '("x.py" . 1) "x"))
-           (context (list :buffer source :entry-handle handle :request-id nil))
-           scheduled timer prompt reply)
-      (ejn-panel-append-text handle "old")
-      (emacs-jupyter-notebook-events-dispatch context '(:type clear :wait t))
-      (should (equal (ejn-panel-entry-text handle) "old"))
-      (should (plist-get (ejn-panel-entry-snapshot handle) :pending-clear))
-      (let ((real-run-at-time (symbol-function 'run-at-time)))
-        (cl-letf (((symbol-function 'run-at-time)
-                   (lambda (_delay _repeat function &rest args)
-                     (setq scheduled (lambda () (apply function args)))
-                     (setq timer (funcall real-run-at-time 100 nil #'ignore))))
-                  ((symbol-function 'read-passwd)
-                   (lambda (value) (setq prompt value) "secret")))
-          (emacs-jupyter-notebook-events-dispatch
-           (plist-put (copy-sequence context) :input-reply
-                      (lambda (value) (setq reply (copy-sequence value))))
-           '(:type input-request :prompt "Password: " :password t))
-          (should-not prompt)
-          (should-not reply)
-          (funcall scheduled)
-          (should (equal prompt "Password: "))
-          (should (equal reply "secret"))))
-      (when (timerp timer) (cancel-timer timer)))))
+  (save-window-excursion
+    (with-temp-buffer
+      (set-window-buffer (selected-window) (current-buffer))
+      (let* ((source (current-buffer))
+             (panel (ejn-panel-ensure source))
+             (handle (ejn-panel-start-entry panel '("x.py" . 1) "x"))
+             (context (list :buffer source :entry-handle handle :request-id nil))
+             scheduled timer prompt reply)
+        (ejn-panel-append-text handle "old")
+        (emacs-jupyter-notebook-events-dispatch context '(:type clear :wait t))
+        (should (equal (ejn-panel-entry-text handle) "old"))
+        (should (plist-get (ejn-panel-entry-snapshot handle) :pending-clear))
+        (let ((real-run-at-time (symbol-function 'run-at-time)))
+          (cl-letf (((symbol-function 'run-at-time)
+                     (lambda (_delay _repeat function &rest args)
+                       (setq scheduled (lambda () (apply function args)))
+                       (setq timer (funcall real-run-at-time 100 nil #'ignore))))
+                    ((symbol-function 'read-passwd)
+                     (lambda (value) (setq prompt value) "secret")))
+                   (emacs-jupyter-notebook-events-dispatch
+                    (plist-put (copy-sequence context) :input-reply
+                               (lambda (value) (setq reply (copy-sequence value))))
+                    '(:type input-request :prompt "Password: " :password t))
+                   (should-not prompt)
+                   (should-not reply)
+                   (funcall scheduled)
+                   (should (equal prompt "Password: "))
+                   (should (equal reply "secret"))))
+        (when (timerp timer) (cancel-timer timer))))))
 
 (ert-deftest ejn-ei1r-result-display-and-update-have-distinct-semantics ()
   "Result replaces text, display appends, and update replaces in place."

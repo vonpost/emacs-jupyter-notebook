@@ -175,7 +175,8 @@ a hard protocol limit requires a protocol-version decision and stress test.
 The Emacs process filter may append bytes and decode complete envelopes, but it
 must not synchronously dispatch an unbounded number of messages.  It processes
 at most 16 frames or 262144 payload bytes per invocation, then schedules a
-zero-delay timer to continue.  The raw accumulator must never exceed
+1 ms timer to continue (CC19: allow keyboard dispatch between batches).
+The raw accumulator must never exceed
 `EJN_MAX_RAW_ACCUMULATOR`; excess or malformed input is a protocol violation
 and kills the local helper.
 

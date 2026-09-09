@@ -12,8 +12,8 @@
 (require 'json)
 (require 'subr-x)
 (require 'tabulated-list)
-(require 'thingatpt)
 (require 'emacs-jupyter-notebook-backend)
+(require 'emacs-jupyter-notebook-ui)
 
 (defvar emacs-jupyter-notebook-mode)
 (defvar emacs-jupyter-notebook--client)
@@ -30,7 +30,9 @@
 (defcustom emacs-jupyter-notebook-variable-eldoc t
   "Show Python variable type, shape and dtype at point through Eldoc.
 Only simple variable names are queried, and busy kernels are skipped.  Values
-are never transferred.  Unknown object types expose type metadata only."
+are never transferred.  Unknown object types expose type metadata only.
+Automatic name detection is skipped in buffers larger than 1,048,576
+characters; explicit commands still accept a variable name at their prompt."
   :type 'boolean :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-variable-cache-seconds 5
@@ -69,17 +71,31 @@ Use Customize or directory-local settings for persistent defaults."
 (defvar-local emacs-jupyter-notebook-variables--refresh-pending nil)
 (defvar-local emacs-jupyter-notebook-variables--refresh-retry-timer nil)
 (defvar-local emacs-jupyter-notebook-variables--refresh-retries 0)
+(defvar-local emacs-jupyter-notebook-variables--view-token nil)
+
+(defconst emacs-jupyter-notebook-variables--name-buffer-max-chars (* 1024 1024)
+  "Largest source buffer admitted to automatic variable syntax inspection.")
 
 (defun emacs-jupyter-notebook-variables--name-at-point ()
-  "Return a simple Python identifier at point, excluding attributes and text."
-  (when (derived-mode-p 'python-mode 'python-ts-mode)
-    (unless (nth 8 (syntax-ppss))
-      (when-let ((bounds (bounds-of-thing-at-point 'symbol)))
-        (let ((name (buffer-substring-no-properties (car bounds) (cdr bounds))))
-          (when (and (<= (length name) 128) (<= (string-bytes name) 128)
+  "Return a bounded Python identifier at point, excluding attributes and text.
+Skip large sources before entering the potentially cold syntax parser.  Scan
+at most 129 characters each way before copying or parsing a candidate."
+  (when (and (derived-mode-p 'python-mode 'python-ts-mode)
+             (<= (buffer-size) emacs-jupyter-notebook-variables--name-buffer-max-chars))
+    (let* ((origin (point))
+           (beg (save-excursion
+                  (skip-syntax-backward "w_" (max (point-min) (- origin 129)))
+                  (point)))
+           (end (save-excursion
+                  (skip-syntax-forward "w_" (min (point-max) (+ origin 129)))
+                  (point))))
+      (when (<= 1 (- end beg) 128)
+        (let ((name (buffer-substring-no-properties beg end)))
+          (when (and (<= (string-bytes name) 128)
                      (string-match-p "\\`[[:alpha:]_][[:alnum:]_]*\\'" name)
-                     (not (eq (char-before (car bounds)) ?.))
-                     (not (eq (char-after (cdr bounds)) ?.)))
+                     (not (eq (char-before beg) ?.))
+                     (not (eq (char-after end) ?.))
+                     (not (nth 8 (syntax-ppss))))
             name))))))
 
 (defun emacs-jupyter-notebook-variables--ready-p ()
@@ -109,7 +125,9 @@ or closes the kernel to dispose a metadata lookup."
   "Mark metadata stale after execution admission or a client transition.
 Retain the last known rows and cache while fencing old asynchronous replies."
   (cl-incf emacs-jupyter-notebook-variables--generation)
-  (setq emacs-jupyter-notebook-variables--queued nil)
+  (setq emacs-jupyter-notebook-variables--queued nil
+        emacs-jupyter-notebook-variables--view-token nil)
+  (emacs-jupyter-notebook-ui-cancel 'variable-view)
   (emacs-jupyter-notebook-variables--cancel-pending)
   (emacs-jupyter-notebook-variables--cancel-refresh-retry)
   (setq emacs-jupyter-notebook-variables--stale t
@@ -603,14 +621,34 @@ including any channel axis.  Only the selected 2D plane leaves the kernel."
     (user-error "Use a simple Python variable name"))
   ;; Always refresh metadata before picking axes: a previous cell may have
   ;; rebound the variable, including to a differently shaped array.
-  (emacs-jupyter-notebook-variables--request
-   (vector name)
-   (lambda (reply)
-     (let ((metadata (car (append (plist-get reply :variables) nil))))
-       (unless metadata (user-error "%s is not defined in this kernel" name))
-       (emacs-jupyter-notebook-variables--cache-put name metadata)
-       (emacs-jupyter-notebook-variables--view-metadata name metadata)))
-   (lambda () (message "Array metadata unavailable; try again when the kernel is idle"))))
+  (let* ((source (current-buffer))
+         (selected (window-buffer (selected-window)))
+         (origin (if (eq selected emacs-jupyter-notebook-variables--table) selected source))
+         (client emacs-jupyter-notebook--client)
+         (generation emacs-jupyter-notebook-variables--generation)
+         (token (list 'variable-view)))
+    (setq emacs-jupyter-notebook-variables--view-token token)
+    (emacs-jupyter-notebook-variables--request
+     (vector name)
+     (lambda (reply)
+       (let ((metadata (car (append (plist-get reply :variables) nil))))
+         (unless metadata (user-error "%s is not defined in this kernel" name))
+         (emacs-jupyter-notebook-variables--cache-put name metadata)
+         (if (> (length (plist-get metadata :shape)) 2)
+             ;; Never enter recursive minibuffer input from a helper drain.
+             ;; Keep the explicit request pending until its source/table is
+             ;; selected and another minibuffer interaction has finished.
+             (emacs-jupyter-notebook-ui-defer
+              source
+              (lambda ()
+                (and (bound-and-true-p emacs-jupyter-notebook-mode)
+                     (eq token emacs-jupyter-notebook-variables--view-token)
+                     (eq client emacs-jupyter-notebook--client)
+                     (= generation emacs-jupyter-notebook-variables--generation)))
+              (lambda () (emacs-jupyter-notebook-variables--view-metadata name metadata))
+              origin 'variable-view)
+           (emacs-jupyter-notebook-variables--view-metadata name metadata))))
+     (lambda () (message "Array metadata unavailable; try again when the kernel is idle")))))
 
 (defun emacs-jupyter-notebook-variables-view-row ()
   "Open the current table variable in the array viewer."
