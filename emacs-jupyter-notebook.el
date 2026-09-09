@@ -541,6 +541,9 @@ binding is added, and a user-owned binding must never be overwritten."
 (defvar-local emacs-jupyter-notebook--saved-imenu-create-index-function-local-p nil
   "Whether `imenu-create-index-function' was buffer-local before enabling.")
 
+(defvar-local emacs-jupyter-notebook--imenu-installed nil
+  "Whether this buffer has saved and replaced its imenu index function.")
+
 (defconst emacs-jupyter-notebook--imenu-title-max-characters 512
   "Immutable source characters copied from one code-cell marker title.")
 
@@ -568,22 +571,26 @@ binding is added, and a user-owned binding must never be overwritten."
 
 (defun emacs-jupyter-notebook--enable-imenu ()
   "Use cell markers as the imenu index for the current buffer."
-  (setq emacs-jupyter-notebook--saved-imenu-create-index-function
-        imenu-create-index-function
-        emacs-jupyter-notebook--saved-imenu-create-index-function-local-p
-        (local-variable-p 'imenu-create-index-function))
-  (setq-local imenu-create-index-function
-              #'emacs-jupyter-notebook--imenu-index))
+  (unless emacs-jupyter-notebook--imenu-installed
+    (setq emacs-jupyter-notebook--saved-imenu-create-index-function
+          imenu-create-index-function
+          emacs-jupyter-notebook--saved-imenu-create-index-function-local-p
+          (local-variable-p 'imenu-create-index-function))
+    (setq-local imenu-create-index-function
+                #'emacs-jupyter-notebook--imenu-index)
+    (setq emacs-jupyter-notebook--imenu-installed t)))
 
 (defun emacs-jupyter-notebook--disable-imenu ()
   "Restore the imenu index function that was active before mode enable."
-  (let ((saved-function emacs-jupyter-notebook--saved-imenu-create-index-function)
-        (saved-local-p emacs-jupyter-notebook--saved-imenu-create-index-function-local-p))
-    (if saved-local-p
-        (setq-local imenu-create-index-function saved-function)
-      (kill-local-variable 'imenu-create-index-function))
-    (kill-local-variable 'emacs-jupyter-notebook--saved-imenu-create-index-function)
-    (kill-local-variable 'emacs-jupyter-notebook--saved-imenu-create-index-function-local-p)))
+  (when emacs-jupyter-notebook--imenu-installed
+    (let ((saved-function emacs-jupyter-notebook--saved-imenu-create-index-function)
+          (saved-local-p emacs-jupyter-notebook--saved-imenu-create-index-function-local-p))
+      (if saved-local-p
+          (setq-local imenu-create-index-function saved-function)
+        (kill-local-variable 'imenu-create-index-function))
+      (kill-local-variable 'emacs-jupyter-notebook--saved-imenu-create-index-function)
+      (kill-local-variable 'emacs-jupyter-notebook--saved-imenu-create-index-function-local-p)
+      (kill-local-variable 'emacs-jupyter-notebook--imenu-installed))))
 
 (defvar-local emacs-jupyter-notebook--client nil
   "Current buffer's opaque backend session.")
@@ -1888,14 +1895,25 @@ panel's own kill-buffer-hook only cancels its flush timer)."
      (message "emacs-jupyter-notebook: panel kill failed: %s"
               (error-message-string err)))))
 
+(defvar-local emacs-jupyter-notebook--mode-initialized nil
+  "Whether notebook mode has installed its buffer-local integration.")
+
+(defvar-local emacs-jupyter-notebook--owns-code-cells-mode nil
+  "Whether notebook mode enabled `code-cells-mode' in this buffer.")
+
 ;;;###autoload
 (define-minor-mode emacs-jupyter-notebook-mode
   "Minor mode for evaluating local source cells in remote Jupyter kernels."
   :lighter (:eval (emacs-jupyter-notebook--mode-line-string))
   :keymap emacs-jupyter-notebook-mode-map
   (if emacs-jupyter-notebook-mode
-      (progn
-        (code-cells-mode 1)
+      (unless emacs-jupyter-notebook--mode-initialized
+        ;; Re-enabling code-cells saves its own outline-level function as
+        ;; the previous one, making Python heading fontification recurse.
+        ;; A user's independently enabled code-cells mode belongs to them.
+        (unless code-cells-mode
+          (code-cells-mode 1)
+          (setq emacs-jupyter-notebook--owns-code-cells-mode t))
         (emacs-jupyter-notebook-cell-tracking-enable)
         (emacs-jupyter-notebook-variables-setup)
         (add-hook 'completion-at-point-functions
@@ -1905,8 +1923,13 @@ panel's own kill-buffer-hook only cancels its flush timer)."
         (add-hook 'kill-buffer-hook
                   #'emacs-jupyter-notebook--kill-buffer-hook nil t)
         (emacs-jupyter-notebook--enable-imenu)
-        (emacs-jupyter-notebook--completion-start-idle-timer))
-    (code-cells-mode -1)
+        (emacs-jupyter-notebook--completion-start-idle-timer)
+        (setq emacs-jupyter-notebook--mode-initialized t))
+    (setq emacs-jupyter-notebook--mode-initialized nil)
+    (when emacs-jupyter-notebook--owns-code-cells-mode
+      (when code-cells-mode
+        (code-cells-mode -1))
+      (setq emacs-jupyter-notebook--owns-code-cells-mode nil))
     (emacs-jupyter-notebook-cell-tracking-disable)
     (emacs-jupyter-notebook-variables-teardown)
     (emacs-jupyter-notebook-ui-cancel)

@@ -76,6 +76,9 @@ Enable the mode in a Python buffer:
 M-x emacs-jupyter-notebook-mode
 ```
 
+Enabling the mode again is safe. If `code-cells-mode` was already enabled,
+EJN preserves it when notebook mode is disabled.
+
 Send the current cell:
 
 ```elisp

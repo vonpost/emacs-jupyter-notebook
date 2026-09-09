@@ -14,10 +14,40 @@ the same stack shape while normally awaiting M-x input: the anonymous lambda
 can be the completion-table argument, not an executing frame. This trace does
 not identify a blocking EJN or Vertico function.
 
+Further controls changed the incident assessment: M-x works in scratch, and
+the affected buffer is a plain Python buffer with Eglot running; the user has
+not enabled EJN there. The successful timer-disabled prompt was also tested
+in scratch, so it does **not** establish timer causation. The current
+source-buffer failure remains under investigation independently of the EJN
+defects documented here.
+
 The review covered runtime bootstrap, registry and SSH lifecycle callbacks,
 helper framing and writes, completion and prompt delivery, variable Eldoc,
 cell tracking, panel rendering, native preview scaling and artifact cleanup.
 No remote host was needed for the regressions.
+
+## Follow-up: repeated mode activation
+
+Two independent reviewers reproduced another defect without any kernel:
+the installed `code-cells-mode` saves the current outline function every time
+it is enabled. EJN unconditionally enabled it, even when it was already
+active. Enabling EJN after code-cells, or enabling EJN twice, therefore saved
+`code-cells--outline-level` as its own fallback. Querying the outline level at
+a Python `def` recurses until Emacs's Lisp nesting limit. This also occurs
+through actual Consult outline enumeration and built-in outline fontification.
+
+Repeated enable also nests the outline regexp and overwrites EJN's saved
+imenu function. Disabling an already damaged instance can restore the
+recursive function rather than the original major-mode setting. These are
+independent EJN lifecycle defects, not an attribution of the user's current
+incident, where EJN was not enabled.
+
+The CC20 fix makes EJN activation idempotent, activates code-cells only when
+needed, and disables it only if EJN originally activated it. Imenu save and
+restore are also idempotent. Seven lifecycle regressions cover actual outline
+fontification, repeated enable/disable, preservation of user-owned code-cells,
+source text, and timer cleanup. Already corrupted upstream state is not
+automatically rewritten; a fresh source-buffer setup is needed after updating.
 
 ## Findings and fixes
 
@@ -62,6 +92,8 @@ in Emacs, and evaluated-cell edit tracking scales with tracked source cells.
 - `EJN_TEST_TIMEOUT=60 tests/run-local-tests.sh`: 1067/1067 ERT passed;
   array protocol 4/4, helper 248 tests with 4 optional dependency skips,
   registry 25/25, and stress-fixture unit tests 12/12 passed.
+- After CC20, strict compilation and the same source-based command passed
+  again: 1074/1074 ERT, with the same Python results and four optional skips.
 - Four existing AG3 subprocess stress tests passed: credited output flood,
   every-phase process exits, late ping and hostile helper framing. The flood
   delivered 14,916 events, two pings and 117 independent timer ticks, with
