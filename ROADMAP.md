@@ -159,6 +159,16 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
+- [~] owner=root claimed=2026-09-09 CC19 Review and eliminate probable Emacs
+  hangs reported after runtime bootstrap and when opening Vertico/M-x.
+  — touches: core/events and shared UI scheduling, runtime/process transports,
+  panel/cell/artifact handling, variables/actions, focused regression tests and
+  review documentation. Root integrates; panel_hangs owns panel/cell fixes,
+  variables_hangs owns variables/actions fixes, transport_hangs owns assigned
+  transport fixes. Shared-checkout agents do not edit ledgers or commit.
+  Preserve remote kernels, durable registry data, bounded protocol ceilings,
+  source cleanliness, and non-blocking ordinary editing.
+
 - [x] sha=4b2934e CC15 Implement the user-approved UX
   improvements: source-following output navigation, descriptive/stale/timed
   headers and folded summaries. — touches: result Elisp, focused ERT.
