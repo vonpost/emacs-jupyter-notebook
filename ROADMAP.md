@@ -159,6 +159,14 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
+- [~] owner=root claimed=2026-09-09 CC20 Make notebook mode setup idempotent
+  and preserve pre-enabled code-cells ownership. — touches: core mode/imenu
+  setup, focused lifecycle ERT and incident review documentation. Repeated
+  code-cells activation is proven to install a self-recursive outline-level;
+  investigate as a candidate for the source-only minibuffer hang. Assigned
+  implementation to variables_hangs; root integrates and source_minibuffer_review
+  reviews. No remote operations or source text changes.
+
 - [x] sha=2ef2e80 CC19 Review and eliminate probable Emacs
   hangs reported after runtime bootstrap and when opening Vertico/M-x.
   — touches: core/events and shared UI scheduling, runtime/process transports,
