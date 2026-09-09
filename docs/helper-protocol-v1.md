@@ -146,7 +146,10 @@ Requests require `v`, `kind`, string `id`, string `op`, and object `params`.
 `hello.params.versions` is an integer list; `grant_event_credit.bytes` is a
 non-negative integer. `connect` requires absolute `connection_file` and
 `artifact_dir` strings. `execute` requires UTF-8 `code` at most
-`EJN_MAX_CODE_BYTES`; `complete` and `inspect` require `code` and integer
+`EJN_MAX_CODE_BYTES` and accepts optional boolean `store_history` (default true).
+Explicit variable-plane inspection sets it false and disables stdin, while
+preserving normal output events and execution terminality. `complete` and
+`inspect` require `code` and integer
 `cursor_pos`; `is_complete` requires `code`; `input_reply` requires the owning
 execution's string `request_id`, its exact 32-character lowercase-hex
 `input_id`, and a UTF-8 `value` of at most 65536 bytes. The no-parameter

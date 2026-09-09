@@ -2,6 +2,7 @@
 
 import base64
 import json
+import hashlib
 import uuid
 from collections.abc import Mapping
 from itertools import islice
@@ -100,19 +101,98 @@ def _view(planes, *, key="default", sample_id=None, grid_id=None, units=None):
     return None
 
 
+def _view_variable(namespace, name, *, axes=None, indices=None):
+    """Publish only one selected 2D plane of a named NumPy variable.
+
+    AXES contains the display row and column dimensions, in that order.
+    INDICES has one item per source dimension: None for each display axis and
+    a nonnegative integer for every other axis (including a channel axis).
+    NumPy's base descriptors and base view bypass subclass Python getters and
+    slicing overrides. No complete array conversion or representation occurs.
+    """
+    import numpy as np
+
+    if type(name) is not str or not name.isidentifier():
+        raise ValueError("use a simple Python variable name")
+    name = _text(name, "variable name", required=True)
+    if type(namespace) is not dict or name not in namespace:
+        raise ValueError("variable is not defined in this kernel")
+    value = dict.__getitem__(namespace, name)
+    cls = type(value)
+    bases = type.__dict__["__mro__"].__get__(cls)
+    if not any(base is np.ndarray for base in bases):
+        raise ValueError("array viewing currently requires a NumPy ndarray")
+    if any(base is np.ma.MaskedArray for base in bases):
+        raise ValueError("masked arrays are unsupported; select explicit numerical values")
+    descriptors = type.__dict__["__dict__"].__get__(np.ndarray)
+    shape = descriptors["shape"].__get__(value, cls)
+    dtype = descriptors["dtype"].__get__(value, cls)
+    ndim = len(shape)
+    if not 2 <= ndim <= 32:
+        raise ValueError("array viewing requires between 2 and 32 dimensions")
+    if axes is None:
+        if ndim != 2:
+            raise ValueError("choose two display axes for a multidimensional array")
+        axes = [0, 1]
+    if (type(axes) not in (list, tuple) or len(axes) != 2
+            or any(type(axis) is not int or not 0 <= axis < ndim for axis in axes)
+            or axes[0] == axes[1]):
+        raise ValueError("choose two distinct valid display axes")
+    if indices is None:
+        indices = [None if axis in axes else 0 for axis in range(ndim)]
+    if type(indices) not in (list, tuple) or len(indices) != ndim:
+        raise ValueError("provide one slice index per dimension")
+    selector = []
+    for axis, (size, index) in enumerate(zip(shape, indices)):
+        if axis in axes:
+            if index is not None:
+                raise ValueError("display axes must have None slice indices")
+            if not 1 <= size <= _MAX_DIMS:
+                raise ValueError("selected plane dimensions must be between 1 and 16384")
+            selector.append(slice(None))
+        else:
+            if type(index) is not int or not 0 <= index < size:
+                raise ValueError("slice index is outside its array dimension")
+            selector.append(index)
+    if dtype.str not in _DTYPES:
+        raise ValueError("unsupported viewer dtype: " + dtype.str)
+    if shape[axes[0]] * shape[axes[1]] * dtype.itemsize > _MAX_PLANE:
+        raise ValueError("selected plane exceeds 33554432 raw bytes")
+    # A base ndarray view has no Python subclass finalizer or __getitem__.
+    base = np.ndarray.view(value, np.ndarray)
+    plane = np.ndarray.__getitem__(base, tuple(selector))
+    if axes[0] > axes[1]:
+        plane = np.ndarray.transpose(plane)
+    # Stable workspace and selection identity. A different slice must not
+    # inherit ROI geometry. A variable may be rebound to an unrelated image,
+    # so shape/indices alone cannot declare spatial correspondence or units;
+    # the viewer asks for those declarations before comparisons across runs.
+    key = "variable-" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:24]
+    selection = json.dumps([name, list(shape), list(axes), list(indices)], separators=(",", ":"))
+    identity = hashlib.sha256(selection.encode("utf-8")).hexdigest()[:32]
+    return _view({name: plane}, key=key, sample_id=identity)
+
+
 def install(namespace):
-    """Install ``ejn.view`` in an IPython user namespace exactly once."""
+    """Install or refresh the owned ``ejn`` publisher in a user namespace."""
     if not isinstance(namespace, dict):
         raise TypeError("namespace must be a dictionary")
-    if "ejn" in namespace:
-        existing = namespace["ejn"]
-        if getattr(existing, "_ejn_publisher_marker", None) == _MARKER:
-            return existing
-        raise RuntimeError("cannot install array-group publisher: user-owned ejn exists")
-
     class _EJN:
         _ejn_publisher_marker = _MARKER
         view = staticmethod(_view)
+
+        @staticmethod
+        def view_variable(name, *, axes=None, indices=None):
+            return _view_variable(namespace, name, axes=axes, indices=indices)
+    if "ejn" in namespace:
+        existing = namespace["ejn"]
+        if getattr(existing, "_ejn_publisher_marker", None) == _MARKER:
+            # Reconnect injects fresh source into a durable kernel. Refresh the
+            # owned methods while retaining callers' identity reference.
+            type(existing).view = staticmethod(_view)
+            type(existing).view_variable = staticmethod(_EJN.view_variable)
+            return existing
+        raise RuntimeError("cannot install array-group publisher: user-owned ejn exists")
     instance = _EJN()
     namespace["ejn"] = instance
     return instance

@@ -148,6 +148,29 @@ class AuxiliaryRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.backend.client.last_execute, ("long_running()", {}))
         self.assertFalse(execution.done())
 
+    async def test_generated_inspection_keeps_outputs_but_does_not_store_history(self):
+        events = []
+        future = asyncio.get_running_loop().create_future()
+        self.backend.start("execute", {"code": 'ejn.view_variable("image")',
+                                       "store_history": False}, events.append,
+                           future.set_result)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        message_id = next(iter(self.backend._pending))
+        self.assertEqual(self.backend.client.last_execute,
+                         ('ejn.view_variable("image")',
+                          {"store_history": False, "allow_stdin": False}))
+        await self.queues["iopub"].put(self._message(message_id, "stream",
+                                                  {"name": "stdout", "text": "inspected"}))
+        await self.queues["shell"].put(self._message(message_id, "execute_reply",
+                                                  {"status": "ok", "execution_count": 3}))
+        await self.queues["iopub"].put(self._message(message_id, "status",
+                                                  {"execution_state": "idle"}))
+        result = await asyncio.wait_for(future, 1)
+        self.assertIsNone(result.error)
+        self.assertTrue(any(event.name == "stream" for event in events))
+        self.assertEqual(self.backend._pending, {})
+
     async def test_variables_timeout_releases_pending_without_interrupt(self):
         future = await self._request("variables", {"names": ["image"], "limit": 1})
         msg_id = await self._request_id("variables")

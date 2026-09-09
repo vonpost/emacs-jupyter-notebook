@@ -49,7 +49,19 @@ failure itself does not request tunnel reconnection or terminate a kernel.
 Publish a mapping of selected 2D NumPy arrays with `ejn.view`, then use
 `C-c j I`, the panel's `[Inspect]` button, or `C-c j J` (evaluate-and-inspect).
 The latter opens the first numerical publication from that exact execution.
-Ordinary evaluation does not automatically replace an open workspace.
+Once inspected, matching publications from that source cell follow into the
+open workspace without stealing focus. Other cells and workspace keys do not
+replace the selection. Clear/reconnect/source retirement fences old updates.
+
+For an existing NumPy variable, use `C-c j A` at its name or `v` in the variable
+table. Emacs prompts for display axes and any remaining slice/channel indices.
+Only that 2D plane goes through the existing bounded artifact path; the full
+volume remains in the kernel. Generated inspection requests do not add to input
+history. Unsupported dtypes, empty axes and oversized planes report an error.
+Reopen the variable to choose another plane; this requires an idle kernel.
+Variable names and shapes do not establish physical alignment or intensity
+units. Use the viewer's explicit grid/unit declarations for comparisons, or
+publish those metadata yourself with `ejn.view`.
 
 For quantitative comparison, publish corresponding planes with their sample,
 grid and intensity units:
@@ -68,12 +80,23 @@ Differences use float64 arithmetic, preserving negative differences of
 unsigned images, with a separate display range. Non-finite or overflowing
 differences become unavailable pixels.
 
+Choose the reference member and click **Pin reference** before rerunning. Its
+immutable local snapshot remains available while the candidate follows new
+publications. Hold **B** or the blink button to temporarily show the reference
+in the candidate pane; release to return. Comparisons and linked readouts
+require compatible sample/grid metadata. **Freeze** retains the visible
+evaluation and discards incoming updates; unfreeze follows subsequent
+publications. The status line identifies the visible and pinned executions.
+
 Choose an ROI pane and click **Rectangle ROI** or **Ellipse ROI**. Drag its
 body to move it and its handle to resize it. ROIs appear on corresponding
 panes, including the difference. The table shows mean, population SD
 (`ddof=0`), finite pixel count and excluded non-finite count for each pane.
 Select a named ROI to remove it. Up to 16 ROIs are retained, including across
-compatible reruns of the same sample/grid.
+compatible reruns of the same sample/grid. **Draw ROI** lets you drag a new
+rectangle or ellipse directly on an image (`Esc` cancels). Select an ROI to
+rename it; arrow keys while the image has focus move it one pixel, or ten with
+`Shift`. **Copy statistics** copies the measurement table as tab-separated text.
 
 Measurements use original samples and source pixel centers, independently of
 zoom or window/level. Rectangles include their left/top edges and exclude
@@ -83,6 +106,11 @@ statistics, and one finite pixel has SD zero. Arithmetic uses float64 with
 stable block accumulation. RGB/rendered images do not offer these quantitative
 controls. Difference/statistics work is debounced and runs in a bounded local
 worker; it makes no requests to the kernel.
+
+Hovering an image places linked crosshairs on corresponding panes and displays
+reference, candidate and difference values at the same sample location. A
+31×31 magnified patch uses original samples with nearest-neighbor display;
+non-finite values remain identifiable and out-of-image locations are unavailable.
 
 Current controls: pinch to zoom around the pointer, two-finger scroll to pan,
 mouse wheel to zoom, drag to pan, `F` to fit, hover for source pixel values,
@@ -123,12 +151,11 @@ and estimated display/load buffers; Qt/Python overhead is additional.
 
 Differences are limited to 32 MiB of float64 samples; source images, derived
 displays, pending loads and analysis scratch share the viewer's 256 MiB
-accounting budget. Over-budget requests report an error and leave the source
-samples intact.
+accounting budget, including pinned snapshots and active worker references.
+Over-budget requests report an error and leave the source samples intact.
 
-Pinned baselines, blink, magnifiers, follow/freeze,
-native-pixel verification, and routing ordinary PNG/JPEG outputs into this
-viewer are unfinished. PNG/JPEG originals still open with the panel's `o`.
+Native-pixel verification and routing ordinary PNG/JPEG outputs into this
+viewer remain unfinished. PNG/JPEG originals still open with the panel's `o`.
 See [VIEWER_PLAN.md](../VIEWER_PLAN.md) for the full release gates.
 
 ## Verification

@@ -216,6 +216,9 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
             ),
             ("execute", {}),
             ("execute", {"code": 1}),
+            ("execute", {"code": "x", "store_history": 0}),
+            ("execute", {"code": "x", "store_history": "false"}),
+            ("is_complete", {"code": "x", "store_history": False}),
             ("complete", {"code": "x"}),
             ("complete", {"code": "x", "cursor_pos": True}),
             ("inspect", {"code": "x", "cursor_pos": 1, "detail_level": 2}),
@@ -230,6 +233,15 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
                     self.responses[-1]["error"]["code"], "invalid-request"
                 )
         self.assertEqual(self.backend.starts, [])
+
+    async def test_inspection_execute_admits_boolean_history_flag(self):
+        await self.connect()
+        params = {"code": 'ejn.view_variable("image")', "store_history": False}
+        self.dispatcher.dispatch(request("inspection", "execute", params))
+        await asyncio.sleep(0)
+        self.assertEqual(self.backend.starts[-1].operation, "execute")
+        self.assertEqual(self.backend.starts[-1].params, params)
+        self.assertTrue(self.responses[-1]["ok"])
 
     async def test_backend_operations_dispatch_after_connect(self):
         await self.connect()

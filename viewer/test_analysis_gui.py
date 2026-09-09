@@ -16,6 +16,7 @@ from PySide6 import QtCore, QtTest, QtWidgets
 from ejn_viewer.analysis import DIFFERENCE
 from ejn_viewer.analysis_worker import AnalysisJob, AnalysisWorker, compute
 from ejn_viewer.workspace import WorkspaceWindow
+from ejn_viewer.memory import source_allocations
 from ejn_viewer.ipc import MAX_MEMORY, PipeServer
 
 
@@ -223,7 +224,7 @@ class AnalysisGuiTests(unittest.TestCase):
             self.assertTrue(all(identifier != threading.get_ident() for identifier in threads))
 
     def test_worker_budget_rejection_and_release_on_close(self):
-        worker = AnalysisWorker(admit=lambda _extra: False)
+        worker = AnalysisWorker(admit=lambda: False)
         self.addCleanup(worker.shutdown)
         window = self.window(analysis_worker=worker)
         window.rectangle_button.click()
@@ -266,9 +267,9 @@ class AnalysisGuiTests(unittest.TestCase):
                        for name in data.planes}
         data.nbytes = sum(array.nbytes for array in data.planes.values())
         derived = np.broadcast_to(np.float64(0), (2048, 2048))
-        window = SimpleNamespace(_snapshot=data, analysis_bytes=derived.nbytes * 2)
+        window = SimpleNamespace(allocations={**source_allocations(data), ("array", id(derived)): derived.nbytes, ("render", "test"): 3 * derived.size * 8})
         server = SimpleNamespace(windows={"test": window}, active=None)
-        worker = AnalysisWorker(admit=lambda extra: PipeServer.memory_used(server) + extra <= MAX_MEMORY)
+        worker = AnalysisWorker(admit=lambda: PipeServer.memory_used(server) <= MAX_MEMORY)
         server.analysis = worker
         self.addCleanup(worker.shutdown)
         entered, release = threading.Event(), threading.Event()

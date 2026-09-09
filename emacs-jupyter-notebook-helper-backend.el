@@ -918,8 +918,12 @@ core can retain an attached helper for the existing PID busy arbitration.
   (cond
    ((or (eq operation 'execute)
         (emacs-jupyter-notebook-helper-backend--is-complete-operation-p operation))
-    (emacs-jupyter-notebook-helper-backend--make-object
-     "code" (plist-get payload :code)))
+    (let ((object (emacs-jupyter-notebook-helper-backend--make-object
+                   "code" (plist-get payload :code))))
+      (when (and (eq operation 'execute)
+                 (plist-get (plist-get payload :options) :inspection))
+        (puthash "store_history" :false object))
+      object))
    ((emacs-jupyter-notebook-helper-backend--complete-operation-p operation)
     (emacs-jupyter-notebook-helper-backend--make-object
      "code" (plist-get payload :code)

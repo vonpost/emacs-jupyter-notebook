@@ -33,6 +33,7 @@
 (require 'emacs-jupyter-notebook-viewer)
 (require 'emacs-jupyter-notebook-inspect)
 (require 'emacs-jupyter-notebook-variables)
+(require 'emacs-jupyter-notebook-actions)
 
 ;;; W8 — local interactive matplotlib viewer: remote formatter injection
 ;;
@@ -699,6 +700,10 @@ currentness from panel position or a mutable singleton request slot.")
 (defvar-local emacs-jupyter-notebook--execution-counter 0
   "Monotonic source for buffer-local execution ledger ids.")
 
+(defvar emacs-jupyter-notebook-execution-created-hook nil
+  "Hook receiving each reserved execution record before it can dispatch.
+Used for exact-execution inspection, including synchronously delivered output.")
+
 (defvar-local emacs-jupyter-notebook--execution-setup-pending nil
   "Non-nil while post-connect silent setup blocks user FIFO dispatch.")
 
@@ -1165,7 +1170,9 @@ All command bindings live under `emacs-jupyter-notebook-prefix-key'
     (define-key map (kbd "t")    #'emacs-jupyter-notebook-toggle-panel-view)
     (define-key map (kbd "h")    #'emacs-jupyter-notebook-toggle-cell-output)
     (define-key map (kbd "V")    #'emacs-jupyter-notebook-list-variables)
-    (define-key map (kbd "i")    #'emacs-jupyter-notebook-inspect-variable)
+    (define-key map (kbd "i")    #'emacs-jupyter-notebook-inspect)
+    (define-key map (kbd "a")    #'emacs-jupyter-notebook-actions)
+    (define-key map (kbd "A")    #'emacs-jupyter-notebook-view-variable)
     (define-key map (kbd "I")    #'emacs-jupyter-notebook-inspect-images)
     (define-key map (kbd "J")    #'emacs-jupyter-notebook-evaluate-and-inspect)
     (define-key map (kbd ".")    #'emacs-jupyter-notebook-inspect-at-point)
@@ -1382,7 +1389,8 @@ at the FIFO head until correlated terminal evidence arrives.
         (ignore-errors
           (emacs-jupyter-notebook-fringe-set cell-key status execution-count))))
     (emacs-jupyter-notebook--execution-remove record)
-    (emacs-jupyter-notebook--execution-pump)))
+    (emacs-jupyter-notebook--execution-pump)
+    (emacs-jupyter-notebook-variables-execution-finished)))
 
 (defun emacs-jupyter-notebook--execution-admitted-p (record client)
   "Return non-nil only when RECORD has evidence of reaching CLIENT.
@@ -1616,7 +1624,8 @@ never make Emacs appear hung.
     ;; after that bounded setup sequence completes successfully.
     (unless reason
       (emacs-jupyter-notebook--reset-auto-reconnect-episode))
-    (emacs-jupyter-notebook--execution-pump)))
+    (emacs-jupyter-notebook--execution-pump)
+    (emacs-jupyter-notebook-variables-execution-finished)))
 
 (defun emacs-jupyter-notebook--execution-setup-send-next (client epoch snippets)
   "Send SNIPPETS serially before permitting user work on CLIENT."
@@ -5489,7 +5498,9 @@ in-flight invalidation contract."
                 (let ((backend-id
                      (emacs-jupyter-notebook-backend-execute
                       client (plist-get record :code)
-                      (list :entry-handle handle :ledger-id id)
+                      (append (list :entry-handle handle :ledger-id id)
+                              (when (plist-get record :inspection)
+                                (list :inspection t)))
                       (lambda (_backend-id _result)
                         ;; EI4 terminality is driven only by the real,
                         ;; correlated execute_reply plus status=idle event
@@ -5722,8 +5733,10 @@ returns is boundedly staged until its generic backend id can be validated."
             (emacs-jupyter-notebook--execution-maybe-finish record))))))))
 
 (defun emacs-jupyter-notebook--evaluate-code
-    (code cell-key &optional start-profile announce-start)
-  "Reserve CODE in FIFO order before any asynchronous client/completeness work."
+    (code cell-key &optional start-profile announce-start options)
+  "Reserve CODE in FIFO order before asynchronous client/completeness work.
+Internal OPTIONS may carry :title, :inspection, and :on-created.  The latter
+receives the reserved record before dispatch can produce any output."
   (emacs-jupyter-notebook--ensure-no-replacement-operation)
   (unless (stringp code)
     (user-error "Evaluation code must be a string"))
@@ -5736,23 +5749,30 @@ returns is boundedly staged until its generic backend id can be validated."
     (user-error "EJN execution queue is full; cancel or wait for pending work"))
   (let* ((buffer (current-buffer))
          (panel (ejn-panel-ensure buffer))
-         (handle (ejn-panel-start-entry panel cell-key code))
+         (handle (if (plist-get options :title)
+                     (ejn-panel-start-entry panel cell-key code (plist-get options :title))
+                   (ejn-panel-start-entry panel cell-key code)))
          (id (cl-incf emacs-jupyter-notebook--execution-counter))
           (record (list :id id :code code :cell-key cell-key :panel-entry handle
                         :generation (plist-get handle :generation) :state 'queued
                        :status-token (gensym "ejn-execution-status-")
                        :started-at (float-time) :reply-seen nil :idle-seen nil
                        :terminal nil :timer nil :start-profile start-profile
-                       :announce-start announce-start))
+                       :announce-start announce-start
+                       :inspection (plist-get options :inspection)))
          (modified (buffer-modified-p)))
-    (emacs-jupyter-notebook-variables-invalidate)
     (emacs-jupyter-notebook-panel--display panel)
+    (ejn-panel-reveal-entry handle)
     (ejn-panel-set-entry-status handle 'queued)
     (when cell-key (emacs-jupyter-notebook-fringe-set cell-key 'queued))
     (emacs-jupyter-notebook--execution-put record)
     (setq emacs-jupyter-notebook--execution-queue
           (append emacs-jupyter-notebook--execution-queue (list id)))
+    (emacs-jupyter-notebook-variables-invalidate)
     (set-buffer-modified-p modified)
+    (when-let ((created (plist-get options :on-created)))
+      (funcall created record))
+    (run-hook-with-args 'emacs-jupyter-notebook-execution-created-hook record)
     (emacs-jupyter-notebook--execution-pump)
     id))
 

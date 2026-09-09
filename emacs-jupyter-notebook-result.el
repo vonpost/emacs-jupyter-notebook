@@ -126,6 +126,27 @@ Each entry plist supports:
 (defvar-local emacs-jupyter-notebook-panel--restore-entry-id nil
   "Entry whose header should regain point after an output visibility toggle.")
 
+(defcustom emacs-jupyter-notebook-panel-follow-source t
+  "Reveal the current source cell's output when moving between cells.
+The output window is never selected.  Scrolling output pauses following until
+the source moves to another cell, a new evaluation is revealed, or `f' resumes."
+  :type 'boolean :group 'emacs-jupyter-notebook)
+
+(defvar-local emacs-jupyter-notebook-panel--follow-paused nil
+  "Non-nil while the user is reading output independently of the source.")
+(defvar-local emacs-jupyter-notebook-panel--follow-empty nil
+  "Non-nil when the current source cell has no retained output to reveal.")
+(defvar-local emacs-jupyter-notebook-panel--reveal-entry-id nil
+  "Entry to reveal once the pending panel layout has finished rendering.")
+(defvar-local emacs-jupyter-notebook-panel--navigation-snapshot nil
+  "Reading positions retained across a complete or interrupted redraw.")
+(defvar-local emacs-jupyter-notebook-panel--duration-timer nil
+  "Timer refreshing elapsed durations in a visible panel.")
+(defvar-local emacs-jupyter-notebook-panel--last-source-cell nil
+  "Last source-cell identity observed by the local post-command hook.")
+(defvar emacs-jupyter-notebook-panel--adjusting-window nil
+  "Non-nil during a programmatic reveal or reading-position restoration.")
+
 (defvar-local emacs-jupyter-notebook-panel--next-id 0
   "Monotonic id counter for new entries.")
 
@@ -355,6 +376,9 @@ mistaking an arbitrary user-created image plist for a helper publication.")
     (define-key map (kbd "RET") #'emacs-jupyter-notebook-panel-visit-source)
     (define-key map (kbd "n") #'emacs-jupyter-notebook-panel-next-entry)
     (define-key map (kbd "p") #'emacs-jupyter-notebook-panel-previous-entry)
+    (define-key map (kbd "f") #'emacs-jupyter-notebook-panel-resume-follow)
+    (define-key map (kbd "i") #'emacs-jupyter-notebook-inspect)
+    (define-key map (kbd "a") #'emacs-jupyter-notebook-actions)
     ;; W2.5: native image zoom keys for images rendered inline in the panel.
     (define-key map (kbd "+") #'emacs-jupyter-notebook-panel-image-zoom-in)
     (define-key map (kbd "=") #'emacs-jupyter-notebook-panel-image-zoom-in)
@@ -374,6 +398,16 @@ evaluated cell, keyed by the cell's `# %%' marker location.  The
 history-log view appends every evaluation in time order."
   (setq buffer-read-only t)
   (setq truncate-lines nil)
+  (setq header-line-format
+        '(:eval (cond (emacs-jupyter-notebook-panel--follow-paused
+                       "Reading output · f: follow source · a: actions")
+                      (emacs-jupyter-notebook-panel--follow-empty
+                       "Current cell has no output · a: actions")
+                      (t "Following source · TAB: fold · i: inspect · a: actions"))))
+  (add-hook 'window-scroll-functions
+            #'emacs-jupyter-notebook-panel--window-scrolled nil t)
+  (add-hook 'pre-command-hook #'emacs-jupyter-notebook-panel--user-command nil t)
+  (add-hook 'post-command-hook #'emacs-jupyter-notebook-panel--user-command-finished nil t)
   (add-hook 'kill-buffer-hook
             #'emacs-jupyter-notebook-panel--on-kill nil t))
 
@@ -384,19 +418,27 @@ history-log view appends every evaluation in time order."
 ;; panel in emacs state so its keymap works exactly as designed.
 (declare-function evil-set-initial-state "evil-core" (mode state))
 (declare-function evil-define-key* "evil-core" (state keymap key def &rest bindings))
+(declare-function emacs-jupyter-notebook-inspect "emacs-jupyter-notebook-actions")
+(declare-function emacs-jupyter-notebook-actions "emacs-jupyter-notebook-actions")
 (with-eval-after-load 'evil
   (evil-set-initial-state 'emacs-jupyter-notebook-panel-mode 'emacs)
   ;; Honor an explicit switch to normal/motion state as well as Doom's
   ;; special-buffer state preferences without affecting insert-state TAB.
   (evil-define-key* '(normal motion) emacs-jupyter-notebook-panel-mode-map
     (kbd "TAB") #'emacs-jupyter-notebook-toggle-cell-output
-    (kbd "<tab>") #'emacs-jupyter-notebook-toggle-cell-output))
+    (kbd "<tab>") #'emacs-jupyter-notebook-toggle-cell-output
+    (kbd "f") #'emacs-jupyter-notebook-panel-resume-follow
+    (kbd "i") #'emacs-jupyter-notebook-inspect
+    (kbd "a") #'emacs-jupyter-notebook-actions))
 
 (defun emacs-jupyter-notebook-panel--on-kill ()
   "Release timers, cached images, and private files owned by this panel."
   (when (timerp emacs-jupyter-notebook-panel--flush-timer)
     (cancel-timer emacs-jupyter-notebook-panel--flush-timer))
   (setq emacs-jupyter-notebook-panel--flush-timer nil)
+  (when (timerp emacs-jupyter-notebook-panel--duration-timer)
+    (cancel-timer emacs-jupyter-notebook-panel--duration-timer))
+  (setq emacs-jupyter-notebook-panel--duration-timer nil)
   (emacs-jupyter-notebook-panel--cancel-sliced-render)
   (emacs-jupyter-notebook-panel--cleanup-external-image-opens-for-panel
    (current-buffer))
@@ -456,17 +498,200 @@ with the same basename) so distinct sources always map to distinct panels."
 
 (defun emacs-jupyter-notebook-panel--display (panel)
   "Pop PANEL up in a side window honoring the user's customization."
-  (display-buffer
-   panel
-   `((display-buffer-in-side-window)
-     (side . ,emacs-jupyter-notebook-panel-side)
-     (window-width . ,emacs-jupyter-notebook-panel-width))))
+  (prog1
+      (display-buffer
+       panel
+       `((display-buffer-in-side-window)
+         (side . ,emacs-jupyter-notebook-panel-side)
+         (window-width . ,emacs-jupyter-notebook-panel-width)))
+    (emacs-jupyter-notebook-panel--track-duration panel)))
 
 (defun emacs-jupyter-notebook-show-output-panel ()
   "Open or pop up the current source buffer's output panel."
   (interactive)
   (let ((panel (ejn-panel-ensure (current-buffer))))
-    (emacs-jupyter-notebook-panel--display panel)))
+    (emacs-jupyter-notebook-panel--display panel)
+    (emacs-jupyter-notebook-panel--source-post-command t)))
+
+(defun emacs-jupyter-notebook-panel--pause-follow ()
+  "Keep this panel's reading position until the source changes cells."
+  (setq emacs-jupyter-notebook-panel--follow-paused t
+        emacs-jupyter-notebook-panel--reveal-entry-id nil)
+  (force-mode-line-update))
+
+(defun emacs-jupyter-notebook-panel--user-command ()
+  "Treat navigation in the selected panel as a request to read independently."
+  (unless (memq this-command '(emacs-jupyter-notebook-panel-resume-follow
+                              emacs-jupyter-notebook-toggle-cell-output
+                              emacs-jupyter-notebook-actions
+                              emacs-jupyter-notebook-inspect))
+    (emacs-jupyter-notebook-panel--pause-follow)))
+
+(defun emacs-jupyter-notebook-panel--user-command-finished ()
+  "Retain navigation made while a sliced redraw is still in progress."
+  (when (and emacs-jupyter-notebook-panel--follow-paused
+             emacs-jupyter-notebook-panel--navigation-snapshot)
+    (setq emacs-jupyter-notebook-panel--navigation-snapshot nil)
+    (emacs-jupyter-notebook-panel--capture-navigation)))
+
+(defun emacs-jupyter-notebook-panel--window-scrolled (window start)
+  "Pause following when an interactive scroll moves WINDOW to START.
+Mouse wheels may scroll an unselected panel while point remains in source.
+Ignore redisplay-driven and programmatic window changes."
+  (when (and (window-live-p window)
+             (eq (window-buffer window) (current-buffer))
+             (not emacs-jupyter-notebook-panel--adjusting-window)
+             (not (equal start (window-parameter window 'ejn-panel-programmatic-start)))
+             (symbolp this-command)
+             (string-match-p (regexp-opt '("scroll" "wheel" "recenter"))
+                             (symbol-name this-command)))
+    (emacs-jupyter-notebook-panel--pause-follow)
+    (emacs-jupyter-notebook-panel--user-command-finished)))
+
+(defun emacs-jupyter-notebook-panel--position-anchor (position)
+  "Describe panel POSITION by entry identity and offset for later restoration."
+  (save-excursion
+    (goto-char (max (point-min) (min (point-max) position)))
+    (let* ((id (emacs-jupyter-notebook-panel--entry-id-at-point))
+           (bounds (and id (emacs-jupyter-notebook-panel--entry-bounds id))))
+      (if bounds
+          (let* ((position (point))
+                 (body-start (progn (goto-char (car bounds))
+                                    (min (cdr bounds) (1+ (line-end-position))))))
+            (if (>= position body-start)
+                (list :id id :body-offset (- position body-start))
+              (list :id id :offset (- position (car bounds)))))
+        (list :absolute (point))))))
+
+(defun emacs-jupyter-notebook-panel--anchor-position (anchor)
+  "Resolve a retained reading ANCHOR against the current panel layout."
+  (if-let ((id (plist-get anchor :id)))
+      (when-let ((bounds (emacs-jupyter-notebook-panel--entry-bounds id)))
+        (min (max (car bounds) (1- (cdr bounds)))
+             (if (plist-member anchor :body-offset)
+                 (+ (save-excursion
+                      (goto-char (car bounds))
+                      (1+ (line-end-position)))
+                    (plist-get anchor :body-offset))
+               (+ (car bounds) (plist-get anchor :offset)))))
+    (max (point-min) (min (point-max) (or (plist-get anchor :absolute) (point-min))))))
+
+(defun emacs-jupyter-notebook-panel--capture-navigation ()
+  "Remember panel reading positions once before a cancellable full redraw."
+  (unless emacs-jupyter-notebook-panel--navigation-snapshot
+    (setq emacs-jupyter-notebook-panel--navigation-snapshot
+          (list :point (emacs-jupyter-notebook-panel--position-anchor (point))
+                :at-end (= (point) (point-max))
+                :windows
+                (mapcar
+                 (lambda (window)
+                   (list window
+                         (emacs-jupyter-notebook-panel--position-anchor (window-start window))
+                         (emacs-jupyter-notebook-panel--position-anchor (window-point window))
+                         (window-vscroll window t)))
+                 (get-buffer-window-list (current-buffer) nil t))))))
+
+(defun emacs-jupyter-notebook-panel--apply-reveal ()
+  "Reveal a requested entry once this panel has a complete current layout."
+  (when (and emacs-jupyter-notebook-panel--reveal-entry-id
+             (not emacs-jupyter-notebook-panel--follow-paused)
+             (not emacs-jupyter-notebook-panel--dirty)
+             (not emacs-jupyter-notebook-panel--sliced-render-job))
+    (when-let ((bounds (emacs-jupyter-notebook-panel--entry-bounds
+                       emacs-jupyter-notebook-panel--reveal-entry-id)))
+      (let ((position (car bounds))
+            (emacs-jupyter-notebook-panel--adjusting-window t))
+        (goto-char position)
+        (dolist (window (get-buffer-window-list (current-buffer) nil t))
+          (set-window-parameter window 'ejn-panel-programmatic-start position)
+          (set-window-start window position t)
+          (set-window-point window position)
+          (set-window-vscroll window 0 t)))
+      (setq emacs-jupyter-notebook-panel--reveal-entry-id nil))))
+
+(defun emacs-jupyter-notebook-panel--finish-navigation ()
+  "Restore reading positions, then apply an explicit reveal or fold target."
+  (let ((snapshot emacs-jupyter-notebook-panel--navigation-snapshot)
+        (emacs-jupyter-notebook-panel--adjusting-window t))
+    (setq emacs-jupyter-notebook-panel--navigation-snapshot nil)
+    (if (and snapshot
+             (not (and (plist-get snapshot :at-end)
+                       (eq emacs-jupyter-notebook-panel--view 'history)
+                       (not emacs-jupyter-notebook-panel--follow-paused))))
+        (progn
+          (when-let ((position (emacs-jupyter-notebook-panel--anchor-position
+                               (plist-get snapshot :point))))
+            (goto-char position))
+          (dolist (saved (plist-get snapshot :windows))
+            (let ((window (nth 0 saved)))
+              (when (and (window-live-p window)
+                         (eq (window-buffer window) (current-buffer)))
+                (when-let ((position (emacs-jupyter-notebook-panel--anchor-position (nth 1 saved))))
+                  (set-window-parameter window 'ejn-panel-programmatic-start position)
+                  (set-window-start window position t)
+                  (set-window-vscroll window (nth 3 saved) t))
+                (when-let ((position (emacs-jupyter-notebook-panel--anchor-position (nth 2 saved))))
+                  (set-window-point window position))))))
+      (goto-char (if (eq emacs-jupyter-notebook-panel--view 'history)
+                     (point-max) (point-min))))
+    (emacs-jupyter-notebook-panel--restore-entry-point)
+    (emacs-jupyter-notebook-panel--apply-reveal)))
+
+(defun ejn-panel-reveal-entry (handle)
+  "Reveal live HANDLE without selecting the output window.
+History-only executions select history view so region/inspection output is
+visible immediately.  A pending render performs the reveal when it completes."
+  (when (ejn-panel-entry-live-p handle)
+    (with-current-buffer (plist-get handle :panel)
+      ;; The evaluation command itself will run the source post-command hook.
+      ;; Remember its cell now so that hook cannot immediately replace a
+      ;; region/inspection reveal with the last whole-cell result.
+      (when (buffer-live-p emacs-jupyter-notebook-panel--source-buffer)
+        (with-current-buffer emacs-jupyter-notebook-panel--source-buffer
+          (setq emacs-jupyter-notebook-panel--last-source-cell
+                (emacs-jupyter-notebook--cell-key-for
+                 (car (emacs-jupyter-notebook-cell-full-bounds))))))
+      (setq emacs-jupyter-notebook-panel--follow-paused nil
+            emacs-jupyter-notebook-panel--follow-empty nil
+            emacs-jupyter-notebook-panel--reveal-entry-id (plist-get handle :id))
+      (when (and (null (plist-get handle :cell-key))
+                 (not (eq emacs-jupyter-notebook-panel--view 'history)))
+        (setq emacs-jupyter-notebook-panel--view 'history)
+        (emacs-jupyter-notebook-panel--invalidate-structure (current-buffer)))
+      (emacs-jupyter-notebook-panel--apply-reveal)
+      (emacs-jupyter-notebook-panel--track-duration (current-buffer))
+      (force-mode-line-update))))
+
+(defun emacs-jupyter-notebook-panel--source-post-command (&optional force)
+  "Reveal the current source cell after crossing its boundary.
+FORCE permits an explicit reveal while a panel or action menu is selected."
+  (when (and (or force emacs-jupyter-notebook-panel-follow-source)
+             (or force (eq (window-buffer (selected-window)) (current-buffer))))
+    (when-let ((panel (emacs-jupyter-notebook-panel-buffer (current-buffer))))
+      (when (get-buffer-window panel t)
+        (let ((key (emacs-jupyter-notebook--cell-key-for
+                    (car (emacs-jupyter-notebook-cell-full-bounds)))))
+          (when (or force (not (equal key emacs-jupyter-notebook-panel--last-source-cell)))
+            (setq emacs-jupyter-notebook-panel--last-source-cell key)
+            (with-current-buffer panel
+              (let ((entry (cl-find-if
+                            (lambda (cell) (equal key (plist-get (cdr cell) :cell-key)))
+                            (reverse emacs-jupyter-notebook-panel--entries))))
+                (setq emacs-jupyter-notebook-panel--follow-paused nil
+                      emacs-jupyter-notebook-panel--follow-empty (null entry)
+                      emacs-jupyter-notebook-panel--reveal-entry-id (car-safe entry))
+                (emacs-jupyter-notebook-panel--apply-reveal)
+                (force-mode-line-update)))))))))
+
+(defun emacs-jupyter-notebook-panel-resume-follow ()
+  "Resume following the current source cell without changing selected windows."
+  (interactive)
+  (let ((source (if (derived-mode-p 'emacs-jupyter-notebook-panel-mode)
+                    emacs-jupyter-notebook-panel--source-buffer (current-buffer))))
+    (unless (buffer-live-p source) (user-error "The source buffer is no longer open"))
+    (with-current-buffer source
+      (setq-local emacs-jupyter-notebook-panel-follow-source t)
+      (emacs-jupyter-notebook-panel--source-post-command t))))
 
 ;;; Entry handle helpers
 
@@ -977,6 +1202,104 @@ configured inline previews; placeholder images never call `image-size'."
     (add-text-properties
      start (point) (list 'emacs-jupyter-notebook-segment-index index))))
 
+(defun emacs-jupyter-notebook-panel--short-line (text &optional limit)
+  "Return the bounded first line of TEXT without control characters.
+LIMIT defaults to 80 characters.  Never scan an unbounded source line."
+  (when (stringp text)
+    (let* ((prefix (substring-no-properties text 0 (min (length text) (or limit 80))))
+           (line (substring prefix 0 (string-search "\n" prefix))))
+      (string-trim (replace-regexp-in-string "[[:cntrl:]]" " " line)))))
+
+(defun emacs-jupyter-notebook-panel--source-cell-title (key source)
+  "Return the current explicit marker title for KEY in SOURCE, if present."
+  (when (and key (buffer-live-p source))
+    (with-current-buffer source
+      (when-let ((marker (and emacs-jupyter-notebook--cell-key-markers
+                             (gethash (cdr key) emacs-jupyter-notebook--cell-key-markers))))
+        (when (eq (marker-buffer marker) source)
+          (save-restriction
+            (widen)
+            (save-excursion
+              (save-match-data
+                (goto-char marker)
+                (when (looking-at code-cells-boundary-regexp)
+                  (goto-char (match-end 0))
+                  (let ((title (emacs-jupyter-notebook-panel--short-line
+                                (buffer-substring-no-properties
+                                 (point) (min (point-max) (+ (point) 80))))))
+                    (unless (string-empty-p title) title)))))))))))
+
+(defun emacs-jupyter-notebook-panel--newline-count (text)
+  "Count newline characters in bounded TEXT."
+  (let ((start 0) (count 0) next)
+    (while (setq next (string-search "\n" text start))
+      (setq count (1+ count) start (1+ next)))
+    count))
+
+(defun emacs-jupyter-notebook-panel--text-segment-lines (segment)
+  "Return the retained logical line count for text SEGMENT without joining it."
+  (let ((value (cdr segment)))
+    (if (emacs-jupyter-notebook-panel--text-state-p value)
+        (+ (or (plist-get value :newlines) 0)
+           (if (or (zerop (plist-get value :bytes))
+                   (plist-get value :ends-newline)) 0 1))
+      (+ (emacs-jupyter-notebook-panel--newline-count value)
+         (if (or (string-empty-p value) (string-suffix-p "\n" value)) 0 1)))))
+
+(defun emacs-jupyter-notebook-panel--last-output-line (entry)
+  "Return ENTRY's final nonempty text line, examining at most 512 characters."
+  (let ((remaining 512) pieces)
+    (dolist (segment (reverse (plist-get entry :outputs)))
+      (when (and (> remaining 0) (eq (car segment) 'text))
+        (let* ((value (cdr segment))
+               (chunks (if (emacs-jupyter-notebook-panel--text-state-p value)
+                           (reverse (plist-get value :chunks)) (list value))))
+          (while (and chunks (> remaining 0))
+            (let* ((chunk (pop chunks))
+                   (suffix (substring chunk (max 0 (- (length chunk) remaining)))))
+              (push suffix pieces)
+              (cl-decf remaining (length suffix)))))))
+    (when-let ((line (car (last (split-string (apply #'concat pieces) "\n" t "[ \t]+")))))
+      (emacs-jupyter-notebook-panel--short-line line 120))))
+
+(defun emacs-jupyter-notebook-panel--folded-summary (entry)
+  "Summarize ENTRY using retained counters and bounded error text only."
+  (let ((lines 0) (images 0) (planes 0) labels)
+    (dolist (segment (plist-get entry :outputs))
+      (pcase (car segment)
+        ('text (cl-incf lines (emacs-jupyter-notebook-panel--text-segment-lines segment)))
+        ('image (cl-incf images))
+        ('array
+         (let ((manifest (plist-get (cdr segment) :manifest)))
+           (cl-incf planes (if (hash-table-p manifest)
+                               (length (gethash "planes" manifest)) 1))))))
+    (when (> lines 0) (push (format "%d line%s" lines (if (= lines 1) "" "s")) labels))
+    (when (> images 0) (push (format "%d image%s" images (if (= images 1) "" "s")) labels))
+    (when (> planes 0) (push (format "%d plane%s" planes (if (= planes 1) "" "s")) labels))
+    (when (eq (plist-get entry :status) 'error)
+      (when-let ((message (emacs-jupyter-notebook-panel--last-output-line entry)))
+        (push message labels)))
+    (if labels (mapconcat #'identity (nreverse labels) " · ") "no output")))
+
+(defun emacs-jupyter-notebook-panel--duration-text (entry)
+  "Return ENTRY's finished duration or current running elapsed time."
+  (let ((seconds (or (plist-get entry :duration)
+                     (and (eq (plist-get entry :status) 'running)
+                          (plist-get entry :started-at)
+                          (- (float-time) (plist-get entry :started-at))))))
+    (if (numberp seconds) (format " · %.1fs" (max 0 seconds)) "")))
+
+(defun emacs-jupyter-notebook-panel--replace-header (entry bounds)
+  "Replace only ENTRY's bounded header at rendered BOUNDS."
+  (goto-char (car bounds))
+  (let ((end (min (cdr bounds) (1+ (line-end-position))))
+        (header (emacs-jupyter-notebook-panel--format-header entry)))
+    (unless (equal-including-properties
+             header (buffer-substring (point) end))
+      (delete-region (point) end)
+      (insert header)))
+  (plist-put entry :metadata-dirty-p nil))
+
 (defun emacs-jupyter-notebook-panel--format-header (entry)
   "Return the propertized header string for ENTRY."
   (let* ((count (or (plist-get entry :exec-count) "*"))
@@ -1002,7 +1325,10 @@ configured inline previews; placeholder images never call `image-size'."
       (while (and (< title-end title-limit)
                   (not (eq (aref code title-end) ?\n)))
         (cl-incf title-end))
-      (let ((title (substring code title-start title-end))
+      (let ((title (or (plist-get entry :title)
+                       (emacs-jupyter-notebook-panel--source-cell-title
+                        (plist-get entry :cell-key) emacs-jupyter-notebook-panel--source-buffer)
+                       (substring code title-start title-end)))
           (status-s (pcase status
                       ('running "running")
                       ('ok "ok")
@@ -1011,8 +1337,12 @@ configured inline previews; placeholder images never call `image-size'."
                       ('outcome-unknown "outcome unknown")
                       (_ (format "%s" status)))))
         (propertize
-         (format "[%s] %s [%s] %s%s\n" count ts status-s title
-                 (if (plist-get entry :hidden) " [outputs hidden]" ""))
+         (format "[%s] %s [%s] %s%s%s%s\n" count ts status-s title
+                 (emacs-jupyter-notebook-panel--duration-text entry)
+                 (if (plist-get entry :edited-since-run) " · edited since run" "")
+                 (if (plist-get entry :hidden)
+                     (format " [outputs hidden: %s]"
+                             (emacs-jupyter-notebook-panel--folded-summary entry)) ""))
          'face 'emacs-jupyter-notebook-result-header-face
          'emacs-jupyter-notebook-entry-id (plist-get entry :id)
          'emacs-jupyter-notebook-cell-key (plist-get entry :cell-key))))))
@@ -1044,6 +1374,9 @@ configured inline previews; placeholder images never call `image-size'."
       (setq state (plist-put state :chunk-count (1- count)))
       (setq state (plist-put state :bytes
                              (- (plist-get state :bytes) chunk-bytes)))
+      (setq state (plist-put state :newlines
+                             (- (or (plist-get state :newlines) 0)
+                                (emacs-jupyter-notebook-panel--newline-count chunk))))
       ;; The current line always occupies the final LINE-COUNT chunks.
       (when (<= count line-count)
         (setq state (plist-put state :last-line-chunks (1- line-count)))
@@ -1088,6 +1421,9 @@ CURRENT-LINE-P means TEXT belongs to the logical line after the last newline."
                              (1+ (or (plist-get state :chunk-count) 0))))
       (setq state (plist-put state :bytes
                              (+ (plist-get state :bytes) bytes)))
+      (setq state (plist-put state :newlines
+                             (+ (or (plist-get state :newlines) 0)
+                                (emacs-jupyter-notebook-panel--newline-count text))))
       (setq state
             (emacs-jupyter-notebook-panel--text-state-note-pending state text))
       (if current-line-p
@@ -1127,7 +1463,7 @@ CURRENT-LINE-P means TEXT belongs to the logical line after the last newline."
 (defun emacs-jupyter-notebook-panel--make-text-state (text)
   "Return a chunked text state initialized with TEXT."
   (emacs-jupyter-notebook-panel--text-state-append
-   (list :chunks nil :tail nil :chunk-count 0 :bytes 0 :cache nil
+   (list :chunks nil :tail nil :chunk-count 0 :bytes 0 :newlines 0 :cache nil
          :pending nil :pending-count 0 :pending-overflow nil
          :last-line-chunks 0 :last-line-bytes 0
          :ends-newline nil :rendered-ends-newline nil)
@@ -1214,6 +1550,10 @@ CURRENT-LINE-P means TEXT belongs to the logical line after the last newline."
             (setq bytes (- bytes chunk-bytes)))
         (let ((kept (emacs-jupyter-notebook--last-bytes
                      chunk (- chunk-bytes bytes))))
+          (setq state (plist-put state :newlines
+                                 (+ (- (or (plist-get state :newlines) 0)
+                                       (emacs-jupyter-notebook-panel--newline-count chunk))
+                                    (emacs-jupyter-notebook-panel--newline-count kept))))
           (setcar chunks kept)
           (setq state (plist-put state :bytes
                                  (- (plist-get state :bytes)
@@ -1277,6 +1617,7 @@ CURRENT-LINE-P means TEXT belongs to the logical line after the last newline."
         ('text
          (emacs-jupyter-notebook-panel--insert-text-segment seg index)))))
   (insert "\n")
+  (plist-put entry :metadata-dirty-p nil)
   (plist-put entry :stream-dirty-p nil))
 
 (defun emacs-jupyter-notebook-panel--pending-text-fits-p (pending max-bytes)
@@ -1337,6 +1678,11 @@ it so the caller can use the bounded full renderer instead."
             (setq state (plist-put state :rendered-ends-newline new-ends-newline))
             (setcdr segment state)
             (plist-put entry :stream-dirty-p nil)
+            ;; A stream can arrive after a status/source edit but before its
+            ;; scheduled redraw.  Refresh metadata too, so a suffix-only patch
+            ;; cannot leave a stale status, title, or edited-since-run label.
+            (when (plist-get entry :metadata-dirty-p)
+              (emacs-jupyter-notebook-panel--replace-header entry bounds))
             t))))))
 
 (defun emacs-jupyter-notebook-panel--sliced-render-insert-text (text index)
@@ -1400,6 +1746,7 @@ chunked by `--make-text-state'."
   (let ((entry (plist-get job :current-entry)))
     (insert "\n")
     (when entry
+      (setq entry (plist-put entry :metadata-dirty-p nil))
       ;; `plist-put' can return a fresh plist when this optional key was not
       ;; already present, so install it back in the durable entry table.
       (emacs-jupyter-notebook-panel--set-entry
@@ -1565,11 +1912,15 @@ flags."
         (let ((inhibit-read-only t)
               (job emacs-jupyter-notebook-panel--sliced-render-job)
               (work 0)
+              (reader-position (copy-marker (point)))
               (text-bytes 0)
               (clear-characters 0)
               (image-used nil)
               complete blocked)
           (setq emacs-jupyter-notebook-panel--sliced-render-timer nil)
+          ;; Point belongs to the reader between slices.  Always append the
+          ;; next render slice at the end, even after panel navigation.
+          (goto-char (point-max))
           (while (and (< work emacs-jupyter-notebook-panel--sliced-render-max-work-items)
                       (not complete) (not blocked))
             (let ((result
@@ -1588,17 +1939,17 @@ flags."
               (progn
                 (setq emacs-jupyter-notebook-panel--sliced-render-job nil)
                 (cl-incf emacs-jupyter-notebook-panel--render-count)
-                (if (eq emacs-jupyter-notebook-panel--view 'history)
-                    (goto-char (point-max))
-                  (goto-char (point-min)))
-                (emacs-jupyter-notebook-panel--restore-entry-point))
-            (emacs-jupyter-notebook-panel--sliced-render-arm panel token)))))))
+                (emacs-jupyter-notebook-panel--finish-navigation))
+            (goto-char reader-position)
+            (emacs-jupyter-notebook-panel--sliced-render-arm panel token))
+          (set-marker reader-position nil))))))
 
 (defun emacs-jupyter-notebook-panel--start-sliced-render (panel)
   "Start a cancellable, bounded full render of PANEL on regular timers.
 Only fixed-size state is prepared synchronously.  The callback inserts at
 most `--sliced-render-max-text-bytes' text bytes and one image per tick."
   (with-current-buffer panel
+    (emacs-jupyter-notebook-panel--capture-navigation)
     (emacs-jupyter-notebook-panel--cancel-sliced-render)
     (let* ((entries (emacs-jupyter-notebook-panel--visible-entries))
            (inline (emacs-jupyter-notebook-panel--bounded-inline-specs entries))
@@ -1632,6 +1983,7 @@ most `--sliced-render-max-text-bytes' text bytes and one image per tick."
 Falls back to a full render if an affected visible entry has no existing
 section, which means ordering or view membership changed unexpectedly."
   (with-current-buffer panel
+    (emacs-jupyter-notebook-panel--capture-navigation)
     (let ((ids (prog1 emacs-jupyter-notebook-panel--dirty-entry-ids
                  (setq emacs-jupyter-notebook-panel--dirty-entry-ids nil))))
       (setq emacs-jupyter-notebook-panel--force-full-render nil)
@@ -1693,15 +2045,17 @@ section, which means ordering or view membership changed unexpectedly."
               (emacs-jupyter-notebook-panel--render panel)
             (cl-incf emacs-jupyter-notebook-panel--render-count)
             (when was-at-end
-              (goto-char (point-max)))))))))
+              (goto-char (point-max)))))))
+    (when (and emacs-jupyter-notebook-panel--navigation-snapshot
+               (not emacs-jupyter-notebook-panel--sliced-render-job))
+      (emacs-jupyter-notebook-panel--finish-navigation))))
 
 (defun emacs-jupyter-notebook-panel--render (panel)
-  "Render PANEL contents according to current view.
-History view auto-scrolls to the bottom of the buffer so the newest
-entry is visible; latest-per-cell view goes to the top."
+  "Render PANEL contents, preserving reading positions and pending reveals."
   (with-current-buffer panel
     ;; This is retained as the explicit synchronous diagnostic/test hook.
     ;; Ordinary timer-driven full renders go through `--start-sliced-render'.
+    (emacs-jupyter-notebook-panel--capture-navigation)
     (emacs-jupyter-notebook-panel--cancel-sliced-render)
     (let ((inhibit-read-only t)
           (entries (emacs-jupyter-notebook-panel--visible-entries)))
@@ -1722,10 +2076,7 @@ entry is visible; latest-per-cell view goes to the top."
       (dolist (entry entries)
         (emacs-jupyter-notebook-panel--insert-entry
          entry emacs-jupyter-notebook-panel--inline-image-specs))
-      (if (eq emacs-jupyter-notebook-panel--view 'history)
-          (goto-char (point-max))
-        (goto-char (point-min)))
-      (emacs-jupyter-notebook-panel--restore-entry-point))))
+      (emacs-jupyter-notebook-panel--finish-navigation))))
 
 ;;; Public API
 
@@ -2544,7 +2895,9 @@ configured budgets remain hard limits."
           (cl-set-difference emacs-jupyter-notebook-panel--inline-image-specs
                              images :test #'equal))
     (setq emacs-jupyter-notebook-panel--entries
-          (delq cell emacs-jupyter-notebook-panel--entries))))
+          (delq cell emacs-jupyter-notebook-panel--entries))
+    (when (eql (car cell) emacs-jupyter-notebook-panel--reveal-entry-id)
+      (setq emacs-jupyter-notebook-panel--reveal-entry-id nil))))
 
 (defun emacs-jupyter-notebook-panel--enforce-retention-budgets (panel)
   "Evict oldest history entries from PANEL until all retention budgets hold."
@@ -2648,6 +3001,10 @@ normal Emacs exit; it never consults source, registry, SSH, or kernel state."
       (setq emacs-jupyter-notebook-panel--entries nil)
       (setq emacs-jupyter-notebook-panel--hidden-cells nil)
       (setq emacs-jupyter-notebook-panel--restore-entry-id nil)
+      (setq emacs-jupyter-notebook-panel--reveal-entry-id nil
+            emacs-jupyter-notebook-panel--navigation-snapshot nil
+            emacs-jupyter-notebook-panel--follow-empty nil)
+      (emacs-jupyter-notebook-panel--track-duration panel)
       (setq emacs-jupyter-notebook-panel--retained-text-bytes 0
             emacs-jupyter-notebook-panel--retained-artifact-bytes 0
             emacs-jupyter-notebook-panel--retained-output-segments 0)
@@ -2655,9 +3012,10 @@ normal Emacs exit; it never consults source, registry, SSH, or kernel state."
       (cl-incf emacs-jupyter-notebook-panel--generation)
       (emacs-jupyter-notebook-panel--invalidate-structure panel))))
 
-(defun ejn-panel-start-entry (panel cell-key code)
+(defun ejn-panel-start-entry (panel cell-key code &optional title)
   "Begin a new output entry in PANEL associated with CELL-KEY for CODE.
-Return an entry handle.
+Return an entry handle.  Optional TITLE supplies a short user-facing label
+for generated inspection code; otherwise the source cell's marker title wins.
 
 For latest-per-cell view, re-evaluating the same CELL-KEY replaces the
 prior entry's slot.  The new entry takes its position so the running
@@ -2671,12 +3029,18 @@ state appears in place."
     (let* ((id (cl-incf emacs-jupyter-notebook-panel--next-id))
            (entry (list :id id
                         :cell-key cell-key
+                        :title (when title (emacs-jupyter-notebook-panel--short-line title))
                         :hidden (and cell-key
                                      emacs-jupyter-notebook-panel--hidden-cells
                                      (gethash cell-key
                                               emacs-jupyter-notebook-panel--hidden-cells))
                         :code (or code "")
                         :status 'running
+                        :started-at (float-time)
+                        :finished-at nil
+                        :duration nil
+                        :edited-since-run nil
+                        :metadata-dirty-p nil
                         :exec-count "*"
                         :timestamp (format-time-string "%Y-%m-%dT%H:%M:%S")
                         ;; W16: ordered output segments — `(text . STRING)'
@@ -3181,10 +3545,66 @@ so text segments are left untouched and no new segment is created."
     (emacs-jupyter-notebook-panel--update-entry
      handle
      (lambda (entry)
-       (setq entry (plist-put entry :status (or status 'ok)))
+       (setq entry (emacs-jupyter-notebook-panel--entry-with-status
+                    entry (or status 'ok)))
        (when execution-count
          (setq entry (plist-put entry :exec-count execution-count)))
-       entry))))
+       entry))
+    (emacs-jupyter-notebook-panel--track-duration (plist-get handle :panel))))
+
+(defun emacs-jupyter-notebook-panel--entry-with-status (entry status)
+  "Set ENTRY's STATUS and record elapsed running time, excluding queue time."
+  (pcase status
+    ('queued
+     (setq entry (plist-put entry :started-at nil)))
+    ('running
+     (unless (plist-get entry :started-at)
+       (setq entry (plist-put entry :started-at (float-time)))))
+    (_
+     (unless (plist-get entry :finished-at)
+       (let ((now (float-time)))
+         (setq entry (plist-put entry :finished-at now))
+         (when (plist-get entry :started-at)
+           (setq entry (plist-put entry :duration
+                                  (max 0 (- now (plist-get entry :started-at))))))))))
+  (setq entry (plist-put entry :stream-dirty-p nil))
+  (setq entry (plist-put entry :metadata-dirty-p t))
+  (plist-put entry :status status))
+
+(defun emacs-jupyter-notebook-panel--duration-tick (panel)
+  "Refresh running durations in visible PANEL and retire an unused timer."
+  (when (buffer-live-p panel)
+    (with-current-buffer panel
+      (setq emacs-jupyter-notebook-panel--duration-timer nil)
+      (when (get-buffer-window panel t)
+        ;; Duration updates must never restart a multi-megabyte body render.
+        ;; A pending render already formats a fresh header when it reaches it.
+        (unless (or emacs-jupyter-notebook-panel--dirty
+                    emacs-jupyter-notebook-panel--sliced-render-job)
+          (let ((inhibit-read-only t) (updated 0))
+            (emacs-jupyter-notebook-panel--capture-navigation)
+            (dolist (cell (reverse emacs-jupyter-notebook-panel--entries))
+              (when (and (< updated 4)
+                         (eq (plist-get (cdr cell) :status) 'running))
+                (when-let ((bounds (emacs-jupyter-notebook-panel--entry-bounds (car cell))))
+                  (emacs-jupyter-notebook-panel--replace-header (cdr cell) bounds)
+                  (cl-incf updated))))
+            (emacs-jupyter-notebook-panel--finish-navigation)))
+        (emacs-jupyter-notebook-panel--track-duration panel)))))
+
+(defun emacs-jupyter-notebook-panel--track-duration (panel)
+  "Maintain one bounded-duration refresh timer while PANEL shows running work."
+  (when (buffer-live-p panel)
+    (with-current-buffer panel
+      (if (and (get-buffer-window panel t)
+               (cl-some (lambda (cell) (eq (plist-get (cdr cell) :status) 'running))
+                        emacs-jupyter-notebook-panel--entries))
+          (unless (timerp emacs-jupyter-notebook-panel--duration-timer)
+            (setq emacs-jupyter-notebook-panel--duration-timer
+                  (run-at-time 1 nil #'emacs-jupyter-notebook-panel--duration-tick panel)))
+        (when (timerp emacs-jupyter-notebook-panel--duration-timer)
+          (cancel-timer emacs-jupyter-notebook-panel--duration-timer))
+        (setq emacs-jupyter-notebook-panel--duration-timer nil)))))
 
 (defun ejn-panel-set-entry-status (handle status)
   "Set live HANDLE to nonterminal STATUS without fabricating an execution count.
@@ -3192,7 +3612,8 @@ Used by the serialized execution ledger to expose queued work before it is
 actually dispatched to a kernel."
   (when handle
     (emacs-jupyter-notebook-panel--update-entry
-     handle (lambda (entry) (plist-put entry :status status)))))
+     handle (lambda (entry) (emacs-jupyter-notebook-panel--entry-with-status entry status)))
+    (emacs-jupyter-notebook-panel--track-duration (plist-get handle :panel))))
 
 (defun ejn-panel-clear-entry (handle &optional wait)
   "Clear HANDLE's entry content.
@@ -3305,6 +3726,9 @@ and text are untouched.  A non-positive limit retains zero pickle artifacts."
 (defvar-local emacs-jupyter-notebook--cell-deleted-ids nil
   "Cell IDs whose original boundary is removed by the current change.")
 
+(defvar-local emacs-jupyter-notebook--cell-touched-ids nil
+  "Alist of cells edited by the pending change and their boundary-insert flag.")
+
 (defvar emacs-jupyter-notebook--cell-moving-p nil
   "Non-nil during an explicit cell move that transposes its markers intact.")
 
@@ -3368,6 +3792,27 @@ the kernel, but their handles and cell identities can no longer show output."
 Markers alone cannot detect deletion: Emacs collapses a removed marker onto
 the next cell, which would incorrectly inherit the removed cell's identity."
   (setq emacs-jupyter-notebook--cell-deleted-ids nil)
+  (setq emacs-jupyter-notebook--cell-touched-ids nil)
+  (when (and (not emacs-jupyter-notebook--cell-moving-p)
+             emacs-jupyter-notebook--cell-key-markers
+             (emacs-jupyter-notebook-panel-buffer (current-buffer)))
+    (save-restriction
+      (widen)
+      (save-excursion
+        (save-match-data
+          (goto-char beg)
+          (let ((first (car (emacs-jupyter-notebook-cell-full-bounds))))
+            (goto-char (if (> end beg) (1- end) end))
+            (let ((last (car (emacs-jupyter-notebook-cell-full-bounds))))
+              (maphash
+               (lambda (id marker)
+                 (when (and (eq (marker-buffer marker) (current-buffer))
+                            (<= first (marker-position marker) last))
+                   (push (cons id (and (= beg end (marker-position marker))
+                                       (eq (gethash id emacs-jupyter-notebook--cell-key-kinds)
+                                           'explicit)))
+                         emacs-jupyter-notebook--cell-touched-ids)))
+               emacs-jupyter-notebook--cell-key-markers)))))))
   (when (and (not emacs-jupyter-notebook--cell-moving-p)
              (< beg end) emacs-jupyter-notebook--cell-key-markers)
     (save-restriction
@@ -3393,7 +3838,7 @@ the next cell, which would incorrectly inherit the removed cell's identity."
                    (push id emacs-jupyter-notebook--cell-deleted-ids)))))
            emacs-jupyter-notebook--cell-key-markers))))))
 
-(defun emacs-jupyter-notebook--cell-after-change (&rest _change)
+(defun emacs-jupyter-notebook--cell-after-change (&optional beg _end _old-length)
   "Retire deleted or invalid boundaries after a source edit.
 Normalize surviving anchors, preserving IDs when text is inserted above.
 An explicit boundary merged into the preceding line is no longer a cell.
@@ -3434,18 +3879,39 @@ Ambiguous duplicate anchors are retired together instead of reassociated."
       (maphash (lambda (_position ids)
                  (when (cdr ids) (setq invalid (append ids invalid))))
                positions)
-      (emacs-jupyter-notebook--cell-retire-ids invalid))))
+      (emacs-jupyter-notebook--cell-retire-ids invalid))
+    (when-let ((panel (and emacs-jupyter-notebook--cell-touched-ids
+                          (emacs-jupyter-notebook-panel-buffer (current-buffer)))))
+      (let ((edited (make-hash-table :test 'eql)))
+        (dolist (touched emacs-jupyter-notebook--cell-touched-ids)
+          (when-let ((marker (gethash (car touched) emacs-jupyter-notebook--cell-key-markers)))
+            ;; Inserting complete lines before an existing explicit marker
+            ;; shifts its identity but does not change that cell's source.
+            (unless (and (cdr touched) beg (> (marker-position marker) beg))
+              (puthash (car touched) t edited))))
+        (with-current-buffer panel
+          (dolist (cell emacs-jupyter-notebook-panel--entries)
+            (when (gethash (cdr (plist-get (cdr cell) :cell-key)) edited)
+              (setcdr cell (plist-put (cdr cell) :edited-since-run t))
+              (setcdr cell (plist-put (cdr cell) :metadata-dirty-p t))
+              (setcdr cell (plist-put (cdr cell) :stream-dirty-p nil))
+              (emacs-jupyter-notebook-panel--schedule-render panel (car cell)))))))
+    (setq emacs-jupyter-notebook--cell-touched-ids nil)))
 
 (defun emacs-jupyter-notebook-cell-tracking-enable ()
   "Track source-cell deletion using buffer-local change hooks."
   (add-hook 'before-change-functions #'emacs-jupyter-notebook--cell-before-change nil t)
-  (add-hook 'after-change-functions #'emacs-jupyter-notebook--cell-after-change nil t))
+  (add-hook 'after-change-functions #'emacs-jupyter-notebook--cell-after-change nil t)
+  (add-hook 'post-command-hook #'emacs-jupyter-notebook-panel--source-post-command nil t))
 
 (defun emacs-jupyter-notebook-cell-tracking-disable ()
   "Remove cell tracking and retire its disposable output identities."
   (remove-hook 'before-change-functions #'emacs-jupyter-notebook--cell-before-change t)
   (remove-hook 'after-change-functions #'emacs-jupyter-notebook--cell-after-change t)
-  (setq emacs-jupyter-notebook--cell-deleted-ids nil)
+  (remove-hook 'post-command-hook #'emacs-jupyter-notebook-panel--source-post-command t)
+  (setq emacs-jupyter-notebook--cell-deleted-ids nil
+        emacs-jupyter-notebook--cell-touched-ids nil
+        emacs-jupyter-notebook-panel--last-source-cell nil)
   (when emacs-jupyter-notebook--cell-key-markers
     (emacs-jupyter-notebook--cell-retire-ids
      (hash-table-keys emacs-jupyter-notebook--cell-key-markers))))

@@ -110,8 +110,12 @@ class NavigationGroup:
 class ImageGraphicsWidget(pg.GraphicsLayoutWidget):
     """Route native pinch and full-resolution wheel events before scene conversion."""
 
+    roiDragged = QtCore.Signal(object, object, object, bool)
+
     def __init__(self, *args, **kwargs):
         self._gesture_view = None
+        self.draw_roi = False
+        self._roi_drag = None
         super().__init__(*args, **kwargs)
 
     def _view_at(self, position):
@@ -139,6 +143,24 @@ class ImageGraphicsWidget(pg.GraphicsLayoutWidget):
 
     def viewportEvent(self, event):
         kind = event.type()
+        if self.draw_roi and kind == QtCore.QEvent.Type.MouseButtonPress and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            view, scene = self._view_at(event.position())
+            if view is not None:
+                start = view.mapSceneToView(scene)
+                self._roi_drag = view, start
+                self.roiDragged.emit(view, start, start, False)
+                event.accept()
+                return True
+        if self._roi_drag is not None and kind in (QtCore.QEvent.Type.MouseMove,
+                                                   QtCore.QEvent.Type.MouseButtonRelease):
+            view, start = self._roi_drag
+            end = view.mapSceneToView(self.mapToScene(event.position().toPoint()))
+            finished = kind == QtCore.QEvent.Type.MouseButtonRelease
+            if finished:
+                self._roi_drag = None
+            self.roiDragged.emit(view, start, end, finished)
+            event.accept()
+            return True
         if kind not in (QtCore.QEvent.Type.Wheel, QtCore.QEvent.Type.NativeGesture):
             return super().viewportEvent(event)
         view, scene = self._view_at(event.position())

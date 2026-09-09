@@ -174,7 +174,8 @@
       (should (string-match-p "truncated" header-line-format)))
     (emacs-jupyter-notebook-variables-invalidate)
     (with-current-buffer emacs-jupyter-notebook-variables--table
-      (should-not tabulated-list-entries)
+      (should tabulated-list-entries)
+      (should (string-match-p "Stale metadata" header-line-format))
       (should (string-match-p "refresh" header-line-format)))))
 
 (ert-deftest ejn-variables-setup-restores-eldoc-and-hooks ()
@@ -206,7 +207,153 @@
     (should (equal (cddr binding)
                    (list (kbd "g") #'emacs-jupyter-notebook-variables-refresh
                          (kbd "RET") #'emacs-jupyter-notebook-variables-inspect-row
+                         (kbd "i") #'emacs-jupyter-notebook-inspect
+                         (kbd "a") #'emacs-jupyter-notebook-actions
+                         (kbd "v") #'emacs-jupyter-notebook-variables-view-row
+                         (kbd "f") #'emacs-jupyter-notebook-variables-toggle-favorite
+                         (kbd "F") #'emacs-jupyter-notebook-variables-toggle-favorites-only
                          (kbd "q") #'quit-window)))))
+
+(ert-deftest ejn-variables-dashboard-refreshes-on-idle-without-popup-and-highlights-changes ()
+  (ejn-variables-test--with-source
+    (cl-letf (((symbol-function 'display-buffer) #'ignore))
+      (emacs-jupyter-notebook-list-variables))
+    (ejn-variables-test--fire scheduled 0)
+    (funcall (nth 3 (car requests)) 1 ejn-variables-test--reply)
+    (let ((table emacs-jupyter-notebook-variables--table))
+      (emacs-jupyter-notebook-variables-invalidate)
+      (setq emacs-jupyter-notebook--kernel-status 'busy)
+      (emacs-jupyter-notebook-variables-execution-finished)
+      (should (= (length requests) 1))
+      (with-current-buffer table
+        (should (= (length tabulated-list-entries) 1))
+        (should (string-match-p "kernel busy" header-line-format)))
+      (setq emacs-jupyter-notebook--kernel-status 'idle)
+      (cl-letf (((symbol-function 'display-buffer) (lambda (&rest _) (ert-fail "dashboard popped up"))))
+        (emacs-jupyter-notebook-variables-execution-finished)
+        (emacs-jupyter-notebook-variables-execution-finished))
+      (ejn-variables-test--fire scheduled 2)
+      (should (= (length requests) 2))
+      (funcall (nth 3 (nth 1 requests)) 2
+               '(:variables ((:name "image" :type "numpy.ndarray" :shape [32 64] :dtype "float64"))
+                 :truncated nil))
+      (with-current-buffer table
+        (let ((columns (cadar tabulated-list-entries)))
+          (should (equal (aref columns 3) "(32, 64)"))
+          (should (eq (get-text-property 0 'face (aref columns 3)) 'emacs-jupyter-notebook-variable-changed))
+          (should (eq (get-text-property 0 'face (aref columns 4)) 'emacs-jupyter-notebook-variable-changed))))
+      (should-not emacs-jupyter-notebook-variables--refresh-pending)
+      (should-not emacs-jupyter-notebook-variables--stale))))
+
+(ert-deftest ejn-variables-stale-cache-remains-visible-while-busy-and-disconnected ()
+  (ejn-variables-test--with-source
+    (emacs-jupyter-notebook-variables--cache-put "image" (car (plist-get ejn-variables-test--reply :variables)))
+    (emacs-jupyter-notebook-variables-invalidate)
+    (should-not (emacs-jupyter-notebook-variables--cached "image"))
+    (let (delivered)
+      (setq emacs-jupyter-notebook--kernel-status 'busy)
+      (emacs-jupyter-notebook-variables-eldoc (lambda (text) (setq delivered text)))
+      (should (string-match-p "shape=(128, 64).*stale: kernel busy" delivered))
+      (setq emacs-jupyter-notebook--client nil)
+      (emacs-jupyter-notebook-variables-eldoc (lambda (text) (setq delivered text)))
+      (should (string-match-p "stale: disconnected" delivered))
+      (should-not scheduled))))
+
+(ert-deftest ejn-variables-favorites-survive-refresh-and-filter-without-kernel-work ()
+  (ejn-variables-test--with-source
+    (cl-letf (((symbol-function 'display-buffer) #'ignore))
+      (emacs-jupyter-notebook-list-variables))
+    (ejn-variables-test--fire scheduled 0)
+    (funcall (nth 3 (car requests)) 1
+             '(:variables ((:name "image" :type "numpy.ndarray" :shape [2 3] :dtype "float32")
+                           (:name "other" :type "builtins.int" :shape nil :dtype nil)) :truncated nil))
+    (let ((source (current-buffer)))
+      (with-current-buffer emacs-jupyter-notebook-variables--table
+        (goto-char (point-min))
+        (emacs-jupyter-notebook-variables-toggle-favorite)
+        (emacs-jupyter-notebook-variables-toggle-favorites-only)
+        (should (= (length tabulated-list-entries) 1))
+        (should (equal (aref (cadar tabulated-list-entries) 0) "★")))
+      (should (equal emacs-jupyter-notebook-variable-favorites '("image")))
+      (emacs-jupyter-notebook-variables-invalidate)
+      (emacs-jupyter-notebook-variables--render emacs-jupyter-notebook-variables--table ejn-variables-test--reply)
+      (should (equal emacs-jupyter-notebook-variable-favorites '("image")))
+      (should (eq source (current-buffer)))
+      (should (= (length requests) 1)))))
+
+(ert-deftest ejn-variables-view-array-uses-only-generated-two-dimensional-selection ()
+  (ejn-variables-test--with-source
+    (let ((before (buffer-string)) generated)
+      (cl-letf (((symbol-function 'emacs-jupyter-notebook-inspect-evaluate)
+                 (lambda (code title) (setq generated (list code title)))))
+        (emacs-jupyter-notebook-view-variable "image")
+        (ejn-variables-test--fire scheduled 0)
+        (funcall (nth 3 (car requests)) 1 ejn-variables-test--reply))
+      (should (equal (car generated) "ejn.view_variable(\"image\", axes=[0,1], indices=[None,None])\n"))
+      (should (equal before (buffer-string)))
+      (should-not (overlays-in (point-min) (point-max))))))
+
+(ert-deftest ejn-variables-multidimensional-selector-includes-channel-index-and-axis-order ()
+  (let ((choices '("Axis 2 — size 16" "Axis 1 — size 32"))
+        (indices '(1 2)))
+    (cl-letf (((symbol-function 'completing-read) (lambda (&rest _) (pop choices)))
+              ((symbol-function 'read-number) (lambda (&rest _) (pop indices))))
+      (let* ((selection (emacs-jupyter-notebook-variables--select-plane [4 32 16 3]))
+             (code (emacs-jupyter-notebook-variables--plane-code "volume" (car selection) (cadr selection))))
+        (should (equal selection '([2 1] [1 nil nil 2])))
+        (should (equal code "ejn.view_variable(\"volume\", axes=[2,1], indices=[1,None,None,2])\n")))))
+  (cl-letf (((symbol-function 'completing-read) (lambda (_prompt _choices _pred _require _initial _history default) default))
+            ((symbol-function 'read-number) (lambda (&rest _) -1)))
+    (should-error (emacs-jupyter-notebook-variables--select-plane [2 8 8]) :type 'user-error)))
+
+(ert-deftest ejn-variables-reconnect-reply-cannot-replace-retained-dashboard ()
+  (ejn-variables-test--with-source
+    (cl-letf (((symbol-function 'display-buffer) #'ignore))
+      (emacs-jupyter-notebook-list-variables))
+    (ejn-variables-test--fire scheduled 0)
+    (funcall (nth 3 (car requests)) 1 ejn-variables-test--reply)
+    (emacs-jupyter-notebook-variables-execution-finished)
+    (ejn-variables-test--fire scheduled 2)
+    (emacs-jupyter-notebook-variables-invalidate)
+    (setq emacs-jupyter-notebook--client
+          (emacs-jupyter-notebook-backend-session-create nil (current-buffer)))
+    (funcall (nth 3 (nth 1 requests)) 2 '(:variables nil :truncated nil))
+    (should (= (length emacs-jupyter-notebook-variables--rows) 1))
+    (should emacs-jupyter-notebook-variables--stale)))
+
+(ert-deftest ejn-variables-dashboard-retries-retiring-helper-race-at-most-twice ()
+  (ejn-variables-test--with-source
+    (cl-letf (((symbol-function 'display-buffer) #'ignore))
+      (emacs-jupyter-notebook-list-variables))
+    (ejn-variables-test--fire scheduled 0)
+    (funcall (nth 4 (car requests)) 1 'busy)
+    (should emacs-jupyter-notebook-variables--refresh-retry-timer)
+    (ejn-variables-test--fire scheduled 2)
+    (ejn-variables-test--fire scheduled 3)
+    (funcall (nth 4 (nth 1 requests)) 2 'busy)
+    (ejn-variables-test--fire scheduled 5)
+    (ejn-variables-test--fire scheduled 6)
+    (funcall (nth 4 (nth 2 requests)) 3 'busy)
+    (should (= (length requests) 3))
+    (should (= emacs-jupyter-notebook-variables--refresh-retries 2))
+    (should-not emacs-jupyter-notebook-variables--refresh-retry-timer)
+    (should-not emacs-jupyter-notebook-variables--refresh-pending)
+    (should emacs-jupyter-notebook-variables--stale)))
+
+(ert-deftest ejn-variables-stale-state-does-not-label-fresh-targeted-lookup-stale ()
+  (ejn-variables-test--with-source
+    (emacs-jupyter-notebook-variables-invalidate)
+    (let (delivered)
+      (emacs-jupyter-notebook-variables-eldoc (lambda (text) (setq delivered text)))
+      (ejn-variables-test--fire scheduled 0)
+      (funcall (nth 3 (car requests)) 1 ejn-variables-test--reply)
+      (should (string-match-p "shape=(128, 64)" delivered))
+      (should-not (string-match-p "stale" delivered))
+      (setq delivered nil)
+      (emacs-jupyter-notebook-variables-eldoc (lambda (text) (setq delivered text)))
+      (should delivered)
+      (should-not (string-match-p "stale" delivered))
+      (should (= (length requests) 1)))))
 
 (provide 'emacs-jupyter-notebook-variables-tests)
 ;;; emacs-jupyter-notebook-variables-tests.el ends here

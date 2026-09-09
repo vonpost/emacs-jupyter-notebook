@@ -729,7 +729,13 @@ class JupyterBackend:
         code = params.get("code")
         if not isinstance(code, str):
             raise BackendError("invalid-request")
-        message_id = self.client.execute(code)
+        history = params.get("store_history", True)
+        if type(history) is not bool:
+            raise BackendError("invalid-request")
+        # Explicit variable-plane inspections still publish numerical output,
+        # but generated requests must not consume an input-history number.
+        message_id = (self.client.execute(code) if history else
+                      self.client.execute(code, store_history=False, allow_stdin=False))
         pending = _Pending(
             asyncio.get_running_loop().create_future(),
             ExecutionState(message_id),

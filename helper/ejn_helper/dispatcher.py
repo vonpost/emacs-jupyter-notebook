@@ -399,8 +399,14 @@ class Dispatcher:
             _exact_fields(params, frozenset())
             return {}
         if operation in {"execute", "is_complete"}:
-            _exact_fields(params, frozenset({"code"}))
-            return {"code": Dispatcher._validate_code(params["code"])}
+            optional = frozenset({"store_history"}) if operation == "execute" else frozenset()
+            _exact_fields(params, frozenset({"code"}), optional)
+            result = {"code": Dispatcher._validate_code(params["code"])}
+            if "store_history" in params:
+                if type(params["store_history"]) is not bool:
+                    raise _RequestError("invalid-request", "store_history must be boolean")
+                result["store_history"] = params["store_history"]
+            return result
         if operation == "variables":
             _exact_fields(params, frozenset({"names", "limit"}))
             names, limit = params["names"], params["limit"]

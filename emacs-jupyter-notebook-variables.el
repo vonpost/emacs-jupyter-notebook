@@ -9,6 +9,7 @@
 
 (require 'cl-lib)
 (require 'eldoc)
+(require 'json)
 (require 'subr-x)
 (require 'tabulated-list)
 (require 'thingatpt)
@@ -21,6 +22,10 @@
 (defvar emacs-jupyter-notebook--execution-queue)
 (defvar emacs-jupyter-notebook--execution-setup-pending)
 (declare-function emacs-jupyter-notebook--async-in-progress-p "emacs-jupyter-notebook")
+(declare-function emacs-jupyter-notebook-inspect-at-point "emacs-jupyter-notebook")
+(declare-function emacs-jupyter-notebook-inspect-evaluate "emacs-jupyter-notebook" (code title))
+(declare-function emacs-jupyter-notebook-inspect "emacs-jupyter-notebook-actions")
+(declare-function emacs-jupyter-notebook-actions "emacs-jupyter-notebook-actions")
 
 (defcustom emacs-jupyter-notebook-variable-eldoc t
   "Show Python variable type, shape and dtype at point through Eldoc.
@@ -37,6 +42,18 @@ Starting a new source execution invalidates this cache immediately."
   "Maximum public variables to show in the variable table, at most 200."
   :type 'integer :group 'emacs-jupyter-notebook)
 
+(defcustom emacs-jupyter-notebook-variable-favorites nil
+  "Favorite variable names, shown first in the variable table.
+The f command changes this option buffer-locally for the current notebook.
+Use Customize or directory-local settings for persistent defaults."
+  :type '(repeat string) :group 'emacs-jupyter-notebook)
+(make-variable-buffer-local 'emacs-jupyter-notebook-variable-favorites)
+
+(defface emacs-jupyter-notebook-variable-changed
+  '((t :inherit warning :weight bold))
+  "Face for a variable's shape or dtype changed by the latest execution."
+  :group 'emacs-jupyter-notebook)
+
 (defvar-local emacs-jupyter-notebook-variables--cache nil)
 (defvar-local emacs-jupyter-notebook-variables--generation 0)
 (defvar-local emacs-jupyter-notebook-variables--pending nil)
@@ -45,6 +62,13 @@ Starting a new source execution invalidates this cache immediately."
 (defvar-local emacs-jupyter-notebook-variables--table nil)
 (defvar-local emacs-jupyter-notebook-variables--source nil)
 (defvar-local emacs-jupyter-notebook-variables--enabled-eldoc nil)
+(defvar-local emacs-jupyter-notebook-variables--rows nil)
+(defvar-local emacs-jupyter-notebook-variables--stale t)
+(defvar-local emacs-jupyter-notebook-variables--truncated nil)
+(defvar-local emacs-jupyter-notebook-variables--favorites-only nil)
+(defvar-local emacs-jupyter-notebook-variables--refresh-pending nil)
+(defvar-local emacs-jupyter-notebook-variables--refresh-retry-timer nil)
+(defvar-local emacs-jupyter-notebook-variables--refresh-retries 0)
 
 (defun emacs-jupyter-notebook-variables--name-at-point ()
   "Return a simple Python identifier at point, excluding attributes and text."
@@ -82,16 +106,46 @@ or closes the kernel to dispose a metadata lookup."
   (setq emacs-jupyter-notebook-variables--timer nil))
 
 (defun emacs-jupyter-notebook-variables-invalidate ()
-  "Forget metadata after user execution admission or a client transition."
+  "Mark metadata stale after execution admission or a client transition.
+Retain the last known rows and cache while fencing old asynchronous replies."
   (cl-incf emacs-jupyter-notebook-variables--generation)
   (setq emacs-jupyter-notebook-variables--queued nil)
   (emacs-jupyter-notebook-variables--cancel-pending)
-  (setq emacs-jupyter-notebook-variables--cache nil)
+  (emacs-jupyter-notebook-variables--cancel-refresh-retry)
+  (setq emacs-jupyter-notebook-variables--stale t
+        emacs-jupyter-notebook-variables--refresh-pending nil)
+  (emacs-jupyter-notebook-variables--status))
+
+(defun emacs-jupyter-notebook-variables--cancel-refresh-retry ()
+  "Cancel this source's bounded dashboard retry sequence."
+  (when (timerp emacs-jupyter-notebook-variables--refresh-retry-timer)
+    (cancel-timer emacs-jupyter-notebook-variables--refresh-retry-timer))
+  (setq emacs-jupyter-notebook-variables--refresh-retry-timer nil
+        emacs-jupyter-notebook-variables--refresh-retries 0))
+
+(defun emacs-jupyter-notebook-variables--availability ()
+  "Return a truthful short label for unavailable or stale metadata."
+  (cond
+   ((and (fboundp 'emacs-jupyter-notebook--async-in-progress-p)
+         (emacs-jupyter-notebook--async-in-progress-p)) "reconnecting")
+   ((or (not (bound-and-true-p emacs-jupyter-notebook-mode))
+        (not (bound-and-true-p emacs-jupyter-notebook--client))
+        (not (emacs-jupyter-notebook-backend-session-live-p emacs-jupyter-notebook--client)))
+    "disconnected")
+   ((not (emacs-jupyter-notebook-variables--ready-p)) "kernel busy")
+   (t "awaiting refresh")))
+
+(defun emacs-jupyter-notebook-variables--status (&optional message)
+  "Update the table status using MESSAGE without removing retained rows."
   (when (buffer-live-p emacs-jupyter-notebook-variables--table)
-    (with-current-buffer emacs-jupyter-notebook-variables--table
-      (setq header-line-format "Variable metadata changed; press g to refresh")
-      (setq tabulated-list-entries nil)
-      (tabulated-list-print t))))
+    (let ((status (or message
+                      (if emacs-jupyter-notebook-variables--stale
+                          (concat "Stale metadata — " (emacs-jupyter-notebook-variables--availability))
+                        (if emacs-jupyter-notebook-variables--truncated
+                            "Live variables (list truncated)" "Live variables")))))
+      (with-current-buffer emacs-jupyter-notebook-variables--table
+        (setq header-line-format
+              (concat status " · g refresh · v view array · f favorite · F favorites · i inspect · a actions"))))))
 
 (defun emacs-jupyter-notebook-variables--cached (name)
   "Return the fresh cached metadata envelope for NAME, if any."
@@ -102,6 +156,8 @@ or closes the kernel to dispose a metadata lookup."
                   seconds 5)))
     (and cached
          (eq (plist-get cached :client) emacs-jupyter-notebook--client)
+         (= (or (plist-get cached :generation) -1)
+            emacs-jupyter-notebook-variables--generation)
          (< (- (float-time) (plist-get cached :time)) ttl)
          cached)))
 
@@ -112,6 +168,7 @@ or closes the kernel to dispose a metadata lookup."
   (when (>= (hash-table-count emacs-jupyter-notebook-variables--cache) 200)
     (clrhash emacs-jupyter-notebook-variables--cache))
   (puthash name (list :metadata metadata :client emacs-jupyter-notebook--client
+                      :generation emacs-jupyter-notebook-variables--generation
                       :time (float-time))
            emacs-jupyter-notebook-variables--cache))
 
@@ -141,6 +198,9 @@ for automatic lookups, whose replies are discarded if editing moved on."
       ;; An explicit gesture follows the current bounded lookup.  Do not send
       ;; overlapping silent executions merely because Eldoc got there first.
       (unless context
+        (when-let ((old emacs-jupyter-notebook-variables--queued))
+          (setq emacs-jupyter-notebook-variables--queued nil)
+          (funcall (nth 2 old)))
         (setq emacs-jupyter-notebook-variables--queued
               (list names callback error-callback))
         t)
@@ -201,16 +261,29 @@ for automatic lookups, whose replies are discarded if editing moved on."
             (error (finish nil t))))
         t))))
 
+(defun emacs-jupyter-notebook-variables--retained (name)
+  "Return retained metadata for NAME, even when its client is unavailable."
+  (or (plist-get (and emacs-jupyter-notebook-variables--cache
+                      (gethash name emacs-jupyter-notebook-variables--cache)) :metadata)
+      (cl-find name emacs-jupyter-notebook-variables--rows
+               :key (lambda (row) (plist-get row :name)) :test #'equal)))
+
 (defun emacs-jupyter-notebook-variables-eldoc (callback &rest _ignored)
   "Asynchronously pass metadata for the variable at point to Eldoc CALLBACK."
-  (when (and emacs-jupyter-notebook-variable-eldoc
-             (emacs-jupyter-notebook-variables--ready-p))
+  (when emacs-jupyter-notebook-variable-eldoc
     (when-let ((name (emacs-jupyter-notebook-variables--name-at-point)))
       (let ((cached (emacs-jupyter-notebook-variables--cached name)))
-        (if cached
+        (cond
+         ((not (emacs-jupyter-notebook-variables--ready-p))
+          (when-let ((metadata (emacs-jupyter-notebook-variables--retained name)))
+            (funcall callback
+                     (concat (emacs-jupyter-notebook-variables--describe metadata)
+                             "  [stale: " (emacs-jupyter-notebook-variables--availability) "]")) t))
+         (cached
             (when-let ((text (emacs-jupyter-notebook-variables--describe
                               (plist-get cached :metadata))))
-              (funcall callback text) t)
+              (funcall callback text) t))
+         (t
           (emacs-jupyter-notebook-variables--request
            (vector name)
            (lambda (reply)
@@ -218,7 +291,7 @@ for automatic lookups, whose replies are discarded if editing moved on."
                (emacs-jupyter-notebook-variables--cache-put name metadata)
                (funcall callback (emacs-jupyter-notebook-variables--describe metadata))))
            (lambda () (funcall callback nil))
-           (list (point) (buffer-chars-modified-tick) name)))))))
+           (list (point) (buffer-chars-modified-tick) name))))))))
 
 (defun emacs-jupyter-notebook-variables--ensure-ready ()
   "Signal a useful user error when a metadata query cannot be admitted."
@@ -237,26 +310,39 @@ for automatic lookups, whose replies are discarded if editing moved on."
 Interactively use the simple variable at point, or prompt for a name.  Only
 metadata is retrieved; custom objects are never printed or traversed."
   (interactive)
-  (emacs-jupyter-notebook-variables--ensure-ready)
   (setq name (or name (emacs-jupyter-notebook-variables--name-at-point)
                  (read-string "Variable name: ")))
   (unless (and (stringp name) (<= (length name) 128) (<= (string-bytes name) 128)
                (string-match-p "\\`[[:alpha:]_][[:alnum:]_]*\\'" name))
     (user-error "Use a simple Python variable name"))
-  (emacs-jupyter-notebook-variables--request
-   (vector name)
-   (lambda (reply)
-     (let ((metadata (car (append (plist-get reply :variables) nil))))
-       (emacs-jupyter-notebook-variables--cache-put name metadata)
-       (message "%s" (or (emacs-jupyter-notebook-variables--describe metadata)
-                         (format "%s is not defined in this kernel" name)))))
-   (lambda () (message "Variable metadata request failed or timed out"))))
+  (if (not (emacs-jupyter-notebook-variables--ready-p))
+      (if-let ((metadata (emacs-jupyter-notebook-variables--retained name)))
+          (message "%s  [stale: %s]" (emacs-jupyter-notebook-variables--describe metadata)
+                   (emacs-jupyter-notebook-variables--availability))
+        (emacs-jupyter-notebook-variables--ensure-ready))
+    (emacs-jupyter-notebook-variables--request
+     (vector name)
+     (lambda (reply)
+       (let ((metadata (car (append (plist-get reply :variables) nil))))
+         (emacs-jupyter-notebook-variables--cache-put name metadata)
+         (cond
+          (metadata (message "%s" (emacs-jupyter-notebook-variables--describe metadata)))
+          ((and (equal name (emacs-jupyter-notebook-variables--name-at-point))
+                (fboundp 'emacs-jupyter-notebook-inspect-at-point))
+           (emacs-jupyter-notebook-inspect-at-point))
+          (t (message "%s is not defined in this kernel" name)))))
+     (lambda () (message "Variable metadata request failed or timed out")))))
 
 (defvar emacs-jupyter-notebook-variables-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map tabulated-list-mode-map)
     (define-key map (kbd "g") #'emacs-jupyter-notebook-variables-refresh)
     (define-key map (kbd "RET") #'emacs-jupyter-notebook-variables-inspect-row)
+    (define-key map (kbd "i") #'emacs-jupyter-notebook-inspect)
+    (define-key map (kbd "a") #'emacs-jupyter-notebook-actions)
+    (define-key map (kbd "v") #'emacs-jupyter-notebook-variables-view-row)
+    (define-key map (kbd "f") #'emacs-jupyter-notebook-variables-toggle-favorite)
+    (define-key map (kbd "F") #'emacs-jupyter-notebook-variables-toggle-favorites-only)
     (define-key map (kbd "q") #'quit-window)
     map))
 
@@ -269,6 +355,11 @@ metadata is retrieved; custom objects are never printed or traversed."
   (evil-define-key* '(normal motion) emacs-jupyter-notebook-variables-mode-map
     (kbd "g") #'emacs-jupyter-notebook-variables-refresh
     (kbd "RET") #'emacs-jupyter-notebook-variables-inspect-row
+    (kbd "i") #'emacs-jupyter-notebook-inspect
+    (kbd "a") #'emacs-jupyter-notebook-actions
+    (kbd "v") #'emacs-jupyter-notebook-variables-view-row
+    (kbd "f") #'emacs-jupyter-notebook-variables-toggle-favorite
+    (kbd "F") #'emacs-jupyter-notebook-variables-toggle-favorites-only
     (kbd "q") #'quit-window))
 
 (with-eval-after-load 'evil
@@ -277,37 +368,114 @@ metadata is retrieved; custom objects are never printed or traversed."
 (define-derived-mode emacs-jupyter-notebook-variables-mode tabulated-list-mode
   "EJN Variables"
   "Kernel variable metadata.  Press g to refresh, RET to inspect, q to close."
-  (setq tabulated-list-format [("Name" 26 t) ("Type" 28 t)
+  (setq tabulated-list-format [("★" 2 t) ("Name" 24 t) ("Type" 28 t)
                                ("Shape" 24 t) ("Dtype" 16 t)]
         tabulated-list-padding 2
-        tabulated-list-sort-key '("Name" . nil))
+        tabulated-list-sort-key '("★" . t))
   (tabulated-list-init-header))
 
 (defun emacs-jupyter-notebook-variables--render (table reply)
-  "Render bounded variable metadata REPLY into TABLE."
+  "Adopt bounded metadata REPLY and render TABLE, highlighting changes."
   (when (buffer-live-p table)
-    (with-current-buffer table
-      (setq header-line-format
-            (if (plist-get reply :truncated)
-                "Variable list truncated; g refreshes, RET inspects a name"
-              "g refreshes · RET inspects · shapes describe the current kernel"))
-      (setq tabulated-list-entries
-            (mapcar (lambda (row)
-                      (let ((name (plist-get row :name)))
-                        (list name
-                              (vector name (plist-get row :type)
-                                      (emacs-jupyter-notebook-variables--shape-text
-                                       (plist-get row :shape))
-                                      (or (plist-get row :dtype) "—")))))
-                    (append (plist-get reply :variables) nil)))
-      (tabulated-list-print t))))
+    (let ((previous emacs-jupyter-notebook-variables--rows))
+      (setq emacs-jupyter-notebook-variables--cache nil)
+      (setq emacs-jupyter-notebook-variables--rows
+            (mapcar
+             (lambda (metadata)
+               (let* ((row (copy-sequence metadata))
+                      (name (plist-get row :name))
+                      (old (cl-find name previous :test #'equal
+                                    :key (lambda (item) (plist-get item :name)))))
+                 (dolist (field '(:shape :dtype))
+                   (when (and old (not (equal (plist-get old field) (plist-get row field))))
+                     (setq row (plist-put row (if (eq field :shape) :shape-changed :dtype-changed) t))))
+                 (emacs-jupyter-notebook-variables--cache-put name row)
+                 row))
+             (append (plist-get reply :variables) nil))
+            emacs-jupyter-notebook-variables--stale nil
+            emacs-jupyter-notebook-variables--truncated (plist-get reply :truncated))
+      (emacs-jupyter-notebook-variables--render-rows)
+      (emacs-jupyter-notebook-variables--status))))
+
+(defun emacs-jupyter-notebook-variables--render-rows ()
+  "Render retained rows and favorite state into the current source's table."
+  (when (buffer-live-p emacs-jupyter-notebook-variables--table)
+    (let ((rows emacs-jupyter-notebook-variables--rows)
+          (favorites emacs-jupyter-notebook-variable-favorites)
+          (only emacs-jupyter-notebook-variables--favorites-only))
+      (with-current-buffer emacs-jupyter-notebook-variables--table
+        (setq tabulated-list-entries
+              (cl-loop for row in rows
+                       for name = (plist-get row :name)
+                       for favorite = (member name favorites)
+                       when (or (not only) favorite)
+                       collect
+                       (list name
+                             (vector (if favorite "★" "") name (plist-get row :type)
+                                     (propertize
+                                      (emacs-jupyter-notebook-variables--shape-text (plist-get row :shape))
+                                      'face (when (plist-get row :shape-changed)
+                                              'emacs-jupyter-notebook-variable-changed))
+                                     (propertize
+                                      (or (plist-get row :dtype) "—")
+                                      'face (when (plist-get row :dtype-changed)
+                                              'emacs-jupyter-notebook-variable-changed))))))
+        (tabulated-list-print t)))))
+
+(defun emacs-jupyter-notebook-variables--refresh-table ()
+  "Refresh a live table once without selecting or displaying its window."
+  (if (not (emacs-jupyter-notebook-variables--ready-p))
+      (progn (setq emacs-jupyter-notebook-variables--stale t)
+             (emacs-jupyter-notebook-variables--status))
+    (when (and (buffer-live-p emacs-jupyter-notebook-variables--table)
+               (not emacs-jupyter-notebook-variables--refresh-pending)
+               (not emacs-jupyter-notebook-variables--refresh-retry-timer))
+      (let ((table emacs-jupyter-notebook-variables--table))
+        (setq emacs-jupyter-notebook-variables--refresh-pending t)
+        (emacs-jupyter-notebook-variables--status "Refreshing metadata; showing last known rows")
+        (emacs-jupyter-notebook-variables--request
+         nil
+         (lambda (reply)
+           (setq emacs-jupyter-notebook-variables--refresh-pending nil)
+           (emacs-jupyter-notebook-variables--render table reply))
+         (lambda ()
+           (setq emacs-jupyter-notebook-variables--refresh-pending nil
+                 emacs-jupyter-notebook-variables--stale t)
+           (emacs-jupyter-notebook-variables--status "Stale metadata — refresh failed; g retries")
+           (emacs-jupyter-notebook-variables--retry-refresh)))))))
+
+(defun emacs-jupyter-notebook-variables--retry-refresh ()
+  "Retry at most twice when a just-retired helper request races dashboard refresh."
+  (when (and (< emacs-jupyter-notebook-variables--refresh-retries 2)
+             (emacs-jupyter-notebook-variables--ready-p)
+             (buffer-live-p emacs-jupyter-notebook-variables--table))
+    (let ((source (current-buffer))
+          (client emacs-jupyter-notebook--client)
+          (generation emacs-jupyter-notebook-variables--generation))
+      (cl-incf emacs-jupyter-notebook-variables--refresh-retries)
+      (setq emacs-jupyter-notebook-variables--refresh-retry-timer
+            (run-at-time
+             (* 0.2 emacs-jupyter-notebook-variables--refresh-retries) nil
+             (lambda ()
+               (when (buffer-live-p source)
+                 (with-current-buffer source
+                   (when (and (= generation emacs-jupyter-notebook-variables--generation)
+                              (eq client emacs-jupyter-notebook--client))
+                     (setq emacs-jupyter-notebook-variables--refresh-retry-timer nil)
+                     (emacs-jupyter-notebook-variables--refresh-table))))))))))
+
+(defun emacs-jupyter-notebook-variables-execution-finished (&rest _ignored)
+  "Refresh the dashboard after user FIFO execution or reconnect becomes idle."
+  (when (buffer-live-p emacs-jupyter-notebook-variables--table)
+    (emacs-jupyter-notebook-variables--refresh-table)))
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-list-variables ()
   "Show an asynchronous table of public variables in this notebook's kernel.
 The table contains names, actual types, array shapes and dtypes, never values."
   (interactive)
-  (emacs-jupyter-notebook-variables--ensure-ready)
+  (unless (derived-mode-p 'python-mode 'python-ts-mode)
+    (user-error "Variable metadata currently supports Python buffers"))
   (let* ((source (current-buffer))
          (table (or (and (buffer-live-p emacs-jupyter-notebook-variables--table)
                          emacs-jupyter-notebook-variables--table)
@@ -316,15 +484,9 @@ The table contains names, actual types, array shapes and dtypes, never values."
     (with-current-buffer table
       (unless (derived-mode-p 'emacs-jupyter-notebook-variables-mode)
         (emacs-jupyter-notebook-variables-mode))
-      (setq emacs-jupyter-notebook-variables--source source
-            header-line-format "Loading variable metadata…"))
-    (emacs-jupyter-notebook-variables--request
-     nil
-     (lambda (reply) (emacs-jupyter-notebook-variables--render table reply))
-     (lambda ()
-       (when (buffer-live-p table)
-         (with-current-buffer table
-           (setq header-line-format "Variable metadata unavailable; g retries")))))
+      (setq emacs-jupyter-notebook-variables--source source))
+    (emacs-jupyter-notebook-variables--render-rows)
+    (emacs-jupyter-notebook-variables--refresh-table)
     (display-buffer table)))
 
 (defun emacs-jupyter-notebook-variables-refresh ()
@@ -333,7 +495,34 @@ The table contains names, actual types, array shapes and dtypes, never values."
   (unless (buffer-live-p emacs-jupyter-notebook-variables--source)
     (user-error "The notebook source buffer is no longer open"))
   (with-current-buffer emacs-jupyter-notebook-variables--source
-    (emacs-jupyter-notebook-list-variables)))
+    (emacs-jupyter-notebook-variables--cancel-refresh-retry)
+    (emacs-jupyter-notebook-variables--refresh-table)))
+
+(defun emacs-jupyter-notebook-variables-toggle-favorite ()
+  "Toggle whether the current variable is a favorite for this notebook."
+  (interactive)
+  (let ((name (tabulated-list-get-id))
+        (source emacs-jupyter-notebook-variables--source))
+    (unless name (user-error "No variable on this row"))
+    (unless (buffer-live-p source) (user-error "The notebook source buffer is no longer open"))
+    (with-current-buffer source
+      (if (member name emacs-jupyter-notebook-variable-favorites)
+          (setq emacs-jupyter-notebook-variable-favorites
+                (delete name (copy-sequence emacs-jupyter-notebook-variable-favorites)))
+        (when (>= (length emacs-jupyter-notebook-variable-favorites) 200)
+          (user-error "At most 200 favorite variables are retained"))
+        (push name emacs-jupyter-notebook-variable-favorites))
+      (emacs-jupyter-notebook-variables--render-rows))))
+
+(defun emacs-jupyter-notebook-variables-toggle-favorites-only ()
+  "Toggle between all variables and favorite variables in the dashboard."
+  (interactive)
+  (unless (buffer-live-p emacs-jupyter-notebook-variables--source)
+    (user-error "The notebook source buffer is no longer open"))
+  (with-current-buffer emacs-jupyter-notebook-variables--source
+    (setq emacs-jupyter-notebook-variables--favorites-only
+          (not emacs-jupyter-notebook-variables--favorites-only))
+    (emacs-jupyter-notebook-variables--render-rows)))
 
 (defun emacs-jupyter-notebook-variables-inspect-row ()
   "Inspect the variable on the current table row."
@@ -345,6 +534,94 @@ The table contains names, actual types, array shapes and dtypes, never values."
       (user-error "The notebook source buffer is no longer open"))
     (with-current-buffer source
       (emacs-jupyter-notebook-inspect-variable name))))
+
+(defun emacs-jupyter-notebook-variables--select-plane (shape)
+  "Choose row/column axes and bounded slice indices for SHAPE.
+Return (AXES INDICES), with nil index entries for the displayed axes."
+  (let* ((dimensions (length shape))
+         (row (if (and (= dimensions 3) (<= (elt shape 2) 4)) 0 (- dimensions 2)))
+         (column (1+ row))
+         (choices (cl-loop for axis below dimensions
+                           collect (cons (format "Axis %d — size %d" axis (elt shape axis)) axis))))
+    (when (> dimensions 2)
+      (setq row (cdr (assoc (completing-read "Display rows (Y): " choices nil t nil nil
+                                           (car (nth row choices))) choices)))
+      (let ((remaining (cl-remove row choices :key #'cdr)))
+        (when (= column row) (setq column (cdar remaining)))
+        (setq column (cdr (assoc (completing-read "Display columns (X): " remaining nil t nil nil
+                                                (car (rassq column remaining))) remaining)))))
+    (let ((indices (make-vector dimensions nil)))
+      (dotimes (axis dimensions)
+        (unless (memq axis (list row column))
+          (let* ((size (elt shape axis))
+                 (index (read-number (format "Axis %d index (size %d, 0–%d): " axis size (1- size))
+                                     (if (<= size 4) 0 (/ size 2)))))
+            (unless (and (integerp index) (>= index 0) (< index size))
+              (user-error "Index for axis %d must be an integer from 0 to %d" axis (1- size)))
+            (aset indices axis index))))
+      (list (vector row column) indices))))
+
+(defun emacs-jupyter-notebook-variables--plane-code (name axes indices)
+  "Build a publisher call for validated NAME, AXES and INDICES.
+Only the generated literal selectors cross Emacs; numerical samples do not."
+  (format "ejn.view_variable(%s, axes=[%s], indices=[%s])\n"
+          (json-encode-string name)
+          (mapconcat #'number-to-string axes ",")
+          (mapconcat (lambda (index) (if (null index) "None" (number-to-string index))) indices ",")))
+
+(defun emacs-jupyter-notebook-variables--view-metadata (name metadata)
+  "Select and publish a plane from NAME using bounded METADATA."
+  (let ((shape (plist-get metadata :shape))
+        (client emacs-jupyter-notebook--client)
+        (generation emacs-jupyter-notebook-variables--generation))
+    (unless (and shape (<= 2 (length shape)) (<= (length shape) 32))
+      (user-error "%s needs an array with at least two dimensions" name))
+    (unless (cl-every (lambda (size) (and (integerp size) (> size 0))) shape)
+      (user-error "%s has an empty or unavailable array dimension" name))
+    (let* ((selection (emacs-jupyter-notebook-variables--select-plane shape))
+           (axes (car selection))
+           (indices (cadr selection)))
+      (unless (and (eq client emacs-jupyter-notebook--client)
+                   (= generation emacs-jupyter-notebook-variables--generation))
+        (user-error "The kernel changed while selecting the array slice; inspect again"))
+      (emacs-jupyter-notebook-inspect-evaluate
+       (emacs-jupyter-notebook-variables--plane-code name axes indices)
+       (format "View %s · axes %d,%d" name (aref axes 0) (aref axes 1))))))
+
+;;;###autoload
+(defun emacs-jupyter-notebook-view-variable (&optional name)
+  "View a selected numerical plane of the array NAME in the local viewer.
+Use the variable at point or prompt for a name.  For multidimensional arrays,
+choose display row/column axes and an index for every remaining dimension,
+including any channel axis.  Only the selected 2D plane leaves the kernel."
+  (interactive)
+  (emacs-jupyter-notebook-variables--ensure-ready)
+  (setq name (or name (emacs-jupyter-notebook-variables--name-at-point)
+                 (read-string "Array variable name: ")))
+  (unless (and (stringp name) (<= (string-bytes name) 128)
+               (string-match-p "\\`[[:alpha:]_][[:alnum:]_]*\\'" name))
+    (user-error "Use a simple Python variable name"))
+  ;; Always refresh metadata before picking axes: a previous cell may have
+  ;; rebound the variable, including to a differently shaped array.
+  (emacs-jupyter-notebook-variables--request
+   (vector name)
+   (lambda (reply)
+     (let ((metadata (car (append (plist-get reply :variables) nil))))
+       (unless metadata (user-error "%s is not defined in this kernel" name))
+       (emacs-jupyter-notebook-variables--cache-put name metadata)
+       (emacs-jupyter-notebook-variables--view-metadata name metadata)))
+   (lambda () (message "Array metadata unavailable; try again when the kernel is idle"))))
+
+(defun emacs-jupyter-notebook-variables-view-row ()
+  "Open the current table variable in the array viewer."
+  (interactive)
+  (let ((name (tabulated-list-get-id))
+        (source emacs-jupyter-notebook-variables--source))
+    (unless name (user-error "No variable on this row"))
+    (unless (buffer-live-p source)
+      (user-error "The notebook source buffer is no longer open"))
+    (with-current-buffer source
+      (emacs-jupyter-notebook-view-variable name))))
 
 (defun emacs-jupyter-notebook-variables-setup ()
   "Install buffer-local metadata Eldoc and lifetime hooks."
@@ -361,6 +638,7 @@ The table contains names, actual types, array shapes and dtypes, never values."
     (eldoc-mode -1))
   (setq emacs-jupyter-notebook-variables--enabled-eldoc nil)
   (emacs-jupyter-notebook-variables-invalidate)
+  (emacs-jupyter-notebook-variables--status "Stale metadata — notebook disconnected")
   (remove-hook 'eldoc-documentation-functions
                #'emacs-jupyter-notebook-variables-eldoc t)
   (remove-hook 'kill-buffer-hook #'emacs-jupyter-notebook-variables-teardown t))

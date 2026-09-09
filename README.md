@@ -207,7 +207,9 @@ or bind `emacs-jupyter-notebook-prefix-map` under your own prefix.
 | `C-c j o` | `show-output-panel` |
 | `C-c j t` | `toggle-panel-view` (latest ↔ history) |
 | `C-c j h` | `toggle-cell-output` (hide/show the current cell's output) |
-| `C-c j i` | `inspect-variable` (type, shape and dtype at point) |
+| `C-c j i` | `inspect` (context-sensitive variable, documentation or output inspection) |
+| `C-c j a` | `actions` (contextual menu with keyboard shortcuts) |
+| `C-c j A` | `view-variable` (open a NumPy array plane without writing viewer code) |
 | `C-c j V` | `list-variables` (kernel variable table) |
 | `C-c j I` | `inspect-images` (inspect the current cell's numerical publication) |
 | `C-c j J` | `evaluate-and-inspect` (evaluate and open that execution's first numerical publication) |
@@ -259,6 +261,14 @@ Evil. A header remains visible while output is hidden; incoming output and
 later evaluations retain the visibility setting. This does not change source
 text or insert-state indentation.
 
+Headers show the `# %%` title, execution duration, and whether the source was
+edited since that execution. Folded outputs retain a compact image/line count
+or the last error. The pane follows the source cell without taking keyboard
+focus. Scrolling in the pane pauses following; move to another source cell or
+press `f` in the pane to resume. Region and other non-cell evaluations reveal
+their history entry automatically. Press `i` to inspect the selected output
+and `a` for the panel's action menu.
+
 Evaluation output never appears in the source buffer. A dedicated side panel (`*ejn: <buffer>*`) opens on the first evaluation and renders results there. The panel has two views:
 
 - **Latest-per-cell** (default): one section per cell, indexed by cell marker. Re-running the same cell replaces its section in place.
@@ -272,7 +282,13 @@ Toggle the view inside the panel with `H`, or globally with `C-c j t`. `q` burie
 
 ## Numerical slice viewer (experimental)
 
-Publish only the slices you need from a NumPy-equipped Python kernel:
+To open an existing NumPy array, use `C-c j A` on its name or `v` on its row in
+the variable browser. For multidimensional arrays, minibuffer selectors choose
+the row/column axes and an index for each remaining axis, including channels.
+Only the selected plane is transferred. Inspection uses generated, history-free
+code; it never edits or re-evaluates the source cell.
+
+To publish several related planes together from a NumPy-equipped Python kernel:
 
 ```python
 # %% inspect reconstruction
@@ -294,6 +310,12 @@ numerical output for the current cell. Each numerical output also has an
 `[Inspect]` button in the panel. Moving point while evaluation runs does not
 change the evaluate-and-inspect target.
 
+After inspecting a cell's publication, subsequent publications with the same
+cell/workspace identity update the viewer without taking focus. Pin the
+reference before rerunning to compare the saved evaluation against the latest
+candidate. Freeze keeps the current display; unfreeze follows subsequent
+publications. Compatible updates preserve zoom, display levels and ROIs.
+
 The separate local PyQtGraph window displays up to four named planes with
 zoom/pan, `F` to fit, pixel-value readout, and window level/width controls.
 Declared compatible grids share zoom/pan. Values and byte order are retained
@@ -305,10 +327,12 @@ first use. It adds no Qt dependency to ordinary kernel work. See
 [viewer setup and limits](docs/viewer-installation.md) for manual setup and
 verification.
 
-This is the first working replacement path, not the completed comparison
-workspace. Pinned previous evaluations, diffs/blink, linked magnifiers,
-native-device-pixel mode, ROI mean/SD, and follow/freeze are still tracked in
-[the viewer roadmap](VIEWER_PLAN.md). Actual macOS rendering remains unverified.
+The viewer includes signed/absolute differences, hold-to-blink comparison,
+linked sample readout and magnification, and rectangular/elliptical ROI
+mean/population SD. ROIs can be drawn, named, moved and copied as measurements.
+See [viewer controls](docs/viewer-installation.md) for shortcuts and numerical
+limits. Native-device-pixel mode and full macOS acceptance remain tracked in
+[the viewer roadmap](VIEWER_PLAN.md).
 
 ## Legacy matplotlib viewer (pending removal)
 
@@ -380,13 +404,17 @@ With the notebook mode enabled and a Python kernel connected, pause on a
 variable name to see its type, array shape and dtype in Eldoc's echo area:
 `image: numpy.ndarray  shape=(128, 64)  dtype=float32`. The variable must
 already exist in the kernel. No `.shape` source cell or array transfer is
-needed. `C-c j i` explicitly inspects the variable at point or prompts for a
-simple name; `C-c j .` remains the kernel's general documentation inspector.
+needed. `C-c j i` inspects the identifier at point and falls back to kernel
+documentation when no runtime variable exists. `C-c j .` explicitly requests
+documentation. `C-c j a` opens a contextual action menu with shortcuts.
 
-`C-c j V` opens the variable table. Use `g` to refresh, `RET` to inspect a row,
-and `q` to close it; these keys also work under Doom/Evil. The list is bounded
-to 200 public variables. Evaluating code invalidates cached metadata and marks
-the table for refresh. Requests skip busy kernels and expire asynchronously.
+`C-c j V` opens the variable table. It refreshes after executions and highlights
+changed shapes/dtypes. While busy or reconnecting, it retains the last metadata
+with a stale label. Use `g` to refresh, `RET`/`i` to inspect, `v` to view an array,
+`f` to favorite a variable, `F` to show only favorites, `a` for actions, and `q`
+to close; these keys also work under Doom/Evil. Favorites can have persistent
+defaults through `emacs-jupyter-notebook-variable-favorites`. The list is bounded
+to 200 public variables. Requests skip busy kernels and expire asynchronously.
 
 NumPy arrays (including subclasses), ordinary PyTorch tensors and memoryviews
 expose shapes/dtypes without copying samples. Other objects show their type;

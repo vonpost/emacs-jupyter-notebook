@@ -14,9 +14,10 @@ from PySide6 import QtCore, QtWidgets
 from .snapshots import load_snapshot
 from .workspace import WorkspaceWindow
 from .analysis_worker import AnalysisWorker
+from .memory import MAX_MEMORY, merge_allocations
+from .magnifier import MAX_PATCH_BYTES
 
 MAX_FRAME = 65536
-MAX_MEMORY = 256 * 1024 * 1024
 MAX_WORKSPACES = 4
 
 
@@ -78,10 +79,12 @@ class PipeServer(QtCore.QObject):
         self.decoder = Decoder()
         self.output = bytearray()
         self.windows = {}
+        self.closed_workspaces = deque(maxlen=128)
+        self.suppress_absent_automatic = False
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ejn-snapshot")
         self.active = None
         self.pending = None
-        self.analysis = AnalysisWorker(self, admit=lambda extra: self.memory_used() + extra <= MAX_MEMORY)
+        self.analysis = AnalysisWorker(self, admit=lambda: self.memory_used() <= MAX_MEMORY)
         self.finished = deque(maxlen=128)
         self.negotiated = False
         self.closed = False
@@ -227,6 +230,18 @@ class PipeServer(QtCore.QObject):
     def start(self, job):
         params = job["params"]
         workspace = params["workspace"]
+        window = self.windows.get(workspace)
+        if window is None and params.get("focus") is False and (
+                workspace in self.closed_workspaces or self.suppress_absent_automatic):
+            self.finished.append(job["id"])
+            self.reply(job["id"], {"state": "visible", "closed": True})
+            return
+        if params.get("focus") is True and workspace in self.closed_workspaces:
+            self.closed_workspaces.remove(workspace)
+        if window is not None and window.frozen:
+            self.finished.append(job["id"])
+            self.reply(job["id"], {"state": "visible", "frozen": True})
+            return
         retained = self.memory_used()
         # Two source buffers may overlap at chunk-join time. Raster decoding
         # additionally reserves three worst-case RGBA planes before allocation.
@@ -255,12 +270,18 @@ class PipeServer(QtCore.QObject):
             if self.closed or job["cancelled"] or self.active is not job:
                 return
             snapshot = future.result()
+            window = self.windows.get(snapshot.workspace)
+            if window is not None and window.frozen:
+                self.finished.append(job["id"])
+                self.reply(job["id"], {"state": "visible", "frozen": True})
+                return
             # Loading allocations are now owned by SNAPSHOT. Replacing this
             # reservation with its actual charge still includes analysis jobs
             # retaining an older publication and displayed difference buffers.
             job["reserve"] = 0
             retained = self.memory_used()
-            if retained + snapshot_charge(snapshot) > MAX_MEMORY:
+            incoming = snapshot_charge(snapshot) + (MAX_PATCH_BYTES if window is None else 0)
+            if retained + incoming > MAX_MEMORY:
                 self.reply(job["id"], error="viewer-budget-exceeded")
                 return
             window = self.windows.get(snapshot.workspace)
@@ -268,17 +289,18 @@ class PipeServer(QtCore.QObject):
                 self.reply(job["id"], error="stale-generation")
                 return
             if window is None:
-                window = WorkspaceWindow(analysis_worker=self.analysis)
+                window = WorkspaceWindow(analysis_worker=self.analysis,
+                                         admit=lambda: self.memory_used() <= MAX_MEMORY)
                 window.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
                 window.closed.connect(lambda key=snapshot.workspace: self.workspace_closed(key))
                 self.windows[snapshot.workspace] = window
-            window.install_snapshot(snapshot)
+            installed = window.install_snapshot(snapshot)
             window.show()
             if snapshot.focus:
                 window.raise_()
                 window.activateWindow()
             self.finished.append(job["id"])
-            self.reply(job["id"], {"state": "visible"})
+            self.reply(job["id"], {"state": "visible" if installed else "pending"})
         except Exception:
             if window is not None:
                 job["cancelled"] = True
@@ -288,18 +310,29 @@ class PipeServer(QtCore.QObject):
             if self.active is job:
                 self.active = None
             if not self.closed and self.pending:
-                pending, self.pending = self.pending, None
-                self.start(pending)
+                QtCore.QTimer.singleShot(0, self.start_pending)
+
+    def start_pending(self):
+        if not self.closed and self.active is None and self.pending is not None:
+            pending, self.pending = self.pending, None
+            self.start(pending)
 
     def memory_used(self):
         """Conservative application allocations, including worker references."""
-        return (sum(snapshot_charge(window._snapshot) + window.analysis_bytes
-                    for window in self.windows.values() if window._snapshot is not None)
-                + self.analysis.reserved
+        allocations = merge_allocations(self.analysis.allocations,
+                                        *(window.allocations for window in self.windows.values()))
+        return (sum(allocations.values())
                 + (self.active.get("reserve", 0) if self.active is not None else 0))
 
     def workspace_closed(self, key):
         self.windows.pop(key, None)
+        if key not in self.closed_workspaces:
+            if len(self.closed_workspaces) == self.closed_workspaces.maxlen:
+                # Once the bounded tombstone set fills, unknown absent windows
+                # also require an explicit Inspect. An evicted old subscription
+                # must never start resurrecting windows again.
+                self.suppress_absent_automatic = True
+            self.closed_workspaces.append(key)
         for job in (self.active, self.pending):
             if job and job["params"]["workspace"] == key and not job["cancelled"]:
                 job["cancelled"] = True

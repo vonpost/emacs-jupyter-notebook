@@ -166,6 +166,27 @@ class StdioProcessTests(unittest.TestCase):
             process.stdout.close()
             process.stderr.close()
 
+    def test_closed_workspace_ignores_automatic_follow_until_explicit_inspect(self):
+        process = self.process()
+        try:
+            self.send(process, _request("hello", "hello"))
+            self.receive(process)
+            self.send(process, _request("first", "open", self.params))
+            self.assertTrue(self.receive(process, timeout=10)["ok"])
+            self.send(process, _request("close-workspace", "close_workspace", {"workspace": "ipc-test"}))
+            self.assertTrue(self.receive(process)["result"]["found"])
+            self.send(process, _request("follow", "open", self.params))
+            self.assertEqual(self.receive(process)["result"], {"state": "visible", "closed": True})
+            self.send(process, _request("focus-closed", "focus", {"workspace": "ipc-test"}))
+            self.assertFalse(self.receive(process)["result"]["found"])
+            self.send(process, _request("inspect", "open", dict(self.params, focus=True)))
+            self.assertEqual(self.receive(process, timeout=10)["result"], {"state": "visible"})
+        finally:
+            process.stdin.close()
+            process.wait(timeout=5)
+            process.stdout.close()
+            process.stderr.close()
+
 
 if __name__ == "__main__":
     unittest.main()

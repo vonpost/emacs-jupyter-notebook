@@ -371,12 +371,16 @@ remain historical. A row's checkboxes mean landed work, not proposed design.
   sample/crop/settings, local signed/absolute difference. Gate: mutation
   cannot alter old snapshots, unsigned subtraction, mismatched sample/grid/
   units, non-finite handling, cache pressure, panel eviction and viewer crash.
+  > CC14/CC17 now implement differences, pinning, blink and follow/freeze.
+  > See `docs/dogfood/2026-09-09-notebook-ux.md`; full platform gates remain.
 - [ ] **V9 Add linked measurement ROIs and statistics.** Depends: V8.
   Files: viewer ROI/statistics modules and tests. Named rectangles/ellipses,
   per-pane mean/population-SD/counts, geometry persistence. Gate: independently
   hand-calculated masks/results, edge/clipped/empty/single-pixel/non-finite
   cases, difference measurements, display invariance, bounded jobs and stale
   result rejection during ROI movement and candidate replacement.
+  > CC14/CC17 implement named rectangle/ellipse gestures and local statistics,
+  > linked samples/magnification and copy. Full release acceptance remains.
 
 ### M4 — Cutover and release verification
 
@@ -409,6 +413,10 @@ remain historical. A row's checkboxes mean landed work, not proposed design.
   concurrent busy-kernel-read promise, interrupt or replay. Gate: local delay/
   busy-kernel simulation, scrubbing, stale handles and no full-volume transfer
   or promise of unfetched historical slices.
+  > CC16/CC18 implement explicit NumPy plane selection from source/table with
+  > Emacs axis/index prompts and history-free FIFO publication. Viewer sliders,
+  > versioned remote handles, prefetch and unfetched historical slices remain
+  > outside that approved subset.
 - [ ] **V13 Add bounded overview/exact-crop transfer for huge planes.**
   Depends: V12. Files: publisher/helper artifacts, viewer cache/rendering,
   protocol and stress tests. Distinguish overview/exact data and cache crops

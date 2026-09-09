@@ -4,19 +4,23 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
+import html
 import math
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from .analysis import (DIFFERENCE, MAX_ROIS, Region, comparison_error,
                        correspondence, scalar_plane)
 from .analysis_worker import AnalysisJob, AnalysisWorker
 from .navigation import ImageGraphicsWidget, ImageViewBox, NavigationGroup, camera
+from .memory import AnalysisSource, MAX_MEMORY, merge_allocations, source_allocations
+from .magnifier import Magnifier, MAX_PATCH_BYTES
 
 
 MAX_LEVEL_SAMPLE = 65_536
+PINNED = "\0pinned"
 
 
 def _sample_extrema(array: np.ndarray) -> tuple[float, float] | None:
@@ -41,11 +45,21 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
 
     closed = QtCore.Signal()
 
-    def __init__(self, parent=None, *, analysis_worker=None):
+    def __init__(self, parent=None, *, analysis_worker=None, admit=None):
         super().__init__(parent)
         self.setWindowTitle("EJN viewer")
         self.resize(1100, 800)
         self._snapshot = None
+        self._pinned = None
+        self._pinned_name = None
+        self._analysis_source = None
+        self._pending_snapshot = None
+        self._blinking = False
+        self._draw_kind = None
+        self._drawing_region = None
+        self._crosshairs = {}
+        self._cursor = None
+        self._rendered_selection = None
         self._planes: dict[str, np.ndarray] = {}
         self._items: dict[str, pg.ImageItem] = {}
         self._views: dict[str, pg.ViewBox] = {}
@@ -67,11 +81,23 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self._analysis_owner = object()
         self._owns_worker = analysis_worker is None
         self._worker = analysis_worker or AnalysisWorker(self)
+        self._admit = admit or (lambda: sum(merge_allocations(
+            self.allocations, self._worker.allocations).values()) <= MAX_MEMORY)
+        if self._owns_worker:
+            self._worker.admit = self._admit
         self._worker.ready.connect(self._analysis_ready)
         self._analysis_timer = QtCore.QTimer(self)
         self._analysis_timer.setSingleShot(True)
         self._analysis_timer.setInterval(75)
         self._analysis_timer.timeout.connect(self._submit_analysis)
+        self._cursor_timer = QtCore.QTimer(self)
+        self._cursor_timer.setSingleShot(True)
+        self._cursor_timer.setInterval(25)
+        self._cursor_timer.timeout.connect(self._update_magnifier)
+        self._pending_snapshot_timer = QtCore.QTimer(self)
+        self._pending_snapshot_timer.setSingleShot(True)
+        self._pending_snapshot_timer.setInterval(75)
+        self._pending_snapshot_timer.timeout.connect(self._adopt_pending_snapshot)
 
         central = QtWidgets.QWidget(self)
         outer = QtWidgets.QVBoxLayout(central)
@@ -113,18 +139,43 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         for widget in (self.comparison, self.declare_grid, self.declare_units):
             comparison_controls.addWidget(widget)
         outer.addLayout(comparison_controls)
+        review_controls = QtWidgets.QHBoxLayout()
+        self.pin_button = QtWidgets.QPushButton("Pin reference", central)
+        self.pin_button.setCheckable(True)
+        self.freeze_button = QtWidgets.QPushButton("Freeze updates", central)
+        self.freeze_button.setCheckable(True)
+        self.freeze_button.setToolTip("Keep the current images; discard updates until unfrozen.")
+        self.blink_button = QtWidgets.QPushButton("Hold to blink (B)", central)
+        self.blink_button.setToolTip("While held, show the reference in the candidate pane.")
+        self.magnifier_toggle = QtWidgets.QCheckBox("Magnifier", central)
+        self.magnifier_toggle.setChecked(True)
+        self.publication_status = QtWidgets.QLabel(central)
+        self.publication_status.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                                              QtWidgets.QSizePolicy.Policy.Preferred)
+        for widget in (self.pin_button, self.freeze_button, self.blink_button, self.magnifier_toggle):
+            review_controls.addWidget(widget)
+        review_controls.addWidget(self.publication_status, 1)
+        outer.addLayout(review_controls)
         self.analysis_status = QtWidgets.QLabel(central)
         self.analysis_status.setWordWrap(True)
         self.analysis_status.setMinimumHeight(30)
         outer.addWidget(self.analysis_status)
         self.graphics = ImageGraphicsWidget(central)
+        self.graphics.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+        self.graphics.setMinimumHeight(180)
         outer.addWidget(self.graphics, 1)
+        self.magnifier = Magnifier(central)
+        outer.addWidget(self.magnifier)
 
         roi_controls = QtWidgets.QHBoxLayout()
         self.roi_plane = QtWidgets.QComboBox(central)
         self.rectangle_button = QtWidgets.QPushButton("Rectangle ROI", central)
         self.ellipse_button = QtWidgets.QPushButton("Ellipse ROI", central)
         self.roi_selector = QtWidgets.QComboBox(central)
+        for combo in (self.reference, self.candidate, self.roi_plane, self.roi_selector):
+            combo.setMinimumContentsLength(8)
+            combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMaximumWidth(220)
         self.remove_roi_button = QtWidgets.QPushButton("Remove ROI", central)
         self.refresh_button = QtWidgets.QPushButton("Refresh", central)
         roi_controls.addWidget(QtWidgets.QLabel("ROI pane", central))
@@ -132,6 +183,25 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
                        self.roi_selector, self.remove_roi_button, self.refresh_button):
             roi_controls.addWidget(widget)
         outer.addLayout(roi_controls)
+        roi_edit_controls = QtWidgets.QHBoxLayout()
+        self.draw_button = QtWidgets.QToolButton(central)
+        self.draw_button.setText("Draw ROI")
+        self.draw_button.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QtWidgets.QMenu(self.draw_button)
+        for kind in ("rectangle", "ellipse"):
+            action = menu.addAction("Draw " + kind)
+            action.triggered.connect(lambda _checked=False, shape=kind: self.arm_roi(shape))
+        menu.addAction("Cancel drawing", self.cancel_drawing)
+        self.draw_button.setMenu(menu)
+        self.roi_name = QtWidgets.QLineEdit(central)
+        self.roi_name.setPlaceholderText("ROI name (Enter to rename)")
+        self.roi_name.setMaxLength(128)
+        self.copy_button = QtWidgets.QPushButton("Copy statistics", central)
+        roi_edit_controls.addWidget(self.draw_button)
+        roi_edit_controls.addWidget(self.roi_name, 1)
+        roi_edit_controls.addWidget(QtWidgets.QLabel("Arrow keys: nudge ROI · Shift: 10 px", central))
+        roi_edit_controls.addWidget(self.copy_button)
+        outer.addLayout(roi_edit_controls)
         self.stats_table = QtWidgets.QTableWidget(0, 6, central)
         self.stats_table.setHorizontalHeaderLabels(["ROI / pane", "Units", "Mean", "SD (population)",
                                                     "Finite N", "Excluded"])
@@ -144,6 +214,7 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self.level.valueChanged.connect(self._levels_changed)
         self.width.valueChanged.connect(self._levels_changed)
         self.graphics.scene().sigMouseMoved.connect(self._mouse_moved)
+        self.graphics.roiDragged.connect(self._draw_region)
         for combo in (self.reference, self.candidate, self.comparison):
             combo.currentIndexChanged.connect(self._comparison_changed)
         self.declare_grid.toggled.connect(self._comparison_changed)
@@ -152,14 +223,169 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self.ellipse_button.clicked.connect(lambda: self.add_roi("ellipse"))
         self.remove_roi_button.clicked.connect(lambda: self.remove_roi(self.roi_selector.currentData()))
         self.refresh_button.clicked.connect(self._schedule_analysis)
+        self.pin_button.toggled.connect(self._pin_toggled)
+        self.freeze_button.toggled.connect(self._publication_status)
+        self.blink_button.pressed.connect(lambda: self._blink(True))
+        self.blink_button.released.connect(lambda: self._blink(False))
+        self.magnifier_toggle.toggled.connect(self._magnifier_toggled)
+        self.roi_selector.currentIndexChanged.connect(self._roi_selection_changed)
+        self.roi_name.returnPressed.connect(lambda: self.rename_roi(self.roi_name.text()))
+        self.copy_button.clicked.connect(self.copy_statistics)
+        self._roi_shortcuts = []
+        for key, dx, dy in (("Left", -1, 0), ("Right", 1, 0), ("Up", 0, -1), ("Down", 0, 1)):
+            for prefix, step in (("", 1), ("Shift+", 10)):
+                shortcut = QtGui.QShortcut(QtGui.QKeySequence(prefix + key), self.graphics)
+                shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
+                shortcut.activated.connect(lambda x=dx * step, y=dy * step: self.nudge_roi(x, y))
+                self._roi_shortcuts.append(shortcut)
 
     @property
     def analysis_bytes(self):
         """Retained derived data and conservative render conversion reservation."""
         return 0 if self._difference is None else self._difference.nbytes * 2
 
+    @property
+    def frozen(self):
+        return self.freeze_button.isChecked()
+
+    @property
+    def allocations(self):
+        result = {}
+        result["magnifier", id(self)] = MAX_PATCH_BYTES
+        for snapshot in (self._snapshot, self._pinned):
+            if snapshot is not None:
+                result = merge_allocations(result, source_allocations(snapshot))
+        for name, array in self._planes.items():
+            result["render", id(self), name] = array.shape[0] * array.shape[1] * 8
+        if self._difference is not None:
+            result["array", id(self._difference)] = self._difference.nbytes
+        if DIFFERENCE in self._planes:
+            array = self._planes[DIFFERENCE]
+            result["array", id(array)] = array.nbytes
+        if self._pending_snapshot is not None:
+            result = merge_allocations(result, source_allocations(self._pending_snapshot))
+            result["pending-render", id(self)] = sum(array.shape[0] * array.shape[1] * 8
+                for array in self._pending_snapshot.planes.values())
+        return result
+
+    def _all_planes(self):
+        arrays = dict(self._snapshot.planes)
+        if self._pinned is not None:
+            arrays[PINNED] = self._pinned.planes[self._pinned_name]
+        return arrays
+
+    def _update_analysis_source(self):
+        sources = tuple({id(value): value for value in (self._snapshot, self._pinned)
+                         if value is not None}.values())
+        self._analysis_source = AnalysisSource(self._all_planes(), sources)
+
+    def _reference_name(self):
+        return self.reference.currentData()
+
+    def _candidate_name(self):
+        return self.candidate.currentData()
+
+    def _sample(self, name):
+        snapshot = self._pinned if name == PINNED else self._snapshot
+        return (snapshot.manifest or {}).get("sample_id")
+
+    def _publication_status(self, *_):
+        if self._snapshot is None:
+            return
+        state = "Frozen: new updates are skipped" if self.frozen else "Following latest updates"
+        execution = getattr(self._snapshot, "execution", "")
+        if execution:
+            state += " · " + execution
+        if self._pinned is not None:
+            state += " · pinned " + self._pinned_name + " / " + getattr(self._pinned, "execution", "saved evaluation")
+        if self._blinking:
+            state += " · showing reference in candidate pane"
+        if self._pending_snapshot is not None:
+            state += " · new evaluation ready after drag"
+        self.publication_status.setText(state)
+        self.publication_status.setToolTip(state)
+
+    def _populate_selectors(self, preserve=True):
+        names = list(self._snapshot.planes)
+        for combo, default in ((self.reference, names[0]),
+                               (self.candidate, names[min(1, len(names) - 1)])):
+            previous = combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            for name in names:
+                combo.addItem(name, name)
+            if combo is self.reference and self._pinned is not None:
+                combo.addItem("Pinned: " + self._pinned_name, PINNED)
+            index = combo.findData(previous) if preserve else -1
+            combo.setCurrentIndex(index if index >= 0 else combo.findData(default))
+            combo.blockSignals(False)
+
+    def _pin_toggled(self, checked):
+        if self._snapshot is None:
+            return
+        self._blink(False)
+        if checked:
+            name = self._reference_name()
+            if name == PINNED or not self._snapshot.numerical:
+                return
+            if self._snapshot.planes[name].flags.writeable:
+                self.pin_button.blockSignals(True)
+                self.pin_button.setChecked(False)
+                self.pin_button.blockSignals(False)
+                self.analysis_status.setText("Pinning requires an immutable loaded snapshot.")
+                return
+            self._pinned, self._pinned_name = self._snapshot, name
+            # Promotion shares source bytes but adds a second displayed pane
+            # for a single-plane publication. Admit its render buffers first.
+            previous_planes, previous_difference = self._planes, self._difference
+            self._planes = {PINNED: self._pinned.planes[name],
+                            self._candidate_name(): self._snapshot.planes[self._candidate_name()]}
+            self._difference = None
+            allowed = self._admit()
+            self._planes, self._difference = previous_planes, previous_difference
+            if not allowed:
+                self._pinned = self._pinned_name = None
+                self.pin_button.blockSignals(True)
+                self.pin_button.setChecked(False)
+                self.pin_button.blockSignals(False)
+                self.analysis_status.setText("Pinning exceeds the local memory budget.")
+                return
+        else:
+            previous_pin, previous_name = self._pinned, self._pinned_name
+            previous_planes, previous_difference = self._planes, self._difference
+            self._pinned = self._pinned_name = None
+            self._planes, self._difference = dict(self._snapshot.planes), None
+            allowed = self._admit()
+            self._pinned, self._pinned_name = previous_pin, previous_name
+            self._planes, self._difference = previous_planes, previous_difference
+            if not allowed:
+                self.pin_button.blockSignals(True)
+                self.pin_button.setChecked(True)
+                self.pin_button.blockSignals(False)
+                self.analysis_status.setText("This display exceeds the local memory budget; keep the reference pinned or close another workspace.")
+                return
+            replacement = self._candidate_name()
+            for identifier, region in list(self._regions.items()):
+                if region.plane == PINNED:
+                    if self._corresponds(PINNED, replacement):
+                        self._regions[identifier] = replace(region, plane=replacement)
+                    else:
+                        del self._regions[identifier]
+            self._pinned = self._pinned_name = None
+        self._populate_selectors()
+        if checked:
+            self.reference.blockSignals(True)
+            self.reference.setCurrentIndex(self.reference.findData(PINNED))
+            self.reference.blockSignals(False)
+        self.pin_button.setText("Unpin reference" if checked else "Pin reference")
+        self._update_analysis_source()
+        self._comparison_changed()
+        self._publication_status()
+
     def install_snapshot(self, snapshot) -> None:
         """Install SNAPSHOT, preserving geometry only for declared correspondence."""
+        if self.frozen and self._snapshot is not None:
+            return False
         planes = getattr(snapshot, "planes", None)
         if not isinstance(planes, Mapping) or not 1 <= len(planes) <= 4:
             raise ValueError("snapshot must contain 1 to 4 planes")
@@ -170,7 +396,16 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
                    (array.ndim == 3 and array.shape[-1] in (3, 4)))
                for name, array in planes.items()):
             raise ValueError("snapshot planes have unsupported shape or dtype")
+        if self._snapshot is not None and self._gesturing():
+            self._pending_snapshot = snapshot
+            self._pending_snapshot_timer.start()
+            self._publication_status()
+            return False
+        self._pending_snapshot = None
+        self._pending_snapshot_timer.stop()
+        self.cancel_drawing()
         manifest = getattr(snapshot, "manifest", None) or {}
+        self._blink(False)
         new_meta = _plane_metadata(manifest)
         old = self._snapshot
         old_manifest = getattr(old, "manifest", None) or {}
@@ -200,67 +435,125 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             self.declare_units.blockSignals(False)
         self._snapshot = snapshot
         self._metadata = new_meta
-        names = list(planes)
-        for combo, default in ((self.reference, names[0]),
-                               (self.candidate, names[min(1, len(names) - 1)])):
-            previous = combo.currentText()
-            combo.blockSignals(True)
-            combo.clear()
-            combo.addItems(names)
-            combo.setCurrentText(previous if preserve and previous in names else default)
-            combo.blockSignals(False)
+        self._populate_selectors(preserve=preserve or self._pinned is not None)
+        self._update_analysis_source()
         for widget in (self.reference, self.candidate, self.comparison, self.declare_grid,
                        self.declare_units, self.rectangle_button, self.ellipse_button,
                        self.roi_plane, self.refresh_button):
             widget.setEnabled(numerical)
         self.level.setEnabled(numerical)
         self.width.setEnabled(numerical)
+        self.pin_button.setEnabled(numerical or self._pinned is not None)
+        self.draw_button.setEnabled(numerical)
+        self.magnifier_toggle.setEnabled(numerical)
+        self.magnifier.setVisible(numerical and self.magnifier_toggle.isChecked())
         self._render(preserve=preserve)
         self._schedule_analysis()
+        self._publication_status()
+        self._compact_layout()
+        return True
+
+    def _adopt_pending_snapshot(self):
+        if self._closed or self._pending_snapshot is None:
+            return
+        if self.frozen:
+            self._pending_snapshot = None
+            self._publication_status()
+        elif self._gesturing():
+            self._pending_snapshot_timer.start()
+        else:
+            snapshot, self._pending_snapshot = self._pending_snapshot, None
+            self.install_snapshot(snapshot)
 
     def _comparison_error(self):
         if not self._snapshot.numerical:
             return "Rendered image: differences and quantitative ROI statistics are unavailable."
-        names = self.reference.currentText(), self.candidate.currentText()
+        names = self._reference_name(), self._candidate_name()
         if names[0] == names[1]:
             return "Select distinct reference and candidate images."
-        manifest = self._snapshot.manifest or {}
-        return comparison_error(self._snapshot.planes[names[0]], self._snapshot.planes[names[1]],
-                                self._metadata.get(names[0], {}), self._metadata.get(names[1], {}),
-                                manifest.get("sample_id"), manifest.get("sample_id"),
+        arrays = self._all_planes()
+        return comparison_error(arrays[names[0]], arrays[names[1]],
+                                self._meta(names[0]), self._meta(names[1]),
+                                self._sample(names[0]), self._sample(names[1]),
                                 declared_grid=self.declare_grid.isChecked(),
                                 declared_units=self.declare_units.isChecked())
 
     def _comparison_key(self):
-        return (id(self._snapshot), self.reference.currentText(), self.candidate.currentText(),
-                self.comparison.currentData())
+        return (id(self._snapshot), self._reference_name(), self._candidate_name(),
+                self.comparison.currentData(), id(self._pinned))
 
     def _comparison_changed(self, *_):
         if self._snapshot is None:
             return
+        self.cancel_drawing()
+        self._blink(False)
+        previous_difference, previous_key = self._difference, self._difference_key
         self._difference = self._difference_key = None
+        old_planes, self._planes = self._planes, self._display_planes()
+        allowed = self._admit()
+        self._planes = old_planes
+        if not allowed:
+            self._difference, self._difference_key = previous_difference, previous_key
+            self._restore_selection()
+            self.analysis_status.setText("This display exceeds the local memory budget; close another workspace first.")
+            return
         self._render(preserve=True)
         self._schedule_analysis()
+        self.blink_button.setEnabled(self._comparison_error() is None)
 
     def _display_name(self, name):
+        if name == PINNED:
+            return "Pinned: " + self._pinned_name
         if name != DIFFERENCE:
             return name
         order = self.candidate.currentText() + " − " + self.reference.currentText()
         return "|" + order + "|" if self.comparison.currentData() == "absolute" else order
 
     def _meta(self, name):
+        if name == PINNED:
+            return _plane_metadata(self._pinned.manifest).get(self._pinned_name, {})
         if name == DIFFERENCE:
             name = self.candidate.currentText()
         return self._metadata.get(name, {})
 
     def _corresponds(self, first, second):
-        arrays = dict(self._snapshot.planes)
+        arrays = self._all_planes()
         if self._difference is not None:
             arrays[DIFFERENCE] = self._difference
         return (first == second or
                 first in arrays and second in arrays and
+                self._sample(first) == self._sample(second) and
                 correspondence(arrays[first], arrays[second], self._meta(first), self._meta(second),
                                declared=self.declare_grid.isChecked()))
+
+    def _selection(self):
+        return (self._reference_name(), self._candidate_name(), self.comparison.currentIndex(),
+                self.declare_grid.isChecked(), self.declare_units.isChecked())
+
+    def _restore_selection(self):
+        if self._rendered_selection is None:
+            return
+        reference, candidate, mode, grid, units = self._rendered_selection
+        for combo, value in ((self.reference, reference), (self.candidate, candidate)):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(combo.findData(value))
+            combo.blockSignals(False)
+        self.comparison.blockSignals(True)
+        self.comparison.setCurrentIndex(mode)
+        self.comparison.blockSignals(False)
+        for widget, value in ((self.declare_grid, grid), (self.declare_units, units)):
+            widget.blockSignals(True)
+            widget.setChecked(value)
+            widget.blockSignals(False)
+
+    def _display_planes(self):
+        planes = dict(self._snapshot.planes)
+        if self._difference is not None or self._reference_name() == PINNED:
+            arrays = self._all_planes()
+            planes = {name: arrays[name] for name in (self._reference_name(), self._candidate_name())}
+        if self._difference is not None:
+            planes[DIFFERENCE] = self._difference
+        return planes
 
     def _render(self, *, preserve):
         cameras = {name: camera(view) for name, view in self._views.items()}
@@ -270,19 +563,18 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         for group in self._navigation_groups:
             group.dispose()
         self._navigation_groups.clear()
+        self.graphics._gesture_view = None
         for key in list(self._roi_items):
             self._dispose_roi(key)
+        self._clear_crosshairs()
         for item in self._items.values():
+            item.clear()
             item.deleteLater()
         self._items.clear()
         self._views.clear()
         self.graphics.clear()
         numerical = self._snapshot.numerical
-        self._planes = dict(self._snapshot.planes)
-        if self._difference is not None:
-            self._planes = {name: self._snapshot.planes[name] for name in
-                            (self.reference.currentText(), self.candidate.currentText())}
-            self._planes[DIFFERENCE] = self._difference
+        self._planes = self._display_planes()
         extrema = [_sample_extrema(array) for array in self._snapshot.planes.values() if numerical]
         extrema = [value for value in extrema if value is not None]
         low = min((value[0] for value in extrema), default=0.0)
@@ -296,7 +588,9 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             row, col = divmod(index, 2)
             units = self._meta(name).get("units") or "unspecified units"
             title = self._display_name(name) + (" [" + units + "]" if numerical else " (rendered image)")
-            self.graphics.addLabel(title, row=row * 2, col=col)
+            label = self.graphics.addLabel(html.escape(title if len(title) <= 64 else title[:61] + "…"),
+                                           row=row * 2, col=col)
+            label.setToolTip(title)
             view = ImageViewBox()
             self.graphics.addItem(view, row=row * 2 + 1, col=col)
             view.setMenuEnabled(False)
@@ -314,6 +608,13 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             view.invertY(True)
             self._views[name], self._items[name] = view, item
             self._levels[name] = levels
+            cross = (pg.InfiniteLine(angle=90, pen=pg.mkPen("#f5dd42", width=1)),
+                     pg.InfiniteLine(angle=0, pen=pg.mkPen("#f5dd42", width=1)))
+            for line in cross:
+                line.setZValue(30)
+                line.setVisible(False)
+                view.addItem(line, ignoreBounds=True)
+            self._crosshairs[name] = cross
         names = list(self._planes)
         groups = []
         for name in names:
@@ -347,6 +648,33 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         if index >= 0:
             self.roi_plane.setCurrentIndex(index)
         self._rebuild_rois()
+        self.blink_button.setEnabled(numerical and self._comparison_error() is None)
+        if not preserve:
+            self._cursor = None
+        if self._cursor is not None and self._cursor[0] in self._planes:
+            self._show_cursor(*self._cursor)
+        else:
+            self._clear_cursor()
+        self._apply_blink_image()
+        self._rendered_selection = self._selection()
+
+    def _blink(self, enabled):
+        if enabled and (self._snapshot is None or self._comparison_error() is not None):
+            return
+        if self._blinking == enabled:
+            return
+        self._blinking = enabled
+        self._apply_blink_image()
+        self._publication_status()
+        self._update_magnifier()
+
+    def _apply_blink_image(self):
+        name = self._candidate_name()
+        if name in self._items:
+            array = (self._all_planes()[self._reference_name()] if self._blinking
+                     else self._planes[name])
+            item = self._items[name]
+            item.setImage(array, autoLevels=False, levels=item.getLevels())
 
     def _targets(self, region):
         return tuple(name for name in self._planes if self._corresponds(region.plane, name))
@@ -397,6 +725,88 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self._views[key[1]].removeItem(item)
         item.deleteLater()
 
+    def arm_roi(self, kind):
+        if self._snapshot is None or not self._snapshot.numerical or len(self._regions) >= MAX_ROIS:
+            return
+        self.cancel_drawing()
+        self._draw_kind = kind
+        self.graphics.draw_roi = True
+        self.graphics.viewport().setCursor(QtCore.Qt.CursorShape.CrossCursor)
+        self.draw_button.setText("Drawing " + kind + " (Esc cancels)")
+        self.graphics.setFocus()
+
+    def cancel_drawing(self):
+        identifier, self._drawing_region = self._drawing_region, None
+        self._draw_kind = None
+        self.graphics.draw_roi = False
+        self.graphics._roi_drag = None
+        self.graphics.viewport().unsetCursor()
+        self.draw_button.setText("Draw ROI")
+        if identifier in self._regions:
+            self.remove_roi(identifier)
+
+    def _draw_region(self, view, start, end, finished):
+        if self._draw_kind is None:
+            return
+        name = next((key for key, value in self._views.items() if value is view), None)
+        if name is None:
+            return
+        if self._drawing_region is None:
+            if len(self._regions) >= MAX_ROIS:
+                self.cancel_drawing()
+                return
+            self._next_region += 1
+            identifier = self._next_region
+            self._drawing_region = identifier
+            source = self._candidate_name() if name == DIFFERENCE else name
+            self._regions[identifier] = Region(identifier, f"ROI {identifier} ({self._draw_kind})",
+                                               source, self._draw_kind, start.x(), start.y(), .001, .001)
+            self._rebuild_rois()
+            self.roi_selector.setCurrentIndex(self.roi_selector.findData(identifier))
+        item = self._roi_items[self._drawing_region, name]
+        item.setPos((min(start.x(), end.x()), min(start.y(), end.y())))
+        item.setSize((max(.001, abs(end.x() - start.x())), max(.001, abs(end.y() - start.y()))))
+        if finished:
+            self._drawing_region = None
+            self.cancel_drawing()
+
+    def _roi_selection_changed(self, *_):
+        region = self._regions.get(self.roi_selector.currentData())
+        self.roi_name.setText(region.name if region is not None else "")
+        self.roi_name.setEnabled(region is not None)
+
+    def rename_roi(self, name):
+        identifier = self.roi_selector.currentData()
+        name = name.strip()
+        if identifier not in self._regions:
+            return
+        if not name or len(name.encode("utf-8")) > 128 or not name.isprintable():
+            self.analysis_status.setText("Use a nonempty ROI name of at most 128 UTF-8 bytes, without control characters.")
+            return
+        self._regions[identifier] = replace(self._regions[identifier], name=name)
+        self.roi_selector.setItemText(self.roi_selector.currentIndex(), name)
+        self.roi_name.setText(name)
+        self._render_statistics()
+
+    def nudge_roi(self, dx, dy):
+        identifier = self.roi_selector.currentData()
+        item = next((item for (key, _name), item in self._roi_items.items() if key == identifier), None)
+        if item is not None:
+            item.setPos(item.pos() + QtCore.QPointF(dx, dy))
+
+    def copy_statistics(self):
+        rows = ["ROI\tPlane\tUnits\tMean\tSD (population)\tFinite N\tExcluded"]
+        for (identifier, name), value in self._statistics.items():
+            if identifier not in self._regions or name not in self._planes:
+                continue
+            rows.append("\t".join((self._regions[identifier].name, self._display_name(name),
+                                    self._meta(name).get("units") or "unspecified",
+                                    "unavailable" if value.mean is None else format(value.mean, ".17g"),
+                                    "unavailable" if value.sd is None else format(value.sd, ".17g"),
+                                    str(value.finite), str(value.excluded))))
+        QtWidgets.QApplication.clipboard().setText("\n".join(rows))
+        return "\n".join(rows)
+
     def add_roi(self, kind):
         """Add a centered ROI in the selected pane; drag it or its resize handle."""
         if not self._snapshot or not self._snapshot.numerical or len(self._regions) >= MAX_ROIS:
@@ -409,7 +819,7 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         y = min(max(view.center().y() - height / 2, 0), array.shape[0] - height)
         self._next_region += 1
         identifier = self._next_region
-        source = self.candidate.currentText() if name == DIFFERENCE else name
+        source = self._candidate_name() if name == DIFFERENCE else name
         self._regions[identifier] = Region(identifier, f"ROI {identifier} ({kind})", source,
                                            kind, x, y, width, height)
         self._rebuild_rois()
@@ -462,15 +872,18 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
     def _submit_analysis(self):
         if self._closed or self._snapshot is None:
             return
+        if self._gesturing():
+            self._analysis_timer.start()
+            return
         compare = bool(self.comparison.currentData() and not self._comparison_error())
-        reference = self.reference.currentText() if compare else None
-        candidate = self.candidate.currentText() if compare else None
+        reference = self._reference_name() if compare else None
+        candidate = self._candidate_name() if compare else None
         targets = {roi.identifier: self._targets(roi) for roi in self._regions.values()}
         if compare:
             for roi in self._regions.values():
                 if self._corresponds(roi.plane, candidate):
                     targets[roi.identifier] = tuple(dict.fromkeys((*targets[roi.identifier], DIFFERENCE)))
-        self._worker.submit(AnalysisJob(self._analysis_owner, self._analysis_token, self._snapshot,
+        self._worker.submit(AnalysisJob(self._analysis_owner, self._analysis_token, self._analysis_source,
                                        tuple(self._regions.values()), targets, reference, candidate,
                                        self.comparison.currentData() == "absolute",
                                        self._difference if self._difference_key == self._comparison_key() else None))
@@ -484,11 +897,24 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             return
         if result is None:
             return
-        derived, self._statistics = result
+        derived, statistics = result
+        if derived is not None and self._difference is not derived and self._gesturing():
+            # Replacing ViewBoxes while Qt owns a drag target can invalidate
+            # its scene object. Drop this bounded result and recompute after
+            # release; no extra snapshot/difference retention is needed.
+            self._analysis_timer.start()
+            return
+        self._statistics = statistics
         if derived is not None and self._difference is not derived:
             self._difference = derived
             self._difference_key = self._comparison_key()
             self._render(preserve=True)
+        self._render_statistics()
+        comparison_error_text = self._comparison_error() if self.comparison.currentData() else None
+        self.analysis_status.setText(comparison_error_text or
+                                    "Local original-sample measurements; SD is population SD (ddof=0).")
+
+    def _render_statistics(self):
         rows = [(key, value) for key, value in self._statistics.items() if key[1] in self._planes]
         self.stats_table.setRowCount(len(rows))
         for row, ((identifier, name), value) in enumerate(rows):
@@ -500,15 +926,17 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
                       str(value.finite), str(value.excluded)]
             for col, text in enumerate(values):
                 self.stats_table.setItem(row, col, QtWidgets.QTableWidgetItem(text))
-        comparison_error_text = self._comparison_error() if self.comparison.currentData() else None
-        self.analysis_status.setText(comparison_error_text or
-                                    "Local original-sample measurements; SD is population SD (ddof=0).")
+
+    def _gesturing(self):
+        return (self._drawing_region is not None or self.graphics._roi_drag is not None
+                or QtWidgets.QApplication.mouseButtons() != QtCore.Qt.MouseButton.NoButton)
 
     def _levels_changed(self) -> None:
         center, width = self.level.value(), self.width.value()
         for name, item in self._items.items():
             if name != DIFFERENCE:
                 item.setLevels((center - width / 2.0, center + width / 2.0))
+        self._update_magnifier()
 
     def fit(self) -> None:
         for group in self._navigation_groups:
@@ -523,20 +951,110 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             array = self._planes[name]
             if 0 <= row < array.shape[0] and 0 <= col < array.shape[1]:
                 if self._snapshot.numerical:
-                    self.readout.setText("%s [%d,%d] = %s" %
-                                         (self._display_name(name), row, col, array[row, col]))
+                    self._show_cursor(name, row, col)
                 else:
                     self.readout.setText("%s [%d,%d] (numeric unavailable)" % (name, row, col))
                 return
+        self._clear_cursor()
+
+    def _show_cursor(self, name, row, col):
+        if name not in self._planes or not (0 <= row < self._planes[name].shape[0]
+                                            and 0 <= col < self._planes[name].shape[1]):
+            self._clear_cursor()
+            return
+        self._cursor = name, row, col
+        values = []
+        for target, array in self._planes.items():
+            linked = self._corresponds(name, target)
+            for line in self._crosshairs[target]:
+                line.setVisible(linked)
+            if linked:
+                self._crosshairs[target][0].setPos(col + .5)
+                self._crosshairs[target][1].setPos(row + .5)
+                values.append(self._display_name(target) + "=" + str(array[row, col]))
+        text = f"[{row},{col}] " + " · ".join(values)
+        self.readout.setText(text)
+        self.readout.setToolTip(text)
+        self._cursor_timer.start()
+
+    def _update_magnifier(self):
+        if self._closed or self._cursor is None or not self.magnifier.isVisible():
+            return
+        name, row, col = self._cursor
+        if name not in self._planes:
+            return
+        planes = []
+        for target, array in self._planes.items():
+            if self._corresponds(name, target):
+                label = self._display_name(target)
+                if self._blinking and target == self._candidate_name():
+                    array = self._all_planes()[self._reference_name()]
+                    label += " (reference blink)"
+                planes.append((target, label, array, self._items[target].getLevels()))
+        self.magnifier.display(planes, row, col)
+
+    def _clear_cursor(self):
+        self._cursor = None
+        self._cursor_timer.stop()
         self.readout.setText("Pixel: —")
+        self.readout.setToolTip("")
+        self.magnifier.clear()
+        for cross in self._crosshairs.values():
+            for line in cross:
+                line.setVisible(False)
+
+    def _magnifier_toggled(self, enabled):
+        self._compact_layout()
+        if enabled:
+            self._update_magnifier()
+        else:
+            self.magnifier.clear()
+
+    def _compact_layout(self):
+        if not hasattr(self, "magnifier"):
+            return
+        roomy = self.height() >= 650
+        numerical = self._snapshot is not None and self._snapshot.numerical
+        self.magnifier_toggle.setEnabled(numerical and roomy)
+        self.magnifier_toggle.setToolTip("Show a 31×31 patch around the pointer." if roomy else
+                                       "Enlarge the viewer to show magnified patches.")
+        self.magnifier.setVisible(numerical and roomy and self.magnifier_toggle.isChecked())
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._compact_layout()
+
+    def _clear_crosshairs(self):
+        for name, cross in self._crosshairs.items():
+            for line in cross:
+                self._views[name].removeItem(line)
+                line.deleteLater()
+        self._crosshairs.clear()
 
     def keyPressEvent(self, event) -> None:
         if event.key() == QtCore.Qt.Key_F:
             self.fit()
         elif event.key() == QtCore.Qt.Key_Escape:
-            self.close()
+            if self._draw_kind is not None:
+                self.cancel_drawing()
+            else:
+                self.close()
+        elif event.key() == QtCore.Qt.Key_B:
+            if not event.isAutoRepeat():
+                self._blink(True)
         else:
             super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() == QtCore.Qt.Key_B and not event.isAutoRepeat():
+            self._blink(False)
+        else:
+            super().keyReleaseEvent(event)
+
+    def changeEvent(self, event):
+        if event.type() == QtCore.QEvent.Type.ActivationChange and not self.isActiveWindow():
+            self._blink(False)
+        super().changeEvent(event)
 
     def closeEvent(self, event) -> None:
         if self._closed:
@@ -545,6 +1063,8 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self._closed = True
         self._analysis_token += 1
         self._analysis_timer.stop()
+        self._cursor_timer.stop()
+        self._pending_snapshot_timer.stop()
         self._worker.cancel(self._analysis_owner)
         self._worker.ready.disconnect(self._analysis_ready)
         if self._owns_worker:
@@ -554,12 +1074,15 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self._navigation_groups.clear()
         for key in list(self._roi_items):
             self._dispose_roi(key)
+        self._clear_crosshairs()
+        self.magnifier.clear()
         for item in self._items.values():
+            item.clear()
             item.deleteLater()
         self._items.clear()
         self._views.clear()
         self.graphics.clear()
         self._planes.clear()
-        self._snapshot = self._difference = None
+        self._snapshot = self._difference = self._pinned = self._analysis_source = self._pending_snapshot = None
         self.closed.emit()
         super().closeEvent(event)

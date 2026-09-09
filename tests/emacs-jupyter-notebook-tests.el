@@ -10039,8 +10039,8 @@ session does not pay an O(history) erase+reinsert on every stream flush."
         (emacs-jupyter-notebook-panel-flush-now panel)
         (with-current-buffer panel
           (let* ((text (buffer-substring-no-properties (point-min) (point-max)))
-                 (second-pos (string-match "second cell" text))
-                 (first-pos (string-match "first cell" text)))
+                 (second-pos (string-match "\\[running\\] B" text))
+                 (first-pos (string-match "\\[running\\] A" text)))
             (should second-pos)
             (should first-pos)
             (should (< second-pos first-pos))
