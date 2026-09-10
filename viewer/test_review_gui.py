@@ -25,6 +25,32 @@ class ReviewGuiTests(unittest.TestCase):
         APP.processEvents()
         return window
 
+    def use_menu(self, button, interact, *, keyboard=False):
+        """Exercise an InstantPopup through its nested Qt event loop."""
+        menu = button.menu()
+        errors = []
+
+        def while_open():
+            try:
+                self.assertTrue(menu.isVisible())
+                interact(menu)
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                menu.close()
+
+        if keyboard:
+            button.setFocus()
+            self.assertIs(APP.focusWidget(), button)
+        QtCore.QTimer.singleShot(0, while_open)
+        if keyboard:
+            QtTest.QTest.keyClick(APP.focusWidget(), QtCore.Qt.Key.Key_Space)
+        else:
+            QtTest.QTest.mouseClick(button, QtCore.Qt.MouseButton.LeftButton)
+        APP.processEvents()
+        if errors:
+            raise errors[0]
+
     def test_pin_old_reference_accepts_new_candidate_preserving_camera_levels_roi(self):
         original = snapshot()
         window = self.window(original)
@@ -144,17 +170,190 @@ class ReviewGuiTests(unittest.TestCase):
 
     def test_compact_window_keeps_images_visible_and_optional_patches_collapse(self):
         window = self.window()
-        window.resize(860, 440)
-        APP.processEvents()
-        self.assertGreaterEqual(window.graphics.height(), 180)
-        self.assertTrue(all(view.height() > 40 for view in window._views.values()))
-        self.assertFalse(window.magnifier.isVisible())
-        self.assertTrue(window.stats_table.isVisible())
+        for width, height, image_fraction in ((1100, 800, .75), (860, 440, .65)):
+            with self.subTest(size=(width, height)):
+                window.resize(width, height)
+                APP.processEvents()
+                self.assertEqual(window.size(), QtCore.QSize(width, height))
+                self.assertGreater(window.graphics.height(), height * image_fraction)
+                self.assertTrue(all(view.height() > 100 for view in window._views.values()))
+                self.assertFalse(window.magnifier.isVisible())
+                self.assertFalse(window.stats_table.isVisible())
+                self.assertTrue(window.analysis_status.isVisible())
+                self.assertTrue(window.publication_status.isVisible())
         window.install_snapshot(snapshot(delta=3))
         self.assertFalse(window.magnifier.isVisible())
         window.resize(1100, 800)
         APP.processEvents()
+        self.assertFalse(window.magnifier.isVisible())
+        window.magnifier_toggle.setChecked(True)
         self.assertTrue(window.magnifier.isVisible())
+        window.resize(860, 440)
+        APP.processEvents()
+        self.assertFalse(window.magnifier.isVisible())
+        window.resize(1100, 800)
+        APP.processEvents()
+        self.assertTrue(window.magnifier.isVisible())
+
+    def test_compare_dropdown_controls_select_difference_pin_and_blink(self):
+        data = snapshot()
+        for metadata in data.manifest["planes"]:
+            metadata.pop("grid_id")
+            metadata.pop("units")
+        window = self.window(data)
+        self.assertFalse(window.reference.isVisible())
+
+        def compare(_menu):
+            for widget in (window.reference, window.candidate, window.comparison,
+                           window.declare_grid, window.declare_units, window.pin_button,
+                           window.blink_button):
+                self.assertTrue(widget.isVisible())
+            QtTest.QTest.keyClick(window.comparison, QtCore.Qt.Key.Key_Down)
+            self.assertEqual(window.comparison.currentData(), "signed")
+            QtTest.QTest.mouseClick(window.declare_grid, QtCore.Qt.MouseButton.LeftButton)
+            QtTest.QTest.mouseClick(window.declare_units, QtCore.Qt.MouseButton.LeftButton)
+            QtTest.QTest.keyClick(window.reference, QtCore.Qt.Key.Key_End)
+            QtTest.QTest.keyClick(window.candidate, QtCore.Qt.Key.Key_Home)
+            self.assertEqual(window._reference_name(), "candidate")
+            self.assertEqual(window._candidate_name(), "reference")
+
+        self.use_menu(window.compare_button, compare)
+        pump_until(lambda: window._difference is not None)
+        np.testing.assert_array_equal(window._difference, np.full((3, 4), -2.))
+        self.assertFalse(window.reference.isVisible())
+
+        def pin_and_blink(_menu):
+            QtTest.QTest.mouseClick(window.pin_button, QtCore.Qt.MouseButton.LeftButton)
+            self.assertTrue(window.pin_button.isChecked())
+            candidate = window._candidate_name()
+            QtTest.QTest.mousePress(window.blink_button, QtCore.Qt.MouseButton.LeftButton)
+            self.assertTrue(np.shares_memory(window._items[candidate].image, data.planes["candidate"]))
+            QtTest.QTest.mouseRelease(window.blink_button, QtCore.Qt.MouseButton.LeftButton)
+            self.assertTrue(np.shares_memory(window._items[candidate].image, data.planes["reference"]))
+
+        self.use_menu(window.compare_button, pin_and_blink)
+
+    def test_settings_menus_support_keyboard_focus_and_skip_disabled_controls(self):
+        window = self.window()
+
+        def compare(menu):
+            self.assertIs(APP.focusWidget(), window.reference)
+            order = (window.reference, window.candidate, window.comparison, window.pin_button,
+                     window.blink_button, window.declare_grid, window.declare_units)
+            for expected in (*order[1:], order[0]):
+                QtTest.QTest.keyClick(APP.focusWidget(), QtCore.Qt.Key.Key_Tab)
+                self.assertIs(APP.focusWidget(), expected)
+            for expected in (*reversed(order[1:]), order[0]):
+                QtTest.QTest.keyClick(APP.focusWidget(), QtCore.Qt.Key.Key_Backtab)
+                self.assertIs(APP.focusWidget(), expected)
+            QtTest.QTest.keyClick(APP.focusWidget(), QtCore.Qt.Key.Key_Escape)
+            self.assertFalse(menu.isVisible())
+            self.assertTrue(window.isVisible())
+
+        self.use_menu(window.compare_button, compare, keyboard=True)
+        # A fresh window avoids offscreen Qt's stale popup activation after
+        # the nested key event returns; native Qt restores toolbar focus.
+        window = self.window()
+        window.resize(860, 440)
+        APP.processEvents()
+
+        def options(menu):
+            self.assertFalse(window.magnifier_toggle.isEnabled())
+            self.assertIs(APP.focusWidget(), window.freeze_button)
+            for key in (QtCore.Qt.Key.Key_Tab, QtCore.Qt.Key.Key_Backtab):
+                QtTest.QTest.keyClick(APP.focusWidget(), key)
+                self.assertIs(APP.focusWidget(), window.freeze_button)
+            QtTest.QTest.keyClick(APP.focusWidget(), QtCore.Qt.Key.Key_Space)
+            self.assertTrue(window.frozen)
+            QtTest.QTest.keyClick(APP.focusWidget(), QtCore.Qt.Key.Key_Escape)
+            self.assertFalse(menu.isVisible())
+            self.assertTrue(window.isVisible())
+
+        self.use_menu(window.options_button, options, keyboard=True)
+
+    def test_options_dropdown_freezes_updates_and_enables_magnifier(self):
+        window = self.window()
+        original = window._snapshot
+
+        def enable(_menu):
+            self.assertTrue(window.freeze_button.isVisible())
+            self.assertTrue(window.magnifier_toggle.isVisible())
+            QtTest.QTest.mouseClick(window.freeze_button, QtCore.Qt.MouseButton.LeftButton)
+            QtTest.QTest.mouseClick(window.magnifier_toggle, QtCore.Qt.MouseButton.LeftButton,
+                                   pos=QtCore.QPoint(8, window.magnifier_toggle.height() // 2))
+
+        self.use_menu(window.options_button, enable)
+        self.assertFalse(window.install_snapshot(snapshot(delta=50)))
+        self.assertIs(window._snapshot, original)
+        self.assertIn("Frozen", window.publication_status.text())
+        self.assertTrue(window.magnifier.isVisible())
+        self.use_menu(window.options_button, lambda _menu: QtTest.QTest.mouseClick(
+            window.freeze_button, QtCore.Qt.MouseButton.LeftButton))
+        self.assertTrue(window.install_snapshot(snapshot(delta=100)))
+
+    def test_measurements_toggle_restores_image_space_and_retains_measurements(self):
+        window = self.window()
+        full_height = window.graphics.height()
+        QtTest.QTest.mouseClick(window.measurements_button, QtCore.Qt.MouseButton.LeftButton)
+        APP.processEvents()
+        self.assertTrue(window.stats_table.isVisible())
+        self.assertTrue(window.roi_name.isVisible())
+        self.assertLess(window.graphics.height(), full_height)
+        QtTest.QTest.mouseClick(window.rectangle_button, QtCore.Qt.MouseButton.LeftButton)
+        pump_until(lambda: bool(window._statistics))
+        window.roi_name.selectAll()
+        QtTest.QTest.keyClicks(window.roi_name, "Review region")
+        QtTest.QTest.keyClick(window.roi_name, QtCore.Qt.Key.Key_Return)
+        identifier = window.roi_selector.currentData()
+        region = window._regions[identifier]
+        statistics = dict(window._statistics)
+        displayed_rows = [[window.stats_table.item(row, col).text()
+                           for col in range(window.stats_table.columnCount())]
+                          for row in range(window.stats_table.rowCount())]
+        self.assertIn("Review region", displayed_rows[0][0])
+        QtTest.QTest.mouseClick(window.measurements_button, QtCore.Qt.MouseButton.LeftButton)
+        APP.processEvents()
+        self.assertFalse(window.stats_table.isVisible())
+        self.assertEqual(window.graphics.height(), full_height)
+        QtTest.QTest.mouseClick(window.measurements_button, QtCore.Qt.MouseButton.LeftButton)
+        APP.processEvents()
+        self.assertTrue(window.stats_table.isVisible())
+        self.assertEqual(window.roi_selector.currentData(), identifier)
+        self.assertEqual(window._regions[identifier], region)
+        self.assertEqual(window._statistics, statistics)
+        self.assertEqual([[window.stats_table.item(row, col).text()
+                           for col in range(window.stats_table.columnCount())]
+                          for row in range(window.stats_table.rowCount())], displayed_rows)
+        QtTest.QTest.mouseClick(window.copy_button, QtCore.Qt.MouseButton.LeftButton)
+        self.assertIn("Review region\treference\tHU", APP.clipboard().text())
+
+    def test_long_values_and_drawing_leave_compact_window_width_stable(self):
+        data = snapshot()
+        data.execution = "evaluation-" + "1234567890" * 20
+        window = self.window(data)
+        window.resize(860, 440)
+        window.level.setValue(1.0e30)
+        window.width.setValue(1.0e30)
+        window._show_cursor("reference", 1, 2)
+        APP.processEvents()
+        self.assertEqual(window.size(), QtCore.QSize(860, 440))
+
+        def draw(menu):
+            action = next(action for action in menu.actions() if action.text() == "Draw rectangle")
+            QtTest.QTest.mouseClick(menu, QtCore.Qt.MouseButton.LeftButton,
+                                   pos=menu.actionGeometry(action).center())
+
+        self.use_menu(window.draw_button, draw)
+        self.assertEqual(window._draw_kind, "rectangle")
+        self.assertEqual(window.size(), QtCore.QSize(860, 440))
+        self.assertGreater(window.graphics.height(), 440 * .65)
+        for widget in (window.fit_button, window.level, window.width, window.compare_button,
+                       window.draw_button, window.measurements_button, window.options_button):
+            self.assertTrue(widget.isVisible())
+            point = widget.mapTo(window.centralWidget(), QtCore.QPoint(0, 0))
+            self.assertTrue(window.centralWidget().rect().contains(QtCore.QRect(point, widget.size())))
+        QtTest.QTest.keyClick(window.graphics, QtCore.Qt.Key.Key_Escape)
+        self.assertIsNone(window._draw_kind)
 
     def test_changed_sample_clears_all_cursor_values_and_tooltips(self):
         window = self.window()
@@ -249,6 +448,7 @@ class ReviewGuiTests(unittest.TestCase):
 
     def test_linked_readout_and_magnifier_use_exact_samples_and_bound_copies(self):
         window = self.window()
+        window.magnifier_toggle.setChecked(True)
         window.comparison.setCurrentIndex(1)
         pump_until(lambda: window._difference is not None)
         window._show_cursor("reference", 1, 2)
@@ -278,6 +478,7 @@ class ReviewGuiTests(unittest.TestCase):
 
     def test_close_clears_pin_patches_and_source_references_under_gc(self):
         window = self.window()
+        window.magnifier_toggle.setChecked(True)
         window.pin_button.click()
         window._show_cursor(PINNED, 1, 1)
         window._update_magnifier()

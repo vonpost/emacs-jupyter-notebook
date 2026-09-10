@@ -40,6 +40,60 @@ def _plane_metadata(manifest: dict) -> dict[str, dict]:
             and isinstance(p.get("name"), str)}
 
 
+class StatusLabel(QtWidgets.QLabel):
+    """Single-line status that cannot enlarge the window; hover for full text."""
+
+    def __init__(self, text="", parent=None):
+        super().__init__(parent)
+        self.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                           QtWidgets.QSizePolicy.Policy.Fixed)
+        self.setText(text)
+
+    def setText(self, text):
+        super().setText(text)
+        self.setToolTip(text)
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        text = self.fontMetrics().elidedText(self.text(), QtCore.Qt.TextElideMode.ElideRight,
+                                            self.contentsRect().width())
+        painter.setPen(self.palette().color(self.foregroundRole()))
+        painter.drawText(self.contentsRect(), self.alignment(), text)
+
+
+class SettingsMenu(QtWidgets.QMenu):
+    """A popup form whose controls participate in keyboard focus traversal."""
+
+    def focusNextPrevChild(self, forward):
+        content = self.actions()[0].defaultWidget()
+        controls = [widget for widget in content.findChildren(QtWidgets.QWidget)
+                    if widget.focusPolicy() & QtCore.Qt.FocusPolicy.TabFocus
+                    and widget.isEnabled() and widget.isVisible()]
+        if not controls:
+            return False
+        focused = QtWidgets.QApplication.focusWidget()
+        index = controls.index(focused) if focused in controls else (-1 if forward else 0)
+        reason = (QtCore.Qt.FocusReason.TabFocusReason if forward
+                  else QtCore.Qt.FocusReason.BacktabFocusReason)
+        controls[(index + (1 if forward else -1)) % len(controls)].setFocus(reason)
+        return True
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.focusNextPrevChild(True)
+
+
+def _settings_menu(button, content):
+    """Keep related, keyboard-accessible controls together in one popup."""
+    menu = SettingsMenu(button)
+    action = QtWidgets.QWidgetAction(menu)
+    action.setDefaultWidget(content)
+    menu.addAction(action)
+    button.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+    button.setMenu(menu)
+
+
 class WorkspaceWindow(QtWidgets.QMainWindow):
     """Persistent row-major panes; all numerical analysis runs off the GUI."""
 
@@ -101,8 +155,13 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
 
         central = QtWidgets.QWidget(self)
         outer = QtWidgets.QVBoxLayout(central)
+        outer.setContentsMargins(6, 6, 6, 6)
+        outer.setSpacing(4)
         controls = QtWidgets.QHBoxLayout()
-        self.fit_button = QtWidgets.QPushButton("Fit", central)
+        controls.setSpacing(4)
+        self.fit_button = QtWidgets.QToolButton(central)
+        self.fit_button.setText("Fit")
+        self.fit_button.setToolTip("Fit all images (F)")
         self.level = QtWidgets.QDoubleSpinBox(central)
         self.level.setRange(-1.0e30, 1.0e30)
         self.level.setDecimals(6)
@@ -113,15 +172,19 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self.width.setPrefix("Width ")
         self.level.setToolTip("Original image display level; measurements use original samples.")
         self.width.setToolTip("Original image display width; difference uses its own range.")
-        self.readout = QtWidgets.QLabel("Pixel: —", central)
-        self.readout.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
-                                   QtWidgets.QSizePolicy.Policy.Preferred)
+        for spin in (self.level, self.width):
+            spin.setMinimumWidth(95)
+            spin.setMaximumWidth(150)
+        self.readout = StatusLabel("Pixel: —", central)
         for widget in (self.fit_button, self.level, self.width):
             controls.addWidget(widget)
-        controls.addWidget(self.readout, 1)
         outer.addLayout(controls)
 
-        comparison_controls = QtWidgets.QHBoxLayout()
+        self.compare_button = QtWidgets.QToolButton(central)
+        self.compare_button.setText("Compare")
+        self.compare_button.setToolTip("Select images, differences and a pinned reference")
+        comparison_panel = QtWidgets.QWidget()
+        comparison_controls = QtWidgets.QFormLayout(comparison_panel)
         self.reference = QtWidgets.QComboBox(central)
         self.candidate = QtWidgets.QComboBox(central)
         self.comparison = QtWidgets.QComboBox(central)
@@ -132,14 +195,9 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self.declare_grid.setToolTip("Explicitly declare pixel correspondence when both grid IDs are absent.")
         self.declare_units = QtWidgets.QCheckBox("Declare common units", central)
         self.declare_units.setToolTip("Explicitly declare common intensity units when both units are absent.")
-        comparison_controls.addWidget(QtWidgets.QLabel("Reference", central))
-        comparison_controls.addWidget(self.reference)
-        comparison_controls.addWidget(QtWidgets.QLabel("Candidate", central))
-        comparison_controls.addWidget(self.candidate)
-        for widget in (self.comparison, self.declare_grid, self.declare_units):
-            comparison_controls.addWidget(widget)
-        outer.addLayout(comparison_controls)
-        review_controls = QtWidgets.QHBoxLayout()
+        comparison_controls.addRow("Reference", self.reference)
+        comparison_controls.addRow("Candidate", self.candidate)
+        comparison_controls.addRow("Display", self.comparison)
         self.pin_button = QtWidgets.QPushButton("Pin reference", central)
         self.pin_button.setCheckable(True)
         self.freeze_button = QtWidgets.QPushButton("Freeze updates", central)
@@ -147,26 +205,43 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self.freeze_button.setToolTip("Keep the current images; discard updates until unfrozen.")
         self.blink_button = QtWidgets.QPushButton("Hold to blink (B)", central)
         self.blink_button.setToolTip("While held, show the reference in the candidate pane.")
+        comparison_controls.addRow(self.pin_button)
+        comparison_controls.addRow(self.blink_button)
+        comparison_controls.addRow(self.declare_grid)
+        comparison_controls.addRow(self.declare_units)
+        _settings_menu(self.compare_button, comparison_panel)
+        controls.addWidget(self.compare_button)
+
+        self.options_button = QtWidgets.QToolButton(central)
+        self.options_button.setText("Options")
+        options_panel = QtWidgets.QWidget()
+        options_controls = QtWidgets.QVBoxLayout(options_panel)
         self.magnifier_toggle = QtWidgets.QCheckBox("Magnifier", central)
-        self.magnifier_toggle.setChecked(True)
-        self.publication_status = QtWidgets.QLabel(central)
-        self.publication_status.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
-                                              QtWidgets.QSizePolicy.Policy.Preferred)
-        for widget in (self.pin_button, self.freeze_button, self.blink_button, self.magnifier_toggle):
-            review_controls.addWidget(widget)
-        review_controls.addWidget(self.publication_status, 1)
-        outer.addLayout(review_controls)
-        self.analysis_status = QtWidgets.QLabel(central)
-        self.analysis_status.setWordWrap(True)
-        self.analysis_status.setMinimumHeight(30)
-        outer.addWidget(self.analysis_status)
+        options_controls.addWidget(self.magnifier_toggle)
+        options_controls.addWidget(self.freeze_button)
+        help_label = QtWidgets.QLabel("F: fit images · B: hold to blink\n"
+                                     "Drag / two-finger scroll: pan\n"
+                                     "Wheel / pinch: zoom", options_panel)
+        options_controls.addWidget(help_label)
+        _settings_menu(self.options_button, options_panel)
+        self.publication_status = StatusLabel(parent=central)
+        self.analysis_status = StatusLabel(parent=central)
         self.graphics = ImageGraphicsWidget(central)
         self.graphics.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         self.graphics.setMinimumHeight(180)
         outer.addWidget(self.graphics, 1)
         self.magnifier = Magnifier(central)
         outer.addWidget(self.magnifier)
+        self.magnifier.hide()
 
+        self.measurements_button = QtWidgets.QToolButton(central)
+        self.measurements_button.setText("Measurements")
+        self.measurements_button.setCheckable(True)
+        self.measurements_button.setToolTip("Show ROI tools and statistics")
+        self.measurements_panel = QtWidgets.QWidget(central)
+        measurements_layout = QtWidgets.QVBoxLayout(self.measurements_panel)
+        measurements_layout.setContentsMargins(0, 4, 0, 0)
+        measurements_layout.setSpacing(4)
         roi_controls = QtWidgets.QHBoxLayout()
         self.roi_plane = QtWidgets.QComboBox(central)
         self.rectangle_button = QtWidgets.QPushButton("Rectangle ROI", central)
@@ -182,7 +257,7 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         for widget in (self.roi_plane, self.rectangle_button, self.ellipse_button,
                        self.roi_selector, self.remove_roi_button, self.refresh_button):
             roi_controls.addWidget(widget)
-        outer.addLayout(roi_controls)
+        measurements_layout.addLayout(roi_controls)
         roi_edit_controls = QtWidgets.QHBoxLayout()
         self.draw_button = QtWidgets.QToolButton(central)
         self.draw_button.setText("Draw ROI")
@@ -193,22 +268,35 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             action.triggered.connect(lambda _checked=False, shape=kind: self.arm_roi(shape))
         menu.addAction("Cancel drawing", self.cancel_drawing)
         self.draw_button.setMenu(menu)
+        controls.addWidget(self.draw_button)
+        controls.addWidget(self.measurements_button)
+        controls.addStretch(1)
+        controls.addWidget(self.options_button)
         self.roi_name = QtWidgets.QLineEdit(central)
         self.roi_name.setPlaceholderText("ROI name (Enter to rename)")
         self.roi_name.setMaxLength(128)
         self.copy_button = QtWidgets.QPushButton("Copy statistics", central)
-        roi_edit_controls.addWidget(self.draw_button)
         roi_edit_controls.addWidget(self.roi_name, 1)
-        roi_edit_controls.addWidget(QtWidgets.QLabel("Arrow keys: nudge ROI · Shift: 10 px", central))
+        self.roi_name.setToolTip("Enter to rename. Arrow keys on the image nudge the ROI; Shift moves 10 pixels.")
         roi_edit_controls.addWidget(self.copy_button)
-        outer.addLayout(roi_edit_controls)
+        measurements_layout.addLayout(roi_edit_controls)
         self.stats_table = QtWidgets.QTableWidget(0, 6, central)
         self.stats_table.setHorizontalHeaderLabels(["ROI / pane", "Units", "Mean", "SD (population)",
                                                     "Finite N", "Excluded"])
         self.stats_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.stats_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self.stats_table.setMaximumHeight(175)
-        outer.addWidget(self.stats_table)
+        self.stats_table.setMaximumHeight(150)
+        measurements_layout.addWidget(self.stats_table)
+        outer.addWidget(self.measurements_panel)
+        self.measurements_panel.hide()
+        self.measurements_button.toggled.connect(self.measurements_panel.setVisible)
+        outer.addWidget(self.analysis_status)
+        status = QtWidgets.QHBoxLayout()
+        status.addWidget(self.readout, 1)
+        status.addWidget(self.publication_status, 1)
+        self.publication_status.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight |
+                                             QtCore.Qt.AlignmentFlag.AlignVCenter)
+        outer.addLayout(status)
         self.setCentralWidget(central)
         self.fit_button.clicked.connect(self.fit)
         self.level.valueChanged.connect(self._levels_changed)
@@ -732,7 +820,8 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self._draw_kind = kind
         self.graphics.draw_roi = True
         self.graphics.viewport().setCursor(QtCore.Qt.CursorShape.CrossCursor)
-        self.draw_button.setText("Drawing " + kind + " (Esc cancels)")
+        self.draw_button.setText("Drawing…")
+        self.draw_button.setToolTip("Drag to draw a " + kind + "; Esc cancels")
         self.graphics.setFocus()
 
     def cancel_drawing(self):
@@ -742,6 +831,7 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self.graphics._roi_drag = None
         self.graphics.viewport().unsetCursor()
         self.draw_button.setText("Draw ROI")
+        self.draw_button.setToolTip("Draw a rectangle or ellipse directly on an image")
         if identifier in self._regions:
             self.remove_roi(identifier)
 
@@ -865,7 +955,7 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         elif self.comparison.currentData() or self._regions:
             self.analysis_status.setText("Computing from original samples…")
         else:
-            self.analysis_status.setText("Select a difference or add an ROI; drag its body to move and handle to resize.")
+            self.analysis_status.setText("Ready")
         if self._regions or self.comparison.currentData() and not error:
             self._analysis_timer.start()
 

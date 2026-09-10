@@ -72,7 +72,17 @@ ejn.view({"reference": reference[z], "candidate": candidate[z]},
          grid_id="reconstruction-grid", units="intensity")
 ```
 
-Use the viewer's Reference and Candidate selectors and choose **Signed
+The viewer opens with one compact toolbar and the rest of the window devoted
+to images. **Fit**, level/width and **Draw ROI** remain directly accessible.
+**Compare** opens the image selectors, difference modes, pin/blink controls
+and grid/unit declarations. **Options** contains **Freeze updates** and the
+optional **Magnifier**. **Measurements** shows or hides ROI tools and the
+statistics table without removing selections or results. Both the measurement
+panel and magnifier start hidden. Pixel values, analysis messages and the
+following/frozen/pinned evaluation status remain visible below the images;
+hover over shortened status text to read it in full.
+
+In **Compare**, use the Reference and Candidate selectors and choose **Signed
 difference** (`candidate − reference`) or **Absolute difference**. If neither
 plane declares grids or units, the checkboxes let you explicitly declare
 matching grids and common units. Conflicting metadata cannot be overridden.
@@ -80,16 +90,16 @@ Differences use float64 arithmetic, preserving negative differences of
 unsigned images, with a separate display range. Non-finite or overflowing
 differences become unavailable pixels.
 
-Choose the reference member and click **Pin reference** before rerunning. Its
-immutable local snapshot remains available while the candidate follows new
+Choose the reference member in **Compare** and click **Pin reference** before
+rerunning. Its immutable local snapshot remains available while the candidate follows new
 publications. Hold **B** or the blink button to temporarily show the reference
 in the candidate pane; release to return. Comparisons and linked readouts
 require compatible sample/grid metadata. **Freeze** retains the visible
 evaluation and discards incoming updates; unfreeze follows subsequent
 publications. The status line identifies the visible and pinned executions.
 
-Choose an ROI pane and click **Rectangle ROI** or **Ellipse ROI**. Drag its
-body to move it and its handle to resize it. ROIs appear on corresponding
+Open **Measurements**, choose an ROI pane and click **Rectangle ROI** or
+**Ellipse ROI**. Drag its body to move it and its handle to resize it. ROIs appear on corresponding
 panes, including the difference. The table shows mean, population SD
 (`ddof=0`), finite pixel count and excluded non-finite count for each pane.
 Select a named ROI to remove it. Up to 16 ROIs are retained, including across
@@ -109,8 +119,9 @@ worker; it makes no requests to the kernel.
 
 Hovering an image places linked crosshairs on corresponding panes and displays
 reference, candidate and difference values at the same sample location. A
-31×31 magnified patch uses original samples with nearest-neighbor display;
-non-finite values remain identifiable and out-of-image locations are unavailable.
+31×31 magnified patch, enabled in **Options → Magnifier**, uses original
+samples with nearest-neighbor display; non-finite values remain identifiable
+and out-of-image locations are unavailable.
 
 Current controls: pinch to zoom around the pointer, two-finger scroll to pan,
 mouse wheel to zoom, drag to pan, `F` to fit, hover for source pixel values,
