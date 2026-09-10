@@ -165,12 +165,21 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
-- [~] owner=root claimed=2026-09-10 CC24 Consolidate the external viewer
+- [x] sha=53f3121 CC24 Consolidate the external viewer
   layout around the images. — touches: viewer workspace layout and GUI
   tests, viewer installation docs. Keep one compact toolbar, move secondary
   settings into dropdowns, and make measurements and magnification optional.
   Root implements; viewer_layout_review inspects and reviews without edits.
   Preserve local numerical interactions, visible status and snapshot lifetime.
+  > Default image area grew from 289 to 725 pixels at 1100×800 (36% to 91%
+  > of window height); 860×440 now fits without forced enlargement and gives
+  > images 365 pixels. Dropdown keyboard traversal was fixed after independent
+  > review and verified with native Xvfb/xcb keys. Final viewer suite: 86 passed;
+  > Nix viewer package/check passed. Strict Elisp compilation and canonical
+  > source checks passed: 1105 ERT, 4 array protocol, 260 helper (4 optional
+  > skips), 25 registry and 12 fixture tests. Bytecode removed before ERT.
+  > Layout/navigation also passed 34 GUI checks at 2× scaling before the
+  > final keyboard fix. macOS physical-display verification remains separate.
 
 - [x] sha=b82fc55 CC23 Give the output buffer ordinary
   window handling. — touches: result display, panel option docs, README and
