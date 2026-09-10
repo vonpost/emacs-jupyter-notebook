@@ -159,6 +159,14 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
+- [~] owner=root claimed=2026-09-10 CC21 Preserve running execution output
+  and the unsent FIFO across SSH tunnel recovery, including completion while
+  offline. — touches: core reconnect/ledger, helper transport and adapter,
+  panel completion presentation, protocol docs and focused local tests.
+  Root owns core integration; helper_recovery owns Python/helper contract;
+  delegated adapter and regression/review scopes remain disjoint. No remote
+  kernel restart, execution replay, source edits, or remote installation.
+
 - [x] sha=4803b32 CC20 Make notebook mode setup idempotent
   and preserve pre-enabled code-cells ownership. — touches: core mode/imenu
   setup, focused lifecycle ERT and incident review documentation. Repeated

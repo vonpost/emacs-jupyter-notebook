@@ -92,6 +92,15 @@ row explicitly permits it.
 
 ## Fixed decisions
 
+CC21 amendment (2026-09-10, user requested): a recoverable SSH tunnel outage
+preserves the live helper, original Jupyter request and unsent Emacs FIFO.
+Rebuilding the same local forwards resumes future output. A correlated shell
+barrier proves completion when terminal messages were lost during the outage;
+such a run is presented as completed with an explicit output/outcome gap,
+without claiming success or replaying user code. Helper death remains an
+ambiguous terminal failure under the original rules below. Recovery is local,
+asynchronous and bounded, and never restarts or terminates the remote kernel.
+
 Agents implement these decisions; they do not reopen them inside a task.
 
 - Python is the first helper implementation because `jupyter_client` is the
