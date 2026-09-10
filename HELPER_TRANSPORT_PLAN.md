@@ -100,6 +100,9 @@ such a run is presented as completed with an explicit output/outcome gap,
 without claiming success or replaying user code. Helper death remains an
 ambiguous terminal failure under the original rules below. Recovery is local,
 asynchronous and bounded, and never restarts or terminates the remote kernel.
+Landed as `4adc3a9`; source ERT, pure helper tests, strict compilation, Nix
+packaging and four real local-kernel relay regressions passed. Pending stdin
+prompts are reissued with renewed leases; input values are never retained.
 
 Agents implement these decisions; they do not reopen them inside a task.
 
