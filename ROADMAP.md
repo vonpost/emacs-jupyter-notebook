@@ -154,10 +154,21 @@ These are binding for every workstream. Update only by appending a new entry.
   to ordinary helper/registry startup. Validate actual graphical rendering
   on both systems in addition to package builds.
 
+- **2026-09-10 / Output uses ordinary windows.** The user requested normal
+  window handling for the output buffer. Supersedes W2's forced side-window
+  placement: reuse an existing output window or open an ordinary, non-dedicated
+  window in the configured direction, honoring `display-buffer-alist`.
+  Output remains read-only and separate from source text.
+
 ## Cross-cutting changes
 
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
+
+- [~] owner=root claimed=2026-09-10 CC23 Give the output buffer ordinary
+  window handling. — touches: result display, panel option docs, README and
+  focused deterministic window ERT tests. Root implements; panel_review
+  reviews without editing. Preserve output rendering and kernel lifetime.
 
 - [x] sha=4adc3a9 CC22 Investigate reported SSH mux broken
   pipes and enforce the documented independent tunnel connection even with
