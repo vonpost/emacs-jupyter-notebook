@@ -159,6 +159,13 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
+- [~] owner=root claimed=2026-09-10 CC22 Investigate reported SSH mux broken
+  pipes and enforce the documented independent tunnel connection even with
+  inherited or explicit multiplexing options. — touches: SSH argv builder,
+  option docs and focused deterministic SSH/ERT tests. recovery_adapter owns
+  SSH implementation; root reviews and integrates. The debug line alone also
+  occurs at successful mux client exit; no external cause is presumed.
+
 - [~] owner=root claimed=2026-09-10 CC21 Preserve running execution output
   and the unsent FIFO across SSH tunnel recovery, including completion while
   offline. — touches: core reconnect/ledger, helper transport and adapter,
