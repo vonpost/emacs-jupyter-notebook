@@ -272,7 +272,14 @@ press `f` in the pane to resume. Region and other non-cell evaluations reveal
 their history entry automatically. Press `i` to inspect the selected output
 and `a` for the panel's action menu.
 
-Evaluation output never appears in the source buffer. A dedicated side panel (`*ejn: <buffer>*`) opens on the first evaluation and renders results there. The panel has two views:
+Evaluation output never appears in the source buffer. A separate read-only
+buffer (`*ejn: <buffer>*`) opens in an ordinary window on the first evaluation.
+You can split, resize, move, maximize, or switch buffers in that window using
+normal Emacs commands. Redisplaying output reuses its existing window without
+resetting its size or placement. New output windows open to the right by
+default; `emacs-jupyter-notebook-panel-side` and
+`emacs-jupyter-notebook-panel-width` control initial placement and width, and
+`display-buffer-alist` can override them. The panel has two views:
 
 - **Latest-per-cell** (default): one section per cell, indexed by cell marker. Re-running the same cell replaces its section in place.
 - **History log**: every evaluation, including region/paragraph/defun, appended in time order with timestamp, execution count, and status.

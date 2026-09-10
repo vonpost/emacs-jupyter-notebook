@@ -694,7 +694,9 @@ immutable queue ceiling."
 ;;; W2 panel customization
 
 (defcustom emacs-jupyter-notebook-panel-side 'right
-  "Side of the frame where the output panel side window opens."
+  "Direction from the selected window for a newly displayed output buffer.
+The output uses an ordinary window.  An existing output window is reused
+in place, and `display-buffer-alist' can override the default placement."
   :type '(choice (const :tag "Right" right)
                  (const :tag "Left" left)
                  (const :tag "Top" top)
@@ -702,7 +704,8 @@ immutable queue ceiling."
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-panel-width 80
-  "Width of the panel side window in columns."
+  "Preferred initial output window width in columns for left/right placement.
+Redisplaying a visible output buffer preserves its window size."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 

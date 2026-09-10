@@ -8,7 +8,7 @@
 ;; This file is not part of GNU Emacs.
 
 ;;; Commentary:
-;; W2: A dedicated side-panel buffer per source buffer that owns all
+;; A separate output buffer per source buffer that owns all
 ;; evaluation output.  The source buffer carries no result text and only
 ;; a fringe/margin indicator (W2.8) that cannot interfere with editing.
 ;;
@@ -403,7 +403,7 @@ mistaking an arbitrary user-created image plist for a helper publication.")
 
 (define-derived-mode emacs-jupyter-notebook-panel-mode special-mode
   "EJN-Panel"
-  "Side-panel buffer that displays Jupyter evaluation output.
+  "Read-only buffer that displays Jupyter evaluation output.
 The latest-per-cell view shows the most recent output for each
 evaluated cell, keyed by the cell's `# %%' marker location.  The
 history-log view appends every evaluation in time order."
@@ -513,13 +513,21 @@ with the same basename) so distinct sources always map to distinct panels."
            emacs-jupyter-notebook--panel-buffer))))
 
 (defun emacs-jupyter-notebook-panel--display (panel)
-  "Pop PANEL up in a side window honoring the user's customization."
+  "Display PANEL in an ordinary window without selecting it.
+Reuse its existing window and preserve its size and placement.  Otherwise
+open in the configured direction.  Honor `display-buffer-alist' overrides."
   (prog1
       (display-buffer
        panel
-       `((display-buffer-in-side-window)
-         (side . ,emacs-jupyter-notebook-panel-side)
-         (window-width . ,emacs-jupyter-notebook-panel-width)))
+       `((display-buffer-reuse-window display-buffer-in-direction)
+         (direction . ,(pcase emacs-jupyter-notebook-panel-side
+                         ('top 'above)
+                         ('bottom 'below)
+                         (side side)))
+         (dedicated . nil)
+         ;; Reapplying a width to a reused window would undo manual resizing.
+         ,@(unless (get-buffer-window panel t)
+             `((window-width . ,emacs-jupyter-notebook-panel-width)))))
     (emacs-jupyter-notebook-panel--track-duration panel)))
 
 (defun emacs-jupyter-notebook-show-output-panel ()
