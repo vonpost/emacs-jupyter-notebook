@@ -268,6 +268,14 @@ its normal failure path."
     (error "Not an emacs-jupyter-notebook backend request"))
   (emacs-jupyter-notebook-backend--finish request reason t))
 
+(defun emacs-jupyter-notebook-backend-request-retire (request)
+  "Retire a superseded REQUEST without delivering either consumer callback."
+  (when (emacs-jupyter-notebook-backend-request-p request)
+    (setf (emacs-jupyter-notebook-backend-request-terminal request) t)
+    (remhash (emacs-jupyter-notebook-backend-request-id request)
+             (emacs-jupyter-notebook-backend-session-requests
+              (emacs-jupyter-notebook-backend-request-session request)))))
+
 (defun emacs-jupyter-notebook-backend-session-notify-transport-failure
     (session reason)
   "Notify SESSION's owner once that its local transport failed with REASON.
@@ -346,6 +354,14 @@ timer per output frame."
 (defun emacs-jupyter-notebook-backend-connect (session connection-file callback error-callback)
   "Asynchronously attach SESSION to CONNECTION-FILE and return a request id."
   (emacs-jupyter-notebook-backend--start session 'connect connection-file callback error-callback))
+
+(defun emacs-jupyter-notebook-backend-suspend (session callback error-callback)
+  "Pause SESSION's tunnel-dependent work while retaining its live execution."
+  (emacs-jupyter-notebook-backend--start session 'suspend nil callback error-callback))
+
+(defun emacs-jupyter-notebook-backend-resume (session callback error-callback)
+  "Reattach SESSION through rebuilt forwards without replaying execution."
+  (emacs-jupyter-notebook-backend--start session 'resume nil callback error-callback))
 
 (defun emacs-jupyter-notebook-backend-close-local (session callback error-callback)
   "Release SESSION's local transport only and return a request id.

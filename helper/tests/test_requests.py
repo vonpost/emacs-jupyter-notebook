@@ -363,7 +363,7 @@ class BackendReaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(backend._transport_failed)
         self.assertTrue(backend._readers)
 
-    async def test_heartbeat_failure_fails_pending_once_and_wait_closed_reaps_tasks(self):
+    async def test_heartbeat_loss_preserves_channels_until_auxiliary_timeout(self):
         backend, client = await self._backend()
         callbacks = []
         backend.start("kernel_info", {}, lambda _event: None, callbacks.append)
@@ -373,7 +373,9 @@ class BackendReaderTests(unittest.IsolatedAsyncioTestCase):
             if callbacks:
                 break
         self.assertEqual(len(callbacks), 1)
-        self.assertEqual(getattr(callbacks[0].error, "code", None), "transport-error")
+        self.assertEqual(getattr(callbacks[0].error, "code", None), "timeout")
+        self.assertTrue(backend._suspended)
+        self.assertIs(backend.client, client)
         backend.close()
         tasks = tuple(backend._retired_tasks)
         await asyncio.wait_for(backend.wait_closed(), 1)
@@ -401,7 +403,7 @@ class BackendReaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(backend._tasks)
         self.assertFalse(backend._retired_tasks)
 
-    async def test_awaitable_heartbeat_timeout_fails_once_and_reaps_cleanly(self):
+    async def test_awaitable_heartbeat_timeout_suspends_and_reaps_cleanly(self):
         backend, client = await self._backend()
         backend.operation_deadlines["kernel_info"] = 1.0
         callbacks = []
@@ -409,10 +411,11 @@ class BackendReaderTests(unittest.IsolatedAsyncioTestCase):
         client.never_alive = True
         for _ in range(12):
             await asyncio.sleep(0.05)
-            if callbacks:
+            if backend._suspended:
                 break
-        self.assertEqual(len(callbacks), 1)
-        self.assertEqual(getattr(callbacks[0].error, "code", None), "transport-error")
+        self.assertEqual(callbacks, [])
+        self.assertTrue(backend._suspended)
+        self.assertIs(backend.client, client)
         backend.close()
         await asyncio.wait_for(backend.wait_closed(), 1)
         self.assertFalse(backend._pending)

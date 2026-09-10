@@ -1168,21 +1168,22 @@ A3: it also carries multiplexing options so short commands share a master."
 
 (ert-deftest ejn-a3-tunnel-opts-out-of-multiplexing ()
   "A3: the persistent tunnel must own its own connection — it carries
-`ControlPath=none' and never a shared master, so liveness stays detectable."
+`-S none' and never a shared master, so liveness stays detectable."
   (let ((emacs-jupyter-notebook-ssh-control-master t)
         (emacs-jupyter-notebook-ssh-control-path "/tmp/ejn-ssh-%i-%C"))
     (let ((cmd (emacs-jupyter-notebook-ssh-tunnel-command
                 '(:profile "p" :host "example.com")
                 '(:shell_port 1) '(:shell_port 1001))))
-      (should (member "ControlPath=none" cmd))
+      (should (equal (cadr (member "-S" cmd)) "none"))
       (should-not (member "ControlMaster=auto" cmd))
       (should-not (member "ControlPath=/tmp/ejn-ssh-%i-%C" cmd))))
-  ;; Disabled: no multiplexing options anywhere on the tunnel.
+  ;; Disabling EJN-managed one-shot multiplexing still isolates the tunnel
+  ;; from a master configured independently through ssh_config.
   (let ((emacs-jupyter-notebook-ssh-control-master nil))
     (let ((cmd (emacs-jupyter-notebook-ssh-tunnel-command
                 '(:profile "p" :host "example.com")
                 '(:shell_port 1) '(:shell_port 1001))))
-      (should-not (member "ControlPath=none" cmd))
+      (should (equal (cadr (member "-S" cmd)) "none"))
       (should-not (member "ControlMaster=auto" cmd)))))
 
 (ert-deftest ejn-ssh-tunnel-command-multiple-ports ()

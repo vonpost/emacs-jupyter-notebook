@@ -7,6 +7,8 @@ from typing import Callable, Literal, Mapping, Protocol, TypeAlias
 
 BackendOperation: TypeAlias = Literal[
     "connect",
+    "suspend",
+    "resume",
     "kernel_info",
     "execute",
     "complete",

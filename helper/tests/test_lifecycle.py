@@ -42,6 +42,8 @@ class LifecycleBackendTests(unittest.IsolatedAsyncioTestCase):
                 self.send_error = None
                 self.control_count = 0
                 self.sent = []
+                self.execute_codes = []
+                self.info_count = 0
                 self.stopped = 0
                 self.session = Session(self)
                 self.control_channel = types.SimpleNamespace(socket=object())
@@ -65,10 +67,12 @@ class LifecycleBackendTests(unittest.IsolatedAsyncioTestCase):
                 return self.alive
 
             def execute(self, _code):
+                self.execute_codes.append(_code)
                 return "execute-1"
 
             def kernel_info(self):
-                return "kernel-info-1"
+                self.info_count += 1
+                return f"kernel-info-{self.info_count}"
 
         for name in self.queues:
             async def getter(self, timeout, name=name):
@@ -280,11 +284,182 @@ class LifecycleBackendTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
 
         self.assertEqual(observed, ["heartbeat"])
-        self.assertTrue(backend._transport_failed)
-        self.assertIsNone(backend.client)
-        self.assertGreaterEqual(client.stopped, 1)
+        self.assertFalse(backend._transport_failed)
+        self.assertTrue(backend._suspended)
+        self.assertIs(backend.client, client)
+        self.assertEqual(client.stopped, 0)
         await asyncio.sleep(0.08)
         self.assertEqual(observed, ["heartbeat"])
+
+    async def _resume_recovery(self, backend, client):
+        _token, resumed = await self._request(backend, "resume")
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if client.sent:
+                break
+        probe = client.sent[-1][0]
+        self.assertEqual(client.sent[-1][1], "kernel_info_request")
+        await self.queues["control"].put(
+            self._message(probe, "kernel_info_reply", {"status": "ok"})
+        )
+        # The control reply alone cannot prove the IOPub subscription works.
+        await asyncio.sleep(0)
+        self.assertFalse(resumed.done())
+        await self.queues["iopub"].put(
+            self._message(probe, "status", {"execution_state": "idle"})
+        )
+        self.assertEqual((await asyncio.wait_for(resumed, 1)).result, {"attached": True})
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if backend._recovery_barrier is None or client.info_count:
+                break
+
+    async def test_suspend_resume_keeps_execution_and_reader_ownership(self):
+        backend, client = await self._connected(deadline=1)
+        events, completed = [], asyncio.get_running_loop().create_future()
+        backend.start("execute", {"code": "side_effect()"}, events.append, completed.set_result)
+        await asyncio.sleep(0)
+        old_pending = backend._pending["execute-1"]
+        old_readers = set(backend._readers)
+        _token, suspended = await self._request(backend, "suspend")
+        self.assertEqual((await suspended).result, {"suspended": True})
+        self.assertIs(backend._pending["execute-1"], old_pending)
+        self.assertEqual(backend._readers, old_readers)
+        self.assertFalse(completed.done())
+        await self._resume_recovery(backend, client)
+        self.assertFalse(completed.done())
+        for channel, kind, data in (
+            ("iopub", "stream", {"name": "stdout", "text": "after reconnect"}),
+            ("shell", "execute_reply", {"status": "ok", "execution_count": 1}),
+            ("iopub", "status", {"execution_state": "idle"}),
+        ):
+            await self.queues[channel].put(self._message("execute-1", kind, data))
+        self.assertEqual((await asyncio.wait_for(completed, 1)).result["status"], "ok")
+        self.assertIn("after reconnect", "".join(e.data.get("text", "") for e in events))
+        self.assertEqual(client.execute_codes, ["side_effect()"])
+        self.assertIsNone(backend._recovery_barrier)
+        self.assertEqual(backend._pending, {})
+
+    async def test_recovery_barrier_resolves_offline_completion_without_replay(self):
+        backend, client = await self._connected(deadline=1)
+        events, completed = [], asyncio.get_running_loop().create_future()
+        backend.start("execute", {"code": "side_effect()"}, events.append, completed.set_result)
+        await asyncio.sleep(0)
+        backend._suspend()
+        await self._resume_recovery(backend, client)
+        probe = f"kernel-info-{client.info_count}"
+        await self.queues["shell"].put(self._message(probe, "kernel_info_reply", {"status": "ok"}))
+        await asyncio.sleep(0)
+        self.assertFalse(completed.done())
+        await self.queues["iopub"].put(self._message(probe, "status", {"execution_state": "idle"}))
+        self.assertEqual((await asyncio.wait_for(completed, 1)).result, {"status": "completed"})
+        self.assertEqual([(e.name, dict(e.data)) for e in events], [
+            ("execute_reply", {"status": "completed"}),
+            ("status", {"execution_state": "idle"}),
+        ])
+        self.assertEqual(client.execute_codes, ["side_effect()"])
+        self.assertEqual(backend._pending, {})
+
+    async def test_recovery_barrier_preserves_an_observed_error_reply(self):
+        backend, client = await self._connected(deadline=1)
+        _token, execution = await self._request(backend, "execute")
+        reply = {"status": "error", "ename": "ValueError", "execution_count": 8}
+        backend._route("shell", self._message("execute-1", "execute_reply", reply))
+        backend._suspend()
+        await self._resume_recovery(backend, client)
+        probe = f"kernel-info-{client.info_count}"
+        backend._route("iopub", self._message(probe, "status", {"execution_state": "idle"}))
+        backend._route("shell", self._message(probe, "kernel_info_reply", {"status": "ok"}))
+        self.assertEqual((await asyncio.wait_for(execution, 1)).result, reply)
+
+    async def test_second_outage_cancels_barrier_and_ignores_old_probe(self):
+        backend, client = await self._connected(deadline=1)
+        token, execution = await self._request(backend, "execute")
+        backend._suspend()
+        await self._resume_recovery(backend, client)
+        probe = f"kernel-info-{client.info_count}"
+        barrier = backend._recovery_barrier
+        backend._suspend()
+        await asyncio.sleep(0)
+        self.assertTrue(barrier.done())
+        self.assertEqual(set(backend._pending), {"execute-1"})
+        backend._route("shell", self._message(probe, "kernel_info_reply", {"status": "ok"}))
+        backend._route("iopub", self._message(probe, "status", {"execution_state": "idle"}))
+        self.assertFalse(execution.done())
+        token.cancel()
+        await asyncio.sleep(0)
+        self.assertEqual(backend._pending, {})
+        self.assertEqual(client.execute_codes, ["x"])
+
+    async def test_resume_timeout_retains_work_and_close_reaps_recovery(self):
+        backend, client = await self._connected(deadline=0.1)
+        _token, execution = await self._request(backend, "execute")
+        backend._suspend()
+        _token, resumed = await self._request(backend, "resume")
+        self.assertEqual((await asyncio.wait_for(resumed, 1)).error.code, "timeout")
+        self.assertTrue(backend._suspended)
+        self.assertFalse(execution.done())
+        self.assertEqual(set(backend._pending), {"execute-1"})
+        backend.close()
+        await asyncio.wait_for(backend.wait_closed(), 1)
+        self.assertFalse(backend._tasks)
+        self.assertFalse(backend._pending)
+        self.assertIsNone(backend._recovery_barrier)
+        self.assertEqual(client.stopped, 1)
+        self.assertTrue(all(kind == "kernel_info_request" for _id, kind, _data in client.sent))
+
+    async def test_resume_retries_a_lost_subscription_probe_without_leaking_waiters(self):
+        backend, client = await self._connected(deadline=0.3)
+        backend._suspend()
+        _token, resumed = await self._request(backend, "resume")
+        for _ in range(30):
+            if len(client.sent) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(len(client.sent), 2)
+        first, second = (record[0] for record in client.sent)
+        self.assertNotIn(first, backend._pending)
+        self.assertEqual(set(backend._pending), {second})
+        backend._route("control", self._message(first, "kernel_info_reply", {}))
+        backend._route("iopub", self._message(first, "status", {"execution_state": "idle"}))
+        self.assertFalse(resumed.done())
+        backend._route("control", self._message(second, "kernel_info_reply", {}))
+        backend._route("iopub", self._message(second, "status", {"execution_state": "idle"}))
+        self.assertEqual((await asyncio.wait_for(resumed, 1)).result, {"attached": True})
+        self.assertFalse(backend._pending)
+        self.assertFalse(backend._pending_by_task)
+
+    async def test_fatal_reader_failure_while_suspended_still_retires_execution(self):
+        backend, client = await self._connected(deadline=1)
+        _token, execution = await self._request(backend, "execute")
+        origins = []
+        backend.set_transport_failure_callback(origins.append)
+        backend._suspend()
+        backend._fail_transport("channel-reader")
+        self.assertEqual((await asyncio.wait_for(execution, 1)).error.code, "transport-error")
+        self.assertEqual(origins, ["channel-reader"])
+        self.assertIsNone(backend.client)
+        self.assertEqual(client.stopped, 1)
+
+    async def test_shutdown_terminal_heartbeat_does_not_start_recovery(self):
+        backend, _client = await self._connected(deadline=1)
+        origins = []
+        backend.set_transport_failure_callback(origins.append)
+        backend._shutting_down = True
+        backend._shutdown_reply_received = True
+        backend._fail_transport("heartbeat")
+        self.assertEqual(origins, [])
+        self.assertFalse(backend._suspended)
+
+    async def test_resume_requires_suspension_before_sending_any_probe(self):
+        backend, client = await self._connected(deadline=1)
+        _token, execution = await self._request(backend, "execute")
+        _token, resumed = await self._request(backend, "resume")
+        self.assertEqual((await asyncio.wait_for(resumed, 1)).error.code, "busy")
+        self.assertFalse(execution.done())
+        self.assertFalse(backend._suspended)
+        self.assertEqual(client.sent, [])
+        self.assertEqual(client.info_count, 0)
 
     async def test_shutdown_requires_reply_and_terminal_liveness_then_retires_local_state(self):
         backend, client = await self._connected()

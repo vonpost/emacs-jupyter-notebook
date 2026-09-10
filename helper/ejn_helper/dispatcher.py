@@ -37,6 +37,8 @@ EJN_MAX_INPUT_VALUE_BYTES = 65_536
 _BACKEND_OPERATIONS = frozenset(
     {
         "connect",
+        "suspend",
+        "resume",
         "kernel_info",
         "execute",
         "complete",
@@ -213,6 +215,7 @@ class Dispatcher:
         self.late_completions = 0
         self.late_events = 0
         self._transport_failure_reported = False
+        self._recoverable_failure_reported = False
         self._transport_failure_message: str | None = None
         register_transport_failure = getattr(
             backend, "set_transport_failure_callback", None
@@ -225,22 +228,30 @@ class Dispatcher:
         return len(self._inflight)
 
     def _backend_transport_failed(self, origin: object) -> None:
-        """Publish one uncorrelated fatal Jupyter-channel event.
+        """Publish bounded, uncorrelated Jupyter transport failure events.
 
         An attached backend can discover a dead channel while no EJN request is
         in flight.  A local helper ping proves only that this dispatcher is
         alive, so that condition must cross the protocol boundary explicitly.
         The reserved priority event reaches Emacs independently of request
-        traffic; closing the connected gate also prevents a later operation
-        from being sent on the failed backend while that event drains.
+        traffic. Heartbeat loss suspends recoverable sockets; a reader/send
+        failure also closes the connected gate. A recoverable notification
+        cannot hide a later fatal failure while recovery is underway.
         """
         if self.closed or self._transport_failure_reported:
             return
         if not isinstance(origin, str) or origin not in _TRANSPORT_FAILURE_MESSAGES:
             origin = "channel-reader"
+        recoverable = origin == "heartbeat"
+        if recoverable and self._recoverable_failure_reported:
+            return
         self._transport_failure_message = _TRANSPORT_FAILURE_MESSAGES[origin]
-        self._transport_failure_reported = True
-        self.connected = False
+        if recoverable:
+            self._recoverable_failure_reported = True
+            self._retire_input_prompts()
+        else:
+            self._transport_failure_reported = True
+            self.connected = False
         try:
             self.event_queue.enqueue(
                 {
@@ -252,6 +263,7 @@ class Dispatcher:
                         "code": "transport-error",
                         "message": self._transport_failure_message,
                         "origin": origin,
+                        "recoverable": recoverable,
                     },
                 }
             )
@@ -392,6 +404,8 @@ class Dispatcher:
         if operation in {
             "ping",
             "kernel_info",
+            "suspend",
+            "resume",
             "interrupt",
             "shutdown",
             "close",
@@ -542,6 +556,8 @@ class Dispatcher:
         typed_operation = cast(BackendOperation, operation)
         record = _Inflight(request_id, typed_operation, timer)
         self._inflight[request_id] = record
+        if operation == "suspend":
+            self._retire_input_prompts()
         if prompt_lease is not None:
             # All local admission checks have passed.  From this point onward a
             # backend.start failure is outcome-ambiguous, so this lease must
@@ -752,6 +768,8 @@ class Dispatcher:
                 payload["admitted"] = True
         if success and record.operation == "connect":
             self.connected = True
+        if success and record.operation == "resume":
+            self._recoverable_failure_reported = False
         # A shutdown request is terminal or outcome-unknown after admission.
         # The backend has released local channels on every completion path, so
         # retain neither a stale dispatcher attachment nor a false reconnect
@@ -783,6 +801,11 @@ class Dispatcher:
             except FlowControlError:
                 pass
             self._inflight.pop(request_id, None)
+
+    def _retire_input_prompts(self) -> None:
+        """Revoke offline reply capabilities; the backend keeps prompt metadata."""
+        for request_id in tuple(self._prompt_leases):
+            self._retire_prompt_lease(request_id)
 
     def _retire_prompt_lease(self, execution_request_id: str) -> None:
         lease = self._prompt_leases.pop(execution_request_id, None)

@@ -358,6 +358,20 @@ helper session, clear the async context's local handle without resurrecting a
 superseded context, and leave the remote kernel plus durable registry intact.
 Helper process death is transport loss, not evidence that the kernel died.
 
+### 25a. A tunnel outage can preserve a live helper and execution
+
+CC21 distinguishes recoverable SSH loss from helper death. Retain the helper's
+Jupyter sockets and request map, rebuild the same forwarded ports, pause local
+execution deadlines, and keep unsent cells behind the running execution.
+Control-channel kernel-info plus its correlated IOPub idle proves subscription
+readiness while the shell is busy; only a later shell-channel barrier proves
+the preceding execution ended. Lost terminal replies become neutral
+`completed`, never fabricated success. Jupyter cannot replay missed outputs.
+Fence recovery acknowledgements against subsequent suspension, including
+deadline rearming, and rotate pending stdin leases before asking for input
+again. Tests: `tests/emacs-jupyter-notebook-tunnel-recovery-tests.el` and
+`helper/integration_tests/test_tunnel_recovery.py`.
+
 ---
 
 ## Test discipline

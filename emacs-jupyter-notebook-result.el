@@ -77,6 +77,11 @@
   "Face for the success indicator in the source buffer's fringe."
   :group 'emacs-jupyter-notebook)
 
+(defface emacs-jupyter-notebook-fringe-completed-face
+  '((t :inherit shadow))
+  "Face for completed execution whose exact outcome was lost during recovery."
+  :group 'emacs-jupyter-notebook)
+
 (defface emacs-jupyter-notebook-fringe-error-face
   '((t :inherit error))
   "Face for the error indicator in the source buffer's fringe."
@@ -111,7 +116,7 @@ Each entry plist supports:
   :id N
   :cell-key KEY-or-nil
   :code STRING
-  :status queued|running|ok|error|cancelled|outcome-unknown
+  :status queued|running|ok|completed|error|cancelled|outcome-unknown
   :exec-count INTEGER-or-\"*\"
   :timestamp ISO-string
   :outputs ordered text/image segments
@@ -1369,6 +1374,7 @@ LIMIT defaults to 80 characters.  Never scan an unbounded source line."
           (status-s (pcase status
                       ('running "running")
                       ('ok "ok")
+                      ('completed "completed")
                       ('error "error")
                       ('cancelled "cancelled")
                       ('outcome-unknown "outcome unknown")
@@ -4213,6 +4219,7 @@ Also coerces a non-numeric `:scale' (Emacs 29+ reports the symbol
     (pcase state
       ('running "►")
       ('ok (concat "✓" digit))
+      ('completed (concat "✓" digit))
       ('error "✗")
       ('cancelled "!")
       ('outcome-unknown "?")
@@ -4224,6 +4231,7 @@ Also coerces a non-numeric `:scale' (Emacs 29+ reports the symbol
   (pcase state
     ('running 'emacs-jupyter-notebook-fringe-running-face)
     ('ok 'emacs-jupyter-notebook-fringe-ok-face)
+    ('completed 'emacs-jupyter-notebook-fringe-completed-face)
     ('error 'emacs-jupyter-notebook-fringe-error-face)
     ((or 'cancelled 'outcome-unknown) 'emacs-jupyter-notebook-fringe-error-face)
     ('queued 'emacs-jupyter-notebook-fringe-queued-face)

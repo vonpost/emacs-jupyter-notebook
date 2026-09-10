@@ -37,6 +37,8 @@ VALID_PARAMS = {
         "image_max_pixels": 4_194_304,
     },
     "kernel_info": {},
+    "suspend": {},
+    "resume": {},
     "execute": {"code": "1 + 1"},
     "complete": {"code": "pri", "cursor_pos": 3},
     "inspect": {"code": "print", "cursor_pos": 5, "detail_level": 0},
@@ -355,7 +357,7 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(execute_timer)
         dispatcher.dispose()
 
-    async def test_idle_backend_transport_failure_emits_one_priority_event(self):
+    async def test_recoverable_heartbeat_loss_does_not_hide_later_fatal_failure(self):
         class FatalBackend(FakeBackend):
             def __init__(self, loop):
                 super().__init__(loop)
@@ -375,8 +377,12 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
             backend, responses.append, event_queue=queue, loop=self.loop
         )
         self.assertIsNotNone(backend.transport_failure_callback)
+        dispatcher.connected = True
         backend.fail_transport("heartbeat")
+        backend.fail_transport("heartbeat")
+        self.assertTrue(dispatcher.connected)
         backend.fail_transport("channel-reader")
+        self.assertFalse(dispatcher.connected)
 
         events = decode_events(queue.drain())
         self.assertEqual(
@@ -392,8 +398,22 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
                         "code": "transport-error",
                         "message": "Jupyter heartbeat lost",
                         "origin": "heartbeat",
+                        "recoverable": True,
                     },
-                }
+                },
+                {
+                    "v": 1,
+                    "kind": "event",
+                    "seq": 10**15 + 1,
+                    "event": "transport_error",
+                    "request_id": None,
+                    "data": {
+                        "code": "transport-error",
+                        "message": "Jupyter channel reader failed",
+                        "origin": "channel-reader",
+                        "recoverable": False,
+                    },
+                },
             ],
         )
         self.assertEqual(responses, [])

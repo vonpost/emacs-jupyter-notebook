@@ -36,7 +36,7 @@
 
 (cl-defstruct (emacs-jupyter-notebook-helper-request
                (:constructor emacs-jupyter-notebook-helper--make-request))
-  id op callback timer finished)
+  id op callback timer deadline deadline-token paused-remaining finished)
 
 (cl-defstruct (emacs-jupyter-notebook-helper-session
                (:constructor emacs-jupyter-notebook-helper--make-session))
@@ -590,15 +590,56 @@ This is used by the process filter so it never runs user callbacks."
         (remhash (emacs-jupyter-notebook-helper-request-id request) requests)))
     (emacs-jupyter-notebook-helper--cancel-timer
      (emacs-jupyter-notebook-helper-request-timer request))
-    (setf (emacs-jupyter-notebook-helper-request-timer request) nil)
+    (setf (emacs-jupyter-notebook-helper-request-timer request) nil
+          (emacs-jupyter-notebook-helper-request-deadline-token request) nil
+          (emacs-jupyter-notebook-helper-request-paused-remaining request) nil)
     (emacs-jupyter-notebook-helper--run-request-callback request session response error)))
 
-(defun emacs-jupyter-notebook-helper--request-deadline (session id request)
+(defun emacs-jupyter-notebook-helper--request-deadline (session id request token)
   "Fail REQUEST if ID remains pending when its independent timer fires."
   (when (and (not (emacs-jupyter-notebook-helper-session-disposed session))
+             (not (emacs-jupyter-notebook-helper-request-paused-remaining request))
+             (eq token (emacs-jupyter-notebook-helper-request-deadline-token request))
              (eq request (gethash id (emacs-jupyter-notebook-helper-session-requests session))))
     (emacs-jupyter-notebook-helper--finish-request
      session request nil (format "helper %s request timed out" (emacs-jupyter-notebook-helper-request-op request)))))
+
+(defun emacs-jupyter-notebook-helper--arm-request-deadline (session request seconds)
+  "Arm REQUEST's deadline for SECONDS with a fresh late-callback fence."
+  (let ((token (make-symbol "ejn-helper-deadline")))
+    (setf (emacs-jupyter-notebook-helper-request-deadline request) (+ (float-time) seconds)
+          (emacs-jupyter-notebook-helper-request-deadline-token request) token
+          (emacs-jupyter-notebook-helper-request-timer request)
+          (run-at-time seconds nil #'emacs-jupyter-notebook-helper--request-deadline
+                       session (emacs-jupyter-notebook-helper-request-id request) request token))))
+
+(defun emacs-jupyter-notebook-helper-pause-execution-deadlines (session)
+  "Preserve remaining execute deadlines across SESSION's SSH tunnel outage.
+Helper ping, credit and auxiliary deadlines keep running normally."
+  (when (hash-table-p (emacs-jupyter-notebook-helper-session-requests session))
+    (maphash
+     (lambda (_id request)
+       (when (and (equal (emacs-jupyter-notebook-helper-request-op request) "execute")
+                  (not (emacs-jupyter-notebook-helper-request-finished request))
+                  (not (emacs-jupyter-notebook-helper-request-paused-remaining request))
+                  (numberp (emacs-jupyter-notebook-helper-request-deadline request)))
+         (setf (emacs-jupyter-notebook-helper-request-paused-remaining request)
+               (max 0 (- (emacs-jupyter-notebook-helper-request-deadline request) (float-time)))
+               (emacs-jupyter-notebook-helper-request-deadline-token request) nil)
+         (emacs-jupyter-notebook-helper--cancel-timer
+          (emacs-jupyter-notebook-helper-request-timer request))
+         (setf (emacs-jupyter-notebook-helper-request-timer request) nil)))
+     (emacs-jupyter-notebook-helper-session-requests session))))
+
+(defun emacs-jupyter-notebook-helper-resume-execution-deadlines (session)
+  "Rearm SESSION's preserved execution budgets after a proven reattachment."
+  (when (hash-table-p (emacs-jupyter-notebook-helper-session-requests session))
+    (maphash
+     (lambda (_id request)
+       (when-let ((remaining (emacs-jupyter-notebook-helper-request-paused-remaining request)))
+         (emacs-jupyter-notebook-helper--arm-request-deadline session request (max 0.001 remaining))
+         (setf (emacs-jupyter-notebook-helper-request-paused-remaining request) nil)))
+     (emacs-jupyter-notebook-helper-session-requests session))))
 
 (cl-defun emacs-jupyter-notebook-helper-request
     (session op params callback &key timeout internal allow-long-timeout)
@@ -627,11 +668,10 @@ local deadline or transport failure; ERROR is then a short local reason."
       ;; provisional slot if timer allocation itself fails.
       (condition-case err
           (progn
-            (setf (emacs-jupyter-notebook-helper-request-timer request)
-                  (run-at-time
-                   (emacs-jupyter-notebook-helper--bounded-positive-number
-                    timeout 5 allow-long-timeout)
-                   nil #'emacs-jupyter-notebook-helper--request-deadline session id request))
+            (emacs-jupyter-notebook-helper--arm-request-deadline
+             session request
+             (emacs-jupyter-notebook-helper--bounded-positive-number
+              timeout 5 allow-long-timeout))
             (condition-case send-error
                 (emacs-jupyter-notebook-helper--send-envelope session id op params)
               (error

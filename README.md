@@ -376,6 +376,35 @@ The local viewer is **Emacs-owned**: it is spawned lazily on first use, reused a
 
 A small fringe/margin indicator next to each cell marker reflects the cell's most recent state: blank (never run), `►` (running), `✓N` (ok with execution count `N`), `✗` (error), `…` (queued). The indicator is overlay-only and never modifies source text.
 
+When an SSH tunnel drops, EJN keeps the running cell and queued cells in the
+live local helper session. Reconnection restores output to the same panel
+entry. Queued cells run in order after the original execution finishes,
+including when it finished during the outage. EJN never reruns that execution.
+Execution deadlines pause while the tunnel is disconnected.
+
+Jupyter does not retain a replayable output stream: output sent during the
+outage may be missing, which the panel records explicitly. If the execution's
+reply was also lost, EJN checks that the run ended and displays `completed`
+with a neutral `✓`; this does not claim that the code succeeded. A helper crash
+or Emacs restart still loses the in-memory execution queue. Update the local
+helper together with the Elisp to use tunnel recovery.
+
+The persistent tunnel uses its own SSH connection, including when global or
+profile SSH options enable multiplexing. Short setup and management commands
+can still share EJN's master connection. In `ssh -vvv` output,
+`mux_client_read_packet_timeout: read header failed: Broken pipe` describes
+the local multiplexing socket and can appear at normal session exit. Check
+the following line: `Received exit status from master 0` is successful,
+whereas `Control master terminated unexpectedly` indicates lost master
+ownership. The debug line alone does not identify a proxy or server failure.
+See [OpenSSH's mux client implementation](https://github.com/openssh/openssh-portable/blob/master/mux.c).
+
+For a terminal comparison using EJN's default keepalive policy, run
+`ssh -vvv -S none -o ServerAliveInterval=15 -o ServerAliveCountMax=3 HOST`.
+Three unanswered probes disconnect in about 45 seconds. A ProxyJump uses a
+separate SSH process with its own host configuration, so target-host options
+do not by themselves disable multiplexing on the jump host.
+
 ## Status buffer (`C-c j ?`)
 
 `status` opens `*emacs-jupyter-notebook status*` in a derivative of `special-mode`. While the buffer is visible it refreshes once per second; when buried the refresh timer cancels itself. Suggested actions appear as clickable buttons that switch to the originating source buffer and invoke the suggested command (`start-remote-kernel`, `reconnect-remote-kernel`, `retry-fresh-kernel`, `cancel-operation`, `send-cell`, depending on engine state).

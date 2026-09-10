@@ -69,7 +69,7 @@ wire delivery.  Values therefore increase strictly in observed wire order,
 including when a priority event bypasses ordinary output blocked on credit.
 
 Allowed operations are: `hello`, `ping`, `grant_event_credit`, `connect`,
-`kernel_info`, `execute`, `complete`, `inspect`, `variables`, `is_complete`,
+`suspend`, `resume`, `kernel_info`, `execute`, `complete`, `inspect`, `variables`, `is_complete`,
 `input_reply`, `interrupt`, `shutdown`, and `close`.
 
 Allowed events are: `stream`, `display_data`, `execute_result`,
@@ -116,6 +116,30 @@ local-only. `interrupt` and `shutdown` are sent only after the corresponding
 explicit user command.  Protocol v1 deliberately has no helper `restart`:
 the direct kernel launch contract cannot restart in place.
 
+`suspend {}` returns `{suspended: true}` and pauses network liveness checks
+while retaining the same sockets, pending execution, and output attachment.
+Emacs rebuilds the SSH tunnel on the same local ports. `resume {}` returns
+`{attached: true}` after a bounded control-channel `kernel_info_request` has
+both its reply and correlated IOPub idle, proving the restored subscription
+even while the shell is busy. Heartbeat loss emits `transport_error` with
+`recoverable: true` and suspends the attachment; channel-reader/send failures
+remain fatal (`recoverable: false`). A failed resume releases its probes only.
+
+After resume, one shell-channel kernel-info probe is ordered behind the
+pending execution. Its reply and correlated IOPub idle prove that execution
+has ended if its original terminal messages were lost offline. A known
+execute reply retains its actual status; a missing reply is reported with
+`status: completed`, which confirms completion without claiming success or
+failure. Any missing execution idle follows retained output through the
+normal output drain. The probe has the execution's lifetime and is cancelled
+on completion, another outage, cancellation, or close. Missed output cannot
+be reconstructed by Jupyter; source code is never replayed.
+
+Suspension revokes stdin reply leases. The helper retains only the already
+bounded prompt text and password flag, then emits one fresh `input_request`
+ID per still-waiting prompt after successful resume. Old IDs cannot answer
+the new prompt. Input values are never retained for retry or replay.
+
 `interrupt` completes only after its correlated control-channel
 `interrupt_reply`. `shutdown` first sends that same bounded interrupt so a
 busy or stdin-blocked ipykernel can service control traffic, then sends exactly
@@ -130,6 +154,7 @@ The execution ledger is monotonic:
 ```
 queued -> dispatched -> busy -> terminal-ok
                              -> terminal-error
+                             -> terminal-completed (recovered end, outcome unavailable)
                              -> terminal-cancelled
 queued ----------------------> terminal-cancelled
 dispatched/busy --------------> outcome-unknown
@@ -137,7 +162,8 @@ dispatched/busy --------------> outcome-unknown
 
 Only one user execution is dispatched at a time. An execution is terminal
 only after its correlated `execute_reply` and IOPub `status=idle` have both
-arrived, in either order. Late or duplicate events are logged and ignored;
+arrived, in either order, or the recovery barrier supplies the missing
+terminal evidence described above. Late or duplicate events are logged and ignored;
 an ambiguous transport failure is never replayed automatically.
 
 ### Field contract

@@ -6,7 +6,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from ejn_helper.backend import BackendCompletion, BackendEvent
 from ejn_helper.dispatcher import Dispatcher
@@ -212,6 +212,19 @@ class BackendInputTests(unittest.IsolatedAsyncioTestCase):
         outer = self
 
         class Client:
+            def __init__(self):
+                self.controls = []
+                self.session = types.SimpleNamespace(send=self.send)
+                self.control_channel = types.SimpleNamespace(socket=object())
+
+            def send(self, _socket, kind, *, content):
+                message_id = f"control-{len(self.controls) + 1}"
+                self.controls.append((message_id, kind))
+                return {"header": {"msg_id": message_id}}
+
+            def kernel_info(self):
+                return "shell-probe"
+
             def load_connection_info(self, _info):
                 pass
 
@@ -478,6 +491,94 @@ class BackendInputTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(events[0].data["input_id"], TOKEN_A)
         assert token is not None
         token.cancel()
+
+    async def test_resume_rotates_offline_prompt_and_accepts_one_new_reply(self):
+        backend = await self.backend()
+        responses = []
+        dispatcher = Dispatcher(backend, responses.append, loop=asyncio.get_running_loop())
+        dispatcher.negotiated = dispatcher.connected = True
+        self.addCleanup(dispatcher.dispose)
+
+        async def response_for(request_id):
+            async def wait_response():
+                while True:
+                    for response in responses:
+                        if response["id"] == request_id:
+                            return response
+                    await asyncio.sleep(0)
+            return await asyncio.wait_for(wait_response(), 1)
+
+        dispatcher.dispatch(request("exec", "execute", {"code": "input()"}))
+        await asyncio.sleep(0)
+        with patch("ejn_helper.jupyter_backend.secrets.token_hex", side_effect=[TOKEN_A, TOKEN_B]):
+            backend._route("stdin", self.message("exec-1", "input_request", {
+                "prompt": "Secret: ", "password": True,
+            }))
+            self.assertEqual(dispatcher._prompt_leases["exec"].input_id, TOKEN_A)
+            dispatcher.dispatch(request("pause", "suspend", {}))
+            self.assertTrue((await response_for("pause"))["ok"])
+            self.assertFalse(dispatcher._prompt_leases)
+            offline_secret = "offline-secret-never-retained"
+            rejected = await self.reply(backend, TOKEN_A, offline_secret)
+            self.assertEqual(rejected.error.code, "busy")
+            self.assertEqual(self.inputs, [])
+            self.assertNotIn(offline_secret, repr(backend._input_prompts))
+            dispatcher.dispatch(request("resume", "resume", {}))
+            for _ in range(10):
+                await asyncio.sleep(0)
+                if backend.client.controls:
+                    break
+            control_id = backend.client.controls[-1][0]
+            backend._route("control", self.message(control_id, "kernel_info_reply", {}))
+            backend._route("iopub", self.message(control_id, "status", {"execution_state": "idle"}))
+            self.assertTrue((await response_for("resume"))["ok"])
+            self.assertEqual(dispatcher._prompt_leases["exec"].input_id, TOKEN_B)
+            self.assertEqual(set(backend._input_prompts), {TOKEN_B})
+            retained = backend._input_prompts[TOKEN_B]
+            self.assertEqual((retained.prompt, retained.password), ("Secret: ", True))
+            self.assertNotIn(offline_secret, repr(retained))
+        for request_id, input_id, value in (
+            ("old", TOKEN_A, "stale"),
+            ("new", TOKEN_B, "accepted-once"),
+            ("duplicate", TOKEN_B, "duplicate"),
+        ):
+            dispatcher.dispatch(request(request_id, "input_reply", {
+                "request_id": "exec", "input_id": input_id, "value": value,
+            }))
+            response = await response_for(request_id)
+            self.assertEqual(response["ok"], request_id == "new")
+        self.assertEqual(self.inputs, ["accepted-once"])
+        self.assertFalse(backend._input_prompts)
+        backend._route("shell", self.message("exec-1", "execute_reply", {"status": "ok"}))
+        backend._route("iopub", self.message("exec-1", "status", {"execution_state": "idle"}))
+        self.assertTrue((await response_for("exec"))["ok"])
+        self.assertFalse(dispatcher._prompt_leases)
+
+    async def test_prompt_received_during_suspension_waits_for_resume(self):
+        backend = await self.backend()
+        events = []
+        token, _execution = await self.start(backend, "execute", {"code": "input()"}, events)
+        backend._suspend()
+        backend._route("stdin", self.message("exec-1", "input_request", {"prompt": "Name: "}))
+        self.assertEqual(events, [])
+        self.assertEqual(len(backend._input_prompts), 1)
+        token.cancel()
+        await asyncio.sleep(0)
+        self.assertFalse(backend._input_prompts)
+
+    async def test_recovery_does_not_reprompt_after_observed_execution_reply(self):
+        backend = await self.backend()
+        events = []
+        _token, execution = await self.start(backend, "execute", {"code": "input()"}, events)
+        backend._route("stdin", self.message("exec-1", "input_request", {"prompt": "Name: "}))
+        backend._route("shell", self.message("exec-1", "execute_reply", {"status": "error"}))
+        backend._suspend()
+        with patch.object(backend, "_recovery_probe", AsyncMock(return_value={})):
+            _token, resumed = await self.start(backend, "resume", {})
+            self.assertEqual((await asyncio.wait_for(resumed, 1)).result, {"attached": True})
+            self.assertEqual((await asyncio.wait_for(execution, 1)).result, {"status": "error"})
+        self.assertEqual([event.name for event in events].count("input_request"), 1)
+        self.assertFalse(backend._input_prompts)
 
 
 if __name__ == "__main__":

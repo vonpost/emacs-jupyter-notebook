@@ -44,7 +44,9 @@ Each element is (NAME . PLIST).  Supported PLIST keys include
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-ssh-options nil
-  "Extra SSH options inserted before the remote destination."
+  "Extra SSH options inserted before the remote destination.
+The persistent target tunnel appends `-S none' after user options to keep
+its connection independent of shared control sockets."
   :type '(repeat string)
   :group 'emacs-jupyter-notebook)
 
@@ -71,13 +73,16 @@ new remotes from Emacs and rely on the interactive host-key prompt."
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-ssh-control-master t
-  "When non-nil, multiplex ssh/scp over a shared master connection.
+  "When non-nil, multiplex one-shot ssh/scp over a shared master connection.
 A kernel start otherwise pays a full TCP+SSH+auth handshake on EACH of its
 many short commands (launch, up to N connection-file polls, PID probe,
 cleanup).  With multiplexing the first command opens a master that the rest
 ride, collapsing those handshakes to roughly one — a large win on
-high-latency links and through a ProxyJump.  The persistent tunnel always
-opts OUT (it must own its own connection so its liveness can be detected).
+high-latency links and through a ProxyJump.  When nil, one-shot commands
+continue to honor multiplexing settings from SSH options and ssh_config.
+The persistent target tunnel always opts out with a final `-S none', so
+its lifetime can be supervised.  ProxyJump children retain their jump
+host's SSH configuration, including any multiplexing configured there.
 Requires OpenSSH 6.7+ (for the `%C'/`%i' ControlPath tokens)."
   :type 'boolean
   :group 'emacs-jupyter-notebook)
@@ -98,9 +103,10 @@ anchored at `/tmp' (not `temporary-file-directory') because `%C' expands to
 a 40-character SHA1 and macOS's per-user `$TMPDIR' under `/var/folders/…'
 would push the full path past the ~104-byte unix-domain-socket limit,
 failing every ssh with \"path too long for unix domain socket\".  The
-containing directory must already exist; `/tmp' always does.  Set this to
-nil-length or disable `emacs-jupyter-notebook-ssh-control-master' to turn
-multiplexing off."
+containing directory must already exist; `/tmp' always does.  This template
+applies to one-shot commands only.  Disabling
+`emacs-jupyter-notebook-ssh-control-master' leaves the user's SSH options
+and ssh_config in effect for those commands."
   :type 'string
   :group 'emacs-jupyter-notebook)
 

@@ -14,6 +14,19 @@
 (define-error 'ejn-helper-protocol-frame-too-large "EJN frame too large" 'ejn-helper-protocol-error)
 (define-error 'ejn-helper-protocol-invalid-json "Invalid EJN JSON" 'ejn-helper-protocol-error)
 
+(defun ejn-helper-protocol-execute-result-p (result &optional event-p)
+  "Validate terminal execute RESULT, or an execute-reply when EVENT-P.
+The recovery barrier may prove `completed' without the original reply or its
+execution count.  This is evidence of completion, never evidence of success."
+  (and (hash-table-p result)
+       (let ((status (gethash "status" result))
+             (count (gethash "execution_count" result)))
+         (and (member status '("ok" "error" "aborted" "completed"))
+              (or (and (integerp count) (>= count 0))
+                  (and event-p (null count))
+                  (and (equal status "completed")
+                       (memq count '(nil :null))))))))
+
 (defun ejn-helper-protocol-array-manifest-p (manifest bytes)
   "Validate a bounded numerical MANIFEST summary for an artifact of BYTES.
 This never reads files or samples.  The helper and viewer validate the exact

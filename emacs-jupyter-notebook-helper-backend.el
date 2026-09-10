@@ -60,7 +60,7 @@ the mechanism that interrupts a long-running kernel execution."
   "Local resources owned by one helper backend session."
   helper artifact-dir artifact-identity artifact-capability request-map pending-events pending-event-sequence
   retired-request-ids retired-request-order pending-flush-timer emit closing retired close-timer
-  close-success close-failure transport-failure)
+  close-success close-failure transport-failure recovery-generation)
 
 (defun emacs-jupyter-notebook-helper-backend--make-object (&rest pairs)
   "Build a protocol object from string/value PAIRS."
@@ -289,10 +289,10 @@ generation tuple before any presentation mutation.
                    (unless (stringp value) (error "malformed helper status"))
                    (list :type 'status :execution-state value)))
       ("execute_reply" (let ((status (gethash "status" data)) (count (gethash "execution_count" data)))
-                           (unless (and (member status '("ok" "error" "aborted"))
-                                        (or (null count) (and (integerp count) (>= count 0))))
+                           (unless (ejn-helper-protocol-execute-result-p data t)
                              (error "malformed helper execute reply"))
-                           (list :type 'execute-reply :status status :execution-count count)))
+                           (list :type 'execute-reply :status status
+                                 :execution-count (and (integerp count) count))))
       ("input_request"
        (let ((input-id (gethash "input_id" data))
              (prompt (gethash "prompt" data))
@@ -532,12 +532,15 @@ backend deferral cannot be mistaken for panel acceptance.
     (condition-case err
         (let ((kind (and (hash-table-p event) (gethash "event" event))))
           (if (equal kind "transport_error")
-              (when-let* ((failure
-                           (emacs-jupyter-notebook-helper-backend-state-transport-failure
-                            state)))
-                (funcall failure
-                         (emacs-jupyter-notebook-helper-backend--safe-message
-                          (gethash "data" event))))
+              (let* ((data (gethash "data" event))
+                     (reason (emacs-jupyter-notebook-helper-backend--safe-message data)))
+                (if (and (hash-table-p data) (eq (gethash "recoverable" data) t))
+                    ;; Only an exact helper claim preserves transport ownership.
+                    ;; Process death and malformed protocol still fail closed.
+                    (emacs-jupyter-notebook-backend--emit
+                     session (list :type 'tunnel-lost :message reason))
+                  (emacs-jupyter-notebook-helper-backend--signal-transport-failure
+                   state reason)))
             (let ((helper-id (gethash "request_id" event)))
               ;; A production helper cannot emit before `helper-request' returns,
               ;; but a synchronous fake can.  Keep its bounded FIFO intact until
@@ -766,16 +769,14 @@ Return non-nil when the state still has a live transition owner."
 
 (defun emacs-jupyter-notebook-helper-backend--execute-result (result)
   "Validate and normalize the bounded helper execute RESULT.
-Only Jupyter's two terminal statuses and a nonnegative integer execution
-count are admitted.  The core must never manufacture a successful reply from
-an arbitrary helper object."
+Preserve the neutral `completed' status when only a recovery barrier proves
+completion.  The core must never infer success from that evidence."
   (let ((status (and (hash-table-p result) (gethash "status" result)))
         (count (and (hash-table-p result) (gethash "execution_count" result))))
-    (unless (and (member status '("ok" "error" "aborted"))
-                 (integerp count) (>= count 0))
+    (unless (ejn-helper-protocol-execute-result-p result)
       (error "helper execute returned an invalid terminal result"))
-    (list :status (if (equal status "ok") "ok" "error")
-          :execution-count count)))
+    (list :status (if (member status '("ok" "completed")) status "error")
+          :execution-count (and (integerp count) count))))
 
 (defun emacs-jupyter-notebook-helper-backend-retire-ledger-id (session ledger-id)
   "Retire SESSION's bounded helper wire ids for terminal LEDGER-ID."
@@ -1086,6 +1087,45 @@ validates both values before it can send the Jupyter stdin reply."
         (lambda (reason)
           (emacs-jupyter-notebook-helper-backend--dispose state reason)
           (funcall failure reason)))))
+    ((or 'suspend 'resume)
+     (let* ((state (emacs-jupyter-notebook-backend-session-data session))
+            (suspend-p (eq operation 'suspend)))
+       (unless (and (emacs-jupyter-notebook-helper-backend-state-p state)
+                    (emacs-jupyter-notebook-helper-backend--state-live-p session state))
+         (error "Helper backend is not attached"))
+       (let ((helper (emacs-jupyter-notebook-helper-backend-state-helper state))
+             (generation (make-symbol "ejn-recovery")))
+         (setf (emacs-jupyter-notebook-helper-backend-state-recovery-generation state)
+               generation)
+         (when (and suspend-p (emacs-jupyter-notebook-helper-session-p helper))
+           (emacs-jupyter-notebook-helper-pause-execution-deadlines helper))
+         (emacs-jupyter-notebook-helper-backend--request
+          session state (symbol-name operation)
+          (emacs-jupyter-notebook-helper-backend--make-object)
+          emacs-jupyter-notebook-helper-backend--aux-timeout
+          (lambda (result)
+            (if (not (eq generation
+                         (emacs-jupyter-notebook-helper-backend-state-recovery-generation state)))
+                ;; A newer suspend/resume owns both readiness and deadlines.
+                ;; Retire the old operation without invoking a stale failure
+                ;; callback that could tear down the current recovery.
+                (emacs-jupyter-notebook-backend-request-retire request)
+              (condition-case err
+                  (progn
+                    (emacs-jupyter-notebook-helper-backend--control-result
+                     result (if suspend-p "suspended" "attached"))
+                    (when (and (not suspend-p)
+                               (emacs-jupyter-notebook-helper-session-p helper))
+                      (emacs-jupyter-notebook-helper-resume-execution-deadlines helper))
+                    (funcall success session))
+                (error
+                 (emacs-jupyter-notebook-helper-backend--protocol-failure
+                  state failure (error-message-string err))))))
+          (lambda (reason)
+            (if (eq generation
+                    (emacs-jupyter-notebook-helper-backend-state-recovery-generation state))
+                (funcall failure reason)
+              (emacs-jupyter-notebook-backend-request-retire request)))))))
     ('close-local
      (let ((state (emacs-jupyter-notebook-backend-session-data session)))
        ;; A failed connect can leave a generic session whose adapter state was

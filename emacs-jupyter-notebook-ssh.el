@@ -176,12 +176,12 @@ see `--no-control-args'."
 
 (defun emacs-jupyter-notebook-ssh--no-control-args ()
   "Return SSH option args that force this connection to stand alone.
-When multiplexing is enabled globally, the persistent tunnel must still own
-its own SSH connection so a dropped link is visible to the tunnel
-sentinel/heartbeat; `ControlPath=none' opts it out of any shared master
-(including one configured in the user's ssh_config)."
-  (when emacs-jupyter-notebook-ssh-control-master
-    (list "-o" "ControlPath=none")))
+The persistent target tunnel must own its connection, even when one-shot
+multiplexing is disabled.  Append these args after all user options: unlike
+`-o ControlPath=none', the final `-S none' overrides an earlier `-S' or
+`-o ControlPath' as well as ssh_config.  A ProxyJump child still uses the
+jump host's own SSH configuration."
+  (list "-S" "none"))
 
 (defun emacs-jupyter-notebook-ssh-command (profile &optional remote-command)
   "Return an SSH argv list for PROFILE.

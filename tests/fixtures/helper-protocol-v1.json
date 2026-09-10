@@ -12,6 +12,8 @@
     {"name":"op-grant-event-credit","kind":"frame","object":{"v":1,"kind":"request","id":"op-credit","op":"grant_event_credit","params":{"bytes":262144}}},
     {"name":"op-connect","kind":"frame","object":{"v":1,"kind":"request","id":"op-connect","op":"connect","params":{"connection_file":"/tmp/ejn.json","artifact_dir":"/tmp/ejn-artifacts","image_max_pixels":4194304}}},
     {"name":"op-kernel-info","kind":"frame","object":{"v":1,"kind":"request","id":"op-info","op":"kernel_info","params":{}}},
+    {"name":"op-suspend","kind":"frame","object":{"v":1,"kind":"request","id":"op-suspend","op":"suspend","params":{}}},
+    {"name":"op-resume","kind":"frame","object":{"v":1,"kind":"request","id":"op-resume","op":"resume","params":{}}},
     {"name":"op-execute","kind":"frame","object":{"v":1,"kind":"request","id":"op-exec","op":"execute","params":{"code":"1+1"}}},
     {"name":"op-complete","kind":"frame","object":{"v":1,"kind":"request","id":"op-complete","op":"complete","params":{"code":"pri","cursor_pos":3}}},
     {"name":"op-inspect","kind":"frame","object":{"v":1,"kind":"request","id":"op-inspect","op":"inspect","params":{"code":"print","cursor_pos":5,"detail_level":0}}},

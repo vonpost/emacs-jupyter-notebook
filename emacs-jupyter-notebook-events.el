@@ -94,7 +94,10 @@ only its terminal evidence until the core has validated admission."
 
 (defun emacs-jupyter-notebook-events--reply-status (event)
   "Return the panel status symbol encoded by execute-reply EVENT."
-  (if (equal (plist-get event :status) "ok") 'ok 'error))
+  (pcase (plist-get event :status)
+    ("ok" 'ok)
+    ("completed" 'completed)
+    (_ 'error)))
 
 (defun emacs-jupyter-notebook-events-reduce (context event)
   "Reduce normalized EVENT with CONTEXT to declarative EJN actions.

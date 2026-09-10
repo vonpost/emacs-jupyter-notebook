@@ -312,6 +312,9 @@ class _Pending:
     reply_type: str = "kernel_info_reply"
     auxiliary: str | None = None
     input_id: str | None = None
+    recovery_channel: str | None = None
+    recovery_reply: dict | None = None
+    recovery_idle: bool = False
 
 
 @dataclass(slots=True)
@@ -320,6 +323,8 @@ class _InputPrompt:
 
     input_id: str
     pending: _Pending
+    prompt: str
+    password: bool
 
 
 class _TaskCancellation:
@@ -374,6 +379,11 @@ class JupyterBackend:
         self._retired_tasks: list[asyncio.Task] = []
         self._timed_out_tasks: set[asyncio.Task[None]] = set()
         self._transport_failed = False
+        self._suspended = False
+        self._resuming = False
+        self._recovery_generation = 0
+        self._recovery_barrier: asyncio.Task | None = None
+        self._recovery_execution: _Pending | None = None
         self._transport_failure_callback: Callable[[str], None] | None = None
         self._transport_failure_origin: str | None = None
         self._transport_failure_notified = False
@@ -515,6 +525,15 @@ class JupyterBackend:
                 BackendCompletion.failure(BackendError("busy")),
             )
             return None
+        if operation == "resume" and self._resuming:
+            asyncio.get_running_loop().call_soon(
+                self._deliver,
+                completion_callback,
+                BackendCompletion.failure(BackendError("busy")),
+            )
+            return None
+        if operation == "resume":
+            self._resuming = True
         if operation == "connect":
             self._connecting = True
         if operation == "shutdown":
@@ -554,6 +573,12 @@ class JupyterBackend:
             # request future, and works on the supported Python 3.10 floor.
             if operation == "connect":
                 await self._connect(params)
+                result = {"attached": True}
+            elif operation == "suspend":
+                self._suspend()
+                result = {"suspended": True}
+            elif operation == "resume":
+                await self._resume()
                 result = {"attached": True}
             elif operation == "kernel_info":
                 result = await self._kernel_info()
@@ -601,6 +626,8 @@ class JupyterBackend:
             self._timed_out_tasks.discard(task)
             if operation == "connect":
                 self._connecting = False
+            if operation == "resume":
+                self._resuming = False
             if operation == "shutdown":
                 # A shutdown request has an irreversible remote outcome once
                 # sent.  Every outcome releases only local channels, never
@@ -636,10 +663,140 @@ class JupyterBackend:
         self._channels_started = True
         self._transport_failed = False
         self._transport_failure_origin = None
+        self._suspended = False
         # Attachment is local channel construction only.  A busy/black-holed
         # kernel must not stall it; the caller's bounded kernel_info request
         # owns readiness verification and can be cancelled independently.
         self._start_readers()
+
+    def _cancel_recovery_barrier(self) -> None:
+        """Retire the sole execution-owned recovery waiter locally."""
+        task = self._recovery_barrier
+        self._recovery_barrier = None
+        self._recovery_execution = None
+        if task is not None and task is not asyncio.current_task():
+            self._cancel_operation(task)
+            task.cancel()
+
+    def _suspend(self) -> None:
+        """Keep socket identities and accepted work across a tunnel outage."""
+        if self._transport_failed or self.client is None:
+            raise BackendError("transport-error")
+        self._suspended = True
+        self._recovery_generation += 1
+        self._cancel_recovery_barrier()
+        # A second outage can arrive during the bounded subscription probe.
+        # Fail only that probe; accepted execution and outputs keep ownership.
+        for pending in tuple(self._pending.values()):
+            if pending.recovery_channel is not None and not pending.future.done():
+                pending.future.set_exception(BackendError("busy"))
+
+    async def _resume(self) -> None:
+        """Verify restored control/IOPub, then reconcile the active execution.
+
+        Control traffic can run while the shell is busy, so it verifies the
+        restored subscription without claiming the active cell has finished.
+        The later shell probe is ordered behind that cell and alone can supply
+        missing completion evidence. Neither operation resends user code.
+        """
+        if self._transport_failed or self.client is None or not self._channels_started:
+            raise BackendError("transport-error")
+        if not self._suspended:
+            raise BackendError("busy")
+        generation = self._recovery_generation
+        self._cancel_recovery_barrier()
+        # A freshly reconnected SUB socket can miss the first probe's status.
+        # Retry bounded probes within this operation's existing hard deadline.
+        while True:
+            try:
+                await asyncio.wait_for(
+                    self._recovery_probe("control"),
+                    min(1.0, max(0.05, self.deadline / 3)),
+                )
+                break
+            except asyncio.TimeoutError:
+                if generation != self._recovery_generation:
+                    raise BackendError("busy") from None
+        if generation != self._recovery_generation:
+            raise BackendError("busy")
+        self._suspended = False
+        for prompt in tuple(self._input_prompts.values()):
+            state = prompt.pending.state
+            if (not prompt.pending.future.done() and state is not None
+                    and state.reply is None and not state.idle):
+                self._publish_input_prompt(prompt.pending, prompt.prompt, prompt.password)
+            else:
+                self._retire_input_prompt(prompt.pending)
+        if self._transport_failed:
+            raise BackendError("transport-error")
+        execution = next(
+            (pending for pending in self._pending.values()
+             if pending.state is not None and not pending.future.done()),
+            None,
+        )
+        if execution is not None:
+            task = asyncio.create_task(self._reconcile_execution(execution, generation))
+            self._recovery_barrier = task
+            self._recovery_execution = execution
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    async def _recovery_probe(self, channel: str) -> dict:
+        """Read one kernel-info reply and its idle through the sole router."""
+        client = self.client
+        if client is None:
+            raise BackendError("transport-error")
+        try:
+            if channel == "shell":
+                message_id = client.kernel_info()
+            else:
+                message_id = client.session.send(
+                    client.control_channel.socket, "kernel_info_request", content={}
+                )["header"]["msg_id"]
+            if not isinstance(message_id, str) or not message_id:
+                raise ValueError("missing kernel-info message ID")
+        except Exception as exc:
+            self._fail_transport("channel-send")
+            raise BackendError("transport-error") from exc
+        pending = _Pending(
+            asyncio.get_running_loop().create_future(),
+            auxiliary="kernel_info", recovery_channel=channel,
+        )
+        self._register_pending(message_id, pending)
+        try:
+            return await pending.future
+        finally:
+            self._unregister_pending(message_id, pending)
+
+    async def _reconcile_execution(self, execution: _Pending, generation: int) -> None:
+        """Supply only completion facts proved by an ordered shell barrier."""
+        try:
+            await self._recovery_probe("shell")
+            if (self.closed or self._suspended
+                    or generation != self._recovery_generation
+                    or execution.future.done() or execution.state is None):
+                return
+            state = execution.state
+            if state.reply is None:
+                state.reply = {"status": "completed"}
+                self._deliver_event(execution.event_callback, "execute_reply", state.reply)
+            if not state.idle:
+                state.idle = True
+                execution.idle_received = True
+                execution.idle_content = {"execution_state": "idle"}
+            self._finish_execution(execution)
+        except (asyncio.CancelledError, BackendError):
+            return
+        finally:
+            if self._recovery_barrier is asyncio.current_task():
+                self._recovery_barrier = None
+                self._recovery_execution = None
+
+    @staticmethod
+    def _finish_recovery_probe(pending: _Pending) -> None:
+        if (pending.recovery_reply is not None and pending.recovery_idle
+                and not pending.future.done()):
+            pending.future.set_result(pending.recovery_reply)
 
     async def _kernel_info(self) -> dict:
         self._ensure_connected()
@@ -862,6 +1019,8 @@ class JupyterBackend:
             raise BackendError("transport-error")
         if self.client is None or not self._channels_started:
             raise BackendError("busy")
+        if self._suspended:
+            raise BackendError("busy")
 
     def _start_readers(self) -> None:
         if self._readers:
@@ -895,6 +1054,9 @@ class JupyterBackend:
         while not self.closed and self._channels_started:
             try:
                 await asyncio.sleep(self._heartbeat_interval)
+                if self._suspended:
+                    consecutive_misses = 0
+                    continue
                 if self._execution_pending():
                     consecutive_misses = 0
                     continue
@@ -945,6 +1107,21 @@ class JupyterBackend:
             return
         pending = self._pending.get(message_id)
         if pending is None or pending.future.done():
+            return
+        if pending.recovery_channel is not None:
+            if channel == pending.recovery_channel and message.get("msg_type") == "kernel_info_reply":
+                try:
+                    pending.recovery_reply = _normalize_auxiliary(
+                        "kernel_info", message.get("content", {})
+                    )
+                except BackendError as exc:
+                    pending.future.set_exception(exc)
+                    return
+            elif channel == "iopub" and message.get("msg_type") == "status":
+                content = message.get("content", {})
+                if isinstance(content, Mapping) and content.get("execution_state") == "idle":
+                    pending.recovery_idle = True
+            self._finish_recovery_probe(pending)
             return
         if channel == "shell":
             self._route_shell(pending, message)
@@ -1072,18 +1249,29 @@ class JupyterBackend:
             if pending.input_id is not None:
                 _LOGGER.debug("dropping duplicate stdin request for live execution")
                 return
-            input_id = None
-            for _attempt in range(4):
-                candidate = secrets.token_hex(INPUT_ID_BYTES)
-                if candidate not in self._input_prompts:
-                    input_id = candidate
-                    break
-            if input_id is None:
-                self._fail_transport("channel-reader")
-                return
             prompt, password = _normalize_input_request(message.get("content"))
-            pending.input_id = input_id
-            self._input_prompts[input_id] = _InputPrompt(input_id, pending)
+            self._publish_input_prompt(pending, prompt, password)
+
+    def _publish_input_prompt(self, pending: _Pending, prompt: str, password: bool) -> None:
+        """Publish a fresh one-use lease, retaining bounded prompt metadata only.
+
+        Keep the previous ID reserved until a distinct replacement exists.
+        Values entered by the user never enter this retained state. A prompt
+        read during suspension is presented only after subscription recovery.
+        """
+        input_id = None
+        for _attempt in range(4):
+            candidate = secrets.token_hex(INPUT_ID_BYTES)
+            if candidate not in self._input_prompts:
+                input_id = candidate
+                break
+        if input_id is None:
+            self._fail_transport("channel-reader")
+            return
+        self._retire_input_prompt(pending)
+        pending.input_id = input_id
+        self._input_prompts[input_id] = _InputPrompt(input_id, pending, prompt, password)
+        if not self._suspended:
             admitted = self._deliver_event(
                 pending.event_callback,
                 "input_request",
@@ -1145,6 +1333,8 @@ class JupyterBackend:
             self._pending_by_task[task] = (message_id, pending)
 
     def _unregister_pending(self, message_id: str, pending: _Pending) -> None:
+        if pending is self._recovery_execution:
+            self._cancel_recovery_barrier()
         if self._pending.get(message_id) is pending:
             self._pending.pop(message_id, None)
         task = asyncio.current_task()
@@ -1178,6 +1368,8 @@ class JupyterBackend:
         task.cancel()
 
     def _remove_pending(self, message_id: str, pending: _Pending) -> None:
+        if pending is self._recovery_execution:
+            self._cancel_recovery_barrier()
         if self._pending.get(message_id) is pending:
             self._pending.pop(message_id, None)
         self._retire_input_prompt(pending)
@@ -1197,8 +1389,18 @@ class JupyterBackend:
             return
         if self._shutting_down and self._shutdown_reply_received:
             # After the exact shutdown reply, broken channels are expected as
-            # the direct kernel exits.  The shutdown task owns the bounded
+            # the direct kernel exits. The shutdown task owns the bounded
             # terminal-liveness check and its final local teardown.
+            return
+        if origin == "heartbeat":
+            if not self._suspended:
+                self._suspend()
+                callback = self._transport_failure_callback
+                if callback is not None:
+                    try:
+                        callback(origin)
+                    except Exception:
+                        pass
             return
         self._transport_failed = True
         self._transport_failure_origin = origin
@@ -1212,6 +1414,7 @@ class JupyterBackend:
         self._stop_channels(cancel_pending=False)
 
     def _stop_channels(self, *, cancel_pending: bool = True) -> None:
+        self._cancel_recovery_barrier()
         self._reap_retired_tasks()
         readers = tuple(self._readers)
         for task in readers:
