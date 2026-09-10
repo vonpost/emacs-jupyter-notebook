@@ -165,6 +165,13 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
+- [~] owner=root claimed=2026-09-10 CC24 Consolidate the external viewer
+  layout around the images. — touches: viewer workspace layout and GUI
+  tests, viewer installation docs. Keep one compact toolbar, move secondary
+  settings into dropdowns, and make measurements and magnification optional.
+  Root implements; viewer_layout_review inspects and reviews without edits.
+  Preserve local numerical interactions, visible status and snapshot lifetime.
+
 - [x] sha=b82fc55 CC23 Give the output buffer ordinary
   window handling. — touches: result display, panel option docs, README and
   focused deterministic window ERT tests. Root implements display;
