@@ -77,8 +77,8 @@ to images. **Fit**, level/width and **Draw ROI** remain directly accessible.
 **Compare** opens the image selectors, difference modes, pin/blink controls
 and grid/unit declarations. **Options** contains **Freeze updates** and the
 optional **Magnifier**. **Measurements** shows or hides ROI tools and the
-statistics table without removing selections or results. Both the measurement
-panel and magnifier start hidden. Pixel values, analysis messages and the
+statistics table or line profile without removing selections or results. Both
+the measurement panel and magnifier start hidden. Pixel values, analysis messages and the
 following/frozen/pinned evaluation status remain visible below the images;
 hover over shortened status text to read it in full.
 
@@ -104,9 +104,34 @@ panes, including the difference. The table shows mean, population SD
 (`ddof=0`), finite pixel count and excluded non-finite count for each pane.
 Select a named ROI to remove it. Up to 16 ROIs are retained, including across
 compatible reruns of the same sample/grid. **Draw ROI** lets you drag a new
-rectangle or ellipse directly on an image (`Esc` cancels). Select an ROI to
+line, rectangle or ellipse directly on an image (`Esc` cancels). Select an ROI to
 rename it; arrow keys while the image has focus move it one pixel, or ten with
 `Shift`. **Copy statistics** copies the measurement table as tab-separated text.
+
+For edge comparisons, choose **Draw ROI → Draw line**, then drag from **A** to
+**B** across an image. The measurement panel opens after release with overlaid,
+color-labeled profiles for every corresponding visible image, including a
+pinned reference and any displayed difference. Drag either endpoint to change
+the line, or drag its body to move it. Select another named line to plot that
+selection; selecting a rectangle or ellipse returns to the statistics table.
+Toggle **Measurements** to recover image space while retaining the line.
+
+Line profiles show original pixel values against distance from A **in pixels**,
+with each curve's intensity units in its legend. Grid correspondence follows
+the same rules as linked ROIs: matching sample, shape and spatial metadata,
+plus a common grid ID or an explicit **Declare matching grids** selection for
+images whose grid IDs are absent. No intensity normalization or unit conversion
+is applied. To compare evaluations, pin the reference before rerunning the
+same sample/grid; the line stays in place and the candidate profile updates.
+
+Profiles use bilinear interpolation at evenly spaced positions along the line,
+including both endpoints of the portion inside the image. Pixel centers lie
+at `(column + 0.5, row + 0.5)`; outer pixel values extend to the image boundary.
+Clipping retains distances from the original A endpoint. Spacing is at most
+one pixel, up to **4096 samples** per curve; longer lines show a sample-limit
+notice and use wider spacing. Non-finite contributing pixels leave gaps.
+Only the selected line is sampled, in the existing local worker after dragging
+finishes. Changing zoom, window/level or blink does not change the profile.
 
 Measurements use original samples and source pixel centers, independently of
 zoom or window/level. Rectangles include their left/top edges and exclude
@@ -114,8 +139,8 @@ right/bottom edges; ellipses include centers on their boundary. Selections
 are clipped to each plane. Empty/all-non-finite selections show unavailable
 statistics, and one finite pixel has SD zero. Arithmetic uses float64 with
 stable block accumulation. RGB/rendered images do not offer these quantitative
-controls. Difference/statistics work is debounced and runs in a bounded local
-worker; it makes no requests to the kernel.
+controls. Difference/statistics/profile work is debounced and runs in a bounded
+local worker; it makes no requests to the kernel.
 
 Hovering an image places linked crosshairs on corresponding panes and displays
 reference, candidate and difference values at the same sample location. A

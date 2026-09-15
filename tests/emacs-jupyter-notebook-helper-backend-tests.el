@@ -471,10 +471,11 @@ DISPOSALS receives local-only disposal reasons."
   (with-temp-buffer
     (let* ((entry (ejn-ei2-test--direct-entry))
            (original (copy-tree entry))
+           (release (symbol-function 'emacs-jupyter-notebook--release-local-resources))
            (cleaned nil) context probe ssh)
       (let ((emacs-jupyter-notebook--session-entry entry))
         (cl-letf (((symbol-function 'emacs-jupyter-notebook--release-local-resources)
-                   (lambda () (setq cleaned t)))
+                   (lambda () (setq cleaned t) (funcall release)))
                   ((symbol-function 'emacs-jupyter-notebook-helper-backend-ensure)
                    (lambda () (error "helper missing")))
                   ((symbol-function 'emacs-jupyter-notebook--async-reconnect-context)

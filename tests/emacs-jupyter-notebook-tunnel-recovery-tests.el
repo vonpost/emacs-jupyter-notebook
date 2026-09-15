@@ -538,7 +538,10 @@ Bind SESSION, REQUESTS, SUSPENDS, CLOSES and SCHEDULED for assertions."
             (should (equal closes (list session)))
             (should-not emacs-jupyter-notebook--client)
             (should-not emacs-jupyter-notebook--tunnel-suspended)
-            (should-not emacs-jupyter-notebook--execution-queue)
+            ;; The admitted first execution is never replayed.  The second
+            ;; was still unsent, so acquisition preserves its exact FIFO id.
+            (should (equal emacs-jupyter-notebook--execution-queue
+                           (list (plist-get _second :id))))
             (should (= (length requests) 1))))))))
 
 (provide 'emacs-jupyter-notebook-tunnel-recovery-tests)

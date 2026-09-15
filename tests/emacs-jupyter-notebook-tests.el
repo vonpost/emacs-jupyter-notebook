@@ -747,21 +747,24 @@ via `--cancel-async-operation' and proceeds with the new start."
         (should superseded)
         (should (ejn-test-await (lambda () started)))))))
 
-(ert-deftest ejn-start-remote-kernel-refuses-existing-client-noninteractive ()
+(ert-deftest ejn-start-remote-kernel-probes-existing-client-noninteractive ()
   (let ((emacs-jupyter-notebook-remote-profiles
           '(("p" . (:host "example.com" :remote-cwd "~" :kernelspec "python3"))))
-        started)
+        started probed)
     (cl-letf (((symbol-function 'emacs-jupyter-notebook--ensure-selected-backend)
                #'ignore)
               ((symbol-function 'emacs-jupyter-notebook-ssh-start-process)
                (lambda (&rest _)
                  (setq started t)
-                 'mock-process)))
+                 'mock-process))
+              ((symbol-function 'emacs-jupyter-notebook--verify-existing-client)
+               (lambda (&rest _) (setq probed t))))
       (with-temp-buffer
         (setq buffer-file-name "/tmp/example-notebook.py")
-        (setq emacs-jupyter-notebook--client 'mock-client)
-        (should-error (emacs-jupyter-notebook-start-remote-kernel "p")
-                      :type 'user-error)
+        (setq emacs-jupyter-notebook--client (ejn-test-backend-session)
+              emacs-jupyter-notebook--session-entry '(:profile "p"))
+        (emacs-jupyter-notebook-start-remote-kernel "p")
+        (should probed)
         (should-not started)))))
 
 (ert-deftest ejn-start-preflight-attaches-existing-current-file-session ()
@@ -774,7 +777,7 @@ via `--cancel-async-operation' and proceeds with the new start."
          (resolver-called nil)
          (cleanup-called nil)
          (registry-mutation nil)
-         failure)
+         reconnected)
     (cl-letf (((symbol-function 'emacs-jupyter-notebook-registry-read-async)
                (lambda (success _failure &rest _keys)
                  (ejn-test-registry--defer
@@ -792,21 +795,20 @@ via `--cancel-async-operation' and proceeds with the new start."
               ((symbol-function 'emacs-jupyter-notebook-registry-replace-async)
                (lambda (&rest _) (setq registry-mutation t)))
               ((symbol-function 'emacs-jupyter-notebook-registry-remove-async)
-               (lambda (&rest _) (setq registry-mutation t))))
+               (lambda (&rest _) (setq registry-mutation t)))
+              ((symbol-function 'emacs-jupyter-notebook--begin-reconnect)
+               (lambda (row &rest _) (setq reconnected row))))
       (with-temp-buffer
         (setq buffer-file-name file)
         (should-not emacs-jupyter-notebook--session-entry)
         (let ((context
-               (emacs-jupyter-notebook-start-remote-kernel
-                "p" nil
-                (lambda (_context reason) (setq failure reason)))))
+               (emacs-jupyter-notebook-start-remote-kernel "p")))
           (should (eq (plist-get context :phase) 'registry-start-preflight))
-          (should (ejn-test-await (lambda () failure)))
-          (should (eq (plist-get context :phase) 'error))
+          (should (ejn-test-await (lambda () reconnected)))
+          (should (eq (plist-get context :phase) 'done))
           (should (equal emacs-jupyter-notebook--session-entry entry))
           (should emacs-jupyter-notebook--tunnel-dead)
-          (should (string-match-p "reconnect-remote-kernel" failure))
-          (should (string-match-p "retry-fresh-kernel" failure))
+          (should (equal reconnected entry))
           (should-not resolver-called)
           (should-not cleanup-called)
           (should-not registry-mutation))))))
@@ -859,7 +861,7 @@ via `--cancel-async-operation' and proceeds with the new start."
          (launch-called nil)
          (cleanup-called nil)
          (read-local-file nil)
-         failure)
+         reconnected)
     (unwind-protect
         (progn
           (with-temp-file physical
@@ -892,21 +894,21 @@ via `--cancel-async-operation' and proceeds with the new start."
                      (lambda (&rest _) (setq ssh-called t)))
                     ((symbol-function
                       'emacs-jupyter-notebook--start-remote-kernel-admitted)
-                     (lambda (&rest _) (setq launch-called t))))
+                     (lambda (&rest _) (setq launch-called t)))
+                    ((symbol-function 'emacs-jupyter-notebook--begin-reconnect)
+                     (lambda (row &rest _) (setq reconnected row))))
             (with-temp-buffer
               (setq buffer-file-name alias)
               (let ((context
-                     (emacs-jupyter-notebook-start-remote-kernel
-                      "p" nil
-                      (lambda (_context reason) (setq failure reason)))))
+                     (emacs-jupyter-notebook-start-remote-kernel "p")))
                 (should (eq (plist-get context :phase)
                             'registry-start-preflight))
-                (should (ejn-test-await (lambda () failure)))
+                (should (ejn-test-await (lambda () reconnected)))
                 (should (equal read-local-file (expand-file-name alias)))
-                (should (eq (plist-get context :phase) 'error))
+                (should (eq (plist-get context :phase) 'done))
                 (should (equal emacs-jupyter-notebook--session-entry entry))
                 (should emacs-jupyter-notebook--tunnel-dead)
-                (should (string-match-p "reconnect-remote-kernel" failure))
+                (should (equal reconnected entry))
                 (should-not resolver-called)
                 (should-not ssh-called)
                 (should-not launch-called)
@@ -6456,7 +6458,7 @@ Adding a live `--client' flips both predicates."
             (should-not (emacs-jupyter-notebook--active-session-p))
             (should (emacs-jupyter-notebook--clientless-debris-p))
             ;; A live client flips it: active, NOT debris.
-            (setq emacs-jupyter-notebook--client 'mock-client)
+            (setq emacs-jupyter-notebook--client (ejn-test-backend-session))
             (should (emacs-jupyter-notebook--active-session-p))
             (should-not (emacs-jupyter-notebook--clientless-debris-p)))
         (when (process-live-p tunnel)
@@ -6469,13 +6471,14 @@ Adding a live `--client' flips both predicates."
 start — the guard's original leak-prevention is preserved.  A present
 `--client' is the one state `--ensure-clean-before-start' refuses."
   (with-temp-buffer
-    (setq emacs-jupyter-notebook--client 'mock-client)
+    (setq emacs-jupyter-notebook--client (ejn-test-backend-session))
     (setq emacs-jupyter-notebook--session-entry
           '(:profile "p" :session-id "live"))
     (should-error (emacs-jupyter-notebook--ensure-clean-before-start)
                   :type 'user-error)
     ;; Nothing was reaped: the live client and its entry are untouched.
-    (should (eq emacs-jupyter-notebook--client 'mock-client))
+    (should (emacs-jupyter-notebook-backend-session-live-p
+             emacs-jupyter-notebook--client))
     (should emacs-jupyter-notebook--session-entry)))
 
 
@@ -9361,14 +9364,16 @@ left to run shutdown + start by hand."
                  (setq emacs-jupyter-notebook--async-context
                        (emacs-jupyter-notebook--async-new-context
                         :phase 'error :error-kind 'kernel-dead
+                        :entry entry
                         :origin-buffer (current-buffer)))
                  (funcall error-cb emacs-jupyter-notebook--async-context "dead")))
               ;; `called-interactively-p' with kind `interactive' is nil in
               ;; batch by design; stub it to model a real user invocation.
               ((symbol-function 'called-interactively-p) (lambda (&rest _) t))
               ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
-              ((symbol-function 'emacs-jupyter-notebook-retry-fresh-kernel)
-               (lambda (profile) (setq fresh-profile profile))))
+              ((symbol-function 'emacs-jupyter-notebook--replace-confirmed-dead-kernel)
+               (lambda (_context selected &rest _)
+                 (setq fresh-profile (plist-get selected :profile)))))
       (with-temp-buffer
         (save-window-excursion
           (set-window-buffer (selected-window) (current-buffer))
@@ -9392,8 +9397,8 @@ surfaces the error."
                (lambda (_entry _cb error-cb &optional _owner)
                  (funcall error-cb '(:error-kind kernel-dead) "dead")))
               ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
-              ((symbol-function 'emacs-jupyter-notebook-retry-fresh-kernel)
-               (lambda (_profile) (setq fresh-called t))))
+              ((symbol-function 'emacs-jupyter-notebook--replace-confirmed-dead-kernel)
+               (lambda (&rest _) (setq fresh-called t))))
       (with-temp-buffer
         ;; Non-interactive (Lisp) call: no prompt, error surfaced to the
         ;; caller's error-callback.

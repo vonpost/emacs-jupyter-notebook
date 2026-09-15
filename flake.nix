@@ -149,7 +149,7 @@
               runHook preCheck
               QT_QPA_PLATFORM=offscreen python -m unittest \
                 test_pyqtgraph_gui test_workspace_gui test_snapshots test_ipc \
-                test_analysis test_analysis_gui test_review_gui test_variable_view -v
+                test_analysis test_analysis_gui test_line_profile_gui test_review_gui test_variable_view -v
               runHook postCheck
             '';
             dontUsePythonImportsCheck = false;

@@ -11,7 +11,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .analysis import (DIFFERENCE, MAX_ROIS, Region, comparison_error,
+from .analysis import (DIFFERENCE, MAX_ROIS, MAX_PROFILE_BYTES, Profile, Region, comparison_error,
                        correspondence, scalar_plane)
 from .analysis_worker import AnalysisJob, AnalysisWorker
 from .navigation import ImageGraphicsWidget, ImageViewBox, NavigationGroup, camera
@@ -131,6 +131,10 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self._displayed_comparison = None
         self._analysis_token = 0
         self._statistics = {}
+        self._profiles = {}
+        self._profile_curves = {}
+        self._profile_identifier = None
+        self._profile_error = ""
         self._closed = False
         self._analysis_owner = object()
         self._owns_worker = analysis_worker is None
@@ -237,7 +241,7 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self.measurements_button = QtWidgets.QToolButton(central)
         self.measurements_button.setText("Measurements")
         self.measurements_button.setCheckable(True)
-        self.measurements_button.setToolTip("Show ROI tools and statistics")
+        self.measurements_button.setToolTip("Show ROI tools, statistics and line profiles")
         self.measurements_panel = QtWidgets.QWidget(central)
         measurements_layout = QtWidgets.QVBoxLayout(self.measurements_panel)
         measurements_layout.setContentsMargins(0, 4, 0, 0)
@@ -263,7 +267,7 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self.draw_button.setText("Draw ROI")
         self.draw_button.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
         menu = QtWidgets.QMenu(self.draw_button)
-        for kind in ("rectangle", "ellipse"):
+        for kind in ("line", "rectangle", "ellipse"):
             action = menu.addAction("Draw " + kind)
             action.triggered.connect(lambda _checked=False, shape=kind: self.arm_roi(shape))
         menu.addAction("Cancel drawing", self.cancel_drawing)
@@ -287,6 +291,19 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self.stats_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.stats_table.setMaximumHeight(150)
         measurements_layout.addWidget(self.stats_table)
+        self.profile_status = StatusLabel(parent=central)
+        measurements_layout.addWidget(self.profile_status)
+        self.profile_plot = pg.PlotWidget(central)
+        self.profile_plot.setMinimumHeight(150)
+        self.profile_plot.setMaximumHeight(240)
+        self.profile_plot.setLabel("bottom", "Distance from A", units="pixels")
+        self.profile_plot.setLabel("left", "Value")
+        self.profile_plot.showGrid(x=True, y=True, alpha=.2)
+        self.profile_plot.setMenuEnabled(False)
+        self.profile_plot.addLegend(offset=(10, 10))
+        measurements_layout.addWidget(self.profile_plot)
+        self.profile_status.hide()
+        self.profile_plot.hide()
         outer.addWidget(self.measurements_panel)
         self.measurements_panel.hide()
         self.measurements_button.toggled.connect(self.measurements_panel.setVisible)
@@ -340,6 +357,10 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
     def allocations(self):
         result = {}
         result["magnifier", id(self)] = MAX_PATCH_BYTES
+        # One selected line, at most four originals plus a difference. Include
+        # NumPy vectors, plot paths, finite masks and plotting conversions.
+        if self._profile_identifier is not None:
+            result["profiles", id(self)] = MAX_PROFILE_BYTES * 5 * 8
         for snapshot in (self._snapshot, self._pinned):
             if snapshot is not None:
                 result = merge_allocations(result, source_allocations(snapshot))
@@ -512,6 +533,8 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self._analysis_timer.stop()
         self._difference = self._difference_key = None
         self._statistics = {}
+        self._profiles = {}
+        self._clear_profile_plot()
         if not preserve:
             self._regions.clear()
             self._difference_levels.clear()
@@ -774,16 +797,28 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             if key not in wanted:
                 self._dispose_roi(key)
         selected = self.roi_selector.currentData()
+        self.roi_selector.blockSignals(True)
         self.roi_selector.clear()
         for region in self._regions.values():
             self.roi_selector.addItem(region.name, region.identifier)
             for name in self._targets(region):
                 if (region.identifier, name) in self._roi_items:
                     continue
-                cls = pg.RectROI if region.kind == "rectangle" else pg.EllipseROI
-                item = cls((region.x, region.y), (region.width, region.height),
-                           pen=pg.intColor(region.identifier, hues=MAX_ROIS),
-                           removable=True, rotatable=False)
+                pen = pg.intColor(region.identifier, hues=MAX_ROIS)
+                if region.kind == "line":
+                    item = pg.LineSegmentROI(((0, 0), (region.width, region.height)),
+                                             pos=(region.x, region.y), pen=pen,
+                                             removable=True, rotatable=False)
+                    item._endpoint_labels = tuple(pg.TextItem(text, color=pen, anchor=(0, 1))
+                                                  for text in ("A", "B"))
+                    for label in item._endpoint_labels:
+                        label.setParentItem(item)
+                        label.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
+                    self._label_line(item)
+                else:
+                    cls = pg.RectROI if region.kind == "rectangle" else pg.EllipseROI
+                    item = cls((region.x, region.y), (region.width, region.height),
+                               pen=pen, removable=True, rotatable=False)
                 # EllipseROI includes a rotation handle even with rotatable=False.
                 for handle in list(item.handles):
                     if handle["type"] in ("r", "sr"):
@@ -800,6 +835,8 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         index = self.roi_selector.findData(selected)
         if index >= 0:
             self.roi_selector.setCurrentIndex(index)
+        self.roi_selector.blockSignals(False)
+        self._roi_selection_changed()
         self.remove_roi_button.setEnabled(bool(self._regions))
         allowed = self._snapshot.numerical and len(self._regions) < MAX_ROIS
         self.rectangle_button.setEnabled(allowed)
@@ -814,6 +851,8 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         item.deleteLater()
 
     def arm_roi(self, kind):
+        if kind not in ("line", "rectangle", "ellipse"):
+            raise ValueError("unsupported ROI shape")
         if self._snapshot is None or not self._snapshot.numerical or len(self._regions) >= MAX_ROIS:
             return
         self.cancel_drawing()
@@ -831,7 +870,7 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self.graphics._roi_drag = None
         self.graphics.viewport().unsetCursor()
         self.draw_button.setText("Draw ROI")
-        self.draw_button.setToolTip("Draw a rectangle or ellipse directly on an image")
+        self.draw_button.setToolTip("Draw a line, rectangle or ellipse directly on an image")
         if identifier in self._regions:
             self.remove_roi(identifier)
 
@@ -854,16 +893,34 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             self._rebuild_rois()
             self.roi_selector.setCurrentIndex(self.roi_selector.findData(identifier))
         item = self._roi_items[self._drawing_region, name]
-        item.setPos((min(start.x(), end.x()), min(start.y(), end.y())))
-        item.setSize((max(.001, abs(end.x() - start.x())), max(.001, abs(end.y() - start.y()))))
+        if self._draw_kind == "line":
+            self._syncing_rois = True
+            try:
+                self._set_line(item, start, end)
+            finally:
+                self._syncing_rois = False
+            self._roi_changed(self._drawing_region, item)
+        else:
+            item.setPos((min(start.x(), end.x()), min(start.y(), end.y())))
+            item.setSize((max(.001, abs(end.x() - start.x())), max(.001, abs(end.y() - start.y()))))
         if finished:
+            line = self._draw_kind == "line"
             self._drawing_region = None
             self.cancel_drawing()
+            if line:
+                self.measurements_button.setChecked(True)
 
     def _roi_selection_changed(self, *_):
         region = self._regions.get(self.roi_selector.currentData())
         self.roi_name.setText(region.name if region is not None else "")
         self.roi_name.setEnabled(region is not None)
+        identifier = region.identifier if region is not None and region.kind == "line" else None
+        if identifier != self._profile_identifier:
+            self._profile_identifier = identifier
+            self._schedule_analysis()
+            if identifier is not None and not self._gesturing():
+                self.measurements_button.setChecked(True)
+        self._render_profile()
 
     def rename_roi(self, name):
         identifier = self.roi_selector.currentData()
@@ -877,6 +934,7 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self.roi_selector.setItemText(self.roi_selector.currentIndex(), name)
         self.roi_name.setText(name)
         self._render_statistics()
+        self._render_profile()
 
     def nudge_roi(self, dx, dy):
         identifier = self.roi_selector.currentData()
@@ -899,6 +957,8 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
 
     def add_roi(self, kind):
         """Add a centered ROI in the selected pane; drag it or its resize handle."""
+        if kind not in ("line", "rectangle", "ellipse"):
+            raise ValueError("unsupported ROI shape")
         if not self._snapshot or not self._snapshot.numerical or len(self._regions) >= MAX_ROIS:
             return
         name = self.roi_plane.currentData()
@@ -907,6 +967,9 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         width, height = max(1, min(array.shape[1], view.width()) / 3), max(1, min(array.shape[0], view.height()) / 3)
         x = min(max(view.center().x() - width / 2, 0), array.shape[1] - width)
         y = min(max(view.center().y() - height / 2, 0), array.shape[0] - height)
+        if kind == "line":
+            y += height / 2
+            height = 0
         self._next_region += 1
         identifier = self._next_region
         source = self._candidate_name() if name == DIFFERENCE else name
@@ -925,23 +988,49 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
     def _roi_changed(self, identifier, item):
         if self._syncing_rois or identifier not in self._regions:
             return
-        pos, size = item.pos(), item.size()
+        self.roi_selector.setCurrentIndex(self.roi_selector.findData(identifier))
+        line = self._regions[identifier].kind == "line"
+        if line:
+            pos, end = (item.mapToParent(point) for point in item.listPoints())
+            size = end - pos
+            self._label_line(item)
+        else:
+            pos, size = item.pos(), item.size()
         self._regions[identifier] = replace(self._regions[identifier], x=float(pos.x()),
                                             y=float(pos.y()), width=float(size.x()), height=float(size.y()))
         self._syncing_rois = True
         try:
             for (other_id, _name), other in self._roi_items.items():
                 if other_id == identifier and other is not item:
-                    other.setPos(pos)
-                    other.setSize(size)
+                    if line:
+                        self._set_line(other, pos, pos + size)
+                    else:
+                        other.setPos(pos)
+                        other.setSize(size)
         finally:
             self._syncing_rois = False
         self._schedule_analysis()
 
+    @staticmethod
+    def _label_line(item):
+        for label, point in zip(item._endpoint_labels, item.listPoints()):
+            label.setPos(point)
+
+    @classmethod
+    def _set_line(cls, item, start, end):
+        # Free handles store their positions separately from the ROI size.
+        # Callers guard signals while both endpoints are being replaced.
+        for handle, point in zip(item.getHandles(), (start, end)):
+            item.movePoint(handle, point, finish=False, coords="parent")
+        cls._label_line(item)
+
     def _schedule_analysis(self, *_):
         self._analysis_token += 1
         self._statistics = {}
+        self._profiles = {}
+        self._profile_error = ""
         self.stats_table.setRowCount(0)
+        self._render_profile()
         self._worker.cancel(self._analysis_owner)
         self._analysis_timer.stop()
         if self._closed or self._snapshot is None:
@@ -968,13 +1057,15 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         compare = bool(self.comparison.currentData() and not self._comparison_error())
         reference = self._reference_name() if compare else None
         candidate = self._candidate_name() if compare else None
-        targets = {roi.identifier: self._targets(roi) for roi in self._regions.values()}
+        regions = tuple(roi for roi in self._regions.values()
+                        if roi.kind != "line" or roi.identifier == self._profile_identifier)
+        targets = {roi.identifier: self._targets(roi) for roi in regions}
         if compare:
-            for roi in self._regions.values():
+            for roi in regions:
                 if self._corresponds(roi.plane, candidate):
                     targets[roi.identifier] = tuple(dict.fromkeys((*targets[roi.identifier], DIFFERENCE)))
         self._worker.submit(AnalysisJob(self._analysis_owner, self._analysis_token, self._analysis_source,
-                                       tuple(self._regions.values()), targets, reference, candidate,
+                                       regions, targets, reference, candidate,
                                        self.comparison.currentData() == "absolute",
                                        self._difference if self._difference_key == self._comparison_key() else None))
 
@@ -983,6 +1074,8 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         if owner is not self._analysis_owner or self._closed or token != self._analysis_token:
             return
         if error:
+            self._profile_error = error
+            self._render_profile()
             self.analysis_status.setText(error)
             return
         if result is None:
@@ -994,15 +1087,73 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             # release; no extra snapshot/difference retention is needed.
             self._analysis_timer.start()
             return
-        self._statistics = statistics
+        self._statistics = {key: value for key, value in statistics.items()
+                            if not isinstance(value, Profile)}
+        self._profiles = {key: value for key, value in statistics.items()
+                          if isinstance(value, Profile)}
         if derived is not None and self._difference is not derived:
             self._difference = derived
             self._difference_key = self._comparison_key()
             self._render(preserve=True)
         self._render_statistics()
+        self._render_profile()
         comparison_error_text = self._comparison_error() if self.comparison.currentData() else None
         self.analysis_status.setText(comparison_error_text or
-                                    "Local original-sample measurements; SD is population SD (ddof=0).")
+                                    ("Line profile uses original samples; drag A/B endpoints or the line to compare edges."
+                                     if self._profile_identifier is not None else
+                                     "Local original-sample measurements; SD is population SD (ddof=0)."))
+
+    def _clear_profile_plot(self):
+        self.profile_plot.clear()
+        self._profile_curves.clear()
+
+    def _render_profile(self):
+        self._clear_profile_plot()
+        region = self._regions.get(self._profile_identifier)
+        enabled = region is not None and region.kind == "line"
+        self.profile_plot.setVisible(enabled)
+        self.profile_status.setVisible(enabled)
+        self.stats_table.setVisible(not enabled)
+        self.copy_button.setEnabled(not enabled)
+        if not enabled:
+            self.profile_status.setText("")
+            self.profile_plot.setTitle("")
+            return
+        title = (f"{region.name}: A ({region.x:.4g}, {region.y:.4g}) → "
+                 f"B ({region.x + region.width:.4g}, {region.y + region.height:.4g})")
+        self.profile_plot.setTitle(html.escape(region.name))
+        entries = [(name, self._profiles[region.identifier, name]) for name in self._planes
+                   if (region.identifier, name) in self._profiles]
+        for index, (name, profile) in enumerate(entries):
+            units = self._meta(name).get("units") or "unspecified units"
+            label = self._display_name(name) + " [" + units + "]"
+            color = pg.intColor(index, hues=max(3, len(entries)))
+            curve = self.profile_plot.plot(profile.distance, profile.values,
+                                           name=html.escape(label), pen=pg.mkPen(color, width=2),
+                                           connect="finite", symbol="o" if profile.values.size == 1 else None,
+                                           symbolBrush=color, symbolSize=6)
+            self._profile_curves[name] = curve
+        if self._profile_error:
+            message = self._profile_error
+        elif not entries:
+            message = ("Computing profile…" if self._targets(region) else
+                       "No corresponding visible image for this line.")
+        elif not any(profile.values.size for _name, profile in entries):
+            message = "Line is outside the image."
+        elif not any(np.isfinite(profile.values).any() for _name, profile in entries):
+            message = "No finite values along this line."
+        else:
+            capped = any(profile.capped for _name, profile in entries)
+            message = ("4096 samples (limit); evenly spaced, bilinear interpolation." if capped else
+                       "Bilinear interpolation; distance in pixels; non-finite samples leave gaps.")
+        self.profile_status.setText(title + " · " + message)
+        self.profile_plot.setToolTip(
+            "Values from original samples along A → B, clipped to the image. "
+            "Pixel centers are (column + 0.5, row + 0.5). Edge values extend to the image boundary. "
+            "Sample spacing is at most one pixel, except lines limited to 4096 samples. "
+            "Each curve lists its intensity units; no normalization or unit conversion is applied.")
+        if entries:
+            self.profile_plot.enableAutoRange()
 
     def _render_statistics(self):
         rows = [(key, value) for key, value in self._statistics.items() if key[1] in self._planes]
@@ -1173,6 +1324,11 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self._views.clear()
         self.graphics.clear()
         self._planes.clear()
+        self._profiles.clear()
+        self._statistics.clear()
+        self._regions.clear()
+        self._profile_identifier = None
+        self._clear_profile_plot()
         self._snapshot = self._difference = self._pinned = self._analysis_source = self._pending_snapshot = None
         self.closed.emit()
         super().closeEvent(event)

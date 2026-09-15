@@ -810,7 +810,7 @@ forever.  Set to 0 to disable the idle self-exit."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
-(defcustom emacs-jupyter-notebook-kernel-idle-timeout 14400
+(defcustom emacs-jupyter-notebook-kernel-idle-timeout 43200
   "Seconds a remote kernel may sit idle before it self-reaps (W11).
 On connect (and re-run on restart) Emacs injects an in-memory idle
 watchdog into the kernel: a daemon thread that shuts the kernel down once
@@ -821,7 +821,7 @@ accumulating.
 
 The watchdog NEVER reaps a busy kernel: a cell that runs for hours keeps
 the kernel marked executing for its whole duration and is not counted as
-idle.  The default is 14400 (4 hours).  Set to 0 to disable the watchdog
+idle.  The default is 43200 (12 hours).  Set to 0 to disable the watchdog
 entirely (nothing is injected)."
   :type 'integer
   :group 'emacs-jupyter-notebook)

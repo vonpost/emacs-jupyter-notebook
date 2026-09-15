@@ -160,6 +160,12 @@ These are binding for every workstream. Update only by appending a new entry.
   window in the configured direction, honoring `display-buffer-alist`.
   Output remains read-only and separate from source text.
 
+- **2026-09-15 / Default kernel idle lifetime is 12 hours.** User-requested
+  update to W11's former four-hour default. Set
+  `emacs-jupyter-notebook-kernel-idle-timeout` to 43200 seconds by default;
+  explicit configuration still wins, zero disables expiry, and busy kernels
+  never expire. Reconnecting reinjects the timeout into an existing watchdog.
+
 ## Cross-cutting changes
 
 Use this section to claim ownership of changes that span workstream file
@@ -169,8 +175,8 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
   or confirmed-dead kernels and increase default idle lifetime to 12 hours.
   User-requested follow-up. — touches: core evaluation/connect lifecycle,
   helper backend if needed, customization and focused ERT tests, README.
-  evaluation_recovery owns lifecycle implementation/tests; idle_timeout owns
-  the default and its focused test. Root integrates and reviews. Reconnect a
+  evaluation_recovery owns lifecycle implementation/tests; line_profile_math owns
+  the default and verifies watchdog setup. Root integrates and reviews. Reconnect a
   live kernel without replay; never replace a kernel on ambiguous SSH loss.
   Preserve async progress and explicit handling of confirmed-dead sessions.
 

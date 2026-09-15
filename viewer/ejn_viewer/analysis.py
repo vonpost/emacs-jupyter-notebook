@@ -14,6 +14,9 @@ import numpy as np
 
 MAX_ROIS = 16
 MAX_DIFFERENCE_BYTES = 32 * 1024 * 1024
+MAX_PROFILE_SAMPLES = 4096
+# One float64 distance and value per sample; interpolation uses SCRATCH_BYTES.
+MAX_PROFILE_BYTES = MAX_PROFILE_SAMPLES * 16
 # At most 65,536 values per block, including ellipse masks and float64 scratch.
 BLOCK_PIXELS = 65_536
 SCRATCH_BYTES = 8 * 1024 * 1024
@@ -22,6 +25,8 @@ DIFFERENCE = "\0difference"
 
 @dataclass(frozen=True)
 class Region:
+    """Pixel-coordinate ROI; line width/height are signed endpoint deltas."""
+
     identifier: int
     name: str
     plane: str
@@ -38,6 +43,23 @@ class Statistics:
     sd: float | None
     finite: int
     excluded: int
+
+
+@dataclass(frozen=True)
+class Profile:
+    """Read-only original-sample line values and distances in pixel units.
+
+    ``capped`` reports when the sample limit coarsened the usual spacing of
+    at most one pixel. Both clipped endpoints are retained even in that case.
+    """
+
+    distance: np.ndarray
+    values: np.ndarray
+    capped: bool = False
+
+    @property
+    def nbytes(self):
+        return self.distance.nbytes + self.values.nbytes
 
 
 def scalar_plane(array: np.ndarray) -> bool:
@@ -103,6 +125,95 @@ def difference(reference: np.ndarray, candidate: np.ndarray, *, absolute=False) 
                 np.abs(part, out=part)
     result.setflags(write=False)
     return result
+
+
+def _interpolate(first, second, weight):
+    """Convex float64 interpolation, excluding only contributing nonfinites."""
+    result = np.full(first.shape, np.nan, dtype=np.float64)
+    at_first, at_second = weight == 0, weight == 1
+    valid_first, valid_second = np.isfinite(first), np.isfinite(second)
+    exact_first, exact_second = at_first & valid_first, at_second & valid_second
+    result[exact_first] = first[exact_first]
+    result[exact_second] = second[exact_second]
+    between = ~at_first & ~at_second & valid_first & valid_second
+    # Same-sign subtraction cannot overflow and keeps constant extreme data
+    # exact. Opposite-sign weighted addition avoids an overflowing difference.
+    same_sign = between & (np.signbit(first) == np.signbit(second))
+    opposite_sign = between & ~same_sign
+    with np.errstate(under="ignore"):
+        result[same_sign] = (first[same_sign] + weight[same_sign]
+                             * (second[same_sign] - first[same_sign]))
+        result[opposite_sign] = (first[opposite_sign] * (1 - weight[opposite_sign])
+                                 + second[opposite_sign] * weight[opposite_sign])
+    return result
+
+
+def line_profile(array: np.ndarray, roi: Region) -> Profile:
+    """Bilinear profile of a directed line over immutable original samples.
+
+    Coordinates are in image space: pixel (row, col) is centered at
+    (col + .5, row + .5). Clip the segment to the closed image footprint
+    [0, cols] x [0, rows], extending edge samples through the outer half pixel.
+    Distances start at the original, possibly off-image first endpoint.
+
+    The clipped segment gets ceil(length) + 1 equally spaced samples, including
+    both endpoints; a point gets one sample and a missed/empty image gets none.
+    At most MAX_PROFILE_SAMPLES are produced. Above that bound ``capped`` is
+    true and spacing increases. Nonfinite contributing neighbors produce NaN;
+    a nonfinite neighbor with zero weight does not affect an exact sample.
+    """
+    if not scalar_plane(array):
+        raise ValueError("unsupported scalar dtype")
+    if roi.kind != "line":
+        raise ValueError("line profile requires a line ROI")
+    x, y, dx, dy = (float(value) for value in
+                    (roi.x, roi.y, roi.width, roi.height))
+    length = math.hypot(dx, dy)
+    if not all(math.isfinite(value) for value in
+               (x, y, dx, dy, x + dx, y + dy, length)):
+        raise ValueError("line coordinates and length must be finite")
+
+    def profile(distance, values, capped=False):
+        distance.setflags(write=False)
+        values.setflags(write=False)
+        return Profile(distance, values, capped)
+
+    def empty():
+        return profile(np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64))
+
+    rows, cols = array.shape
+    if not rows or not cols:
+        return empty()
+    start, stop = 0.0, 1.0
+    for origin, delta, limit in ((x, dx, cols), (y, dy, rows)):
+        if delta == 0:
+            if not 0 <= origin <= limit:
+                return empty()
+            continue
+        first, second = -origin / delta, (limit - origin) / delta
+        start = max(start, min(first, second))
+        stop = min(stop, max(first, second))
+        if stop < start:
+            return empty()
+    # Compute clipped coordinates first so a roundoff in the clip parameter
+    # does not add an extra sample to an integer-length horizontal/vertical ROI.
+    first_x, last_x = (min(cols, max(0.0, x + dx * t)) for t in (start, stop))
+    first_y, last_y = (min(rows, max(0.0, y + dy * t)) for t in (start, stop))
+    clipped_length = math.hypot(last_x - first_x, last_y - first_y)
+    requested = math.ceil(clipped_length) + 1
+    count = min(MAX_PROFILE_SAMPLES, requested)
+    distance = np.linspace(start * length, stop * length, count, dtype=np.float64)
+    columns = np.clip(np.linspace(first_x, last_x, count) - .5, 0, cols - 1)
+    rows_at = np.clip(np.linspace(first_y, last_y, count) - .5, 0, rows - 1)
+    left, top = columns.astype(np.intp), rows_at.astype(np.intp)
+    right, bottom = np.minimum(left + 1, cols - 1), np.minimum(top + 1, rows - 1)
+    horizontal_weight, vertical_weight = columns - left, rows_at - top
+    upper = _interpolate(np.asarray(array[top, left], dtype=np.float64),
+                         np.asarray(array[top, right], dtype=np.float64), horizontal_weight)
+    lower = _interpolate(np.asarray(array[bottom, left], dtype=np.float64),
+                         np.asarray(array[bottom, right], dtype=np.float64), horizontal_weight)
+    values = _interpolate(upper, lower, vertical_weight)
+    return profile(distance, values, requested > MAX_PROFILE_SAMPLES)
 
 
 def _blocks(array: np.ndarray, roi: Region):

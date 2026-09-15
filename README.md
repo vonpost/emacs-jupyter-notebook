@@ -338,8 +338,11 @@ first use. It adds no Qt dependency to ordinary kernel work. See
 verification.
 
 The viewer includes signed/absolute differences, hold-to-blink comparison,
-linked sample readout and magnification, and rectangular/elliptical ROI
-mean/population SD. ROIs can be drawn, named, moved and copied as measurements.
+linked sample readout and magnification, rectangular/elliptical ROI
+mean/population SD, and line intensity profiles. Choose **Draw ROI → Draw line**
+and drag across an edge to overlay profiles from matching images. Move the
+line or its A/B endpoints to update the plot. ROIs can be named and retained
+across compatible reruns; area statistics can be copied as measurements.
 See [viewer controls](docs/viewer-installation.md) for shortcuts and numerical
 limits. Native-device-pixel mode and full macOS acceptance remain tracked in
 [the viewer roadmap](VIEWER_PLAN.md).
@@ -502,7 +505,21 @@ Tuning:
 
 Sessions are recorded in a local registry under `user-emacs-directory`. Reopening Emacs and visiting a previously-used file lets you reconnect to the still-running remote kernel via `C-c j R`. The chooser always appears, with the entry for the current file pre-selected as the default — press RET to accept it or pick another.
 
-The remote kernel outlives Emacs. Only the explicit commands `shutdown-kernel`, `clean-orphaned-kernels`, and `retry-fresh-kernel` terminate it; closing the buffer, disabling the mode, and Emacs exit all leave the remote kernel running so a future session can reconnect.
+Evaluating a cell also reconnects its recorded session when needed and keeps
+the cell queued until the connection is ready. Starting a kernel checks the
+existing session instead of requiring a separate reconnect command. If the
+registered kernel is confirmed gone, EJN offers a fresh start on the same
+profile; accepting continues the original queued evaluation. An unreachable
+host is reported as a connection failure and does not trigger replacement.
+
+The remote kernel outlives Emacs. Closing the buffer, disabling the mode, and
+Emacs exit leave it running so a future session can reconnect. Explicit
+shutdown/restart commands and the idle watchdog control its lifetime.
+
+The idle watchdog defaults to **12 hours** without activity
+(`emacs-jupyter-notebook-kernel-idle-timeout`, 43200 seconds). It never expires
+a busy kernel; set the option to `0` to disable idle expiry. An explicitly
+configured timeout takes precedence over the default.
 
 ### Automatic recovery after a drop
 
@@ -518,8 +535,11 @@ If the host simply cannot be reached, that is treated as *transient*: the loop k
 
 ### Explicit reconnect is the escape hatch
 
-`C-c j R` (or `reconnect-remote-kernel`) is an authoritative local reset: it tears down the stale local client and tunnel and rebuilds them against the chosen registry entry, without touching the remote kernel. If a previous connection attempt is wedged in the background, an explicit reconnect supersedes it silently (no second prompt) — you never need to cancel-by-hand first. A wedged *start* attempt still asks before being superseded, because cancelling it may terminate the kernel it launched.
+`C-c j R` (or `reconnect-remote-kernel`) is an authoritative local reset: it tears down the stale local client and tunnel and rebuilds them against the chosen registry entry, without touching the remote kernel. If a previous connection attempt is wedged in the background, an explicit reconnect supersedes it silently (no second prompt) — you never need to cancel-by-hand first. A wedged *start* attempt still asks before being superseded, because its remote launch may already have started a kernel that must remain recorded for recovery.
 
 Before reconnecting, Emacs probes the remote PID **with identity**: it confirms the live process is really this session's kernel (its command line carries the session's connection file), not a reused PID. Every reconnect phase is bounded — each one-shot SSH/SCP process by `emacs-jupyter-notebook-ssh-process-timeout` and the whole attempt by `emacs-jupyter-notebook-connection-attempt-timeout` — so a reconnect can stall neither on a dead ControlMaster nor on an interactive SSH prompt (`BatchMode=yes` is on by default for this reason).
 
-If an interactive reconnect confirms the registered kernel is gone, Emacs offers to start a fresh kernel on the same profile right there (one `y-or-n-p`), instead of leaving you to run shutdown + start by hand.
+If an interactive reconnect, start, or evaluation confirms the registered
+kernel is gone, Emacs offers to start a fresh kernel on the same profile right
+there (one `y-or-n-p`). Existing code that was already sent to a kernel is never
+replayed automatically.

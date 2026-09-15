@@ -144,6 +144,8 @@ any pre-existing `_repr_mimebundle_', and a graceful no-op when
 (defvar-local emacs-jupyter-notebook--tunnel-suspended nil
   "Exact live helper retained while its SSH forwards are being recovered.")
 (defvar emacs-jupyter-notebook--kernel-status)
+(defvar emacs-jupyter-notebook--kernel-verified-at)
+(defvar emacs-jupyter-notebook-mode)
 
 (defun emacs-jupyter-notebook--ensure-selected-backend ()
   "Validate the local helper before admitting a remote launch."
@@ -257,6 +259,7 @@ published image is not locally admitted as a panel artifact."
                    (and (equal backend-id
                                (plist-get record :backend-request-id))
                         (equal generation (plist-get record :generation)))))
+        (setq emacs-jupyter-notebook--kernel-verified-at (float-time))
         (let* ((record (emacs-jupyter-notebook--execution-record ledger-id))
                (actions
                 (emacs-jupyter-notebook-events-dispatch
@@ -372,7 +375,7 @@ if _ejn_wd_ip is not None:
                 _ejn_wd_ip.events.register('post_run_cell', _ejn_wd_post)
             except Exception:
                 pass
-            # Wake ~10x per idle window, clamped to [1s, 60s].  For the 4h
+            # Wake ~10x per idle window, clamped to [1s, 60s].  For the 12h
             # default this polls once a minute; a tiny timeout (tests / smoke)
             # polls about once a second.
             _ejn_wd_interval = min(60.0, max(1.0, _EJN_WD_TIMEOUT / 10.0))
@@ -646,6 +649,12 @@ bounded cleanup callback has exclusive ownership until it commits or fails.")
 (defvar-local emacs-jupyter-notebook--transition-token nil
   "Durable lifecycle token currently owned by this buffer, or nil.")
 
+(defvar-local emacs-jupyter-notebook--kernel-verified-at nil
+  "Time of the latest kernel activity or successful liveness verification.")
+
+(defvar-local emacs-jupyter-notebook--local-cleanup-generation 0
+  "Generation fencing unsent work against nested local teardown.")
+
 (defvar-local emacs-jupyter-notebook--completion-cache nil
   "Buffer-local LRU cache: hash-table mapping context-key -> reply plist.
 Created lazily by `emacs-jupyter-notebook--completion-cache-ensure'.")
@@ -882,6 +891,7 @@ probing resumes after the execution retires and the kernel reports non-busy."
 (defun emacs-jupyter-notebook--heartbeat-on-reply ()
   "Handle a successful heartbeat reply: clear inflight and reset misses."
   (setq emacs-jupyter-notebook--heartbeat-inflight nil
+        emacs-jupyter-notebook--kernel-verified-at (float-time)
         emacs-jupyter-notebook--heartbeat-misses 0))
 
 (defun emacs-jupyter-notebook--heartbeat-on-miss ()
@@ -1916,6 +1926,7 @@ leaves an explicit recovery surface rather than guessing whether it started.
 Each disposer is independently best-effort: a raise from one does not prevent
 the remaining disposers from running, and the final state-clearing setq always
 executes."
+  (cl-incf emacs-jupyter-notebook--local-cleanup-generation)
   (ignore-errors
     (emacs-jupyter-notebook--cancel-async-context-locally
      emacs-jupyter-notebook--async-context))
@@ -1959,6 +1970,48 @@ executes."
         emacs-jupyter-notebook--is-complete-request-id 0
         emacs-jupyter-notebook--transition-token nil
         emacs-jupyter-notebook--management-operation nil))
+
+(defun emacs-jupyter-notebook--preserve-unsent-executions (function &rest args)
+  "Call local disposer FUNCTION with ARGS while retaining unsent FIFO records.
+Only queued/checking records with no admission evidence may survive.  Hide
+them before disposal so reentrant callbacks from the old helper cannot cancel
+them; never carry dispatched or cancelling executions onto another client.
+Return non-nil only if the source lifecycle survived the local teardown."
+  (let ((ledger (emacs-jupyter-notebook--execution-ledger-ensure))
+        (active emacs-jupyter-notebook--execution-active-id)
+        (generation emacs-jupyter-notebook--local-cleanup-generation)
+        (mode-enabled emacs-jupyter-notebook-mode)
+        (buffer (current-buffer))
+        retained survived)
+    (dolist (id emacs-jupyter-notebook--execution-queue)
+      (when-let ((record (gethash id ledger)))
+        (when (and (memq (plist-get record :state) '(queued checking))
+                   (not (plist-get record :terminal))
+                   (not (plist-get record :backend-request-id))
+                   (not (emacs-jupyter-notebook--execution-admitted-p
+                         record emacs-jupyter-notebook--client)))
+          (push record retained)
+          (remhash id ledger))))
+    (setq retained (nreverse retained))
+    (setq emacs-jupyter-notebook--execution-queue
+          (cl-set-difference emacs-jupyter-notebook--execution-queue
+                             (mapcar (lambda (record) (plist-get record :id)) retained)))
+    (emacs-jupyter-notebook--execution-mark-transport-lost
+     emacs-jupyter-notebook--client)
+    (unwind-protect (apply function args)
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (when (and (= emacs-jupyter-notebook--local-cleanup-generation (1+ generation))
+                     (eq mode-enabled emacs-jupyter-notebook-mode))
+            (dolist (record retained)
+              (emacs-jupyter-notebook--execution-put record))
+            (setq emacs-jupyter-notebook--execution-queue
+                  (append (mapcar (lambda (record) (plist-get record :id)) retained)
+                          emacs-jupyter-notebook--execution-queue))
+            (when (cl-find active retained :key (lambda (record) (plist-get record :id)))
+              (setq emacs-jupyter-notebook--execution-active-id active))
+            (setq survived t)))))
+    survived))
 
 (defun emacs-jupyter-notebook--mode-disable-cleanup ()
   "Cleanup invoked from the mode-disable branch.
@@ -2291,7 +2344,8 @@ ALLOW-TRANSITION is non-nil only for the retry-fresh recovery command itself."
     registry-restart-provisional
     registry-restart-launch-admission
     registry-shutdown-terminal
-    registry-shutdown-retirement)
+    registry-shutdown-retirement
+    registry-dead-retirement)
   "Async phases whose registry mutation must settle before cancellation.")
 
 (defun emacs-jupyter-notebook--lifecycle-registry-phase-p (phase)
@@ -3329,12 +3383,13 @@ durable registry."
       (user-error "Kept the in-progress Jupyter connection attempt"))))
 
 (defun emacs-jupyter-notebook--live-client-p ()
-  "Return non-nil when the current buffer owns a live backend session.
-W10: a live `--client' is the ONLY state that must block a fresh start or
-reconnect — leaving it in place would leak a running local transport.
-A dangling `--session-entry' or SSH `--tunnel-process' with NO client is
-recoverable DEBRIS (see `--clientless-debris-p'), never a live session."
-  (and emacs-jupyter-notebook--client t))
+  "Return non-nil when the current local session has no known transport loss.
+This is local evidence only, never proof that the remote kernel is alive."
+  (and (emacs-jupyter-notebook-backend-session-live-p emacs-jupyter-notebook--client)
+       (not emacs-jupyter-notebook--tunnel-dead)
+       (not emacs-jupyter-notebook--tunnel-suspended)
+       (or (not (processp emacs-jupyter-notebook--tunnel-process))
+           (process-live-p emacs-jupyter-notebook--tunnel-process))))
 
 (defun emacs-jupyter-notebook--clientless-debris-p ()
   "Return non-nil when the buffer carries reapable connection debris.
@@ -3347,7 +3402,8 @@ refused it and the buffer was unrecoverable except by nuking the live
 kernel.  Debris = NO live client, but a `--session-entry' and/or a live
 `--tunnel-process' still lingering; it must be reaped, not defended."
   (and (not (emacs-jupyter-notebook--live-client-p))
-       (or emacs-jupyter-notebook--session-entry
+       (or emacs-jupyter-notebook--client
+           emacs-jupyter-notebook--session-entry
            (and (processp emacs-jupyter-notebook--tunnel-process)
                 (process-live-p emacs-jupyter-notebook--tunnel-process)))))
 
@@ -3380,7 +3436,9 @@ rule the remote kernel is NEVER shut down here; only LOCAL handles go."
   ;; mode-disable); here we additionally clear the buffer-local entry because
   ;; its LOCAL tunnel is gone and the registry keeps the durable copy.
   (when (emacs-jupyter-notebook--clientless-debris-p)
-    (emacs-jupyter-notebook--release-local-resources)
+    (unless (emacs-jupyter-notebook--preserve-unsent-executions
+             #'emacs-jupyter-notebook--release-local-resources)
+      (user-error "Source lifecycle changed during local cleanup"))
     (setq emacs-jupyter-notebook--session-entry nil))
   ;; W6.2: a brand-new operation clears the lingering ` EJN✗' state.
   (setq emacs-jupyter-notebook--async-last-error nil
@@ -4505,6 +4563,7 @@ clobbering any newer attempt while re-issuing SCP against a killed kernel."
                                  context :restart-local-file nil)))
                 (emacs-jupyter-notebook-backend-session-mark-installed client)
                 (setq emacs-jupyter-notebook--client client
+                      emacs-jupyter-notebook--kernel-verified-at (float-time)
                       emacs-jupyter-notebook--tunnel-dead nil
                       emacs-jupyter-notebook--last-bounded-error nil
                       emacs-jupyter-notebook--kernel-status (if busy 'busy nil))
@@ -4962,29 +5021,30 @@ CALLBACK and ERROR-CALLBACK receive the async context.  Durable registry
       ;; A stale backend session is only a local handle.  Keeping it is
       ;; what made explicit reconnect reject the exact broken state it is
       ;; intended to repair.
-      (emacs-jupyter-notebook--release-local-resources)
-      (setq emacs-jupyter-notebook--session-entry entry
-            emacs-jupyter-notebook--tunnel-dead t
-            emacs-jupyter-notebook--reconnect-attempt attempt)
-      (emacs-jupyter-notebook--ensure-selected-backend)
-      (let* ((profile (emacs-jupyter-notebook--entry-profile entry))
-             (context (emacs-jupyter-notebook--async-reconnect-context
-                       profile entry callback
-                       (lambda (failed-context error-data)
-			 (emacs-jupyter-notebook--handle-reconnect-failure
-                          failed-context error-data error-callback))
-                       (or owner 'explicit))))
-	;; Process construction can signal synchronously before a sentinel owns
-	;; the failure.  Route that through the same context callback so explicit,
-	;; evaluation, and automatic reconnects all get the identical retry rule.
-	(condition-case err
-            (emacs-jupyter-notebook--async-probe-pid-alive context)
-          (error
-           (plist-put context :error-kind 'probe-start-failed)
-           (emacs-jupyter-notebook--async-fail
-            context
-            (format "Could not start kernel liveness probe: %s"
-                    (error-message-string err))))))))))
+      (when (emacs-jupyter-notebook--preserve-unsent-executions
+             #'emacs-jupyter-notebook--release-local-resources)
+        (setq emacs-jupyter-notebook--session-entry entry
+              emacs-jupyter-notebook--tunnel-dead t
+              emacs-jupyter-notebook--reconnect-attempt attempt)
+        (emacs-jupyter-notebook--ensure-selected-backend)
+        (let* ((profile (emacs-jupyter-notebook--entry-profile entry))
+               (context (emacs-jupyter-notebook--async-reconnect-context
+                         profile entry callback
+                         (lambda (failed-context error-data)
+			   (emacs-jupyter-notebook--handle-reconnect-failure
+                            failed-context error-data error-callback))
+                         (or owner 'explicit))))
+	  ;; Process construction can signal synchronously before a sentinel owns
+	  ;; the failure.  Route that through the same context callback so explicit,
+	  ;; evaluation, and automatic reconnects all get the identical retry rule.
+	  (condition-case err
+              (emacs-jupyter-notebook--async-probe-pid-alive context)
+            (error
+             (plist-put context :error-kind 'probe-start-failed)
+             (emacs-jupyter-notebook--async-fail
+              context
+              (format "Could not start kernel liveness probe: %s"
+                      (error-message-string err)))))))))))
 
 (defun emacs-jupyter-notebook--begin-tunnel-recovery
     (entry callback error-callback owner)
@@ -5101,7 +5161,9 @@ bounded by the per-process watchdog so it cannot hang the attempt."
                                 context
                                 (concat "kernel %s alive but identity could not "
                                         "be confirmed; verifying on connect") pid))
-                             (emacs-jupyter-notebook--async-retrieve context))
+                             (if-let ((success (plist-get context :probe-success)))
+                                 (funcall success context kind)
+                               (emacs-jupyter-notebook--async-retrieve context)))
                             ('mismatch
                              (emacs-jupyter-notebook--async-fail
                               (emacs-jupyter-notebook--async-put
@@ -5160,6 +5222,145 @@ bounded by the per-process watchdog so it cannot hang the attempt."
 
 ;;; Ensure client (async)
 
+(defun emacs-jupyter-notebook--offer-dead-kernel-recovery
+    (context reason callback error-callback &optional execution-id)
+  "Offer replacement only for CONTEXT's confirmed-dead kernel.
+Keep EXECUTION-ID reserved until the deferred user decision, then carry the
+same CALLBACK across exact registry retirement and fresh start.  No remote
+termination or file cleanup is performed, including when a PID was reused."
+  (if (not (and (eq context emacs-jupyter-notebook--async-context)
+                (memq (plist-get context :error-kind) '(kernel-dead kernel-mismatch))
+                (not (emacs-jupyter-notebook--transition-entry-p
+                      (plist-get context :entry)))))
+      (if error-callback (funcall error-callback context reason)
+        (display-warning 'emacs-jupyter-notebook (format "%s" reason)))
+    (let* ((source (current-buffer))
+           (entry (plist-get context :entry))
+           (callback (or (plist-get context :callback) callback))
+           (execution-id (or execution-id emacs-jupyter-notebook--execution-active-id))
+           (current
+            (lambda ()
+              (and (eq context emacs-jupyter-notebook--async-context)
+                   (not (emacs-jupyter-notebook--async-in-progress-p))
+                   (or (null execution-id)
+                       (and (emacs-jupyter-notebook--execution-current-p execution-id)
+                            (eq (plist-get (emacs-jupyter-notebook--execution-record
+                                            execution-id) :state) 'checking)))))))
+      (emacs-jupyter-notebook-ui-defer
+       source current
+       (lambda ()
+         (condition-case err
+             (if (y-or-n-p "The registered kernel is gone; start a fresh kernel on the same profile? ")
+                 (when (funcall current)
+                   (emacs-jupyter-notebook--replace-confirmed-dead-kernel
+                    context entry callback error-callback))
+               (when (funcall current)
+                 (emacs-jupyter-notebook--cancel-unsent-acquisitions
+                  "Fresh kernel start declined")
+                 (when error-callback
+                   (funcall error-callback context "Fresh kernel start declined"))))
+           ((error quit)
+            (when (funcall current)
+              (emacs-jupyter-notebook--cancel-unsent-acquisitions
+               (error-message-string err))
+              (when error-callback
+                (funcall error-callback context (error-message-string err)))))))
+       nil 'reconnect-recovery))))
+
+(defun emacs-jupyter-notebook--cancel-unsent-acquisitions (reason)
+  "Retire queued/checking source records after acquisition fails with REASON."
+  (dolist (id (copy-sequence emacs-jupyter-notebook--execution-queue))
+    (when-let ((record (emacs-jupyter-notebook--execution-record id)))
+      (when (memq (plist-get record :state) '(queued checking))
+        (emacs-jupyter-notebook--execution-settle-transport-loss
+         record 'cancelled (concat "\n" reason))))))
+
+(defun emacs-jupyter-notebook--replace-confirmed-dead-kernel
+    (failed-context entry callback error-callback)
+  "Retire the exact confirmed-dead ENTRY, then start with CALLBACK.
+FAILED-CONTEXT must still own the buffer.  Registry compare-and-swap failure
+keeps recovery metadata and never starts another kernel."
+  (when (eq failed-context emacs-jupyter-notebook--async-context)
+    (let ((context (emacs-jupyter-notebook--async-new-context
+                    :phase 'registry-dead-retirement :origin-buffer (current-buffer)
+                    :entry entry :callback callback :error-callback error-callback
+                    :owns-kernel nil)))
+      (when (emacs-jupyter-notebook--preserve-unsent-executions
+             #'emacs-jupyter-notebook--release-local-resources)
+        (setq emacs-jupyter-notebook--async-context context)
+        (setq context (emacs-jupyter-notebook--async-arm-overall-timeout context))
+        (when (emacs-jupyter-notebook--async-fresh-start-dispatch-p
+               context "confirmed-dead registry retirement")
+          (condition-case err
+              (emacs-jupyter-notebook-registry-remove-async
+               (emacs-jupyter-notebook--registry-entry-key entry)
+               (plist-get entry :registry-revision)
+               (lambda (_removed _operation)
+                 (when (emacs-jupyter-notebook--async-context-live-p context)
+                   (setq emacs-jupyter-notebook--session-entry nil)
+                   (when (emacs-jupyter-notebook--async-fresh-start-dispatch-p
+                          context "fresh start after dead-kernel retirement")
+                     (emacs-jupyter-notebook--start-remote-kernel-admitted
+                      (plist-get entry :profile) nil nil context))))
+               (lambda (failure _operation)
+                 (emacs-jupyter-notebook--registry-context-fail
+                  context "Confirmed-dead kernel retirement" failure))
+               :owner (emacs-jupyter-notebook--registry-context-owner context)
+               :deadline (plist-get context :overall-deadline))
+            (error (emacs-jupyter-notebook--async-fail
+                    context (error-message-string err)))))))))
+
+(defun emacs-jupyter-notebook--verify-existing-client
+    (callback error-callback &optional announce-active)
+  "Probe the remote PID before using a seemingly live local client.
+CALLBACK receives the same client after a live result.  ANNOUNCE-ACTIVE is used
+by explicit start to report that a proven-live kernel already exists."
+  (let* ((client emacs-jupyter-notebook--client)
+         (entry emacs-jupyter-notebook--session-entry)
+         (context (emacs-jupyter-notebook--async-new-context
+                   :phase 'probe :origin-buffer (current-buffer) :entry entry
+                   :profile (emacs-jupyter-notebook--entry-profile entry)
+                   :callback callback :error-callback error-callback :owns-kernel nil)))
+    (setq emacs-jupyter-notebook--async-context context)
+    (setq context (emacs-jupyter-notebook--async-put
+                   context :probe-success
+                   (lambda (_context &optional probe-kind)
+                     (when (emacs-jupyter-notebook--async-fresh-start-dispatch-p
+                            context "verified kernel acquisition")
+                       (cond
+                        ((eq probe-kind 'unverified)
+                         ;; An existing PID without identity proof is not yet
+                         ;; permission to use the old channels.  Verify the
+                         ;; actual connection through the bounded helper too.
+                         (emacs-jupyter-notebook-backend-aux
+                          client 'kernel-info nil
+                          (lambda (_id reply)
+                            (when (emacs-jupyter-notebook--async-context-live-p context)
+                              (if reply
+                                  (funcall (plist-get context :probe-success) context 'alive)
+                                (emacs-jupyter-notebook--async-fail
+                                 context "Kernel identity could not be verified"))))
+                          (lambda (_id reason)
+                            (when (emacs-jupyter-notebook--async-context-live-p context)
+                              (emacs-jupyter-notebook--async-fail context reason)))))
+                        ((not (eq client emacs-jupyter-notebook--client))
+                         (emacs-jupyter-notebook--async-fail
+                          context "Local client changed during liveness verification"))
+                        (t
+                         (setq emacs-jupyter-notebook--kernel-verified-at (float-time))
+                         (setq context (emacs-jupyter-notebook--async-cancel-overall-timer context))
+                         (setq context (emacs-jupyter-notebook--async-put context :phase 'done))
+                         (when announce-active
+                           (message "emacs-jupyter-notebook: the existing kernel is alive and connected"))
+                         (when-let ((success (plist-get context :callback)))
+                           (funcall success context))))))))
+    (setq context (emacs-jupyter-notebook--async-arm-overall-timeout context))
+    (when (emacs-jupyter-notebook--async-fresh-start-dispatch-p
+           context "existing kernel liveness probe")
+      (condition-case err
+          (emacs-jupyter-notebook--async-probe-pid-alive context)
+        (error (emacs-jupyter-notebook--async-fail context (error-message-string err)))))))
+
 (defun emacs-jupyter-notebook--registry-lookup-handoff (context continuation)
   "Retire registry lookup CONTEXT, then invoke CONTINUATION with its callbacks."
   (when (emacs-jupyter-notebook--async-context-live-p context)
@@ -5178,6 +5379,17 @@ bounded by the per-process watchdog so it cannot hang the attempt."
 
 (defun emacs-jupyter-notebook--ensure-client-async
     (callback error-callback &optional start-profile announce-start)
+  "Acquire a client for CALLBACK, offering confirmed-dead recovery on failure."
+  (let ((id emacs-jupyter-notebook--execution-active-id))
+    (emacs-jupyter-notebook--ensure-client-async-1
+     callback
+     (lambda (context reason)
+       (emacs-jupyter-notebook--offer-dead-kernel-recovery
+        context reason callback error-callback id))
+     start-profile announce-start)))
+
+(defun emacs-jupyter-notebook--ensure-client-async-1
+    (callback error-callback &optional start-profile announce-start)
   "Ensure a kernel client is connected, then call CALLBACK.
 On failure, call ERROR-CALLBACK with (context error-data).  START-PROFILE is
 used only when the async registry read proves there is no durable session for
@@ -5193,7 +5405,7 @@ decision point."
              'runtime-build))
     (emacs-jupyter-notebook--with-runtime-ready
      (lambda ()
-       (emacs-jupyter-notebook--ensure-client-async
+       (emacs-jupyter-notebook--ensure-client-async-1
         callback error-callback start-profile announce-start))
      error-callback))
    ;; W13-H2: an attempt is already in flight — ATTACH to it and never
@@ -5211,15 +5423,23 @@ decision point."
    ((not (emacs-jupyter-notebook--runtime-ready-p))
     (emacs-jupyter-notebook--with-runtime-ready
      (lambda ()
-       (emacs-jupyter-notebook--ensure-client-async
+       (emacs-jupyter-notebook--ensure-client-async-1
         callback error-callback start-profile announce-start))
      error-callback))
    ;; A dead tunnel with a durable session entry reconnects it.
-   ((and emacs-jupyter-notebook--tunnel-dead
-         emacs-jupyter-notebook--session-entry)
+   ((and emacs-jupyter-notebook--session-entry
+         (not (emacs-jupyter-notebook--live-client-p)))
     (emacs-jupyter-notebook--tunnel-reconnect
      (current-buffer) callback error-callback))
-   (emacs-jupyter-notebook--client
+   ((and (emacs-jupyter-notebook--live-client-p)
+         (emacs-jupyter-notebook-backend-session-installed-p emacs-jupyter-notebook--client)
+         emacs-jupyter-notebook--session-entry
+         (not (eq emacs-jupyter-notebook--kernel-status 'busy))
+         (or (null emacs-jupyter-notebook--kernel-verified-at)
+             (> (- (float-time) emacs-jupyter-notebook--kernel-verified-at)
+                (emacs-jupyter-notebook--effective-heartbeat-interval))))
+    (emacs-jupyter-notebook--verify-existing-client callback error-callback))
+   ((emacs-jupyter-notebook--live-client-p)
     (funcall callback nil))
    (t
     ;; W13-M1: a `--tunnel-dead' flag with no session entry is stale debris
@@ -6452,88 +6672,93 @@ already proved that the current file has no registered session."
          (when error-callback
            (funcall error-callback nil (error-message-string err))))))))
 
-(defun emacs-jupyter-notebook--start-preflight-reject (context entry)
-  "Attach durable ENTRY and reject direct start from live CONTEXT.
-
-No local cleanup, resolver, SSH command, or registry mutation is permitted on
-this path.  The durable row is the recovery authority, including when this
-buffer had no prior `--session-entry'."
+(defun emacs-jupyter-notebook--start-preflight-existing (context entry)
+  "Recover durable ENTRY instead of silently launching a second kernel.
+Lifecycle transitions remain explicitly recoverable through retry-fresh."
   (when (emacs-jupyter-notebook--async-context-live-p context)
     (let ((entry (copy-sequence entry)))
       (setq emacs-jupyter-notebook--session-entry entry
             emacs-jupyter-notebook--tunnel-dead t)
       (setq context (emacs-jupyter-notebook--async-put context :entry entry))
-      (emacs-jupyter-notebook--async-fail
-       (emacs-jupyter-notebook--async-put
-        context :error-kind 'durable-session-exists)
-       (if (emacs-jupyter-notebook--transition-entry-p entry)
+      (if (emacs-jupyter-notebook--transition-entry-p entry)
+          (emacs-jupyter-notebook--async-fail
+           (emacs-jupyter-notebook--async-put
+            context :error-kind 'durable-session-exists)
            (format (concat "This file has a pending durable kernel lifecycle transition (%s); "
                            "finish it with `M-x emacs-jupyter-notebook-retry-fresh-kernel'")
-                   (emacs-jupyter-notebook--transition-description entry))
-         (concat "This file already has a durable remote kernel session; use "
-                 "`M-x emacs-jupyter-notebook-reconnect-remote-kernel'.  "
-                 "If it is confirmed unavailable, use "
-                 "`M-x emacs-jupyter-notebook-retry-fresh-kernel' instead"))))))
+                   (emacs-jupyter-notebook--transition-description entry)))
+        (emacs-jupyter-notebook--registry-lookup-handoff
+         context
+         (lambda (success failure)
+           (emacs-jupyter-notebook--begin-reconnect
+            entry success
+            (lambda (failed reason)
+              (emacs-jupyter-notebook--offer-dead-kernel-recovery
+               failed reason success failure))
+            'explicit)))))))
 
 (defun emacs-jupyter-notebook--start-remote-kernel-ready
     (profile-name &optional callback error-callback)
   "Start PROFILE-NAME after the complete local runtime has resolved.
 
 The durable registry is read before resolving a kernelspec or starting SSH.
-When the current file already has a durable row, that row is attached locally
-and the start is rejected in favor of reconnect or explicit replacement.
+An existing durable row is reconnected, with replacement offered only after
+the PID probe confirms the registered kernel is gone.
 CALLBACK and ERROR-CALLBACK are optional completion hooks."
   (unless buffer-file-name
     (user-error "Buffer has no associated file"))
   (when (file-remote-p buffer-file-name)
     (user-error "Remote source buffers are unsupported; visit a local source file"))
   (emacs-jupyter-notebook--ensure-no-async-operation)
-  ;; Preserve the existing immediate protection for a live local client.  A
-  ;; client-less buffer is intentionally left untouched until the registry
-  ;; lookup establishes whether its durable row still exists.
-  (when (emacs-jupyter-notebook--active-session-p)
-    (user-error "A kernel is already active; shut it down or retry fresh first"))
-  (let ((context
-         (emacs-jupyter-notebook--async-new-context
-          :phase 'registry-start-preflight :origin-buffer (current-buffer)
-          :callback callback :error-callback error-callback :owns-kernel nil)))
-    (setq emacs-jupyter-notebook--async-context context)
-    (setq context (emacs-jupyter-notebook--async-arm-overall-timeout context))
-    (when (emacs-jupyter-notebook--async-context-live-p context)
-      (condition-case err
-        (let ((operation
-               (emacs-jupyter-notebook-registry-read-async
-                (lambda (entries _operation &optional matching-entry)
-                  (when (emacs-jupyter-notebook--async-context-live-p context)
-                    (setq context
-                          (emacs-jupyter-notebook--async-put
-                           context :registry-operation nil))
-                    (if-let ((entry
-                              (or matching-entry
-                                  (emacs-jupyter-notebook--current-file-registry-entry
-                                   entries))))
-                        (emacs-jupyter-notebook--start-preflight-reject context entry)
-                      (emacs-jupyter-notebook--start-remote-kernel-admitted
-                       profile-name nil nil context))))
-                (lambda (failure _operation)
-                  (emacs-jupyter-notebook--registry-context-fail
-                   context "Direct start preflight" failure))
-                :owner (emacs-jupyter-notebook--registry-context-owner context)
-                :deadline (plist-get context :overall-deadline)
-                :local-file (expand-file-name buffer-file-name))))
-          ;; Registry tests may deliberately deliver a completion synchronously.
-          ;; Do not let the returning operation resurrect a context that has
-          ;; already advanced, failed, or been superseded by that callback.
-          (when (emacs-jupyter-notebook--async-context-live-p context)
-            (setq context
-                  (emacs-jupyter-notebook--async-put
-                   context :registry-operation operation)))
-          context)
-      (error
-       (emacs-jupyter-notebook--async-fail
-        context
-        (format "Could not start direct-start registry preflight: %s"
-                (error-message-string err))))))))
+  (if (and (emacs-jupyter-notebook--active-session-p)
+           emacs-jupyter-notebook--session-entry)
+      (emacs-jupyter-notebook--verify-existing-client
+       callback
+       (lambda (context reason)
+         (emacs-jupyter-notebook--offer-dead-kernel-recovery
+          context reason callback error-callback))
+       t)
+    (let ((context
+           (emacs-jupyter-notebook--async-new-context
+            :phase 'registry-start-preflight :origin-buffer (current-buffer)
+            :callback callback :error-callback error-callback :owns-kernel nil)))
+      (setq emacs-jupyter-notebook--async-context context)
+      (setq context (emacs-jupyter-notebook--async-arm-overall-timeout context))
+      (when (emacs-jupyter-notebook--async-context-live-p context)
+        (condition-case err
+            (let ((operation
+                   (emacs-jupyter-notebook-registry-read-async
+                    (lambda (entries _operation &optional matching-entry)
+                      (when (emacs-jupyter-notebook--async-context-live-p context)
+                        (setq context
+                              (emacs-jupyter-notebook--async-put
+                               context :registry-operation nil))
+                        (if-let ((entry
+                                  (or matching-entry
+                                      (emacs-jupyter-notebook--current-file-registry-entry
+                                       entries))))
+                            (emacs-jupyter-notebook--start-preflight-existing context entry)
+                          (emacs-jupyter-notebook--start-remote-kernel-admitted
+                           profile-name nil nil context))))
+                    (lambda (failure _operation)
+                      (emacs-jupyter-notebook--registry-context-fail
+                       context "Direct start preflight" failure))
+                    :owner (emacs-jupyter-notebook--registry-context-owner context)
+                    :deadline (plist-get context :overall-deadline)
+                    :local-file (expand-file-name buffer-file-name))))
+              ;; Registry tests may deliberately deliver a completion synchronously.
+              ;; Do not let the returning operation resurrect a context that has
+              ;; already advanced, failed, or been superseded by that callback.
+              (when (emacs-jupyter-notebook--async-context-live-p context)
+                (setq context
+                      (emacs-jupyter-notebook--async-put
+                       context :registry-operation operation)))
+              context)
+          (error
+           (emacs-jupyter-notebook--async-fail
+            context
+            (format "Could not start direct-start registry preflight: %s"
+                    (error-message-string err)))))))))
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-start-remote-kernel
@@ -6547,8 +6772,6 @@ start one shared, cancellable Nix build before the remote connection deadline."
   (when (file-remote-p buffer-file-name)
     (user-error "Remote source buffers are unsupported; visit a local source file"))
   (emacs-jupyter-notebook--ensure-no-async-operation)
-  (when (emacs-jupyter-notebook--active-session-p)
-    (user-error "A kernel is already active; shut it down or retry fresh first"))
   (emacs-jupyter-notebook--with-runtime-ready
    (lambda ()
      (emacs-jupyter-notebook--start-remote-kernel-ready
@@ -6561,34 +6784,17 @@ start one shared, cancellable Nix build before the remote connection deadline."
 CALLBACK and ERROR-CALLBACK are completion hooks.  INTERACTIVEP controls the
 fresh-kernel recovery prompt for a confirmed dead or mismatched kernel.
 OWNER identifies an `explicit', `evaluation', or `automatic' initiator."
-  (let ((profile-name (plist-get entry :profile)))
-    ;; Explicit reconnect supersedes a stale reconnect attempt without a
-    ;; second prompt.  It never supersedes a start attempt silently.
-    (emacs-jupyter-notebook--ensure-no-async-operation t)
-    (emacs-jupyter-notebook--begin-reconnect
-     entry callback
-     (lambda (context error-data)
-       (when error-callback
-         (funcall error-callback context error-data))
-       (when (and interactivep
-                  (memq (plist-get context :error-kind)
-                        '(kernel-dead kernel-mismatch)))
-         (let ((source (current-buffer)))
-           (emacs-jupyter-notebook-ui-defer
-            source
-            (lambda ()
-              (and (eq context emacs-jupyter-notebook--async-context)
-                   (not (emacs-jupyter-notebook--async-in-progress-p))))
-            (lambda ()
-              (when (and
-                     (y-or-n-p
-                      (concat "The registered kernel is gone; "
-                              "start a fresh kernel on the same profile? "))
-                     (eq context emacs-jupyter-notebook--async-context)
-                     (not (emacs-jupyter-notebook--async-in-progress-p)))
-                (emacs-jupyter-notebook-retry-fresh-kernel profile-name)))
-            nil 'reconnect-recovery))))
-     (or owner 'explicit))))
+  ;; Explicit reconnect supersedes a stale reconnect attempt without a
+  ;; second prompt.  It never supersedes a start attempt silently.
+  (emacs-jupyter-notebook--ensure-no-async-operation t)
+  (emacs-jupyter-notebook--begin-reconnect
+   entry callback
+   (lambda (context error-data)
+     (if interactivep
+         (emacs-jupyter-notebook--offer-dead-kernel-recovery
+          context error-data callback error-callback)
+       (when error-callback (funcall error-callback context error-data))))
+   (or owner 'explicit)))
 
 (defun emacs-jupyter-notebook--reconnect-remote-kernel-ready
     (entry callback error-callback owner interactivep)
@@ -8701,6 +8907,7 @@ W5.3/IR4/IR5: four branches.
 
 If neither is in progress, signal a `user-error'."
   (interactive)
+  (cl-incf emacs-jupyter-notebook--local-cleanup-generation)
   (cond
    ((emacs-jupyter-notebook--management-active-p)
     (emacs-jupyter-notebook--cancel-management-operation))

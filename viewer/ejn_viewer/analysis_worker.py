@@ -8,7 +8,8 @@ import threading
 
 from PySide6 import QtCore
 
-from .analysis import DIFFERENCE, SCRATCH_BYTES, difference, statistics
+from .analysis import (DIFFERENCE, MAX_PROFILE_BYTES, SCRATCH_BYTES,
+                       difference, line_profile, statistics)
 from .memory import MAX_MEMORY, merge_allocations, source_allocations
 
 
@@ -25,6 +26,13 @@ class AnalysisJob:
     cached_difference: object = None
     cancelled: threading.Event = field(default_factory=threading.Event)
 
+
+def profile_result_bytes(regions, targets):
+    """Maximum retained profile vectors for one job, separate from scratch."""
+    return sum(MAX_PROFILE_BYTES * len(targets[region.identifier])
+               for region in regions if region.kind == "line")
+
+
 def compute(job: AnalysisJob):
     derived = job.cached_difference
     if job.cancelled.is_set():
@@ -40,7 +48,8 @@ def compute(job: AnalysisJob):
         for name in job.targets[region.identifier]:
             if job.cancelled.is_set():
                 return None
-            results[region.identifier, name] = statistics(arrays[name], region)
+            operation = line_profile if region.kind == "line" else statistics
+            results[region.identifier, name] = operation(arrays[name], region)
     return derived, results
 
 
@@ -78,6 +87,9 @@ class AnalysisWorker(QtCore.QObject):
         if self.active is not None:
             job = self.active
             result["scratch", id(job)] = SCRATCH_BYTES
+            profile_bytes = profile_result_bytes(job.regions, job.targets)
+            if profile_bytes:
+                result["new-profiles", id(job)] = profile_bytes
             if job.reference is not None and job.cached_difference is None:
                 result["new-difference", id(job)] = job.snapshot.planes[job.reference].size * 16
         return result
