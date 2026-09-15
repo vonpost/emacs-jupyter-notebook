@@ -165,6 +165,15 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
+- [~] owner=root claimed=2026-09-15 CC25 Draw linked line ROIs and compare
+  original-sample intensity profiles. — touches: viewer analysis/worker,
+  workspace and focused numerical/GUI tests, Nix viewer checks, README and
+  viewer installation docs. Root owns GUI/integration; line_profile_math owns
+  numerical sampling and worker changes; line_profile_review reviews read-only.
+  Preserve bounded asynchronous analysis, compatible-grid linking, immutable
+  snapshots and compact default layout. Cover endpoint editing, reverse and
+  clipped lines, interpolation, non-finite samples, stale results and cleanup.
+
 - [x] sha=53f3121 CC24 Consolidate the external viewer
   layout around the images. — touches: viewer workspace layout and GUI
   tests, viewer installation docs. Keep one compact toolbar, move secondary
