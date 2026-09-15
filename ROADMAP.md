@@ -165,6 +165,15 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
+- [~] owner=root claimed=2026-09-15 CC26 Recover evaluation from disconnected
+  or confirmed-dead kernels and increase default idle lifetime to 12 hours.
+  User-requested follow-up. — touches: core evaluation/connect lifecycle,
+  helper backend if needed, customization and focused ERT tests, README.
+  evaluation_recovery owns lifecycle implementation/tests; idle_timeout owns
+  the default and its focused test. Root integrates and reviews. Reconnect a
+  live kernel without replay; never replace a kernel on ambiguous SSH loss.
+  Preserve async progress and explicit handling of confirmed-dead sessions.
+
 - [~] owner=root claimed=2026-09-15 CC25 Draw linked line ROIs and compare
   original-sample intensity profiles. — touches: viewer analysis/worker,
   workspace and focused numerical/GUI tests, Nix viewer checks, README and
