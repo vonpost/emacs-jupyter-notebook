@@ -179,6 +179,27 @@ supported for Docker profiles; use the session's shutdown or retry-fresh
 command. A Docker daemon or SSH failure is treated as unknown liveness and
 does not authorize replacing the container.
 
+The optional real integration test exercises SSH, Docker and Jupyter together:
+
+```sh
+EJN_DOCKER_TEST_HOST=user@gpu-host \
+EJN_DOCKER_TEST_IMAGE=my/image \
+EJN_DOCKER_TEST_RUNTIME=/path/to/local/runtime \
+  tests/run-docker-e2e.sh
+```
+
+The runtime directory must contain `bin/ejn-helper` and
+`bin/ejn-registry-worker`; the image must already be pulled on the SSH host.
+The test launches a unique kernel/container, waits for startup setup,
+evaluates a cell, observes idle heartbeat replies, reconnects to the same
+container, and evaluates again with preserved Python state. It checks that
+source text stays unchanged and cleans up only its own recorded container.
+Diagnostics and a recovery registry remain in the printed temporary directory
+if cleanup cannot be confirmed. Run `tests/run-docker-e2e.sh --help` for working
+directory, Python command, mount/GPU arguments, and SSH configuration options.
+This test is separate from `tests/run-local-tests.sh`, whose Docker coverage
+uses a simulated CLI and cannot establish real container connectivity.
+
 ### Local helper transport
 
 The supervised local Python helper is the only Jupyter transport.  Its
