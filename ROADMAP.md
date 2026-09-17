@@ -180,6 +180,16 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
+- [~] owner=root claimed=2026-09-17 CC29 Reuse local Nix bundles across Emacs restarts.
+  User-reported repeated bootstrap. Persist independently keyed helper/registry
+  and viewer output links beneath user-emacs-directory, retain Nix GC roots,
+  and invalidate only for relevant package source/lock/platform changes.
+  — touches: runtime bootstrap/cache, customization documentation, README,
+  focused runtime/cache ERT tests. Root owns production/docs; runtime_cache_review
+  owns cache regression tests after the read-only audit. Preserve bounded async
+  builds, custom command precedence, failure/cancellation ownership, and local
+  runtime isolation from remote kernel lifetime.
+
 - [x] sha=b32b839 CC28 Add an explicit Docker kernel launcher.
   User-authorized implementation. Omitted `:launcher` means `direct` (the
   existing SSH-host process launcher); `:launcher docker` runs one detached
