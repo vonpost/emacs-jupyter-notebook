@@ -171,6 +171,15 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
+- [~] owner=root claimed=2026-09-17 CC27 Fix panel tracking and preserve the
+  selected profile after failed starts; diagnose Docker resolver commands.
+  User-requested fixes. — touches: core start/evaluation lifecycle, result
+  display, SSH resolver validation if needed, focused ERT tests and README.
+  panel_tracking owns result display and panel window tests; docker_resolver
+  investigates resolver/launch constraints read-only; root owns profile
+  selection, integration and documentation. Preserve hidden-window behavior,
+  asynchronous operations, durable kernels and source text.
+
 - [x] sha=6cd9d42 CC26 Recover evaluation from disconnected
   or confirmed-dead kernels and increase default idle lifetime to 12 hours.
   User-requested follow-up. — touches: core evaluation/connect lifecycle,
