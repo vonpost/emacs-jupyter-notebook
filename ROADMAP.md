@@ -215,7 +215,7 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
   > (4 optional skips), 25 registry and 12 fixture tests passed. These fixes do
   > not establish the cause of the user's actual Docker transport failure.
 
-- [~] owner=root claimed=2026-09-17 CC31 Add a real Docker/Jupyter integration gate.
+- [x] sha=188bc86 CC31 Add a real Docker/Jupyter integration gate.
   User requested actual container coverage beyond the fake Docker CLI.
   — touches: opt-in Docker remote ERT suite/runner, README invocation, and
   focused heartbeat failure diagnostics if real execution identifies a defect.
@@ -224,6 +224,20 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
   and pre-pulled image, exercise start/setup/eval/idle heartbeats/reconnect,
   and clean up only the test's exact registered container identity. Normal
   unit tests must remain independent of Docker, SSH and remote hosts.
+  > Added tests/run-docker-e2e.sh and its optional remote ERT suite. The runner
+  > exercises actual production launch/setup/evaluation, three idle replies,
+  > local teardown, reconnect to the same container and preserved Python state.
+  > It retains diagnostics and an unconfirmed-cleanup registry on failure.
+  > Shell syntax, missing-environment preflights, strict test compilation,
+  > source loading and local diagnostic helper checks pass. No real Docker
+  > run was completed: this workstation has stored Docker binaries but no
+  > daemon/socket, and sudo requires a password. The optional mother probe
+  > found neither a Docker command nor the standard socket. Actual Docker
+  > connectivity and the reported failure's root cause remain unverified.
+  > Final canonical source suite passed with EJN_TEST_TIMEOUT=60: 1193 ERT,
+  > 4 array, 260 helper (4 optional skips), 25 registry and 12 fixture tests.
+  > The first final run reached its default 30-second process deadline with
+  > no test failure; the successful rerun changed only that outer deadline.
 
 - [x] sha=b32b839 CC28 Add an explicit Docker kernel launcher.
   User-authorized implementation. Omitted `:launcher` means `direct` (the
