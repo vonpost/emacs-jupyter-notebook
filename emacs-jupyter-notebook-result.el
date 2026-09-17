@@ -147,6 +147,8 @@ the source moves to another cell, a new evaluation is revealed, or `f' resumes."
   "Reading positions retained across a complete or interrupted redraw.")
 (defvar-local emacs-jupyter-notebook-panel--duration-timer nil
   "Timer refreshing elapsed durations in a visible panel.")
+(defvar-local emacs-jupyter-notebook-panel--last-display-error nil
+  "Last reported display error, cleared after configured placement succeeds.")
 (defvar-local emacs-jupyter-notebook-panel--last-source-cell nil
   "Last source-cell identity observed by the local post-command hook.")
 (defvar emacs-jupyter-notebook-panel--adjusting-window nil
@@ -512,23 +514,52 @@ with the same basename) so distinct sources always map to distinct panels."
       (and (buffer-live-p emacs-jupyter-notebook--panel-buffer)
            emacs-jupyter-notebook--panel-buffer))))
 
+(defun emacs-jupyter-notebook-panel--call-with-display-fallback (panel function)
+  "Call display FUNCTION, retrying failed window rules with Emacs defaults.
+Remember the last diagnostic on PANEL to avoid repeating it on every command.
+Return nil if both attempts fail; a window failure must not abort evaluation."
+  (condition-case err
+      (prog1 (funcall function)
+        (with-current-buffer panel
+          (setq emacs-jupyter-notebook-panel--last-display-error nil)))
+    (error
+     (with-current-buffer panel
+       (unless (equal err emacs-jupyter-notebook-panel--last-display-error)
+         (setq emacs-jupyter-notebook-panel--last-display-error err)
+         ;; A warning buffer could invoke the same broken display rule
+         ;; recursively.  Keep the original error in Messages instead.
+         (message (concat "EJN window display failed: %s. "
+                          "Check display-buffer-alist, "
+                          "display-buffer-overriding-action and "
+                          "display-buffer-base-action; trying default placement.")
+                  (error-message-string err))))
+     (let ((display-buffer-alist nil)
+           (display-buffer-overriding-action nil)
+           (display-buffer-base-action nil))
+       (condition-case nil (funcall function)
+         (error nil))))))
+
 (defun emacs-jupyter-notebook-panel--display (panel)
   "Display PANEL in an ordinary window without selecting it.
 Reuse its existing window and preserve its size and placement.  Otherwise
-open in the configured direction.  Honor `display-buffer-alist' overrides."
-  (prog1
-      (display-buffer
-       panel
-       `((display-buffer-reuse-window display-buffer-in-direction)
-         (direction . ,(pcase emacs-jupyter-notebook-panel-side
-                         ('top 'above)
-                         ('bottom 'below)
-                         (side side)))
-         (dedicated . nil)
-         ;; Reapplying a width to a reused window would undo manual resizing.
-         ,@(unless (get-buffer-window panel t)
-             `((window-width . ,emacs-jupyter-notebook-panel-width)))))
-    (emacs-jupyter-notebook-panel--track-duration panel)))
+open in the configured direction.  Honor `display-buffer-alist' overrides
+when opening a window.  A failed display rule falls back to ordinary EJN
+placement without changing the user's rules or aborting evaluation.
+Return nil for a dead PANEL or when no window can display its output."
+  (when (buffer-live-p panel)
+    (prog1
+        (or (get-buffer-window panel t)
+            (let ((action
+                   `((display-buffer-reuse-window display-buffer-in-direction)
+                     (direction . ,(pcase emacs-jupyter-notebook-panel-side
+                                     ('top 'above)
+                                     ('bottom 'below)
+                                     (side side)))
+                     (dedicated . nil)
+                     (window-width . ,emacs-jupyter-notebook-panel-width))))
+              (emacs-jupyter-notebook-panel--call-with-display-fallback
+               panel (lambda () (display-buffer panel action)))))
+      (emacs-jupyter-notebook-panel--track-duration panel))))
 
 (defun emacs-jupyter-notebook-show-output-panel ()
   "Open or pop up the current source buffer's output panel."
@@ -4188,19 +4219,21 @@ Also coerces a non-numeric `:scale' (Emacs 29+ reports the symbol
     (unless (and key (buffer-live-p source))
       (user-error "Entry has no source cell"))
     (let ((id (cdr key)))
-      (pop-to-buffer source)
-      (let* ((marker (and (integerp id)
-                          emacs-jupyter-notebook--cell-key-markers
-                          (gethash id emacs-jupyter-notebook--cell-key-markers)))
-             (target (cond
-                      ((and (markerp marker)
-                            (eq (marker-buffer marker) (current-buffer)))
-                       (marker-position marker))
-                      ((integerp id) id)
-                      (t nil))))
-        (when target
-          (goto-char (max (point-min)
-                          (min (point-max) target))))))))
+      (emacs-jupyter-notebook-panel--call-with-display-fallback
+       (current-buffer) (lambda () (pop-to-buffer source)))
+      (when (eq (current-buffer) source)
+        (let* ((marker (and (integerp id)
+                            emacs-jupyter-notebook--cell-key-markers
+                            (gethash id emacs-jupyter-notebook--cell-key-markers)))
+               (target (cond
+                        ((and (markerp marker)
+                              (eq (marker-buffer marker) (current-buffer)))
+                         (marker-position marker))
+                        ((integerp id) id)
+                        (t nil))))
+          (when target
+            (goto-char (max (point-min)
+                            (min (point-max) target)))))))))
 
 ;;; Fringe indicator (W2.8)
 

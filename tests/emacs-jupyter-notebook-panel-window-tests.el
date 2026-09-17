@@ -7,7 +7,7 @@
 
 (require 'ert)
 (require 'cl-lib)
-(require 'emacs-jupyter-notebook-result)
+(require 'emacs-jupyter-notebook)
 
 (defmacro ejn-panel-window-test--with-source (&rest body)
   "Run BODY with a source, panel and selected source-window; release the panel."
@@ -138,6 +138,212 @@
       (should (eq (selected-window) source-window))
       (should (>= (nth 1 (window-edges window))
                   (nth 3 (window-edges source-window)))))))
+
+(ert-deftest ejn-panel-window-reuses-output-before-consulting-display-rules ()
+  (ejn-panel-window-test--with-source
+    (let* ((window (emacs-jupyter-notebook-panel--display panel))
+           (display-buffer-overriding-action 'display-buffer-same-window))
+      (should (eq window (emacs-jupyter-notebook-panel--display panel)))
+      (should (eq (selected-window) source-window))
+      (should (eq (window-buffer source-window) source)))))
+
+(ert-deftest ejn-panel-window-malformed-display-actions-fall-back-safely ()
+  ;; This malformed action reproduces the reported listp error exactly.
+  (dolist (setting '(display-buffer-overriding-action
+                     display-buffer-base-action display-buffer-alist))
+    (ejn-panel-window-test--with-source
+      (let* ((value (if (eq setting 'display-buffer-alist)
+                        '(("\\`\\*ejn:" . display-buffer-same-window))
+                      'display-buffer-same-window))
+             (handle (ejn-panel-start-entry panel nil "print(42)"))
+             (messages nil))
+        (ejn-panel-append-text handle "42\n")
+        (ejn-panel-finish-entry handle 'ok 1)
+        (ejn-panel-reveal-entry handle)
+        (emacs-jupyter-notebook-panel-flush-now panel)
+        (cl-progv (list setting) (list value)
+          (cl-letf (((symbol-function 'message)
+                     (lambda (format-string &rest args)
+                       (push (apply #'format format-string args) messages))))
+            (dotimes (_ 2)
+              (let ((window (emacs-jupyter-notebook-panel--display panel)))
+                (should (window-live-p window))
+                (should (eq (window-buffer window) panel))
+                (should-not (eq window source-window))
+                (should-not (window-dedicated-p window))
+                (should-not (window-parameter window 'window-side))
+                (should (eq (selected-window) source-window))
+                (delete-window window))))
+          (should (equal (symbol-value setting) value)))
+        (should (= (length messages) 1))
+        (should (string-match-p "display-buffer-same-window" (car messages)))
+        (with-current-buffer panel
+          (should (string-match-p "42" (buffer-string))))))))
+
+(ert-deftest ejn-panel-window-display-failure-keeps-output-usable ()
+  (ejn-panel-window-test--with-source
+    (let ((handle (ejn-panel-start-entry panel nil "print(42)")))
+      (cl-letf (((symbol-function 'display-buffer)
+                 (lambda (&rest _) (error "No usable window"))))
+        (should-not (emacs-jupyter-notebook-panel--display panel)))
+      (ejn-panel-append-text handle "42\n")
+      (ejn-panel-finish-entry handle 'ok 1)
+      (ejn-panel-reveal-entry handle)
+      (emacs-jupyter-notebook-panel-flush-now panel)
+      (with-current-buffer panel
+        (should (string-match-p "42" (buffer-string))))
+      (should (eq (selected-window) source-window)))))
+
+(ert-deftest ejn-panel-window-respects-explicit-no-window-rule ()
+  (ejn-panel-window-test--with-source
+    (let ((display-buffer-alist
+           '(("\\`\\*ejn:" display-buffer-no-window (allow-no-window . t)))))
+      (should-not (emacs-jupyter-notebook-panel--display panel))
+      (should-not (get-buffer-window panel t))
+      (should (eq (window-buffer source-window) source)))))
+
+(ert-deftest ejn-panel-window-follow-ignores-hidden-or-killed-panel ()
+  (ejn-panel-window-test--with-source
+    (let ((display-buffer-overriding-action 'display-buffer-same-window))
+      (cl-letf (((symbol-function 'display-buffer)
+                 (lambda (&rest _) (ert-fail "Following tried to display a buffer"))))
+        (emacs-jupyter-notebook-panel--source-post-command)
+        (emacs-jupyter-notebook-panel--source-post-command t)
+        (emacs-jupyter-notebook-panel-resume-follow)
+        (should-not (get-buffer-window panel t))
+        (kill-buffer panel)
+        (emacs-jupyter-notebook-panel--source-post-command)
+        (emacs-jupyter-notebook-panel-resume-follow)
+        (should-not (emacs-jupyter-notebook-panel--display panel))
+        (should-not (emacs-jupyter-notebook-panel-buffer source)))
+      (should (eq (window-buffer source-window) source))
+      (should (= (length (window-list)) 1)))))
+
+(ert-deftest ejn-panel-window-follow-keeps-hidden-source-hidden ()
+  (ejn-panel-window-test--with-source
+    (let* ((key (emacs-jupyter-notebook--cell-key-for (point-min)))
+           (handle (ejn-panel-start-entry panel key "print(42)"))
+           (window (emacs-jupyter-notebook-panel--display panel)))
+      (ejn-panel-finish-entry handle 'ok 1)
+      (emacs-jupyter-notebook-panel-flush-now panel)
+      (with-selected-window window
+        (delete-other-windows)
+        (cl-letf (((symbol-function 'display-buffer)
+                   (lambda (&rest _) (ert-fail "Following reopened the source"))))
+          (emacs-jupyter-notebook-panel-resume-follow))
+        (should (eq (selected-window) window))
+        (should-not (get-buffer-window source t))
+        (should (= (length (window-list)) 1))
+        (should (= (window-start window)
+                   (car (emacs-jupyter-notebook-panel--entry-bounds
+                         (plist-get handle :id)))))))))
+
+(ert-deftest ejn-panel-window-follow-updates-visible-panel-without-displaying ()
+  (ejn-panel-window-test--with-source
+    (let* ((key (emacs-jupyter-notebook--cell-key-for (point-min)))
+           (handle (ejn-panel-start-entry panel key "print(42)"))
+           (window (emacs-jupyter-notebook-panel--display panel)))
+      (ejn-panel-append-text handle "42\n")
+      (ejn-panel-finish-entry handle 'ok 1)
+      (emacs-jupyter-notebook-panel-flush-now panel)
+      (with-current-buffer panel (goto-char (point-max)))
+      (goto-char (point-min))
+      (cl-letf (((symbol-function 'display-buffer)
+                 (lambda (&rest _) (ert-fail "Following invoked display rules"))))
+        (emacs-jupyter-notebook-panel--source-post-command))
+      (should (eq (selected-window) source-window))
+      (with-current-buffer panel
+        (should (= (window-start window)
+                   (car (emacs-jupyter-notebook-panel--entry-bounds
+                         (plist-get handle :id)))))))))
+
+(ert-deftest ejn-panel-window-explicit-visit-opens-hidden-source ()
+  (ejn-panel-window-test--with-source
+    (let* ((key (emacs-jupyter-notebook--cell-key-for (point-min)))
+           (handle (ejn-panel-start-entry panel key "print(42)"))
+           (window (emacs-jupyter-notebook-panel--display panel)))
+      (ejn-panel-finish-entry handle 'ok 1)
+      (emacs-jupyter-notebook-panel-flush-now panel)
+      (with-selected-window window
+        (delete-other-windows)
+        (goto-char (car (emacs-jupyter-notebook-panel--entry-bounds
+                         (plist-get handle :id))))
+        (should-not (get-buffer-window source t))
+        (emacs-jupyter-notebook-panel-visit-source)
+        (should (eq (window-buffer (selected-window)) source))
+        (should (= (point) (point-min)))))))
+
+(ert-deftest ejn-panel-window-source-visit-survives-malformed-display-action ()
+  (dolist (hidden '(nil t))
+    (ejn-panel-window-test--with-source
+      (let* ((key (emacs-jupyter-notebook--cell-key-for (point-min)))
+             (handle (ejn-panel-start-entry panel key "print(42)"))
+             (window (emacs-jupyter-notebook-panel--display panel)))
+        (ejn-panel-finish-entry handle 'ok 1)
+        (emacs-jupyter-notebook-panel-flush-now panel)
+        (with-selected-window window
+          (when hidden (delete-other-windows))
+          (goto-char (car (emacs-jupyter-notebook-panel--entry-bounds
+                           (plist-get handle :id))))
+          (let ((display-buffer-overriding-action 'display-buffer-same-window))
+            (emacs-jupyter-notebook-panel-visit-source))
+          (should (eq (window-buffer (selected-window)) source))
+          (should (= (point) (point-min))))))))
+
+(ert-deftest ejn-panel-window-display-errors-do-not-block-execution-dispatch ()
+  (dolist (failure '(malformed unavailable))
+    (ejn-panel-window-test--with-source
+      (let ((emacs-jupyter-notebook-check-code-completeness nil)
+            (display-buffer-overriding-action 'display-buffer-same-window)
+            (original-display (symbol-function 'display-buffer))
+            (original-timers (copy-sequence timer-list))
+            (original-processes (process-list))
+            executions)
+        (setq emacs-jupyter-notebook--client
+              (emacs-jupyter-notebook-backend-session-create nil source))
+        (cl-letf (((symbol-function 'display-buffer)
+                   (if (eq failure 'unavailable)
+                       (lambda (&rest _) (error "No usable window"))
+                     original-display))
+                  ((symbol-function 'emacs-jupyter-notebook--ensure-client-async)
+                   (lambda (success _failure &optional _profile _announce)
+                     (funcall success nil)))
+                  ((symbol-function 'emacs-jupyter-notebook-backend-execute)
+                   (lambda (_client code _options _success _failure)
+                     (push code executions)
+                     123)))
+          (unwind-protect
+              (let* ((id (emacs-jupyter-notebook--evaluate-code "print(42)" nil))
+                     (record (emacs-jupyter-notebook--execution-record id))
+                     (handle (plist-get record :panel-entry))
+                     (context (list :buffer source :entry-handle handle
+                                    :request-id id :backend-request-id 123
+                                    :panel-generation (plist-get record :generation))))
+                (should (equal executions '("print(42)")))
+                (should (eq (plist-get record :state) 'dispatched))
+                (should (equal emacs-jupyter-notebook--execution-active-id id))
+                (ejn-panel-append-text handle "42\n")
+                (emacs-jupyter-notebook--execution-note-event
+                 context '(:type execute-reply :status "ok" :execution-count 1))
+                (emacs-jupyter-notebook--execution-note-event
+                 context '(:type status :execution-state "idle"))
+                (should-not emacs-jupyter-notebook--execution-active-id)
+                (should-not emacs-jupyter-notebook--execution-queue)
+                (should (eq (plist-get (ejn-panel-entry-snapshot handle) :status) 'ok))
+                (emacs-jupyter-notebook-panel-flush-now panel)
+                (with-current-buffer panel
+                  (should (string-match-p "42" (buffer-string))))
+                (should (eq (selected-window) source-window)))
+            ;; The fake backend owns no transport, while the real FIFO and
+            ;; panel still own timers that must be disposed on assertion failure.
+            (setq emacs-jupyter-notebook--client nil)
+            (emacs-jupyter-notebook--release-local-resources)
+            (emacs-jupyter-notebook--kill-panel)
+            (should-not (cl-set-difference (process-list) original-processes))
+            (should-not (cl-remove-if
+                         (lambda (timer)
+                           (eq (timer--function timer) #'undo-auto--boundary-timer))
+                         (cl-set-difference timer-list original-timers)))))))))
 
 (provide 'emacs-jupyter-notebook-panel-window-tests)
 ;;; emacs-jupyter-notebook-panel-window-tests.el ends here

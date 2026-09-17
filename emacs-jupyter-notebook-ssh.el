@@ -72,7 +72,9 @@
 
 (defun emacs-jupyter-notebook-ssh--python-command (profile)
   "Return PROFILE's validated structured resolver Python argv.
-Legacy `:jupyter-command' profile values are rejected rather than parsed."
+Legacy `:jupyter-command' profile values are rejected rather than parsed.
+Direct Docker commands are unsupported: resolved paths must run on the SSH
+host, since this resolver prefix is absent from the actual kernel launch."
   (when (plist-member profile :jupyter-command)
     (error "Legacy :jupyter-command is unsupported; use :python-command argv"))
   (let ((argv (plist-get profile :python-command)))
@@ -89,6 +91,10 @@ Legacy `:jupyter-command' profile values are rejected rather than parsed."
                  (<= (apply #'+ (mapcar #'string-bytes argv))
                      emacs-jupyter-notebook-ssh-kernelspec-max-argv-bytes))
       (error ":python-command must be a non-empty argv list of strings"))
+    (when (equal (file-name-nondirectory (car argv)) "docker")
+      (error (concat "Docker is unsupported in :python-command: it only resolves "
+                     "a kernelspec, then launches its kernel directly on the SSH host; "
+                     "use Python installed on that host")))
     (copy-sequence argv)))
 
 (defun emacs-jupyter-notebook-ssh--profile-name (profile)

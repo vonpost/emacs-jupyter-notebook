@@ -609,6 +609,11 @@ binding is added, and a user-owned binding must never be overwritten."
 (defvar-local emacs-jupyter-notebook--session-entry nil
   "Current buffer's registry entry plist.")
 
+(defvar-local emacs-jupyter-notebook--selected-profile nil
+  "Profile selected for this source buffer's next kernel start.
+Retained across failed attempts and local cleanup.  An existing durable
+session still takes precedence; nil uses the configured default profile.")
+
 (defvar-local emacs-jupyter-notebook--tunnel-process nil
   "Current buffer's SSH tunnel process.")
 
@@ -2224,8 +2229,11 @@ only the fringe indicators need clearing on a structural cell edit."
                        emacs-jupyter-notebook-remote-profiles)))
     (if names
         (completing-read "Remote profile: " names nil nil nil nil
-                         emacs-jupyter-notebook-default-profile)
-      emacs-jupyter-notebook-default-profile)))
+                         (emacs-jupyter-notebook-ssh--profile-name
+                          (or emacs-jupyter-notebook--selected-profile
+                              emacs-jupyter-notebook-default-profile)))
+      (or emacs-jupyter-notebook--selected-profile
+          emacs-jupyter-notebook-default-profile))))
 
 (defun emacs-jupyter-notebook--prompt-host ()
   "Prompt for a remote-host string, looping until valid input is given.
@@ -5396,6 +5404,10 @@ used only when the async registry read proves there is no durable session for
 this file.  ANNOUNCE-START emits the friendly first-start message at that same
 decision point."
   (emacs-jupyter-notebook--ensure-no-replacement-operation)
+  ;; Remember the choice before runtime preparation or registry lookup can
+  ;; fail.  Async contexts are disposable and cannot own this source intent.
+  (when (and start-profile (emacs-jupyter-notebook--cold-start-p))
+    (setq emacs-jupyter-notebook--selected-profile (copy-tree start-profile)))
   (cond
    ;; A first-use Nix build is a local prerequisite, not part of the remote
    ;; connection deadline.  Queue the exact acquisition request and resume it
@@ -5448,8 +5460,9 @@ decision point."
     ;; silently no-op in `--tunnel-reconnect'.
     (setq emacs-jupyter-notebook--tunnel-dead nil)
     (let* ((preferred-profile
-            (copy-sequence (or start-profile
-                               emacs-jupyter-notebook-default-profile)))
+            (copy-tree (or start-profile
+                           emacs-jupyter-notebook--selected-profile
+                           emacs-jupyter-notebook-default-profile)))
            (context
             (emacs-jupyter-notebook--async-new-context
              :phase 'registry-read :origin-buffer (current-buffer)
@@ -5488,8 +5501,11 @@ decision point."
                   :owner (emacs-jupyter-notebook--registry-context-owner context)
                   :deadline (plist-get context :overall-deadline)
                   :local-file (expand-file-name buffer-file-name))))
-            (emacs-jupyter-notebook--async-put
-             context :registry-operation operation))
+            ;; A completion may already have handed ownership to a start or
+            ;; reconnect context.  Never publish the retired lookup again.
+            (when (emacs-jupyter-notebook--async-context-live-p context)
+              (emacs-jupyter-notebook--async-put
+               context :registry-operation operation)))
         (error
          (emacs-jupyter-notebook--async-fail
           context (format "Could not start connection lookup: %s"
@@ -6765,13 +6781,18 @@ CALLBACK and ERROR-CALLBACK are optional completion hooks."
     (profile-name &optional callback error-callback)
   "Build the local runtime if needed, then start PROFILE-NAME asynchronously.
 CALLBACK and ERROR-CALLBACK are optional completion hooks.  The first use may
-start one shared, cancellable Nix build before the remote connection deadline."
+start one shared, cancellable Nix build before the remote connection deadline.
+Remember PROFILE-NAME for later evaluation even if this attempt fails."
   (interactive (list (emacs-jupyter-notebook--read-profile-name)))
   (unless buffer-file-name
     (user-error "Buffer has no associated file"))
   (when (file-remote-p buffer-file-name)
     (user-error "Remote source buffers are unsupported; visit a local source file"))
   (emacs-jupyter-notebook--ensure-no-async-operation)
+  (setq profile-name (copy-tree (or profile-name
+                                   emacs-jupyter-notebook--selected-profile
+                                   emacs-jupyter-notebook-default-profile))
+        emacs-jupyter-notebook--selected-profile profile-name)
   (emacs-jupyter-notebook--with-runtime-ready
    (lambda ()
      (emacs-jupyter-notebook--start-remote-kernel-ready
@@ -6857,14 +6878,16 @@ START-PROFILE and ANNOUNCE-START are forwarded to `--evaluate-code'."
 
 W6.3 contract: when no kernel is connected and no in-flight async exists,
 this command messages the user about which profile it is about to start
-with (the package's `default-profile') before the silent launch.  With a
-\\[universal-argument] CHOOSE prefix, prompt for the profile to start
-instead of using the default."
+with (the buffer's last choice, or `emacs-jupyter-notebook-default-profile')
+before the launch.  With a \\[universal-argument] CHOOSE prefix,
+prompt for the profile to start
+and remember it for later attempts."
   (interactive "P")
   (let* ((cold (emacs-jupyter-notebook--cold-start-p))
          (profile (if (and choose cold)
                       (emacs-jupyter-notebook--read-profile-name)
-                    emacs-jupyter-notebook-default-profile)))
+                    (or emacs-jupyter-notebook--selected-profile
+                        emacs-jupyter-notebook-default-profile))))
     (pcase-let ((`(,beg . ,end) (emacs-jupyter-notebook-cell-bounds)))
       (emacs-jupyter-notebook--evaluate-buffer-range
        beg end (emacs-jupyter-notebook--current-cell-key)
@@ -8118,6 +8141,7 @@ never sends an in-band helper shutdown or uses broad process matching."
          (profile (or profile-name
                       (plist-get entry :profile)
                       (plist-get (plist-get context :profile) :profile)
+                      emacs-jupyter-notebook--selected-profile
                       emacs-jupyter-notebook-default-profile)))
     (when (and cleanup-entry
                (emacs-jupyter-notebook--transition-entry-p cleanup-entry)

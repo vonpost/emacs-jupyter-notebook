@@ -87,6 +87,12 @@ C-c j c
 
 If no kernel is connected, the first send announces which profile it will use ("starting kernel via profile <name> (C-u to choose)") and then launches that kernel asynchronously. The send queues; output streams into the side panel as soon as the kernel connects. `C-u C-c j c` prompts for a profile to start with instead.
 
+The source buffer remembers the profile selected by `start-remote-kernel` or a prefixed
+cell evaluation, including when startup fails. Later cell, region, and buffer
+evaluations retry that profile. The global default applies until you make a
+choice in that buffer; an existing registered session still reconnects to its
+recorded kernel.
+
 ## Minimal Configuration
 
 ```elisp
@@ -109,6 +115,12 @@ strings are unsupported.  The command is used only to resolve the selected
 kernelspec.  The resolved absolute kernel argv then launches directly in a
 detached process, so a wrapper such as Nix does not become the persisted
 kernel PID.
+
+Docker commands are unsupported in `:python-command` and fail with an explicit
+error. Running the resolver inside a container returns container paths, but the
+kernel launch happens on the SSH host and does not repeat the Docker command.
+Use a Python environment available on that host. Container kernel support
+requires separate launch, connection-file, and process-lifetime handling.
 
 ```elisp
 :python-command
@@ -279,7 +291,11 @@ normal Emacs commands. Redisplaying output reuses its existing window without
 resetting its size or placement. New output windows open to the right by
 default; `emacs-jupyter-notebook-panel-side` and
 `emacs-jupyter-notebook-panel-width` control initial placement and width, and
-`display-buffer-alist` can override them. The panel has two views:
+`display-buffer-alist` can override them. Moving through source cells only
+tracks an already visible panel; closing its window leaves it closed. If a
+display rule errors during evaluation, EJN reports it in `*Messages*` and
+tries its default placement so the display error does not cancel execution.
+The panel has two views:
 
 - **Latest-per-cell** (default): one section per cell, indexed by cell marker. Re-running the same cell replaces its section in place.
 - **History log**: every evaluation, including region/paragraph/defun, appended in time order with timestamp, execution count, and status.
