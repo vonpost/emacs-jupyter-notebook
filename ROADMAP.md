@@ -190,6 +190,14 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
   builds, custom command precedence, failure/cancellation ownership, and local
   runtime isolation from remote kernel lifetime.
 
+- [~] owner=root claimed=2026-09-17 CC30 Suspend kernel-info heartbeat misses during startup setup.
+  User reports Docker connects successfully, then repeated kernel-info misses
+  flag the transport dead. Silent startup setup has no user execution ledger
+  record; heartbeat must respect its explicit pending state before dispatch
+  and before counting late misses. — touches: core heartbeat guards and a
+  focused heartbeat regression test file. docker_heartbeat_audit owns core/tests;
+  root integrates and verifies. Preserve remote kernel/container lifetime.
+
 - [x] sha=b32b839 CC28 Add an explicit Docker kernel launcher.
   User-authorized implementation. Omitted `:launcher` means `direct` (the
   existing SSH-host process launcher); `:launcher docker` runs one detached
