@@ -747,6 +747,10 @@ Used for exact-execution inspection, including synchronously delivered output.")
 (defvar-local emacs-jupyter-notebook--heartbeat-timer nil
   "Buffer-local repeating timer driving the W4.5 kernel-info heartbeat.")
 
+(defvar-local emacs-jupyter-notebook--heartbeat-retired nil
+  "Whether this heartbeat monitor has been cancelled or exhausted.
+Only `--heartbeat-start' admits a new monitor after retirement.")
+
 (defvar-local emacs-jupyter-notebook--heartbeat-misses 0
   "Count of consecutive heartbeat misses on the current buffer.
 Reset to 0 on every successful `kernel_info_reply'.")
@@ -769,7 +773,8 @@ seconds and sends a `kernel_info_request' through the configured adapter.
 After `emacs-jupyter-notebook-heartbeat-misses-allowed' consecutive misses
 the tunnel is flagged dead; the remote kernel is NOT shut down."
   (emacs-jupyter-notebook--heartbeat-cancel)
-  (setq emacs-jupyter-notebook--heartbeat-misses 0)
+  (setq emacs-jupyter-notebook--heartbeat-misses 0
+        emacs-jupyter-notebook--heartbeat-retired nil)
   (let* ((buffer (current-buffer))
          (interval (emacs-jupyter-notebook--effective-heartbeat-interval)))
     (setq emacs-jupyter-notebook--heartbeat-timer
@@ -789,7 +794,8 @@ released by `--release-local-resources' or `--mode-disable-cleanup'."
     (cancel-timer emacs-jupyter-notebook--heartbeat-timer))
   (when (timerp emacs-jupyter-notebook--heartbeat-timeout-timer)
     (cancel-timer emacs-jupyter-notebook--heartbeat-timeout-timer))
-  (setq emacs-jupyter-notebook--heartbeat-timer nil
+  (setq emacs-jupyter-notebook--heartbeat-retired t
+        emacs-jupyter-notebook--heartbeat-timer nil
         emacs-jupyter-notebook--heartbeat-timeout-timer nil
         emacs-jupyter-notebook--heartbeat-misses 0
         emacs-jupyter-notebook--heartbeat-inflight nil))
@@ -802,8 +808,10 @@ The reply (or timeout) routes through `--heartbeat-on-reply' or
 `--heartbeat-on-miss', which run in the originating buffer only and only
 when the inflight token still matches (so late replies are ignored).
 
-W15-A: while a user execution is active or the kernel reports BUSY, the probe
-is suspended entirely and the miss counter reset.  The active-execution guard
+W15-A: while silent setup or a user execution is active, or the kernel reports
+BUSY, the probe is suspended entirely and the miss counter reset.  Silent
+setup has no user execution record, so its separate gate is load-bearing.
+The active-execution guard
 closes the interval between local FIFO admission and receipt of Jupyter's
 `busy' status event.  The probe is a shell-channel `kernel_info_request', and
 a busy kernel queues shell messages behind the running cell — silence is the
@@ -811,7 +819,9 @@ EXPECTED state, not evidence of death.  Transport death during execution is
 still caught by the tunnel process sentinel and SSH ServerAlive keepalives;
 probing resumes after the execution retires and the kernel reports non-busy."
   (cond
-   ((or emacs-jupyter-notebook--execution-active-id
+   (emacs-jupyter-notebook--heartbeat-retired nil)
+   ((or emacs-jupyter-notebook--execution-setup-pending
+        emacs-jupyter-notebook--execution-active-id
         (eq emacs-jupyter-notebook--kernel-status 'busy))
     ;; Active/busy: expected shell silence — no probe, no misses (W15-A).  A
     ;; probe may have started immediately before execution admission or the
@@ -907,35 +917,52 @@ death sets `--tunnel-dead' locally so `--ensure-client-async' routes the
 next evaluation through `--tunnel-reconnect'.
 
 W6.6: every miss writes a `heartbeat-miss' line to the global log buffer;
-crossing the misses-allowed threshold writes a `heartbeat-dead' line."
-  (setq emacs-jupyter-notebook--heartbeat-inflight nil)
-  (if (or emacs-jupyter-notebook--execution-active-id
-          (eq emacs-jupyter-notebook--kernel-status 'busy))
-      ;; Execution admission or a status event can race a probe timeout.
-      ;; Expected shell silence is not a transport failure, regardless of
-      ;; which callback won the timer race.
-      (setq emacs-jupyter-notebook--heartbeat-misses 0)
-    (cl-incf emacs-jupyter-notebook--heartbeat-misses)
-    (emacs-jupyter-notebook--log-append
-     'heartbeat-miss
-     "kernel-info miss %d/%d in `%s'"
-     emacs-jupyter-notebook--heartbeat-misses
-     (emacs-jupyter-notebook--effective-heartbeat-misses)
-     (buffer-name))
-    (when (>= emacs-jupyter-notebook--heartbeat-misses
-              (emacs-jupyter-notebook--effective-heartbeat-misses))
-      (emacs-jupyter-notebook--log-append
-       'heartbeat-dead
-       "tunnel flagged dead after %d consecutive misses in `%s'"
-       emacs-jupyter-notebook--heartbeat-misses (buffer-name))
-      (display-warning
-       'emacs-jupyter-notebook
-       (format
-        "Heartbeat: %d consecutive kernel-info misses in `%s'; tunnel flagged dead."
-        emacs-jupyter-notebook--heartbeat-misses (buffer-name)))
-      (emacs-jupyter-notebook--tunnel-lost
-       "heartbeat lost local kernel transport"
-       emacs-jupyter-notebook--client nil))))
+crossing the misses-allowed threshold writes a `heartbeat-dead' line.
+Retire the monitor before any fallible display or recovery callback, so an
+error there cannot keep producing misses beyond the threshold."
+  (unless (or emacs-jupyter-notebook--heartbeat-retired
+              emacs-jupyter-notebook--tunnel-dead)
+    (setq emacs-jupyter-notebook--heartbeat-inflight nil)
+    (if (or emacs-jupyter-notebook--execution-setup-pending
+            emacs-jupyter-notebook--execution-active-id
+            (eq emacs-jupyter-notebook--kernel-status 'busy))
+        ;; Setup, execution admission or a status event can race the timeout.
+        ;; Expected shell silence cannot establish transport loss.
+        (setq emacs-jupyter-notebook--heartbeat-misses 0)
+      (let* ((misses (cl-incf emacs-jupyter-notebook--heartbeat-misses))
+             (limit (emacs-jupyter-notebook--effective-heartbeat-misses))
+             (exhausted (>= misses limit)))
+        (when exhausted
+          (emacs-jupyter-notebook--heartbeat-cancel))
+        (ignore-errors
+          (emacs-jupyter-notebook--log-append
+           'heartbeat-miss "kernel-info miss %d/%d in `%s'"
+           misses limit (buffer-name)))
+        (when exhausted
+          (ignore-errors
+            (emacs-jupyter-notebook--log-append
+             'heartbeat-dead
+             "tunnel flagged dead after %d consecutive misses in `%s'"
+             misses (buffer-name)))
+          (ignore-errors
+            (display-warning
+             'emacs-jupyter-notebook
+             (format
+              "Heartbeat: %d consecutive kernel-info misses in `%s'; tunnel flagged dead."
+              misses (buffer-name))))
+          (condition-case err
+              (emacs-jupyter-notebook--tunnel-lost
+               "heartbeat lost local kernel transport"
+               emacs-jupyter-notebook--client nil)
+            (error
+             ;; The stopped monitor must remain stopped even if local
+             ;; presentation/cleanup fails.  Evaluation can retry the exact
+             ;; durable session through the ordinary reconnect path.
+             (setq emacs-jupyter-notebook--tunnel-dead t)
+             (ignore-errors
+               (emacs-jupyter-notebook--log-append
+                'heartbeat-recovery "local recovery failed: %s"
+                (error-message-string err))))))))))
 
 (defvar-local emacs-jupyter-notebook--async-last-error nil
   "Buffer-local flag: set when the last async operation finished with `error'.
