@@ -194,9 +194,21 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
   User reports Docker connects successfully, then repeated kernel-info misses
   flag the transport dead. Silent startup setup has no user execution ledger
   record; heartbeat must respect its explicit pending state before dispatch
-  and before counting late misses. — touches: core heartbeat guards and a
+  and before counting late misses. User also reports counts reaching 15/2;
+  stop exhausted monitors before warning/log/recovery callbacks can fail.
+  — touches: core heartbeat guards and a
   focused heartbeat regression test file. docker_heartbeat_audit owns core/tests;
   root integrates and verifies. Preserve remote kernel/container lifetime.
+
+- [~] owner=root claimed=2026-09-17 CC31 Add a real Docker/Jupyter integration gate.
+  User requested actual container coverage beyond the fake Docker CLI.
+  — touches: opt-in Docker remote ERT suite/runner, README invocation, and
+  focused heartbeat failure diagnostics if real execution identifies a defect.
+  docker_heartbeat_audit owns the optional integration test and runner; root
+  owns documentation, execution and review. Require an explicit Docker host
+  and pre-pulled image, exercise start/setup/eval/idle heartbeats/reconnect,
+  and clean up only the test's exact registered container identity. Normal
+  unit tests must remain independent of Docker, SSH and remote hosts.
 
 - [x] sha=b32b839 CC28 Add an explicit Docker kernel launcher.
   User-authorized implementation. Omitted `:launcher` means `direct` (the
