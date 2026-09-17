@@ -180,7 +180,7 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
-- [~] owner=root claimed=2026-09-17 CC29 Reuse local Nix bundles across Emacs restarts.
+- [x] sha=4aed07a CC29 Reuse local Nix bundles across Emacs restarts.
   User-reported repeated bootstrap. Persist independently keyed helper/registry
   and viewer output links beneath user-emacs-directory, retain Nix GC roots,
   and invalidate only for relevant package source/lock/platform changes.
@@ -189,8 +189,15 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
   owns cache regression tests after the read-only audit. Preserve bounded async
   builds, custom command precedence, failure/cancellation ownership, and local
   runtime isolation from remote kernel lifetime.
+  > Completed bundles retain keyed Nix output links and bounded completion
+  > records. Discovery after restart requires no Nix process. Builds consume
+  > private snapshots of exactly the hashed inputs, including untracked source.
+  > Runtime/cache ERT: 51 passed. A fresh-process reuse smoke test with an
+  > existing store bundle verified real Nix output-link/GC-root creation and
+  > restored it in another Emacs with process creation forbidden. Building the
+  > full pinned package offline was unavailable because dependencies were absent.
 
-- [~] owner=root claimed=2026-09-17 CC30 Suspend kernel-info heartbeat misses during startup setup.
+- [x] sha=96cbd91 CC30 Suspend kernel-info heartbeat misses during startup setup.
   User reports Docker connects successfully, then repeated kernel-info misses
   flag the transport dead. Silent startup setup has no user execution ledger
   record; heartbeat must respect its explicit pending state before dispatch
@@ -199,6 +206,14 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
   — touches: core heartbeat guards and a
   focused heartbeat regression test file. docker_heartbeat_audit owns core/tests;
   root integrates and verifies. Preserve remote kernel/container lifetime.
+  > Pending silent setup suppresses both probe dispatch and late misses.
+  > Threshold exhaustion retires timers before fallible warning/log/recovery
+  > callbacks. Four new regressions cover setup races and repeated callbacks
+  > after injected notification/recovery failures; all 19 heartbeat ERTs pass.
+  > Combined CC29/CC30 validation: strict production byte-compilation, then
+  > removal of bytecode and canonical source suite: 1193 ERT, 4 array, 260 helper
+  > (4 optional skips), 25 registry and 12 fixture tests passed. These fixes do
+  > not establish the cause of the user's actual Docker transport failure.
 
 - [~] owner=root claimed=2026-09-17 CC31 Add a real Docker/Jupyter integration gate.
   User requested actual container coverage beyond the fake Docker CLI.
