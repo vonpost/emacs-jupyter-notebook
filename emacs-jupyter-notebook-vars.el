@@ -23,8 +23,15 @@
   "Remote profile definitions.
 Each element is (NAME . PLIST).  Supported PLIST keys include
 :host, :user, :port, :identity-file, :ssh-options, :remote-cwd,
-:remote-cache-dir, :kernelspec, and :python-command.
-:host may include a user as in user@example.com."
+:remote-cache-dir, :kernelspec, :python-command, :launcher,
+:docker-image, and :docker-options.
+:host may include a user as in user@example.com.
+An omitted :launcher means `direct', which launches the kernel on the
+SSH host.  `docker' launches a dedicated detached container on that host
+and requires :docker-image.  :docker-options is an argv list of supported
+container resource/environment/volume options; EJN owns container identity,
+networking and lifetime.  For Docker, :remote-cwd and :python-command refer
+to paths and executables inside the image."
   :type '(alist :key-type string :value-type plist)
   :group 'emacs-jupyter-notebook)
 
@@ -121,12 +128,13 @@ and ssh_config in effect for those commands."
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-python-command '("python3")
-  "Remote Python command argv used to resolve a kernelspec.
+  "Python command argv used to resolve a kernelspec in the selected launcher.
 Each element is one argument; this is never parsed as a shell command.  The
 argv must accept appended `-c SCRIPT ARG...' Python arguments, as direct
 Python, `uv run ... python', and `nix shell ... -c python' do.  Shell
 activation command strings are unsupported.  Profiles override it with a
-non-empty `:python-command' string list."
+non-empty `:python-command' string list.  The default `direct' launcher
+runs it on the SSH host; the `docker' launcher runs it inside :docker-image."
   :type '(repeat string)
   :group 'emacs-jupyter-notebook)
 

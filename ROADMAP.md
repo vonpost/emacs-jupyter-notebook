@@ -166,12 +166,21 @@ These are binding for every workstream. Update only by appending a new entry.
   explicit configuration still wins, zero disables expiry, and busy kernels
   never expire. Reconnecting reinjects the timeout into an existing watchdog.
 
+- **2026-09-17 / Explicit Docker launcher.** User-authorized Docker support
+  adds `:launcher docker` for one detached container per kernel. Omitted
+  `:launcher` and explicit `direct` retain SSH-host process launches. Docker
+  containers carry durable ownership/container identity and survive local
+  teardown; reconnect must never create or restart a container. Existing
+  explicit lifecycle commands and the idle watchdog retain termination
+  authority. Initial Docker support targets a local Linux Docker Engine on
+  the SSH host with host networking and a private bind-mounted session cache.
+
 ## Cross-cutting changes
 
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
-- [~] owner=root claimed=2026-09-18 CC28 Add an explicit Docker kernel launcher.
+- [~] owner=root claimed=2026-09-17 CC28 Add an explicit Docker kernel launcher.
   User-authorized implementation. Omitted `:launcher` means `direct` (the
   existing SSH-host process launcher); `:launcher docker` runs one detached
   container per kernel on the remote Linux Docker host, with host networking.

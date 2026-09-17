@@ -107,20 +107,19 @@ recorded kernel.
          :kernelspec "python3")))
 ```
 
+Profiles default to `:launcher direct`: EJN launches the kernel directly on
+the SSH host. You can spell out `:launcher direct`, but ordinary profiles need
+no launcher setting. `:launcher docker` instead creates a dedicated detached
+container on the SSH host.
+
 Kernel resolution uses structured `:python-command` argv, never a shell command
-string.  The argv must accept appended `-c SCRIPT ARG...` Python arguments and
+string. The command runs in the selected launch environment. Its argv must
+accept appended `-c SCRIPT ARG...` Python arguments and
 run Python with `jupyter_client` available; direct Python, `uv run ... python`,
 and `nix shell ... -c python` have this shape.  Shell activation command
 strings are unsupported.  The command is used only to resolve the selected
-kernelspec.  The resolved absolute kernel argv then launches directly in a
-detached process, so a wrapper such as Nix does not become the persisted
-kernel PID.
-
-Docker commands are unsupported in `:python-command` and fail with an explicit
-error. Running the resolver inside a container returns container paths, but the
-kernel launch happens on the SSH host and does not repeat the Docker command.
-Use a Python environment available on that host. Container kernel support
-requires separate launch, connection-file, and process-lifetime handling.
+kernelspec. The resolved absolute kernel argv launches in the same environment.
+For `direct`, a wrapper such as Nix does not become the persisted kernel PID.
 
 ```elisp
 :python-command
@@ -134,6 +133,51 @@ absolute connection-file path in `spec.metadata.ejn_connection_file`, bound
 to the opaque start session in `ejn_session_id`.  Emacs validates both before
 launching or retrieving anything.  Legacy `:jupyter-command` values are
 rejected rather than interpreted.
+
+### Docker kernels
+
+Use `:launcher docker` and an image that already contains Python,
+`jupyter_client`, and the selected kernelspec (usually `ipykernel`). For example:
+
+```elisp
+(setq emacs-jupyter-notebook-remote-profiles
+      '(("gpu"
+         :host "user@gpu-host"
+         :launcher docker
+         :docker-image "my/image"
+         :docker-options ("--gpus" "all" "--ipc=host"
+                          "-v" "/pluto:/pluto:shared"
+                          "-v" "local2:/local2")
+         :remote-cwd "/pluto"
+         :python-command ("python")
+         :kernelspec "python3")))
+```
+
+`:python-command` names Python inside the image; do not put `docker run` there.
+`:remote-cwd` is the working directory inside the container. The cache directory
+is on the SSH host, and EJN mounts a private session directory at the same
+absolute path in the container so connection metadata remains retrievable.
+
+Initial support requires a Linux SSH host with a local Docker Engine at
+`/var/run/docker.sock`, accessible to the SSH user. Pull the image on that host
+before starting EJN. EJN pins its image ID, uses host networking, and runs the
+container as the SSH user's numeric UID/GID. The image must permit that user
+to execute Python and access your mounted working directory. EJN supplies the
+entrypoint directly; image entrypoint scripts are not used for activation.
+
+EJN controls container names, ownership labels, detachment, networking, and
+cleanup; omit `-it`, `-d`, `--rm`, `--name`, and `--restart` from
+`:docker-options`. Unsupported or conflicting flags fail before launch.
+Volumes such as `local2:/local2` are named Docker volumes; use
+`/local2:/local2` instead if you mean a host directory.
+
+Each kernel has its own detached container, which survives Emacs exit, mode
+disable, and SSH loss. Reconnect finds the same registered container. Explicit
+shutdown, restart, and retry-fresh operate on the exact registered container;
+the idle watchdog still ends an inactive kernel. Broad orphan cleanup is not
+supported for Docker profiles; use the session's shutdown or retry-fresh
+command. A Docker daemon or SSH failure is treated as unknown liveness and
+does not authorize replacing the container.
 
 ### Local helper transport
 

@@ -308,6 +308,39 @@
         (when (processp pipe)
           (ignore-errors (delete-process pipe)))))))
 
+(ert-deftest ejn-registry-worker-roundtrip-docker-identity ()
+  "The real worker preserves Docker identity and launch configuration."
+  (ejn-registry-worker-test-with-registry (file)
+    (let* ((entry (plist-put (ejn-registry-worker-test--entry "docker-one")
+                            :launch-kind 'docker))
+           (entry (append entry
+                          (list :docker-container-id (make-string 64 ?a)
+                                :docker-container-name "ejn-0123456789abcdef-0123456789abcdef0123"
+                                :docker-owner "docker-one"
+                                :docker-profile-key (make-string 64 ?c)
+                                :docker-image "my/image"
+                                :docker-image-id (concat "sha256:" (make-string 64 ?b))
+                                :docker-options '("--gpus" "all" "-v" "local2:/local2")
+                                :docker-python-command '("python"))))
+           (created-result
+            (ejn-registry-worker-test--await
+             (lambda (success failure)
+               (emacs-jupyter-notebook-registry-create-async entry success failure))))
+           (created (car (plist-get created-result :success)))
+           (read-result
+            (ejn-registry-worker-test--await
+             (lambda (success failure)
+               (emacs-jupyter-notebook-registry-read-async success failure)))))
+      (should-not (plist-get created-result :failure))
+      (should-not (plist-get read-result :failure))
+      (should (eq (plist-get created :launch-kind) 'docker))
+      (should (equal (car (car (plist-get read-result :success))) created))
+      (dolist (key '(:docker-container-id :docker-container-name :docker-owner
+                     :docker-profile-key
+                     :docker-image :docker-image-id :docker-options
+                     :docker-python-command))
+        (should (equal (plist-get created key) (plist-get entry key)))))))
+
 (ert-deftest ejn-registry-worker-roundtrip-cas-and-prune ()
   "Real worker preserves current entry shapes and enforces exact revisions."
   (ejn-registry-worker-test-with-registry (file)

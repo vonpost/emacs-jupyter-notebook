@@ -73,8 +73,7 @@
 (defun emacs-jupyter-notebook-ssh--python-command (profile)
   "Return PROFILE's validated structured resolver Python argv.
 Legacy `:jupyter-command' profile values are rejected rather than parsed.
-Direct Docker commands are unsupported: resolved paths must run on the SSH
-host, since this resolver prefix is absent from the actual kernel launch."
+Docker belongs in `:launcher', never in this resolver command prefix."
   (when (plist-member profile :jupyter-command)
     (error "Legacy :jupyter-command is unsupported; use :python-command argv"))
   (let ((argv (plist-get profile :python-command)))
@@ -92,9 +91,8 @@ host, since this resolver prefix is absent from the actual kernel launch."
                      emacs-jupyter-notebook-ssh-kernelspec-max-argv-bytes))
       (error ":python-command must be a non-empty argv list of strings"))
     (when (equal (file-name-nondirectory (car argv)) "docker")
-      (error (concat "Docker is unsupported in :python-command: it only resolves "
-                     "a kernelspec, then launches its kernel directly on the SSH host; "
-                     "use Python installed on that host")))
+      (error (concat "Docker in :python-command cannot launch a kernel on the SSH host; "
+                     "use :launcher docker, :docker-image, and Python argv inside the image")))
     (copy-sequence argv)))
 
 (defun emacs-jupyter-notebook-ssh--profile-name (profile)
@@ -121,6 +119,10 @@ host, since this resolver prefix is absent from the actual kernel launch."
                                    stored
                                    nil))))
     (setq plist (plist-put plist :profile name))
+    (unless (plist-member plist :launcher)
+      (setq plist (plist-put plist :launcher 'direct)))
+    (unless (memq (plist-get plist :launcher) '(direct docker))
+      (error ":launcher must be direct or docker"))
     (unless (plist-member plist :remote-cwd)
       (setq plist (plist-put plist :remote-cwd
                              emacs-jupyter-notebook-remote-working-directory)))
