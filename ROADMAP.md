@@ -180,6 +180,16 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
+- [~] owner=root claimed=2026-09-17 CC32 Execute the real Docker/Jupyter gate.
+  The user started a local Docker daemon and granted socket access. Exercise
+  the actual launcher through test-owned SSH transport, Docker and Jupyter;
+  diagnose any observed startup/heartbeat/evaluation/reconnect failures.
+  — touches: optional Docker integration runner/tests, evidence-driven fixes
+  and focused regressions in the launcher/core/helper if a real failure
+  identifies a defect, plus validation notes. Root owns execution and edits;
+  docker_heartbeat_audit provides read-only diagnosis and image preparation.
+  Clean up only exact test-owned resources; preserve unrelated containers.
+
 - [x] sha=4aed07a CC29 Reuse local Nix bundles across Emacs restarts.
   User-reported repeated bootstrap. Persist independently keyed helper/registry
   and viewer output links beneath user-emacs-directory, retain Nix GC roots,
