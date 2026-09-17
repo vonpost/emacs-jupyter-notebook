@@ -180,7 +180,7 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
-- [~] owner=root claimed=2026-09-17 CC32 Execute the real Docker/Jupyter gate.
+- [x] sha=59f5102 CC32 Execute the real Docker/Jupyter gate.
   The user started a local Docker daemon and granted socket access. Exercise
   the actual launcher through test-owned SSH transport, Docker and Jupyter;
   diagnose any observed startup/heartbeat/evaluation/reconnect failures.
@@ -189,6 +189,25 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
   identifies a defect, plus validation notes. Root owns execution and edits;
   docker_heartbeat_audit provides read-only diagnosis and image preparation.
   Clean up only exact test-owned resources; preserve unrelated containers.
+  > Both actual end-to-end runs passed: direct SSH (16.85s) and ProxyJump
+  > (16.98s), with MaxSessions=10 and TCPKeepAlive=no on the test server.
+  > Docker 29.5.1 ran an offline Nix-closure image containing Python 3.8.8,
+  > ipykernel 5.5.0 and Jupyter Client 6.1.11; the local helper ran checkout
+  > source with Python 3.13.15 and Jupyter Client 8.8.0. No protocol, SSH or
+  > Docker operation was mocked. Each run completed setup, cell result 42,
+  > three real idle heartbeat replies (zero misses), local teardown, same-ID
+  > reconnect, and result 43 proving preserved state; source stayed clean.
+  > Exact container cleanup passed. Test images and temporary SSH server were
+  > removed; the user's daemon and existing images were left intact.
+  > Two preliminary runs found a fixture-only startup delay: the minimal image
+  > lacked nsswitch.conf, so old Jupyter's localhost lookup blocked before it
+  > wrote connection metadata. A timed Python traceback identified this;
+  > adding local hostname resolution to that image made the full runs pass.
+  > Fixed the test's failure headline to show the bounded diagnostic instead
+  > of the boolean async-error flag; source loading and focused checks passed.
+  > The reported post-connect heartbeat failure was not reproduced. These
+  > short local runs do not verify the user's image, WAN latency or prolonged
+  > idle/proxy behavior; host/profile/log details were requested for that step.
 
 - [x] sha=4aed07a CC29 Reuse local Nix bundles across Emacs restarts.
   User-reported repeated bootstrap. Persist independently keyed helper/registry
