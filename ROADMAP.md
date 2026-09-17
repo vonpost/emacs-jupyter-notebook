@@ -171,6 +171,20 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
+- [~] owner=root claimed=2026-09-18 CC28 Add an explicit Docker kernel launcher.
+  User-authorized implementation. Omitted `:launcher` means `direct` (the
+  existing SSH-host process launcher); `:launcher docker` runs one detached
+  container per kernel on the remote Linux Docker host, with host networking.
+  — touches: launcher/Docker command construction, SSH profiles, core async
+  lifecycle, registry metadata/tests, customization/docs and focused tests.
+  docker_commands owns Docker/launcher modules and SSH builders/profile
+  validation; docker_lifecycle owns core lifecycle integration and lifecycle
+  regressions; root owns customization/docs, command execution tests and
+  integration review. Preserve durable admission before launch, exact container
+  identity, existing kernels on disconnect, source cleanliness and bounded
+  asynchronous subprocesses. Reconnect never creates a container; lifecycle
+  commands and idle expiry retain their existing explicit authority.
+
 - [x] sha=4d3b9f6 CC27 Fix panel tracking and preserve the
   selected profile after failed starts; diagnose Docker resolver commands.
   User-requested fixes. — touches: core start/evaluation lifecycle, result
