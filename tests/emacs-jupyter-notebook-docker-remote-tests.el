@@ -56,8 +56,7 @@
                   (and emacs-jupyter-notebook--tunnel-dead
                        (not (emacs-jupyter-notebook--async-in-progress-p))))
           (error "%s failed: %s" description
-                 (or emacs-jupyter-notebook--async-last-error
-                     emacs-jupyter-notebook--last-bounded-error
+                 (or emacs-jupyter-notebook--last-bounded-error
                      "local transport marked unavailable")))
         (setq done (funcall predicate)))
       (unless done (accept-process-output nil 0.05)))

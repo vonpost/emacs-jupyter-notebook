@@ -200,6 +200,14 @@ directory, Python command, mount/GPU arguments, and SSH configuration options.
 This test is separate from `tests/run-local-tests.sh`, whose Docker coverage
 uses a simulated CLI and cannot establish real container connectivity.
 
+Real-container validation on 2026-09-17 passed with Docker 29.5.1,
+Python 3.8/ipykernel 5.5 in the container, and Jupyter Client 8.8 in the local
+helper. Both direct SSH and an actual local SSH jump hop passed, including
+`MaxSessions 10` and `TCPKeepAlive no` on the test SSH server. Each run verified
+evaluation, three idle heartbeats without misses, and preserved kernel state
+after reconnect. These short local runs do not cover WAN latency, other
+images, or prolonged idle connections.
+
 ### Local helper transport
 
 The supervised local Python helper is the only Jupyter transport.  Its
