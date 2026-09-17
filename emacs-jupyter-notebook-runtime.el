@@ -33,7 +33,7 @@ Exactly one live waiter receives at most one sample per stderr callback.")
                (:constructor emacs-jupyter-notebook-runtime--make-build))
   token process stdout-buffer stderr-buffer stderr-process timer waiters
   root started-at stdout-bytes stderr-bytes output-overflow terminal
-  stderr-closed last-progress-line viewer)
+  stderr-closed last-progress-line viewer cache-link source-directory)
 
 (defvar emacs-jupyter-notebook-runtime--build nil
   "The single in-flight local runtime build, or nil.")
@@ -128,6 +128,186 @@ login shell's Nix path is commonly absent from `exec-path'."
                      (file-executable-p candidate))
            return candidate))
 
+(defun emacs-jupyter-notebook-runtime--source-key (root viewer &optional destination)
+  "Hash bounded local package inputs under ROOT for VIEWER or the runtime.
+Keep this input list aligned with the source filesets in flake.nix.  Content,
+relative names and executable bits matter; timestamps and unrelated Emacs
+sources do not.  Missing, oversized or unsafe inputs disable persistent reuse.
+When DESTINATION is non-nil, copy the exact hashed bytes into that snapshot."
+  (condition-case nil
+      (when (and (stringp root) (file-name-absolute-p root)
+                 (not (file-remote-p root)))
+        (let ((root (file-name-as-directory (file-truename root)))
+              (count 0) (bytes 0) records)
+          (cl-labels
+              ((visit
+                (relative depth)
+                (when (or (> depth 16) (> (cl-incf count) 512))
+                  (error "Runtime source tree exceeds discovery limits"))
+                (let* ((path (expand-file-name relative root))
+                       (name (file-name-nondirectory path)))
+                  (unless (or (member name '(".git" "__pycache__"))
+                              (string-match-p "\\.\\(?:py[co]\\|egg-info\\)\\'" name)
+                              (member relative '("helper/tests" "helper/integration_tests"
+                                                 "registry_worker/tests")))
+                    ;; Source symlinks could point outside the pinned tree or
+                    ;; invoke a remote handler.  Do not fingerprint through them.
+                    (when (file-symlink-p path) (error "Symlinked runtime input"))
+                    (cond
+                     ((file-directory-p path)
+                      (push (list relative 'directory) records)
+                      (when destination
+                        (make-directory (expand-file-name relative destination) t))
+                      (let ((children (directory-files path nil nil t 513)))
+                        (when (> (length children) 512)
+                          (error "Runtime source directory exceeds discovery limits"))
+                        (dolist (child children)
+                          (unless (member child '("." ".."))
+                            (visit (concat relative "/" child) (1+ depth))))))
+                     ((file-regular-p path)
+                      (let* ((size (file-attribute-size (file-attributes path)))
+                             (remaining (- (* 8 1024 1024) bytes)))
+                        (unless (and (integerp size) (<= size remaining))
+                          (error "Runtime source bytes exceed discovery limits"))
+                        (with-temp-buffer
+                          (set-buffer-multibyte nil)
+                          (insert-file-contents-literally path nil 0 (1+ size))
+                          (unless (= (buffer-size) size)
+                            (error "Runtime source changed during discovery"))
+                          (cl-incf bytes size)
+                          (when destination
+                            (let ((copy (expand-file-name relative destination)))
+                              (make-directory (file-name-directory copy) t)
+                              (let ((coding-system-for-write 'no-conversion))
+                                (write-region (point-min) (point-max) copy nil 'silent))
+                              (set-file-modes copy (file-modes path))))
+                          (push (list relative (logand (file-modes path) #o111)
+                                      (secure-hash 'sha256 (current-buffer))) records))))
+                     (t (error "Missing runtime source input")))))))
+            (dolist (input (append '("flake.nix" "flake.lock" "array_protocol")
+                                   (if viewer '("viewer") '("helper" "registry_worker"))))
+              (visit input 0)))
+          (secure-hash 'sha256
+                       (prin1-to-string
+                        (list 1 system-configuration viewer
+                              (sort records (lambda (a b) (string< (car a) (car b)))))))))
+    (error nil)))
+
+(defun emacs-jupyter-notebook-runtime--cache-link (root viewer &optional source-key)
+  "Return the persistent Nix output link for ROOT and VIEWER, or nil.
+This only inspects local inputs; it creates no files and runs no processes."
+  (condition-case nil
+      (when (and (stringp user-emacs-directory)
+                 (file-name-absolute-p user-emacs-directory)
+                 (not (file-remote-p user-emacs-directory)))
+        (when-let ((key (or source-key (emacs-jupyter-notebook-runtime--source-key root viewer))))
+          (let ((installation (secure-hash 'sha256
+                                            (concat (file-truename root) "\n"
+                                                    system-configuration))))
+            (expand-file-name
+             (concat "ejn/runtime/" installation "/"
+                     (if viewer "viewer-" "runtime-") key)
+             user-emacs-directory))))
+    (error nil)))
+
+(defun emacs-jupyter-notebook-runtime--usable-directory-p (directory viewer)
+  "Whether local DIRECTORY contains every required executable for VIEWER."
+  (and (stringp directory) (file-name-absolute-p directory)
+       (not (file-remote-p directory))
+       (cl-every (lambda (name)
+                   (let ((program (expand-file-name (concat "bin/" name) directory)))
+                     (and (file-regular-p program) (file-executable-p program))))
+                 (if viewer '("ejn-viewer") '("ejn-helper" "ejn-registry-worker")))))
+
+(defun emacs-jupyter-notebook-runtime--cache-output (link viewer)
+  "Read a completed local output LINK for VIEWER without evaluating metadata."
+  (condition-case nil
+      (when (and (stringp link) (file-name-absolute-p link)
+                 (not (file-remote-p link)))
+        (let* ((target (file-symlink-p link))
+               (marker (concat link ".ready")))
+          (when (and (stringp target) (file-name-absolute-p target)
+                     (not (file-remote-p target))
+                     (not (file-symlink-p marker))
+                     (file-regular-p marker)
+                     (<= (file-attribute-size (file-attributes marker)) 4096))
+            (let ((directory (file-name-as-directory (file-truename target)))
+                  (record (with-temp-buffer
+                            (insert-file-contents-literally marker nil 0 4097)
+                            (when (<= (buffer-size) 4096)
+                              (string-trim (decode-coding-string (buffer-string) 'utf-8))))))
+              (when (and (equal record directory)
+                         (emacs-jupyter-notebook-runtime--usable-directory-p directory viewer))
+                directory)))))
+    (error nil)))
+
+(defun emacs-jupyter-notebook-runtime--restore (viewer)
+  "Restore VIEWER's completed output after an Emacs restart, if available."
+  (when-let* ((root (emacs-jupyter-notebook-runtime--package-root))
+              (link (emacs-jupyter-notebook-runtime--cache-link root viewer))
+              (directory (emacs-jupyter-notebook-runtime--cache-output link viewer)))
+    (if viewer
+        (setq emacs-jupyter-notebook-runtime-viewer-directory directory)
+      (setq emacs-jupyter-notebook--runtime-directory directory))))
+
+(defun emacs-jupyter-notebook-runtime--prepare-cache-link (root viewer &optional source-key)
+  "Prepare a persistent out-link for ROOT and VIEWER, if locally writable."
+  (when-let ((link (emacs-jupyter-notebook-runtime--cache-link root viewer source-key)))
+    (condition-case err
+        (let ((directory (file-name-directory link)))
+          (unless (file-directory-p directory)
+            (make-directory directory t)
+            (set-file-modes directory #o700))
+          link)
+      ((error quit)
+       (message "EJN runtime cache unavailable: %.300s" (error-message-string err))
+       nil))))
+
+(defun emacs-jupyter-notebook-runtime--snapshot (root viewer)
+  "Return (DIRECTORY . KEY) for a bounded immutable copy of ROOT's inputs.
+Building this local path flake makes its inputs agree with the cache key,
+including newly added Python files that Git would otherwise silently omit.
+No unrelated checkout files or generated bytecode enter the snapshot."
+  (let ((directory (make-temp-file "ejn-runtime-source-" t)) key)
+    (unwind-protect
+        (condition-case nil
+            (when (setq key (emacs-jupyter-notebook-runtime--source-key root viewer directory))
+              ;; The flake's difference filesets refer to these directories
+              ;; even though their contents are deliberately not packaged.
+              (dolist (excluded '("helper/tests" "helper/integration_tests"
+                                  "registry_worker/tests"))
+                (make-directory (expand-file-name excluded directory) t))
+              (cons directory key))
+          ((error quit) (setq key nil)))
+      (unless key (ignore-errors (delete-directory directory t))))))
+
+(defun emacs-jupyter-notebook-runtime--publish-cache (build directory)
+  "Mark BUILD's DIRECTORY reusable only under its captured source key.
+Nix itself creates the output link and its GC root.  The atomic completion
+record also guards source edits during a build and partially usable outputs.
+Failure here never invalidates an otherwise usable in-process runtime."
+  (let ((link (emacs-jupyter-notebook-runtime--build-cache-link build)) temporary)
+    (when link
+      (unwind-protect
+          (condition-case err
+              (when (and (equal link (emacs-jupyter-notebook-runtime--cache-link
+                                     (emacs-jupyter-notebook-runtime--build-root build)
+                                     (emacs-jupyter-notebook-runtime--build-viewer build)))
+                         (emacs-jupyter-notebook-runtime--usable-directory-p
+                          directory (emacs-jupyter-notebook-runtime--build-viewer build))
+                         (let ((target (file-symlink-p link)))
+                           (and (stringp target) (file-name-absolute-p target)
+                                (not (file-remote-p target))
+                                (equal (file-name-as-directory (file-truename target)) directory))))
+                (setq temporary (make-temp-file (concat link ".ready-")))
+                (let ((coding-system-for-write 'utf-8-unix))
+                  (write-region (concat directory "\n") nil temporary nil 'silent))
+                (rename-file temporary (concat link ".ready") t))
+            ((error quit) (message "EJN runtime cache could not be saved: %.300s"
+                                   (error-message-string err))))
+        (when (and temporary (file-exists-p temporary))
+          (ignore-errors (delete-file temporary)))))))
+
 (defun emacs-jupyter-notebook-runtime--probe (probe)
   "Call PROBE and normalize exceptions into an unbuildable status plist."
   (condition-case err
@@ -182,7 +362,9 @@ login shell's Nix path is commonly absent from `exec-path'."
     (when (buffer-live-p buffer)
       (condition-case nil
           (kill-buffer buffer)
-        ((error quit) nil)))))
+        ((error quit) nil))))
+  (when-let ((source (emacs-jupyter-notebook-runtime--build-source-directory build)))
+    (condition-case nil (delete-directory source t) ((error quit) nil))))
 
 (defun emacs-jupyter-notebook-runtime--decode-output (bytes)
   "Decode bounded unibyte output BYTES into printable text."
@@ -250,6 +432,7 @@ real error and could start the displayed result in the middle of a line."
       (if (emacs-jupyter-notebook-runtime--build-viewer build)
           (setq emacs-jupyter-notebook-runtime-viewer-directory directory)
         (setq emacs-jupyter-notebook--runtime-directory directory))
+      (emacs-jupyter-notebook-runtime--publish-cache build directory)
       (setf (emacs-jupyter-notebook-runtime--build-terminal build) t)
       (emacs-jupyter-notebook-runtime--clear-current-build build)
       (let ((waiters (emacs-jupyter-notebook-runtime--build-waiters build)))
@@ -424,17 +607,25 @@ Use that buffer, not the isolated chunk: credential keys can straddle chunks."
        waiter nil
        "The bundled local runtime is missing and Nix is not available in exec-path"))
      (t
-      (let* ((stdout (generate-new-buffer " *ejn-runtime-build*"))
+      (let* ((snapshot (emacs-jupyter-notebook-runtime--snapshot
+                        root (emacs-jupyter-notebook-runtime--waiter-viewer waiter)))
+             (cache-link (and snapshot (emacs-jupyter-notebook-runtime--prepare-cache-link
+                                       root (emacs-jupyter-notebook-runtime--waiter-viewer waiter)
+                                       (cdr snapshot))))
+             (stdout (generate-new-buffer " *ejn-runtime-build*"))
              (stderr (generate-new-buffer " *ejn-runtime-build stderr*"))
              (command
-              (list nix "--extra-experimental-features" "nix-command flakes"
-                    "build" "--no-link" "--print-out-paths"
-                    "--print-build-logs" "--show-trace"
-                    (if (emacs-jupyter-notebook-runtime--waiter-viewer waiter)
-                        ".#ejn-viewer" ".#default")))
+              (append (list nix "--extra-experimental-features" "nix-command flakes" "build")
+                      (if cache-link (list "--out-link" cache-link) '("--no-link"))
+                      (list "--print-out-paths" "--print-build-logs" "--show-trace"
+                            (concat (if snapshot (concat "path:" (car snapshot)) ".")
+                                    (if (emacs-jupyter-notebook-runtime--waiter-viewer waiter)
+                                        "#ejn-viewer" "#default")))))
              (build (emacs-jupyter-notebook-runtime--make-build
                      :token (gensym "ejn-runtime-build-")
                      :viewer (emacs-jupyter-notebook-runtime--waiter-viewer waiter)
+                     :cache-link cache-link
+                     :source-directory (car snapshot)
                      :stdout-buffer stdout :stderr-buffer stderr
                      :waiters (list waiter) :root root
                      :started-at (float-time) :stdout-bytes 0 :stderr-bytes 0)))
@@ -520,6 +711,13 @@ PROGRESS, when non-nil, receives (BUFFER LINE) instead of the global progress
 function.  It lets callers without a kernel bootstrap context report builds."
   (let* ((buffer (or buffer (current-buffer)))
          (status (emacs-jupyter-notebook-runtime--probe probe)))
+    (when (and (not (plist-get status :ready)) (plist-get status :buildable))
+      (condition-case nil
+          (when (emacs-jupyter-notebook-runtime--restore viewer)
+            (setq status (emacs-jupyter-notebook-runtime--probe probe)))
+        ;; Discovery exceptions are handled by the existing guarded build
+        ;; path, including explicit disabled-build and missing-Nix diagnostics.
+        (error nil)))
     (cond
      ((plist-get status :ready)
       (funcall callback)

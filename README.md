@@ -193,14 +193,26 @@ The helper is local only; it does not install anything on a remote host or
 change the remote kernel.  Its executable is resolved independently of
 `default-directory`, first through `exec-path`, the most recently built Nix
 store closure, and then the package checkout/build layout.  When either bundled
-executable is missing, EJN asynchronously runs a single bounded
-`nix build --no-link --print-out-paths .#default` from the physical package
-source.  It resumes the original command only after both executables resolve.
-Build failure, excessive output, and timeout release every waiter so the next
+executable is missing, EJN first restores a matching cached bundle. If none
+is available, it asynchronously runs a single bounded `nix build` from a
+private snapshot of the package inputs. It resumes the original command only
+after both executables resolve. Build failure, excessive output, and timeout
+release every waiter so the next
 invocation can retry instead of remaining wedged.
 
+Successful helper/registry and viewer bundles are cached independently under
+`user-emacs-directory/ejn/runtime/`. Nix creates persistent output links there,
+which keep the bundles available across Emacs restarts and protect them from
+garbage collection. Cache keys include the package location, platform, pinned
+flake/lockfile and relevant Python source contents. Editing Emacs Lisp or
+documentation does not invalidate a bundle. A missing or incomplete output
+causes a fresh setup on demand. Cache discovery itself never invokes Nix.
+Older source versions retain their own links; deleting this runtime cache
+allows Nix to reclaim those bundles and requires setup on the next use.
+
 Build failures include the complete bounded stderr after its pipe closes.  To
-reproduce a build manually with uncapped terminal output, change to the package
+reproduce a one-off build, use `nix build --no-link --print-out-paths .#default`.
+For uncapped diagnostic output, change to the package
 directory containing `flake.nix` (for Straight, usually
 `~/.config/emacs/.local/straight/repos/emacs-jupyter-notebook`) and run:
 

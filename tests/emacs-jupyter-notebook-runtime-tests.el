@@ -9,7 +9,8 @@
 (defmacro ejn-runtime-test--clean (&rest body)
   "Run BODY with the shared runtime state restored afterwards."
   (declare (indent 0) (debug body))
-  `(let ((saved-build emacs-jupyter-notebook-runtime--build)
+  `(let ((user-emacs-directory (make-temp-file "ejn-runtime-emacs-" t))
+         (saved-build emacs-jupyter-notebook-runtime--build)
          (saved-viewer-build emacs-jupyter-notebook-runtime--viewer-build)
          (saved-directory emacs-jupyter-notebook--runtime-directory)
          (saved-viewer-directory emacs-jupyter-notebook-runtime-viewer-directory))
@@ -31,7 +32,8 @@
              emacs-jupyter-notebook--runtime-directory saved-directory)
        (dolist (buffer (buffer-list))
          (when (string-match-p "\\*ejn-runtime-build" (buffer-name buffer))
-           (kill-buffer buffer))))))
+           (kill-buffer buffer)))
+       (delete-directory user-emacs-directory t))))
 
 (defun ejn-runtime-test--fixture (&optional output)
   "Create a complete runtime fixture and return its directory."

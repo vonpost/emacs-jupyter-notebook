@@ -158,7 +158,10 @@ or a protocol-version mismatch."
 When non-nil and the default helper or registry-worker executable is missing,
 the first start, reconnect, or evaluation command runs the repository's pinned
 `nix build .#default' asynchronously.  Concurrent source buffers share that
-one bounded build.  Custom executable names are never replaced or built."
+one bounded build.  Successful outputs are retained below
+user-emacs-directory/ejn/runtime and reused across Emacs restarts while their
+package inputs are unchanged.  Nil disables new builds, not cached reuse.
+Custom executable names are never replaced or built."
   :type 'boolean
   :group 'emacs-jupyter-notebook)
 
@@ -176,7 +179,8 @@ Exceeding the effective bounded limit terminates the local build."
 
 (defvar emacs-jupyter-notebook--runtime-directory nil
   "Resolved Nix store directory containing the auto-built local runtime.
-This is process-local discovery state, not durable notebook state.")
+Restored from the matching persistent output link after Emacs restarts.
+This is local executable discovery state, not durable notebook state.")
 
 (defcustom emacs-jupyter-notebook-helper-hello-timeout 5
   "Maximum seconds allowed for the helper's initial hello response.
