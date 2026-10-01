@@ -183,10 +183,29 @@ These are binding for every workstream. Update only by appending a new entry.
   and plane selection operate entirely on retained local samples. This
   supersedes W21's 2D-only first-release restriction for explicit publication.
 
+- **2026-10-01 / Physical axis grids for upsampling comparisons.** The user
+  requests per-member axis spacing (for example 0.1 mm versus 0.2 mm). Publish
+  spacing and optional index-zero sample-center origin in ndarray axis order.
+  Common sample/grid identity plus compatible spatial units permits linked
+  physical zoom, cursor, slice position and ROIs across differing sampling
+  densities. Numerical differences require matching sample lattices; do not
+  silently resample data. Ordinary arrays without spatial metadata retain
+  pixel-coordinate behavior.
+
 ## Cross-cutting changes
 
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
+
+- [~] owner=root claimed=2026-10-01 CC34 Per-member physical axis grids.
+  User-requested extension during CC33: spacing/origin publication for 2D/3D,
+  physical display and navigation/measurement mapping across upsampled arrays.
+  Root owns integration/docs/tests; `array_publication` owns publisher/codec;
+  `volume_viewer` owns workspace/GUI; `completion` owns pure spatial geometry,
+  navigation/measurement adapters after finishing the CC33 truncation fix.
+  Scope includes new spatial module/tests, existing analysis/navigation/
+  magnifier/worker where needed, viewer protocol/install docs and focused ERT.
+  Manager coordinates interfaces before edits. No silent resampling.
 
 - [~] owner=root claimed=2026-10-01 CC33 PyTorch, explicit cropped volumes,
   and responsive remote completion. Root manages integration, variable-view
