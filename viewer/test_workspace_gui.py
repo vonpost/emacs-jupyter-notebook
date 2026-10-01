@@ -222,7 +222,8 @@ class WorkspaceGuiTests(unittest.TestCase):
         window.install_snapshot(snapshot({"reference": reference, "candidate": candidate}))
         APP.processEvents()
         self.assertEqual(len(window._views), 2)
-        self.assertFalse(window._linked)
+        # Different calibrated crop extents share a declared physical frame.
+        self.assertTrue(window._linked)
         window.level.setValue(5)
         window.width.setValue(2)
         window.fit()

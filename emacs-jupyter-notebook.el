@@ -671,8 +671,7 @@ Front of list is most recently used.  Bounded by
 `emacs-jupyter-notebook-completion-cache-size'.")
 
 (defvar-local emacs-jupyter-notebook--completion-pending-key nil
-  "In-flight completion request context-key (most recent request only).
-W3.3 contract: a reply whose key does not match this is dropped on arrival.")
+  "Original context key of the single outstanding completion request.")
 
 (defvar-local emacs-jupyter-notebook--completion-request-counter 0
   "Monotonic counter for completion request ids.
@@ -683,6 +682,21 @@ Bumped every time a request is sent; replies for stale ids are dropped.")
 
 (defvar-local emacs-jupyter-notebook--completion-idle-timer nil
   "Idle timer for populating completion cache.")
+
+(defvar-local emacs-jupyter-notebook--completion-epoch 0
+  "Generation changed by edits outside the active completion token.")
+(defvar-local emacs-jupyter-notebook--completion-edit-key nil
+  "Last cursor/prefix tracked by the completion edit hook.")
+(defvar-local emacs-jupyter-notebook--completion-edit-tick nil
+  "Source modification tick owned by the completion edit hook.")
+(defvar-local emacs-jupyter-notebook--completion-reusable nil
+  "Cons of request context and reply reusable for token-prefix extensions.")
+(defvar-local emacs-jupyter-notebook--completion-flight nil
+  "The single outstanding completion request and its display intent.")
+(defvar-local emacs-jupyter-notebook--completion-queued nil
+  "Latest completion demand waiting behind the outstanding request.")
+(defvar-local emacs-jupyter-notebook--completion-ui-timer nil
+  "Deferred presentation timer owned by the completion lifecycle.")
 
 (defvar-local emacs-jupyter-notebook--inspect-request-id 0
   "Monotonic inspect request id.")
@@ -5655,26 +5669,15 @@ decision point."
           context (format "Could not start connection lookup: %s"
                           (error-message-string err))))))))))
 
-;;; Completion (W3: non-blocking capf with LRU cache + idle delay)
-;;
-;; Design contract (see ROADMAP.md W3):
-;; - capf returns IMMEDIATELY with whatever is in the LRU cache.  No call
-;;   ever blocks waiting on the kernel; even a 10-second adapter delay must
-;;   not slow the capf hot path beyond a few milliseconds.
-;; - A new completion request is sent only after the user has been idle for
-;;   `emacs-jupyter-notebook-completion-idle' seconds.  Each keystroke
-;;   restarts the idle window.
-;; - Each request carries a monotonic id and the cache key
-;;   `(point . line-up-to-point)'.  When a new request fires, both the
-;;   pending key and the pending id are overwritten; the prior reply is
-;;   stale and is DROPPED on arrival without rendering.
-;; - The cache is a bounded LRU keyed by `(point . line-up-to-point)'.
-;;   Eviction is least-recently-used.
+;;; Non-blocking completion
+
+;; CAPF reads bounded local data only.  One request per buffer is in flight;
+;; edits coalesce behind it.  Replies survive suffix typing within the same
+;; token, but a directory separator, attribute dot, or unrelated edit starts
+;; a new context.  No filesystem completion is performed locally.
 
 (defun emacs-jupyter-notebook--completion-key ()
-  "Return the completion cache key for point in the current buffer.
-The key is `(point . line-up-to-point)' per W3 design contract.  Return nil
-without copying when the prefix exceeds the immutable completion ceiling."
+  "Return the bounded `(point . line-up-to-point)' completion cache key."
   (when-let ((prefix
               (emacs-jupyter-notebook--bounded-buffer-substring
                (line-beginning-position) (point)
@@ -5682,10 +5685,7 @@ without copying when the prefix exceeds the immutable completion ceiling."
     (cons (point) prefix)))
 
 (defun emacs-jupyter-notebook--completion-context ()
-  "Build a completion context from the current cell.
-Returns a plist with :key (cache key for LRU lookup), :code (cell source
-text sent to the kernel), and :cursor-pos (cursor offset into the code).
-Return nil without allocating cell text when either local bound is exceeded."
+  "Snapshot bounded cell text and completion ownership at point."
   (let* ((bounds (emacs-jupyter-notebook-cell-bounds))
          (beg (car bounds))
          (key (emacs-jupyter-notebook--completion-key))
@@ -5693,16 +5693,15 @@ Return nil without allocating cell text when either local bound is exceeded."
                     (emacs-jupyter-notebook--bounded-buffer-substring
                      beg (cdr bounds) emacs-jupyter-notebook--max-code-bytes t))))
     (when code
-      (list :key key
-            :code code
-            :cursor-pos (- (point) beg)
-            :point (point)
-            :bounds bounds
+      (list :key key :code code :cursor-pos (- (point) beg)
+            :point (point) :bounds bounds
+            :epoch emacs-jupyter-notebook--completion-epoch
+            :mode emacs-jupyter-notebook-mode
+            :generation emacs-jupyter-notebook--local-cleanup-generation
             :source-tick (buffer-chars-modified-tick)))))
 
 (defun emacs-jupyter-notebook--completion-context-current-p (context)
-  "Return non-nil when completion CONTEXT still describes this buffer.
-This validation deliberately compares metadata instead of recopying the cell."
+  "Return non-nil when CONTEXT describes the unchanged cell and cursor."
   (and context
        (= (plist-get context :source-tick) (buffer-chars-modified-tick))
        (= (plist-get context :point) (point))
@@ -5711,15 +5710,35 @@ This validation deliberately compares metadata instead of recopying the cell."
        (equal (plist-get context :key)
               (emacs-jupyter-notebook--completion-key))))
 
+(defun emacs-jupyter-notebook--completion-context-compatible-p (context)
+  "Accept CONTEXT unchanged or after tracked suffix typing in its token.
+The edit hook proves that the rest of the cell is unchanged.  Pure cursor
+motion, untracked edits, and deleting past the requested prefix fail closed."
+  (and context
+       (equal (plist-get context :generation)
+              emacs-jupyter-notebook--local-cleanup-generation)
+       (equal (plist-get context :epoch)
+              emacs-jupyter-notebook--completion-epoch)
+       (eq (plist-get context :mode) emacs-jupyter-notebook-mode)
+       (or (emacs-jupyter-notebook--completion-context-current-p context)
+           (let ((key (emacs-jupyter-notebook--completion-key))
+                 (old (plist-get context :key)))
+             (and key old
+                  (equal emacs-jupyter-notebook--completion-edit-tick
+                         (buffer-chars-modified-tick))
+                  (equal key emacs-jupyter-notebook--completion-edit-key)
+                  (= (- (car key) (length (cdr key)))
+                     (- (car old) (length (cdr old))))
+                  (string-prefix-p (cdr old) (cdr key)))))))
+
 (defun emacs-jupyter-notebook--completion-cache-ensure ()
-  "Return the buffer-local completion cache hash-table, creating it if needed."
+  "Return the buffer-local completion cache, creating it if needed."
   (or emacs-jupyter-notebook--completion-cache
       (setq emacs-jupyter-notebook--completion-cache
             (make-hash-table :test 'equal))))
 
 (defun emacs-jupyter-notebook--completion-cache-get (key)
-  "Return the cached reply for KEY or nil.
-Side-effect: promotes KEY to most-recently-used in the LRU order."
+  "Return the cached reply for KEY, promoting it in the bounded LRU."
   (when emacs-jupyter-notebook--completion-cache
     (let ((reply (gethash key emacs-jupyter-notebook--completion-cache)))
       (when reply
@@ -5738,7 +5757,7 @@ Side-effect: promotes KEY to most-recently-used in the LRU order."
       1)))
 
 (defun emacs-jupyter-notebook--completion-cache-put (key reply)
-  "Insert REPLY under KEY into the LRU cache, evicting LRU entries past the cap."
+  "Insert REPLY under KEY, evicting least-recently-used entries past the cap."
   (let ((cache (emacs-jupyter-notebook--completion-cache-ensure))
         (limit (emacs-jupyter-notebook--completion-cache-limit)))
     (puthash key reply cache)
@@ -5752,172 +5771,275 @@ Side-effect: promotes KEY to most-recently-used in the LRU order."
     reply))
 
 (defun emacs-jupyter-notebook--completion-cache-reset ()
-  "Discard all cached completion replies in the current buffer."
+  "Discard cached completion replies and the reusable token reply."
   (when (hash-table-p emacs-jupyter-notebook--completion-cache)
     (clrhash emacs-jupyter-notebook--completion-cache))
-  (setq emacs-jupyter-notebook--completion-cache-order nil))
+  (setq emacs-jupyter-notebook--completion-cache-order nil
+        emacs-jupyter-notebook--completion-reusable nil))
 
-(defun emacs-jupyter-notebook--completion-after-change (&rest _ignored)
-  "Invalidate completion state after any source-buffer edit.
+(defun emacs-jupyter-notebook--completion-after-change (&optional beg end old-length)
+  "Keep completion data only for suffix edits confined to the same token.
+BEG, END and OLD-LENGTH are the standard after-change arguments.  A slash,
+dot, quote, whitespace, or edit elsewhere invalidates all cached data.  The
+outstanding request stays owned until its reply/timeout, so rapid typing
+cannot fill the remote shell queue with obsolete requests."
+  (let* ((old emacs-jupyter-notebook--completion-edit-key)
+         (key (emacs-jupyter-notebook--completion-key))
+         (safe
+          (and old key beg end old-length (= (point) end)
+               (= (- (car key) (length (cdr key)))
+                  (- (car old) (length (cdr old))))
+               (or (and (= old-length 0) (= beg (car old))
+                        (string-prefix-p (cdr old) (cdr key))
+                        (string-match-p "\\`[[:alnum:]_]+\\'"
+                                        (substring (cdr key) (length (cdr old)))))
+                   (and (= beg end) (= (+ beg old-length) (car old))
+                        (string-prefix-p (cdr key) (cdr old))
+                        (string-match-p "\\`[[:alnum:]_]+\\'"
+                                        (substring (cdr old) (length (cdr key)))))))))
+    (unless safe
+      (cl-incf emacs-jupyter-notebook--completion-epoch)
+      (cl-incf emacs-jupyter-notebook--completion-request-counter)
+      (emacs-jupyter-notebook--completion-cache-reset))
+    (setq emacs-jupyter-notebook--completion-edit-key key
+          emacs-jupyter-notebook--completion-edit-tick (buffer-chars-modified-tick))))
 
-This hook performs no transport or UI work.  Bumping the request generation
-and clearing its public pending identity makes every pre-edit reply stale,
-including edits elsewhere in the current cell that leave point and the current
-line prefix unchanged."
-  (emacs-jupyter-notebook--completion-cache-reset)
-  (setq emacs-jupyter-notebook--completion-pending-key nil
-        emacs-jupyter-notebook--completion-pending-id nil)
-  (cl-incf emacs-jupyter-notebook--completion-request-counter))
+(defun emacs-jupyter-notebook--completion-adapt-reply (context reply)
+  "Narrow REPLY to the current extension of CONTEXT's requested prefix."
+  (when (emacs-jupyter-notebook--completion-context-compatible-p context)
+    (let* ((delta (- (point) (plist-get context :point)))
+           (start (plist-get reply :cursor_start))
+           (end (plist-get reply :cursor_end))
+           (beg (- (plist-get context :point) (- end start))))
+      (when (and (<= (point-min) beg (point))
+                 ;; A truncated broad list cannot prove which narrower matches
+                 ;; exist.  Fetch the narrower prefix even when some survive.
+                 (or (= delta 0) (not (plist-get reply :truncated))))
+        (if (= delta 0)
+            reply
+          (let ((prefix (buffer-substring-no-properties beg (point))))
+            (list :status (plist-get reply :status)
+                  :cursor_start start :cursor_end (+ end delta)
+                  :matches (cl-remove-if-not
+                            (lambda (match) (string-prefix-p prefix match))
+                            (append (plist-get reply :matches) nil)))))))))
 
 (defun emacs-jupyter-notebook--completion-result-from-reply (reply)
-  "Translate a Jupyter complete_reply plist REPLY into a capf return value."
+  "Translate a Jupyter complete_reply plist REPLY into a CAPF return value."
   (when reply
-    (let* ((matches (plist-get reply :matches))
-           (cursor-start (plist-get reply :cursor_start))
-           (cursor-end (plist-get reply :cursor_end)))
+    (let ((matches (append (plist-get reply :matches) nil))
+          (start (plist-get reply :cursor_start))
+          (end (plist-get reply :cursor_end)))
       (when matches
-        (list (- (point) (- cursor-end cursor-start))
-              (point)
-              (append matches nil)
-              :exclusive 'no)))))
+        (list (- (point) (- end start)) (point) matches :exclusive 'no)))))
 
 (defun emacs-jupyter-notebook--completion-result ()
-  "Return cached CAPF result for point or nil.
-Looks up the LRU cache by the current `(point . line-up-to-point)' key.
-Never sends a request and never blocks."
+  "Return exact or prefix-compatible cached CAPF data, without transport."
   (when (and emacs-jupyter-notebook--client
              (not (eq emacs-jupyter-notebook--kernel-status 'busy)))
-    (when-let* ((key (emacs-jupyter-notebook--completion-key))
-                (reply (emacs-jupyter-notebook--completion-cache-get key)))
-      (emacs-jupyter-notebook--completion-result-from-reply reply))))
+    (when-let ((key (emacs-jupyter-notebook--completion-key)))
+      (let ((reply
+             (or (emacs-jupyter-notebook--completion-cache-get key)
+                 (when-let ((reuse emacs-jupyter-notebook--completion-reusable))
+                   (emacs-jupyter-notebook--completion-adapt-reply
+                    (car reuse) (cdr reuse))))))
+        (emacs-jupyter-notebook--completion-result-from-reply reply)))))
 
-(defun emacs-jupyter-notebook--completion-refresh-ui ()
-  "Offer cached completion only when the source buffer still owns input.
-Late replies must not enter Consult/Vertico or Company from another buffer
-or interrupt an existing minibuffer.  Cached candidates remain available
-for the next explicit completion or frontend refresh."
+(defun emacs-jupyter-notebook--completion-refresh-ui (&optional explicit)
+  "Refresh the selected frontend with cached data, including an open popup.
+EXPLICIT allows ordinary completion expansion.  Automatic delivery opens a
+candidate list without inserting text.  Never take over another buffer or
+an active minibuffer, and never run a local filesystem completion backend."
   (when (emacs-jupyter-notebook-ui-available-p (current-buffer))
-    (cond
-     ((and (bound-and-true-p company-mode)
-           (not (bound-and-true-p company-candidates))
-           (fboundp 'company-manual-begin))
-      (funcall 'company-manual-begin))
-     ((not (bound-and-true-p completion-in-region-mode))
-      (when-let ((result (emacs-jupyter-notebook--completion-result)))
-        (apply #'completion-in-region (seq-take result 3)))))))
+    (when-let ((result (emacs-jupyter-notebook--completion-result)))
+      (cond
+       ((and (bound-and-true-p company-mode)
+             (fboundp 'company-begin-backend))
+        (when (fboundp 'company-abort) (funcall 'company-abort))
+        ;; This small backend reads our live cache.  Starting company-capf here
+        ;; would reuse Company's independent tick-keyed cache of the CAPF miss.
+        (funcall 'company-begin-backend
+                 (lambda (command &optional arg &rest _ignored)
+                   (pcase command
+                     ('prefix
+                      (when-let ((data (emacs-jupyter-notebook--completion-result)))
+                        (buffer-substring-no-properties (car data) (cadr data))))
+                     ('candidates
+                      (all-completions
+                       arg (nth 2 (emacs-jupyter-notebook--completion-result))))
+                     ('no-cache t)))))
+       (t
+        ;; Re-enter the public completion-in-region entry point even if its
+        ;; mode is active: Corfu tears down and rebuilds its candidate state.
+        (let* ((candidates (nth 2 result))
+               (presenting (not explicit))
+               (table (if explicit candidates
+                        (lambda (string pred action)
+                          (if (and presenting (null action)) string
+                            (complete-with-action action candidates string pred)))))
+               (completion-cycle-threshold nil)
+               (completion-styles (if explicit completion-styles '(basic)))
+               (completion-category-overrides
+                (if explicit completion-category-overrides nil))
+               (completion-category-defaults
+                (if explicit completion-category-defaults nil)))
+          (unwind-protect
+              (progn
+                (completion-in-region (car result) (cadr result) table)
+                ;; Corfu normally paints from post-command-hook.  This call
+                ;; runs from a reply timer, so that hook will not run until
+                ;; the next keypress.  Rebuilding above refreshes the data;
+                ;; exhibit only paints that fresh state, while automatic
+                ;; presentation still cannot expand the source text.
+                (when (and (bound-and-true-p corfu-mode)
+                           (bound-and-true-p completion-in-region-mode)
+                           (fboundp 'corfu--exhibit))
+                  (funcall 'corfu--exhibit)))
+            ;; The retained table behaves normally on the user's next command.
+            (setq presenting nil))))))))
 
 (defun emacs-jupyter-notebook--completion-present
     (buffer client request-id context &optional explicit)
-  "Present cached completion after unwinding the reply's process callback.
-Abandon popup delivery if the user moves to another buffer or minibuffer."
+  "Present fresh cached data after unwinding the helper process callback."
+  (when (timerp emacs-jupyter-notebook--completion-ui-timer)
+    (cancel-timer emacs-jupyter-notebook--completion-ui-timer))
   (when (emacs-jupyter-notebook-ui-available-p buffer)
-    (emacs-jupyter-notebook-ui-defer
-     buffer
-     (lambda ()
-       (and (emacs-jupyter-notebook-ui-available-p buffer)
-            (eq client emacs-jupyter-notebook--client)
-            (= request-id emacs-jupyter-notebook--completion-request-counter)
-            (emacs-jupyter-notebook--completion-context-current-p context)))
-     (lambda ()
-       (if (and explicit (not (emacs-jupyter-notebook--completion-result)))
-           (message "No completions")
-         (emacs-jupyter-notebook--completion-refresh-ui)))
-     nil 'completion)))
+    (setq emacs-jupyter-notebook--completion-ui-timer
+          (run-at-time
+           0 nil
+           (lambda ()
+             (when (buffer-live-p buffer)
+               (with-current-buffer buffer
+                 (setq emacs-jupyter-notebook--completion-ui-timer nil)
+                 (when (and (emacs-jupyter-notebook-ui-available-p buffer)
+                            (eq client emacs-jupyter-notebook--client)
+                            (= request-id emacs-jupyter-notebook--completion-request-counter)
+                            (emacs-jupyter-notebook--completion-context-compatible-p context))
+                   (if (and explicit (not (emacs-jupyter-notebook--completion-result)))
+                       (message "No completions")
+                     (emacs-jupyter-notebook--completion-refresh-ui explicit))))))))))
 
 (defun emacs-jupyter-notebook--completion-on-reply
-    (buffer client key request-id show-results context-snapshot reply _error)
-  "Cache REPLY for KEY under REQUEST-ID in BUFFER, optionally refreshing UI.
-Stale replies are dropped: a reply is stale when REQUEST-ID no longer
-matches the buffer-local pending id, when KEY no longer matches the live
-pending key, OR when the buffer's current capf context no longer matches
-the request's KEY (i.e. point moved or the line changed).  Only fresh
-replies update the cache; this prevents `out-of-date' completions from
-being cached for the original context after the user moved away from it
-(W3.3 + W3.7)."
+    (buffer client key request-id _show-results context reply error)
+  "Consume one owned reply, reuse it if safe, and drain the latest demand."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (when (and (eq client emacs-jupyter-notebook--client)
-                 (equal emacs-jupyter-notebook--completion-pending-id request-id)
-                 (= request-id emacs-jupyter-notebook--completion-request-counter)
-                 (equal emacs-jupyter-notebook--completion-pending-key key))
-        (setq emacs-jupyter-notebook--completion-pending-key nil
-              emacs-jupyter-notebook--completion-pending-id nil)
-        (when (and reply
-                   (emacs-jupyter-notebook--completion-context-current-p
-                    context-snapshot))
-          (emacs-jupyter-notebook--completion-cache-put key reply)
-          (when show-results
-            (emacs-jupyter-notebook--completion-present
-             buffer client request-id context-snapshot)))))))
+      (let ((flight emacs-jupyter-notebook--completion-flight))
+        (when (and (eq client emacs-jupyter-notebook--client)
+                   (equal request-id (plist-get flight :id))
+                   (eq context (plist-get flight :context))
+                   (equal key emacs-jupyter-notebook--completion-pending-key))
+          (let ((show (plist-get flight :show))
+                (queued emacs-jupyter-notebook--completion-queued)
+                (adapted (and reply
+                              (= request-id emacs-jupyter-notebook--completion-request-counter)
+                              (emacs-jupyter-notebook--completion-adapt-reply context reply))))
+            (setq emacs-jupyter-notebook--completion-flight nil
+                  emacs-jupyter-notebook--completion-pending-key nil
+                  emacs-jupyter-notebook--completion-pending-id nil
+                  emacs-jupyter-notebook--completion-queued nil)
+            (when adapted
+              (setq emacs-jupyter-notebook--completion-reusable (cons context reply))
+              (emacs-jupyter-notebook--completion-cache-put
+               (emacs-jupyter-notebook--completion-key) adapted)
+              (when show
+                (emacs-jupyter-notebook--completion-present
+                 buffer client request-id context (eq show 'explicit))))
+            (cond
+             ((and queued
+                   (equal (plist-get queued :key)
+                          (emacs-jupyter-notebook--completion-key))
+                   (= (plist-get queued :tick) (buffer-chars-modified-tick))
+                   (not (emacs-jupyter-notebook--completion-result))
+                   ;; An empty reply at the identical context is conclusive.
+                   (not (and adapted (equal key (plist-get queued :key)))))
+              (emacs-jupyter-notebook--completion-schedule-request
+               (plist-get queued :show) t))
+             ((and error (eq show 'explicit)
+                   (emacs-jupyter-notebook-ui-available-p buffer))
+              (message "Completion failed: %s" error)))))))))
 
 (defun emacs-jupyter-notebook--request-completion (&optional show-results)
-  "Fire an async completion request for point.
-SHOW-RESULTS non-nil means push the reply to the active completion UI on
-arrival.  The current pending key/id are overwritten so any earlier reply
-arriving after this call is dropped (W3.3)."
+  "Request completions asynchronously, or coalesce behind the current request.
+SHOW-RESULTS is t for automatic display, `explicit' for manual invocation."
   (when (and emacs-jupyter-notebook--client
              (not (eq emacs-jupyter-notebook--kernel-status 'busy)))
-    (when-let* ((context (emacs-jupyter-notebook--completion-context))
-                (key (plist-get context :key)))
-      (let ((code (plist-get context :code))
-            (cursor-pos (plist-get context :cursor-pos))
-            (buffer (current-buffer))
-            (client emacs-jupyter-notebook--client))
-        (unless (and (equal emacs-jupyter-notebook--completion-pending-key key)
-                     emacs-jupyter-notebook--completion-pending-id)
-          (let ((request-id
-                 (cl-incf emacs-jupyter-notebook--completion-request-counter)))
+    (when-let ((key (emacs-jupyter-notebook--completion-key)))
+      (if emacs-jupyter-notebook--completion-flight
+          (progn
+            (when show-results
+              (setf (plist-get emacs-jupyter-notebook--completion-flight :show)
+                    (if (or (eq show-results 'explicit)
+                            (eq (plist-get emacs-jupyter-notebook--completion-flight :show)
+                                'explicit)) 'explicit t)))
+            (unless (and (equal key emacs-jupyter-notebook--completion-pending-key)
+                         (emacs-jupyter-notebook--completion-context-compatible-p
+                          (plist-get emacs-jupyter-notebook--completion-flight :context)))
+              (setq emacs-jupyter-notebook--completion-queued
+                    (list :key key :tick (buffer-chars-modified-tick)
+                          :show (plist-get emacs-jupyter-notebook--completion-flight
+                                           :show)))))
+        (when-let ((context (emacs-jupyter-notebook--completion-context)))
+          (let ((buffer (current-buffer))
+                (client emacs-jupyter-notebook--client)
+                (request-id (cl-incf emacs-jupyter-notebook--completion-request-counter)))
             (setq emacs-jupyter-notebook--completion-pending-key key
-                  emacs-jupyter-notebook--completion-pending-id request-id)
-            (emacs-jupyter-notebook-backend-aux
-             client 'complete
-             (list :code code :cursor-pos cursor-pos)
-             (lambda (_backend-request-id reply)
+                  emacs-jupyter-notebook--completion-pending-id request-id
+                  emacs-jupyter-notebook--completion-edit-key key
+                  emacs-jupyter-notebook--completion-edit-tick (buffer-chars-modified-tick)
+                  emacs-jupyter-notebook--completion-flight
+                  (list :id request-id :context context :show show-results))
+            (condition-case error
+                (emacs-jupyter-notebook-backend-aux
+                 client 'complete
+                 (list :code (plist-get context :code)
+                       :cursor-pos (plist-get context :cursor-pos))
+                 (lambda (_backend-id reply)
+                   (emacs-jupyter-notebook--completion-on-reply
+                    buffer client key request-id show-results context reply nil))
+                 (lambda (_backend-id failure)
+                   (emacs-jupyter-notebook--completion-on-reply
+                    buffer client key request-id show-results context nil failure)))
+              (error
                (emacs-jupyter-notebook--completion-on-reply
-                buffer client key request-id show-results context reply nil))
-             (lambda (_backend-request-id error)
-               (emacs-jupyter-notebook--completion-on-reply
-                buffer client key request-id show-results context nil error)))))))))
+                buffer client key request-id show-results context nil
+                (error-message-string error))))))))))
 
-(defun emacs-jupyter-notebook--completion-schedule-request (&optional show-results)
-  "Restart the idle timer that fires an async completion request.
-Any in-flight request is invalidated by bumping the request counter the
-next time `--request-completion' runs; pending key/id are cleared so the
-older reply is dropped (W3.3)."
-  (emacs-jupyter-notebook--completion-cancel-idle-timer)
-  ;; Invalidate any in-flight request so its reply is dropped on arrival.
-  (setq emacs-jupyter-notebook--completion-pending-key nil
-        emacs-jupyter-notebook--completion-pending-id nil)
+(defun emacs-jupyter-notebook--completion-schedule-request
+    (&optional show-results immediate)
+  "Debounce cache fill without retiring an already outstanding request.
+IMMEDIATE schedules the next event-loop turn, with no typing debounce."
+  (when (timerp emacs-jupyter-notebook--completion-idle-timer)
+    (cancel-timer emacs-jupyter-notebook--completion-idle-timer))
+  (unless emacs-jupyter-notebook--completion-flight
+    (setq emacs-jupyter-notebook--completion-pending-key nil
+          emacs-jupyter-notebook--completion-pending-id nil))
   (let ((buffer (current-buffer))
-        (delay (emacs-jupyter-notebook--effective-completion-idle)))
+        (client emacs-jupyter-notebook--client)
+        (key (emacs-jupyter-notebook--completion-key))
+        (tick (buffer-chars-modified-tick))
+        (generation emacs-jupyter-notebook--local-cleanup-generation))
     (setq emacs-jupyter-notebook--completion-idle-timer
           (run-with-timer
-           delay nil
+           (if immediate 0 (emacs-jupyter-notebook--effective-completion-idle)) nil
            (lambda ()
              (when (buffer-live-p buffer)
                (with-current-buffer buffer
                  (setq emacs-jupyter-notebook--completion-idle-timer nil)
                  (when (and emacs-jupyter-notebook-mode
-                            emacs-jupyter-notebook--client
+                            (eq client emacs-jupyter-notebook--client)
+                            (= generation emacs-jupyter-notebook--local-cleanup-generation)
+                            (= tick (buffer-chars-modified-tick))
+                            (equal key (emacs-jupyter-notebook--completion-key))
                             (not (eq emacs-jupyter-notebook--kernel-status 'busy)))
-                   (emacs-jupyter-notebook--request-completion show-results)))))))))
+                   (if (emacs-jupyter-notebook--completion-result)
+                       (when show-results
+                         (emacs-jupyter-notebook--completion-refresh-ui
+                          (eq show-results 'explicit)))
+                     (emacs-jupyter-notebook--request-completion show-results))))))))))
 
 (defun emacs-jupyter-notebook--completion-explicit-command-p ()
-  "Return non-nil when `this-command' is an explicit completion invocation.
-Covers the vanilla `completion-at-point' (\\[completion-at-point] / M-TAB),
-this package's own `emacs-jupyter-notebook-complete-at-point', Company's
-`company-manual-begin', and any command whose symbol name contains the
-completion verb `complet' (the corfu/company/comint completion TRIGGERS
-all do: `corfu-complete', `company-complete', `company-complete-common',
-`completion-at-point', ...).
-
-Keying on the `complet' verb rather than a frontend prefix is deliberate
-(W9): popup NAVIGATION and dismissal commands — `corfu-next',
-`corfu-previous', `corfu-quit', `company-select-next', `company-abort' —
-do NOT contain `complet', so they never match and never schedule a kernel
-request even if the capf is re-entered under them.  Cursor-motion commands
-(`next-line', `forward-char', mouse events, ...) likewise never match,
-honoring the W3 \"motion must not request\" contract."
+  "Return non-nil for an explicit completion trigger, excluding popup motion."
   (let ((cmd this-command))
     (and (symbolp cmd)
          (or (memq cmd '(completion-at-point
@@ -5926,104 +6048,45 @@ honoring the W3 \"motion must not request\" contract."
              (string-match-p "complet" (symbol-name cmd))))))
 
 (defun emacs-jupyter-notebook-completion-at-point ()
-  "CAPF function: return cached completions immediately; schedule async fill.
-W3.4 contract: this function never blocks.  When the cache misses we
-schedule an idle-delayed async request; the kernel reply (whenever it
-arrives) populates the cache and refreshes the frontend so subsequent
-capf calls hit.
-
-The miss gate fires for two disjoint situations (W9):
-- the user just edited (typed / deleted / yanked), the corfu-auto path;
-- completion was invoked EXPLICITLY (M-TAB, a Corfu/Company manual
-  trigger, or `emacs-jupyter-notebook-complete-at-point').  This is the
-  case that matters for object-attribute completion: after `obj.' the
-  attribute prefix is EMPTY, so corfu-auto (min prefix >= 2) never fires
-  and the ONLY entry point is a manual invocation.  The narrower
-  edit-only gate returned nil here and never sent a request, so `obj.'
-  completion silently produced nothing.
-
-Broadening the gate cannot spam the kernel: `--completion-schedule-request'
-is debounced (each call cancels the prior idle timer and clears the
-pending key/id) and `--request-completion' de-dups on the pending key, so
-repeated capf calls for one stable context collapse to at most one
-request."
+  "Return cached candidates immediately and arrange asynchronous cache fill.
+Explicit CAPF invocations skip the typing debounce.  All transport work is
+deferred, so even a slow backend cannot block this editing hot path."
   (when (and emacs-jupyter-notebook--client
              (not (eq emacs-jupyter-notebook--kernel-status 'busy)))
-    (let ((result (emacs-jupyter-notebook--completion-result)))
-      (if result
-          result
-        (when (or (memq this-command
-                        '(self-insert-command
-                          delete-backward-char
-                          backward-delete-char-untabify
-                          yank))
-                  (emacs-jupyter-notebook--completion-explicit-command-p))
-          (emacs-jupyter-notebook--completion-schedule-request t))
-        nil))))
+    (or (emacs-jupyter-notebook--completion-result)
+        (let ((explicit (emacs-jupyter-notebook--completion-explicit-command-p)))
+          (when (or explicit
+                    (memq this-command '(self-insert-command delete-backward-char
+                                         backward-delete-char-untabify yank)))
+            (emacs-jupyter-notebook--completion-schedule-request
+             (if explicit 'explicit t) explicit))
+          nil))))
 
 (defun emacs-jupyter-notebook--complete-explicit-now ()
-  "Fetch completions immediately and display them when the reply arrives.
-Unlike the debounced auto path (which just primes the cache and relies on
-the frontend re-invoking capf on the next keystroke), an EXPLICIT
-invocation fires the request now and drives `completion-in-region' on
-arrival — so a single \\[emacs-jupyter-notebook-complete-at-point] reliably
-shows candidates after the round trip regardless of the active frontend,
-and reports `No completions' rather than doing nothing."
-  (when-let* ((context (emacs-jupyter-notebook--completion-context))
-              (key (plist-get context :key)))
-    (let ((code (plist-get context :code))
-          (cursor-pos (plist-get context :cursor-pos))
-          (buffer (current-buffer))
-          (client emacs-jupyter-notebook--client)
-          (request-id (cl-incf emacs-jupyter-notebook--completion-request-counter)))
-      ;; This immediate request supersedes any debounced cache fill.  Clearing
-      ;; its public pending identity prevents the retired callback from leaving a
-      ;; same-key request permanently marked in flight.
-      (emacs-jupyter-notebook--completion-cancel-idle-timer)
-      (message "Requesting completions…")
-      (emacs-jupyter-notebook-backend-aux
-       client 'complete
-       (list :code code :cursor-pos cursor-pos)
-       (lambda (_backend-request-id reply)
-         (when (buffer-live-p buffer)
-           (with-current-buffer buffer
-             (when (and (= request-id emacs-jupyter-notebook--completion-request-counter)
-                        (eq client emacs-jupyter-notebook--client)
-                        reply
-                        (emacs-jupyter-notebook--completion-context-current-p
-                         context))
-               (emacs-jupyter-notebook--completion-cache-put key reply)
-               (emacs-jupyter-notebook--completion-present
-                buffer client request-id context t)))))
-       #'ignore))))
+  "Send or promote one completion request immediately, displaying its reply."
+  (when (timerp emacs-jupyter-notebook--completion-idle-timer)
+    (cancel-timer emacs-jupyter-notebook--completion-idle-timer))
+  (setq emacs-jupyter-notebook--completion-idle-timer nil)
+  (emacs-jupyter-notebook--request-completion 'explicit))
 
 (defun emacs-jupyter-notebook-complete-at-point ()
-  "Explicit completion command.
-Shows cached candidates immediately when present; otherwise fetches now and
-displays them when the reply lands (see `--complete-explicit-now')."
+  "Show cached remote completions, or fetch and display them asynchronously."
   (interactive)
   (unless emacs-jupyter-notebook--client
     (user-error "No Jupyter kernel connected"))
   (when (eq emacs-jupyter-notebook--kernel-status 'busy)
     (user-error "Kernel is busy; completion is unavailable until it is idle"))
-  (let ((result (emacs-jupyter-notebook--completion-result)))
-    (if result
-        ;; Strip capf metadata (`:exclusive' etc) before invoking
-        ;; `completion-in-region', which only accepts (START END COLL).
-        (apply #'completion-in-region (seq-take result 3))
-      (emacs-jupyter-notebook--complete-explicit-now))))
+  (if-let ((result (emacs-jupyter-notebook--completion-result)))
+      (apply #'completion-in-region (seq-take result 3))
+    (emacs-jupyter-notebook--complete-explicit-now)))
 
 (defun emacs-jupyter-notebook--completion-start-idle-timer ()
-  "Start the completion cache idle timer (one-shot rescheduled on each tick).
-The timer captures the current buffer in a closure so it always operates
-on the buffer that armed it, not whatever buffer happens to be current
-when the timer fires."
+  "Prime the completion cache once after connection or mode activation."
   (emacs-jupyter-notebook--completion-cancel-idle-timer)
   (let ((buffer (current-buffer)))
     (setq emacs-jupyter-notebook--completion-idle-timer
           (run-with-idle-timer
-           (emacs-jupyter-notebook--effective-completion-idle)
-           nil
+           (emacs-jupyter-notebook--effective-completion-idle) nil
            (lambda ()
              (when (buffer-live-p buffer)
                (with-current-buffer buffer
@@ -6031,26 +6094,31 @@ when the timer fires."
                  (emacs-jupyter-notebook--completion-idle-populate))))))))
 
 (defun emacs-jupyter-notebook--completion-cancel-idle-timer ()
-  "Cancel the completion cache idle timer and clear pending request state.
-Clearing the pending key/id ensures that any reply for a request that was
-in flight when the timer was cancelled is dropped on arrival per the W3.3
-in-flight invalidation contract."
-  (when (timerp emacs-jupyter-notebook--completion-idle-timer)
-    (cancel-timer emacs-jupyter-notebook--completion-idle-timer))
+  "Retire all local completion callbacks and scheduled UI work."
+  (dolist (timer (list emacs-jupyter-notebook--completion-idle-timer
+                       emacs-jupyter-notebook--completion-ui-timer))
+    (when (timerp timer) (cancel-timer timer)))
+  (cl-incf emacs-jupyter-notebook--completion-request-counter)
+  (cl-incf emacs-jupyter-notebook--completion-epoch)
+  (emacs-jupyter-notebook--completion-cache-reset)
   (setq emacs-jupyter-notebook--completion-idle-timer nil
+        emacs-jupyter-notebook--completion-ui-timer nil
         emacs-jupyter-notebook--completion-pending-key nil
-        emacs-jupyter-notebook--completion-pending-id nil))
+        emacs-jupyter-notebook--completion-pending-id nil
+        emacs-jupyter-notebook--completion-flight nil
+        emacs-jupyter-notebook--completion-queued nil
+        emacs-jupyter-notebook--completion-edit-key nil
+        emacs-jupyter-notebook--completion-edit-tick nil))
 
 (defun emacs-jupyter-notebook--completion-idle-populate ()
-  "Populate completion cache on idle when point sits at a fresh context."
+  "Populate the selected buffer's fresh context once on idle."
   (when (and emacs-jupyter-notebook-mode
              emacs-jupyter-notebook--client
              (not (eq emacs-jupyter-notebook--kernel-status 'busy))
              (not (emacs-jupyter-notebook--async-in-progress-p)))
     (when-let ((key (emacs-jupyter-notebook--completion-key)))
       (unless (or (equal key emacs-jupyter-notebook--completion-pending-key)
-                  (and emacs-jupyter-notebook--completion-cache
-                       (gethash key emacs-jupyter-notebook--completion-cache)))
+                  (emacs-jupyter-notebook--completion-cache-get key))
         (emacs-jupyter-notebook--request-completion)))))
 
 ;;; Inspect
@@ -6146,6 +6214,9 @@ in-flight invalidation contract."
           (when (and record (emacs-jupyter-notebook--execution-current-p id)
                      (eq (plist-get record :state) 'dispatched)
                      (timerp (plist-get record :timer)))
+            ;; Execution may change names, attributes, and remote cwd.  No
+            ;; pre-execution candidates or outstanding replies remain valid.
+            (emacs-jupyter-notebook--completion-cancel-idle-timer)
             (condition-case err
                 (let ((backend-id
                      (emacs-jupyter-notebook-backend-execute

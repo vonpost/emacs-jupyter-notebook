@@ -59,6 +59,7 @@ class ReviewGuiTests(unittest.TestCase):
         self.assertEqual(window._reference_name(), PINNED)
         window.comparison.setCurrentIndex(1)
         pump_until(lambda: window._difference is not None)
+        window.roi_plane.setCurrentIndex(window.roi_plane.findData(PINNED))
         window.rectangle_button.click()
         identifier = window.roi_selector.currentData()
         region = window._regions[identifier]
@@ -158,7 +159,7 @@ class ReviewGuiTests(unittest.TestCase):
                                     for name in ("third", "fourth")]
         window = self.window(data)
         window.pin_button.click()
-        self.assertEqual(len(window._planes), 2)
+        self.assertEqual(len(window._planes), 5)
         calls = []
         window._admit = lambda: calls.append(True) or False
         old_views = dict(window._views)

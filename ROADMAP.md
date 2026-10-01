@@ -207,9 +207,23 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
   magnifier/worker where needed, viewer protocol/install docs and focused ERT.
   Manager coordinates interfaces before edits. No silent resampling.
   > Scope update: user clarified input A + saved prediction B + new prediction
-  > C must stay visible together using reused Python variables. Preserve current
-  > publication members alongside the pinned prior prediction and optional
-  > difference; verify reference/candidate selection across checkpoint reruns.
+  > C must be retained for single-image flipping using reused Python variables.
+  > Add an image selector and previous/next shortcuts preserving compatible
+  > physical camera/slice state; retain optional comparison views and verify
+  > selection and immutable pin ownership across checkpoint reruns.
+  > Layout follow-up: side-by-side panes must have equal image-area dimensions
+  > and aligned axis gutters, including long titles, differing tick labels,
+  > window resizing and returning from single-image selection.
+  > Implemented axis-aligned physical geometry throughout navigation, slices,
+  > cursor, magnifier and measurements. Retained input/current/pinned samples
+  > can be selected singly with View or `[`/`]`; reruns preserve the pin.
+  > All 186 viewer tests passed, including real CPU PyTorch and local kernel
+  > publication. Final physical/layout tests passed offscreen and on Linux X11
+  > (15 each); actual panes measured identically with matching physical cameras.
+  > Independent review covered numerical boundary precision, slice identity,
+  > immutable ownership, unequal grids, flips, reruns and resize geometry.
+  > Final Nix viewer package/check and helper package builds passed. GPU
+  > hardware and macOS were not exercised.
 
 - [~] owner=root claimed=2026-10-01 CC33 PyTorch, explicit cropped volumes,
   and responsive remote completion. Root manages integration, variable-view
@@ -220,6 +234,21 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
   commit or edit ledgers. Preserve asynchronous helpers, bounded artifacts,
   exact source/session ownership and source cleanliness. Review independently
   before landing; run source ERT, Python suites and byte compilation.
+  > NumPy/PyTorch publication accepts 2D planes and explicit 3D crops; tensors
+  > detach/copy only after aggregate validation, with lossless bfloat16 widening.
+  > Volume planes and slices use retained local samples, including pinned crops.
+  > Completion coalesces outstanding work, reuses compatible prefix replies,
+  > preserves truncation semantics, and refreshes/paints the selected frontend.
+  > Real ipykernel quoted-path replies delivered after 200 ms painted Corfu
+  > without another command; singleton delivery preserved text/modification
+  > tick. A narrower cached prefix matched the real kernel reply without a
+  > second request. Frontend checks covered vanilla, Corfu and Company.
+  > Strict compilation and final source-based canonical tests passed with no
+  > bytecode artifacts: 1,211 ERT, 8 array, 261 helper, 25 registry and 12 fixture
+  > tests, with no skips. Both local kernel→helper→viewer tests passed (2D/3D).
+  > Registry fixture response deadline increased from 50 to 500 ms to tolerate
+  > parallel cold process startup; its response-before-child-exit invariant
+  > and subsecond completion check remain intact.
 
 - [x] sha=59f5102 CC32 Execute the real Docker/Jupyter gate.
   The user started a local Docker daemon and granted socket access. Exercise

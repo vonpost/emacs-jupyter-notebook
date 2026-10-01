@@ -551,21 +551,22 @@ its watchdog is pending."
 
 ;;; W3 completion customization
 
-(defcustom emacs-jupyter-notebook-completion-idle 0.10
+(defcustom emacs-jupyter-notebook-completion-idle 0.05
   "Seconds of idle time before sending an async completion request.
 The capf returns immediately; the request fires only after the user
-pauses typing for this long.  The effective value has immutable positive
-lower and upper bounds so invalid customization cannot create a timer storm
+pauses typing for this long.  Explicit completion bypasses this delay.
+The effective value has immutable positive lower and upper bounds so
+invalid customization cannot create a timer storm
 or silently defer completion for hours."
   :type 'number
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-completion-cache-size 200
   "Maximum number of cached completion replies per buffer.
-Evicted in least-recently-used order.  The cache key is
-\(point . line-up-to-point\), so identical contexts within a single
-buffer reuse the prior reply without a round trip.  This option may lower,
-but cannot raise, the package's immutable cache ceiling."
+Evicted in least-recently-used order.  Identical contexts and compatible
+extensions of the current token reuse remote candidates without a round
+trip.  Separators, unrelated edits, and execution invalidate reuse.
+This option may lower, but cannot raise, the package's immutable cache ceiling."
   :type 'integer
   :group 'emacs-jupyter-notebook)
 
@@ -677,7 +678,7 @@ terminal grace may elapse before the ambiguous local transport is retired."
 (defun emacs-jupyter-notebook--effective-completion-idle ()
   "Return the immutable bounded completion debounce delay."
   (emacs-jupyter-notebook--bounded-positive-option
-   emacs-jupyter-notebook-completion-idle 0.10 0.025
+   emacs-jupyter-notebook-completion-idle 0.05 0.025
    emacs-jupyter-notebook--hard-completion-idle))
 
 (defun emacs-jupyter-notebook--effective-ssh-process-timeout (&optional override)

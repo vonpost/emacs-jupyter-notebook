@@ -393,13 +393,13 @@ Toggle the view inside the panel with `H`, or globally with `C-c j t`. `q` burie
 
 ## Numerical slice viewer (experimental)
 
-To open an existing NumPy array, use `C-c j A` on its name or `v` on its row in
+To open an existing NumPy array or PyTorch tensor, use `C-c j A` on its name or `v` on its row in
 the variable browser. For multidimensional arrays, minibuffer selectors choose
 the row/column axes and an index for each remaining axis, including channels.
 Only the selected plane is transferred. Inspection uses generated, history-free
 code; it never edits or re-evaluates the source cell.
 
-To publish several related planes together from a NumPy-equipped Python kernel:
+To publish several related planes together from a Python kernel with NumPy:
 
 ```python
 # %% inspect reconstruction
@@ -411,6 +411,58 @@ ejn.view(
     units="HU",                      # only if values are calibrated HU
 )
 ```
+
+The same call accepts PyTorch tensors, including tensors on a GPU and tensors
+with gradients. Slice or crop first; the publisher detaches and transfers only
+the supplied data to CPU after checking byte limits. It does not import PyTorch
+during connection setup or change the original tensor. `float16` is preserved;
+`bfloat16` is stored losslessly as `float32`. Sparse, quantized, complex,
+boolean and 64-bit integer tensors need an explicit conversion before viewing.
+
+For interactive volume browsing, publish a **3D crop** instead of one plane:
+
+```python
+ejn.view(
+    {"reference": reference[20:60, 100:228, 100:228],
+     "prediction": prediction[20:60, 100:228, 100:228]},
+    key="crop-review", sample_id="case-17/crop-20-60-100-228-100-228",
+    grid_id="aligned-crop",
+)
+```
+
+Choose the display plane in the viewer and use its slice slider, slice number,
+Page Up/Down, or Shift+wheel. The crop transfers once; browsing then works
+locally even while the kernel is busy or disconnected. Axes refer to the
+array's dimension order, not anatomical orientation. A 3D member always means
+a scalar volume; select a channel explicitly for RGB or channel-first data.
+Use a distinct `sample_id` when changing the crop's location. Limits remain
+32 MiB per member and 64 MiB per group including the header.
+
+For different sampling densities, supply spacing for each array in **source
+axis order**. This example upsamples axis 0 from 0.2 mm to 0.1 mm:
+
+```python
+ejn.view(
+    {"original": original_crop, "upsampled": upsampled_crop},
+    key="upsampling", sample_id="case-17/crop", grid_id="case-17-physical",
+    spacing={"original": (0.2, 0.2, 0.2),
+             "upsampled": (0.1, 0.2, 0.2)},
+    spatial_units="mm",
+)
+```
+
+Spacing can also be one tuple shared by all members. Optional `origin` accepts
+the same tuple-or-mapping form and gives the physical coordinate of sample
+index zero; it defaults to zero on each axis. For crops, set it to the physical
+position of the crop's first voxel. Two-dimensional spacing/origin use
+`(row, column)` order. `spatial_units` defaults to `"mm"` when spacing is given;
+intensity `units` (such as HU) are separate.
+
+Arrays with the same sample and declared physical grid share physical zoom,
+cursor and ROI placement even when their shapes or spacing differ. Slice
+navigation chooses the nearest retained physical slice in each volume.
+Differences and blink require matching sample lattices; the viewer does not
+silently resample arrays. Arrays without spacing continue to use pixel units.
 
 EJN injects `ejn` in memory during connection setup. Reconnect after updating
 the package; no kernel restart or remote viewer installation is needed. A
@@ -427,11 +479,26 @@ reference before rerunning to compare the saved evaluation against the latest
 candidate. Freeze keeps the current display; unfreeze follows subsequent
 publications. Compatible updates preserve zoom, display levels and ROIs.
 
-The separate local PyQtGraph window displays up to four named planes with
-zoom/pan, `F` to fit, pixel-value readout, and window level/width controls.
+For checkpoint comparisons with the input visible, publish
+`ejn.view({"input": input_image, "prediction": prediction}, key="checkpoints",
+sample_id="case-17", grid_id="case-17")`. Inspect it, then in **Compare** select
+**prediction** as Reference and click **Pin reference**. Load the next
+checkpoint, overwrite `prediction`, and publish again with the same key/sample.
+Use the viewer's image selector or `[` / `]` to flip between input, saved
+prediction and current prediction in one pane, preserving compatible zoom and
+slice position. The saved result is an immutable local snapshot; separate Python
+variables are unnecessary. Use per-member spacing when input and prediction
+have different resolutions. Pin before the next publication, since unpinned
+candidates are replaced. This also works for a prediction-only publication.
+
+The separate local PyQtGraph window accepts up to four named members, plus a
+pinned result and a difference view, with zoom/pan, `F` to fit, pixel-value
+readout, and window level/width controls. Side-by-side views use equal image
+areas and aligned axis gutters, including when resizing the window.
 Declared compatible grids share zoom/pan. Values and byte order are retained
-losslessly; whole volumes stay remote. After loading, these controls need no
-network requests. Clearing the panel does not delete the displayed snapshot.
+losslessly; only explicitly published planes or crops are transferred. After
+loading, these controls need no network requests. Clearing the panel does not
+delete the displayed snapshot.
 
 The viewer builds asynchronously from the pinned `.#ejn-viewer` Nix output on
 first use. It adds no Qt dependency to ordinary kernel work. See
@@ -576,22 +643,25 @@ Completion runs against the remote kernel through `completion-at-point` and is d
 How it works:
 
 - The capf returns immediately from whatever is in a buffer-local LRU cache. Even if the kernel is on the other side of a 500 ms link, the capf hot path stays in the single-millisecond range.
-- After the user pauses typing for `emacs-jupyter-notebook-completion-idle` seconds (default `0.10`), an async `complete_request` is sent to the kernel.
-- A new keystroke invalidates any in-flight request. When the stale reply finally arrives, it is dropped on arrival — never rendered, never blocking.
-- The cache key is `(point . line-up-to-point)`, so identical contexts in the same buffer reuse the prior reply without a round trip.
+- After a short typing pause (`emacs-jupyter-notebook-completion-idle`, default `0.05` seconds), an async `complete_request` is sent. Explicit completion skips this debounce.
+- Matching cached candidates filter locally as you continue a name or remote path component. A reply already in flight can serve the extended prefix, so you do not need to delete and retype a character.
+- Only one request is outstanding per buffer. New demand coalesces behind it; a directory separator, attribute dot, unrelated edit or kernel transition invalidates the old context.
 - The cache is bounded by `emacs-jupyter-notebook-completion-cache-size` (default 200) with LRU eviction.
 
 Frontend integration:
 
-- **Vanilla `completion-at-point`** works out of the box. The capf returns cached candidates; the next call after a reply arrives sees the fresh cache.
-- **Corfu / Vertico / Consult**: when `completion-in-region-mode` is active the package does not try to force the popup to re-fetch candidates programmatically (no cross-version API does this reliably). The next user keystroke re-invokes capf, which finds the now-cached candidates and updates the popup. In practice the lag is invisible because the reply usually arrives in less than one keystroke.
-- **Company**: when `company-mode` is on and no popup is open, the reply path kicks `company-manual-begin` so the popup picks up the fresh candidates.
+- **Vanilla / Corfu**: a reply re-enters completion with fresh cached candidates, including when a popup is already active. Automatic delivery presents candidates without inserting text; explicit completion can expand it.
+- **Company**: the reply restarts the popup with a backend reading the fresh EJN cache.
 - **Cape** and similar capf composers: just include `emacs-jupyter-notebook-completion-at-point` in your `completion-at-point-functions` (the minor mode does this for you).
 
 Late replies only open completion UI while the source buffer is still selected
 and no minibuffer is active. Reconnect, missing-host, array-axis and kernel-input
 prompts wait for their originating buffer, so background work cannot take over
 M-x or a file picker. Quitting a deferred prompt retires that interaction.
+
+The first request for an uncached directory or object still takes a kernel
+round trip. File candidates come from the remote kernel; local filesystem
+lookups are not substituted for remote paths.
 
 See the [responsiveness review](docs/hang-review-2026-09-09.md) for tested hang
 scenarios and instructions for capturing a backtrace when the minibuffer itself

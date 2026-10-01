@@ -6,10 +6,13 @@ functions on the analysis worker, never from a Qt input callback.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 
 import numpy as np
+
+from .spatial import (SPATIAL_FIELDS, physical_frame_correspondence,
+                      plane_geometry, slice_correspondence)
 
 
 MAX_ROIS = 16
@@ -25,7 +28,11 @@ DIFFERENCE = "\0difference"
 
 @dataclass(frozen=True)
 class Region:
-    """Pixel-coordinate ROI; line width/height are signed endpoint deltas."""
+    """ROI geometry; line width/height are signed endpoint deltas.
+
+    Numerical primitives take pixel coordinates. Workspace jobs retain world
+    coordinates and the worker maps each ROI onto its target pixel lattice.
+    """
 
     identifier: int
     name: str
@@ -47,7 +54,7 @@ class Statistics:
 
 @dataclass(frozen=True)
 class Profile:
-    """Read-only original-sample line values and distances in pixel units.
+    """Read-only original-sample line values and calibrated distances.
 
     ``capped`` reports when the sample limit coarsened the usual spacing of
     at most one pixel. Both clipped endpoints are retained even in that case.
@@ -56,6 +63,7 @@ class Profile:
     distance: np.ndarray
     values: np.ndarray
     capped: bool = False
+    distance_units: str = "px"
 
     @property
     def nbytes(self):
@@ -66,7 +74,43 @@ def scalar_plane(array: np.ndarray) -> bool:
     """V1 scalar types have no unsafe int64-to-float64 conversion."""
     return (isinstance(array, np.ndarray) and array.ndim == 2
             and ((array.dtype.kind in "ui" and array.dtype.itemsize <= 4)
-                 or (array.dtype.kind == "f" and array.dtype.itemsize in (4, 8))))
+                 or (array.dtype.kind == "f" and array.dtype.itemsize in (2, 4, 8))))
+
+
+def scalar_array(array: np.ndarray) -> bool:
+    """Admitted numerical publications are scalar planes or explicit 3D crops."""
+    return (isinstance(array, np.ndarray) and array.ndim in (2, 3)
+            and all(size > 0 for size in array.shape)
+            and scalar_plane(array if array.ndim == 2 else array[0]))
+
+
+@dataclass(frozen=True)
+class VolumeSelection:
+    """One retained index per ndarray axis; no anatomical orientation implied."""
+
+    axis: int
+    indices: tuple[int, int, int]
+
+    @classmethod
+    def centered(cls, shape):
+        return cls(0, tuple(size // 2 for size in shape))
+
+    def select(self, shape, *, axis=None, index=None):
+        axis = self.axis if axis is None else axis
+        if type(axis) is not int or not 0 <= axis < 3:
+            raise ValueError("volume axis must be 0, 1 or 2")
+        indices = list(self.indices)
+        if index is not None:
+            indices[axis] = max(0, min(shape[axis] - 1, int(index)))
+        return VolumeSelection(axis, tuple(indices))
+
+    def plane(self, array):
+        selection = [slice(None)] * 3
+        selection[self.axis] = self.indices[self.axis]
+        return array[tuple(selection)]
+
+    def key(self, shape):
+        return tuple(shape), self.axis, self.indices[self.axis]
 
 
 def spatial_key(meta: dict) -> tuple:
@@ -77,11 +121,42 @@ def spatial_key(meta: dict) -> tuple:
 def correspondence(first: np.ndarray, second: np.ndarray,
                    first_meta: dict, second_meta: dict, *, declared=False) -> bool:
     """Explicit local correspondence only fills absent grid declarations."""
-    if first.shape != second.shape or spatial_key(first_meta) != spatial_key(second_meta):
+    if (first.shape != second.shape or spatial_key(first_meta) != spatial_key(second_meta)
+            or not slice_correspondence(first_meta, second_meta)):
         return False
     first_grid, second_grid = first_meta.get("grid_id"), second_meta.get("grid_id")
     return (bool(first_grid) and first_grid == second_grid
             or declared and not first_grid and not second_grid)
+
+
+def frame_correspondence(first: np.ndarray, second: np.ndarray,
+                         first_meta: dict, second_meta: dict, *, declared=False) -> bool:
+    """Same declared physical frame, allowing unequal sample densities/crops.
+
+    Uncalibrated arrays retain the strict historical pixel-grid behavior.
+    Caller must also establish matching sample identity before linking panes.
+    """
+    if not (SPATIAL_FIELDS.intersection(first_meta)
+            or SPATIAL_FIELDS.intersection(second_meta)):
+        return correspondence(first, second, first_meta, second_meta, declared=declared)
+    first_grid, second_grid = first_meta.get("grid_id"), second_meta.get("grid_id")
+    declared_frame = (bool(first_grid) and first_grid == second_grid
+                      or declared and not first_grid and not second_grid)
+    return bool(declared_frame and physical_frame_correspondence(
+        first.shape, second.shape, first_meta, second_meta))
+
+
+def world_region_to_pixel(region: Region, metadata: dict) -> Region:
+    """Map shared world ROI geometry onto one target's original sample grid."""
+    geometry = plane_geometry(metadata)
+    if not geometry.physical:
+        return region
+    x, y = geometry.world_to_pixel(region.x, region.y)
+    # Transform endpoints independently so translated decimal grid centers
+    # retain rectangle half-open and ellipse closed membership exactly.
+    end_x, end_y = geometry.world_to_pixel(region.x + region.width,
+                                          region.y + region.height)
+    return replace(region, x=x, y=y, width=end_x - x, height=end_y - y)
 
 
 def comparison_error(reference: np.ndarray, candidate: np.ndarray,
@@ -94,7 +169,7 @@ def comparison_error(reference: np.ndarray, candidate: np.ndarray,
         return "Differences require the same declared sample."
     if not correspondence(reference, candidate, reference_meta, candidate_meta,
                           declared=declared_grid):
-        return "Differences require matching shape and declared pixel grids."
+        return "Differences require the same sample lattice (shape, spacing, origin and slice)."
     first_units, second_units = reference_meta.get("units"), candidate_meta.get("units")
     if not (first_units and first_units == second_units
             or declared_units and not first_units and not second_units):
@@ -148,13 +223,15 @@ def _interpolate(first, second, weight):
     return result
 
 
-def line_profile(array: np.ndarray, roi: Region) -> Profile:
+def line_profile(array: np.ndarray, roi: Region, *, spacing=None,
+                 distance_units="px") -> Profile:
     """Bilinear profile of a directed line over immutable original samples.
 
     Coordinates are in image space: pixel (row, col) is centered at
     (col + .5, row + .5). Clip the segment to the closed image footprint
     [0, cols] x [0, rows], extending edge samples through the outer half pixel.
     Distances start at the original, possibly off-image first endpoint.
+    Optional row/column SPACING calibrates distances without changing samples.
 
     The clipped segment gets ceil(length) + 1 equally spaced samples, including
     both endpoints; a point gets one sample and a missed/empty image gets none.
@@ -173,10 +250,19 @@ def line_profile(array: np.ndarray, roi: Region) -> Profile:
                (x, y, dx, dy, x + dx, y + dy, length)):
         raise ValueError("line coordinates and length must be finite")
 
+    if spacing is None:
+        spacing = (1.0, 1.0)
+    if (len(spacing) != 2 or not all(math.isfinite(value) and value > 0
+                                   for value in spacing)):
+        raise ValueError("profile spacing must have two finite positive values")
+    physical_length = math.hypot(dx * spacing[1], dy * spacing[0])
+    if not math.isfinite(physical_length):
+        raise ValueError("profile physical length must be finite")
+
     def profile(distance, values, capped=False):
         distance.setflags(write=False)
         values.setflags(write=False)
-        return Profile(distance, values, capped)
+        return Profile(distance, values, capped, distance_units)
 
     def empty():
         return profile(np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64))
@@ -202,7 +288,8 @@ def line_profile(array: np.ndarray, roi: Region) -> Profile:
     clipped_length = math.hypot(last_x - first_x, last_y - first_y)
     requested = math.ceil(clipped_length) + 1
     count = min(MAX_PROFILE_SAMPLES, requested)
-    distance = np.linspace(start * length, stop * length, count, dtype=np.float64)
+    distance = np.linspace(start * physical_length, stop * physical_length,
+                           count, dtype=np.float64)
     columns = np.clip(np.linspace(first_x, last_x, count) - .5, 0, cols - 1)
     rows_at = np.clip(np.linspace(first_y, last_y, count) - .5, 0, rows - 1)
     left, top = columns.astype(np.intp), rows_at.astype(np.intp)

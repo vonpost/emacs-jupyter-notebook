@@ -134,6 +134,43 @@ class VariableMetadataTests(unittest.TestCase):
             with self.subTest(params=params), self.assertRaises(BackendError):
                 build_variables_expression(params)
 
+    def test_tensor_and_parameter_metadata_without_storage_access(self):
+        touched = []
+
+        class Tensor:
+            shape = (3, 5, 7)
+            dtype = "torch.float32"
+
+            def cpu(self):
+                touched.append("cpu")
+                raise AssertionError("metadata must not transfer storage")
+
+            def numpy(self):
+                touched.append("numpy")
+                raise AssertionError("metadata must not convert values")
+
+        class Parameter(Tensor):
+            pass
+
+        class UserSubclass(Tensor):
+            @property
+            def shape(self):
+                touched.append("subclass")
+                raise AssertionError("metadata must not invoke user dispatch")
+
+        torch = types.ModuleType("torch")
+        torch.Tensor = Tensor
+        parameter_module = types.ModuleType("torch.nn.parameter")
+        parameter_module.Parameter = Parameter
+        with patch.dict(sys.modules, {"torch": torch, "torch.nn.parameter": parameter_module}):
+            result = inspect_namespace({"tensor": Tensor(), "weight": Parameter(), "custom": UserSubclass()})
+        by_name = {row["name"]: row for row in result["variables"]}
+        self.assertEqual(by_name["tensor"]["shape"], [3, 5, 7])
+        self.assertEqual(by_name["weight"]["shape"], [3, 5, 7])
+        self.assertEqual(by_name["weight"]["dtype"], "torch.float32")
+        self.assertIsNone(by_name["custom"]["shape"])
+        self.assertEqual(touched, [])
+
     def test_malformed_or_excessive_response_never_crosses_boundary(self):
         for raw in (
             "[]", "{}", json.dumps({"variables": [], "truncated": "false"}),

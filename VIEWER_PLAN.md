@@ -15,6 +15,20 @@ full acceptance checkboxes still require their recorded tests.
 
 ## Outcome and release scope
 
+2026-10-01 / CC33 extends explicit publication to NumPy/PyTorch 2D planes and
+bounded 3D crops. This supersedes the original 2D-only restriction below.
+The caller selects the crop before publishing; no remote array is retained or
+fetched automatically. The local viewer selects source-axis planes and scrolls
+through retained slices without network traffic. Resource ceilings are unchanged.
+This does not implement V12's lazy remote-volume handles or slice fetching.
+
+2026-10-01 / CC34 adds explicit per-member axis spacing and sample-center
+origins, allowing original/upsampled arrays to share physical navigation and
+measurement geometry. Physical frame correspondence is separate from exact
+sample-lattice equality; differences/blink still require the latter. The
+publisher emits axis-aligned metadata, in ndarray dimension order, for 2D
+planes and 3D crops. This supersedes the identical-grid-only linking rule below.
+
 2026-09-07 / CC14 implements the user's requested comparison/measurement
 subset on the experimental workspace: signed/absolute differences, compatible
 grid/unit checks, up to 16 linked rectangles/ellipses, finite-sample mean and

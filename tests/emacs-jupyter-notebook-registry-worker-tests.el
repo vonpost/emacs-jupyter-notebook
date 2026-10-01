@@ -718,7 +718,10 @@
               "sys.stdout.write(raw+'\\n'); sys.stdout.flush()\n"
               "time.sleep(10)\n")))
            (emacs-jupyter-notebook-registry-worker-command (list worker))
-           (emacs-jupyter-notebook-registry-worker-request-timeout 0.05)
+           ;; Allow a cold Python startup under parallel test/build load.
+           ;; The ten-second child sleep and one-second assertion below still
+           ;; prove delivery from the complete frame, before process exit.
+           (emacs-jupyter-notebook-registry-worker-request-timeout 0.5)
            (started (float-time)))
       (unwind-protect
           (let ((result

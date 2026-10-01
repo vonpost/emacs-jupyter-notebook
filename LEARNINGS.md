@@ -298,6 +298,16 @@ section.
 
 ### 21. Refresh-the-popup-programmatically is a trap
 
+CC33 update (2026-10-01): relying on the next keystroke made completion
+unusable on high-latency links. Restart the selected frontend through its
+completion entrypoint with freshly cached data. Corfu also needs a guarded
+`corfu--exhibit` after that rebuild: timer delivery does not run its normal
+post-command paint hook. Redisplay alone still cannot refresh candidates.
+Verify actual popup painting, not just an active mode or populated cache.
+Preserve buffer/minibuffer/context fences and coalesce requests; reuse a reply
+only while edits stay within the same completion token.
+The historical W3.7 approach below is superseded by this behavior.
+
 Corfu has no cross-version stable API to force a re-fetch of capf
 candidates from a live popup. The original W3.5 called `corfu--exhibit`
 which redisplays state but doesn't refresh. The clean answer is: don't

@@ -35,6 +35,7 @@ def _ejn_variables():
     ndarray = numpy.get('ndarray')
     torch = module_dict('torch')
     tensor = torch.get('Tensor')
+    parameter = module_dict('torch.nn.parameter').get('Parameter')
     def metadata(name, value):
         cls = b.type(value)
         # Call type's own descriptors, bypassing a user metaclass's properties.
@@ -48,8 +49,9 @@ def _ejn_variables():
                 shape = descriptors['shape'].__get__(value, cls)
                 dtype = descriptors['dtype'].__get__(value, cls)
                 row['dtype'] = clean(dtype.name, 64)
-            elif tensor is not None and cls is tensor:
-                # Exact Tensor only: subclasses can override torch dispatch.
+            elif tensor is not None and (cls is tensor or cls is parameter):
+                # Exact Tensor/Parameter only: arbitrary subclasses can
+                # override dispatch. Metadata never copies tensor storage.
                 shape = value.shape
                 row['dtype'] = clean(b.str(value.dtype), 64)
             elif cls is b.memoryview:

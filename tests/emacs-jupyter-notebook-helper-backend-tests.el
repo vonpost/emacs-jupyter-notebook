@@ -2023,8 +2023,8 @@ DISPOSALS receives local-only disposal reasons."
           (should-not emacs-jupyter-notebook--completion-pending-id)
           (should (emacs-jupyter-notebook--completion-result)))))))
 
-(ert-deftest ejn-ei5-explicit-completion-drops-late-context-replies ()
-  "Explicit completion accepts only the newest reply for the live context."
+(ert-deftest ejn-ei5-explicit-completion-coalesces-repeated-invocations ()
+  "Repeated explicit completion preserves one request and presents its reply."
   (save-window-excursion
     (with-temp-buffer
       (set-window-buffer (selected-window) (current-buffer))
@@ -2035,22 +2035,21 @@ DISPOSALS receives local-only disposal reasons."
       (let ((emacs-jupyter-notebook-mode t)
             (emacs-jupyter-notebook--client 'client-a)
             callbacks refreshes)
-        (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-aux)
-                   (lambda (_client _operation _payload success _failure)
-                     (push success callbacks)))
-                  ((symbol-function 'completion-in-region)
-                   (lambda (&rest _) (setq refreshes (1+ (or refreshes 0))))))
-                 (emacs-jupyter-notebook--complete-explicit-now)
-                 (emacs-jupyter-notebook--complete-explicit-now)
-                 (let ((newest (car callbacks)) (older (cadr callbacks)))
-                   (funcall older 1
-                            '(:matches ("old") :cursor_start 0 :cursor_end 3))
-                   (should-not refreshes)
-                   (funcall newest 2
-                            '(:matches ("new") :cursor_start 0 :cursor_end 3))
-                   (should-not refreshes)
-                   (accept-process-output nil 0.15)
-                   (should (= refreshes 1))))))))
+        (unwind-protect
+            (cl-letf (((symbol-function 'emacs-jupyter-notebook-backend-aux)
+                       (lambda (_client _operation _payload success _failure)
+                         (push success callbacks)))
+                      ((symbol-function 'completion-in-region)
+                       (lambda (&rest _) (setq refreshes (1+ (or refreshes 0))))))
+              (emacs-jupyter-notebook--complete-explicit-now)
+              (emacs-jupyter-notebook--complete-explicit-now)
+              (should (= (length callbacks) 1))
+              (funcall (car callbacks) 1
+                       '(:matches ("print") :cursor_start 0 :cursor_end 3))
+              (should-not refreshes)
+              (accept-process-output nil 0.01)
+              (should (= refreshes 1)))
+          (emacs-jupyter-notebook--completion-cancel-idle-timer))))))
 
 (ert-deftest ejn-ei5-explicit-completion-drops-moved-edited-and-replaced-context ()
   "Explicit completion replies are no-ops after point, text, or client changes."

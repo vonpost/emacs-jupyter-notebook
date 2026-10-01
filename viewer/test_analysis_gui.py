@@ -126,7 +126,7 @@ class AnalysisGuiTests(unittest.TestCase):
             meta.pop("units")
         window = self.window(data)
         window.comparison.setCurrentIndex(1)
-        self.assertIn("pixel grids", window.analysis_status.text())
+        self.assertIn("same sample lattice", window.analysis_status.text())
         window.declare_grid.setChecked(True)
         self.assertIn("matching units", window.analysis_status.text())
         window.declare_units.setChecked(True)

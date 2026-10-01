@@ -9,7 +9,8 @@ import threading
 from PySide6 import QtCore
 
 from .analysis import (DIFFERENCE, MAX_PROFILE_BYTES, SCRATCH_BYTES,
-                       difference, line_profile, statistics)
+                       difference, line_profile, statistics, world_region_to_pixel)
+from .spatial import plane_geometry
 from .memory import MAX_MEMORY, merge_allocations, source_allocations
 
 
@@ -24,6 +25,7 @@ class AnalysisJob:
     candidate: str | None = None
     absolute: bool = False
     cached_difference: object = None
+    metadata: dict = field(default_factory=dict)
     cancelled: threading.Event = field(default_factory=threading.Event)
 
 
@@ -48,8 +50,16 @@ def compute(job: AnalysisJob):
         for name in job.targets[region.identifier]:
             if job.cancelled.is_set():
                 return None
-            operation = line_profile if region.kind == "line" else statistics
-            results[region.identifier, name] = operation(arrays[name], region)
+            metadata = job.metadata.get(name, {})
+            mapped_region = world_region_to_pixel(region, metadata)
+            if region.kind == "line":
+                geometry = plane_geometry(metadata)
+                result = line_profile(arrays[name], mapped_region,
+                                      spacing=geometry.spacing,
+                                      distance_units=geometry.units or "px")
+            else:
+                result = statistics(arrays[name], mapped_region)
+            results[region.identifier, name] = result
     return derived, results
 
 

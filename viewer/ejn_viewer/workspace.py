@@ -12,10 +12,11 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .analysis import (DIFFERENCE, MAX_ROIS, MAX_PROFILE_BYTES, Profile, Region, comparison_error,
-                       correspondence, scalar_plane)
+                       correspondence, frame_correspondence, scalar_array, VolumeSelection)
+from .spatial import plane_geometry, project_metadata
 from .analysis_worker import AnalysisJob, AnalysisWorker
-from .navigation import ImageGraphicsWidget, ImageViewBox, NavigationGroup, camera
-from .memory import AnalysisSource, MAX_MEMORY, merge_allocations, source_allocations
+from .navigation import ImageGraphicsWidget, ImageViewBox, NavigationGroup, PaneLabel, camera
+from .memory import AnalysisSource, MAX_MEMORY, merge_allocations, source_allocations, render_bytes
 from .magnifier import Magnifier, MAX_PATCH_BYTES
 
 
@@ -25,9 +26,9 @@ PINNED = "\0pinned"
 
 def _sample_extrema(array: np.ndarray) -> tuple[float, float] | None:
     """Return finite extrema from at most MAX_LEVEL_SAMPLE source samples."""
-    flat = np.asarray(array).reshape(-1)
-    step = max(1, (flat.size + MAX_LEVEL_SAMPLE - 1) // MAX_LEVEL_SAMPLE)
-    sample = flat[::step]
+    # Flat indexing samples strided faces without flattening/copying the face.
+    step = max(1, (array.size + MAX_LEVEL_SAMPLE - 1) // MAX_LEVEL_SAMPLE)
+    sample = array.flat[::step]
     finite = sample[np.isfinite(sample)]
     if not finite.size:
         return None
@@ -116,8 +117,12 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self._rendered_selection = None
         self._planes: dict[str, np.ndarray] = {}
         self._items: dict[str, pg.ImageItem] = {}
+        self._labels = {}
+        self._plots = {}
+        self._layout_columns = self._layout_rows = 0
         self._views: dict[str, pg.ViewBox] = {}
         self._metadata: dict[str, dict] = {}
+        self._volume_selections: dict[str, VolumeSelection] = {}
         self._levels: dict[str, tuple[float, float]] = {}
         self._linked = False
         self._navigation_groups = []
@@ -156,6 +161,9 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self._pending_snapshot_timer.setSingleShot(True)
         self._pending_snapshot_timer.setInterval(75)
         self._pending_snapshot_timer.timeout.connect(self._adopt_pending_snapshot)
+        self._layout_timer = QtCore.QTimer(self)
+        self._layout_timer.setSingleShot(True)
+        self._layout_timer.timeout.connect(self._layout_panes)
 
         central = QtWidgets.QWidget(self)
         outer = QtWidgets.QVBoxLayout(central)
@@ -183,6 +191,43 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         for widget in (self.fit_button, self.level, self.width):
             controls.addWidget(widget)
         outer.addLayout(controls)
+
+        image_controls = QtWidgets.QHBoxLayout()
+        image_controls.addWidget(QtWidgets.QLabel("View", central))
+        self.view_selector = QtWidgets.QComboBox(central)
+        self.view_selector.setMinimumWidth(170)
+        self.view_selector.setMaximumWidth(280)
+        self.view_selector.addItem("All images", None)
+        self.view_selector.setToolTip("Show one retained image, or all images. [ and ] flip between images locally.")
+        image_controls.addWidget(self.view_selector)
+        image_controls.addWidget(QtWidgets.QLabel("[ / ] flip images", central))
+        image_controls.addStretch(1)
+        outer.addLayout(image_controls)
+
+        self.volume_controls = QtWidgets.QWidget(central)
+        volume_layout = QtWidgets.QHBoxLayout(self.volume_controls)
+        volume_layout.setContentsMargins(0, 0, 0, 0)
+        self.volume_selector = QtWidgets.QComboBox(self.volume_controls)
+        self.volume_selector.setMaximumWidth(180)
+        self.volume_axis = QtWidgets.QComboBox(self.volume_controls)
+        for axis, text in enumerate(("Axes 1 × 2 (slice axis 0)",
+                                     "Axes 0 × 2 (slice axis 1)",
+                                     "Axes 0 × 1 (slice axis 2)")):
+            self.volume_axis.addItem(text, axis)
+        self.slice_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal, self.volume_controls)
+        self.slice_index = QtWidgets.QSpinBox(self.volume_controls)
+        self.slice_index.setPrefix("Slice ")
+        self.slice_status = QtWidgets.QLabel(self.volume_controls)
+        for widget in (self.volume_selector, self.volume_axis, self.slice_slider,
+                       self.slice_index, self.slice_status):
+            volume_layout.addWidget(widget)
+        volume_layout.setStretch(2, 1)
+        self.volume_controls.setToolTip(
+            "Browse the retained crop locally. Axes follow ndarray order; rows × columns. "
+            "Indices start at zero within the crop. Shift+wheel or PageUp/PageDown changes slice. "
+            "Matching declared volume grids browse together.")
+        outer.addWidget(self.volume_controls)
+        self.volume_controls.hide()
 
         self.compare_button = QtWidgets.QToolButton(central)
         self.compare_button.setText("Compare")
@@ -233,6 +278,7 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self.graphics = ImageGraphicsWidget(central)
         self.graphics.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         self.graphics.setMinimumHeight(180)
+        self.graphics.viewport().installEventFilter(self)
         outer.addWidget(self.graphics, 1)
         self.magnifier = Magnifier(central)
         outer.addWidget(self.magnifier)
@@ -336,6 +382,23 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self.roi_selector.currentIndexChanged.connect(self._roi_selection_changed)
         self.roi_name.returnPressed.connect(lambda: self.rename_roi(self.roi_name.text()))
         self.copy_button.clicked.connect(self.copy_statistics)
+        self.view_selector.currentIndexChanged.connect(self._view_changed)
+        self.volume_selector.currentIndexChanged.connect(self._sync_volume_controls)
+        self.volume_axis.currentIndexChanged.connect(
+            lambda: self.select_volume_slice(axis=self.volume_axis.currentData()))
+        self.slice_slider.valueChanged.connect(lambda index: self.select_volume_slice(index=index))
+        self.slice_index.valueChanged.connect(lambda index: self.select_volume_slice(index=index))
+        self._slice_shortcuts = []
+        for key, step in (("PgUp", -1), ("PgDown", 1)):
+            shortcut = QtGui.QShortcut(QtGui.QKeySequence(key), self.graphics)
+            shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(lambda delta=step: self._step_slice(delta))
+            self._slice_shortcuts.append(shortcut)
+        for key, step in (("[", -1), ("]", 1)):
+            shortcut = QtGui.QShortcut(QtGui.QKeySequence(key), self.graphics)
+            shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(lambda delta=step: self._cycle_images(delta))
+            self._slice_shortcuts.append(shortcut)
         self._roi_shortcuts = []
         for key, dx, dy in (("Left", -1, 0), ("Right", 1, 0), ("Up", 0, -1), ("Down", 0, 1)):
             for prefix, step in (("", 1), ("Shift+", 10)):
@@ -357,10 +420,10 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
     def allocations(self):
         result = {}
         result["magnifier", id(self)] = MAX_PATCH_BYTES
-        # One selected line, at most four originals plus a difference. Include
+        # One selected line, four originals, a pin and a difference. Include
         # NumPy vectors, plot paths, finite masks and plotting conversions.
         if self._profile_identifier is not None:
-            result["profiles", id(self)] = MAX_PROFILE_BYTES * 5 * 8
+            result["profiles", id(self)] = MAX_PROFILE_BYTES * 6 * 8
         for snapshot in (self._snapshot, self._pinned):
             if snapshot is not None:
                 result = merge_allocations(result, source_allocations(snapshot))
@@ -373,15 +436,201 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             result["array", id(array)] = array.nbytes
         if self._pending_snapshot is not None:
             result = merge_allocations(result, source_allocations(self._pending_snapshot))
-            result["pending-render", id(self)] = sum(array.shape[0] * array.shape[1] * 8
+            result["pending-render", id(self)] = sum(render_bytes(array, numerical=self._pending_snapshot.numerical)
                 for array in self._pending_snapshot.planes.values())
         return result
 
-    def _all_planes(self):
+    def _raw_planes(self):
         arrays = dict(self._snapshot.planes)
         if self._pinned is not None:
             arrays[PINNED] = self._pinned.planes[self._pinned_name]
         return arrays
+
+    def _all_planes(self):
+        return {name: self._volume_selections[name].plane(array)
+                if name in self._volume_selections else array
+                for name, array in self._raw_planes().items()}
+
+    def _populate_volumes(self):
+        selected = self.volume_selector.currentData()
+        with QtCore.QSignalBlocker(self.volume_selector):
+            self.volume_selector.clear()
+            for name in self._raw_planes():
+                if name in self._volume_selections:
+                    label = "Pinned: " + self._pinned_name if name == PINNED else name
+                    self.volume_selector.addItem(label, name)
+            index = self.volume_selector.findData(selected)
+            self.volume_selector.setCurrentIndex(max(0, index))
+        self.volume_controls.setVisible(bool(self.volume_selector.count()))
+        self._sync_volume_controls()
+
+    def _populate_views(self):
+        selected = self.view_selector.currentData()
+        with QtCore.QSignalBlocker(self.view_selector):
+            self.view_selector.clear()
+            self.view_selector.addItem("All images", None)
+            for name in self._raw_planes():
+                label = "Pinned: " + self._pinned_name if name == PINNED else name
+                self.view_selector.addItem(label, name)
+            self.view_selector.setCurrentIndex(max(0, self.view_selector.findData(selected)))
+
+    def _view_changed(self, *_):
+        if self._snapshot is None or self._closed:
+            return
+        if self.graphics._roi_drag is not None or self.graphics.scene().mouseGrabberItem() is not None:
+            with QtCore.QSignalBlocker(self.view_selector):
+                self.view_selector.setCurrentIndex(self.view_selector.findData(
+                    next(iter(self._planes)) if len(self._planes) == 1 else None))
+            return
+        self.cancel_drawing()
+        self._blink(False)
+        selected = self.view_selector.currentData()
+        old_planes, self._planes = self._planes, self._display_planes()
+        allowed = self._admit()
+        self._planes = old_planes
+        if not allowed:
+            with QtCore.QSignalBlocker(self.view_selector):
+                self.view_selector.setCurrentIndex(self.view_selector.findData(
+                    next(iter(self._planes)) if len(self._planes) == 1 else None))
+            self.analysis_status.setText("This view exceeds the local memory budget; close another workspace first.")
+            return
+        if selected in self._volume_selections:
+            self.volume_selector.setCurrentIndex(self.volume_selector.findData(selected))
+        preserve = selected is None or any(self._corresponds(selected, name) for name in old_planes)
+        self._render(preserve=preserve)
+        self._schedule_analysis()
+
+    def _cycle_images(self, step):
+        count = self.view_selector.count() - 1
+        if count <= 0:
+            return
+        index = self.view_selector.currentIndex() - 1
+        target = (index + step) % count if index >= 0 else (0 if step > 0 else count - 1)
+        self.view_selector.setCurrentIndex(target + 1)
+
+    def _sync_volume_controls(self, *_):
+        name = self.volume_selector.currentData()
+        if name not in self._volume_selections:
+            return
+        selection = self._volume_selections[name]
+        shape = self._raw_planes()[name].shape
+        index = selection.indices[selection.axis]
+        with QtCore.QSignalBlocker(self.volume_axis):
+            self.volume_axis.setCurrentIndex(selection.axis)
+        for widget in (self.slice_slider, self.slice_index):
+            with QtCore.QSignalBlocker(widget):
+                widget.setRange(0, shape[selection.axis] - 1)
+                widget.setValue(index)
+        status = f"/ {shape[selection.axis] - 1}"
+        meta = self._raw_meta(name)
+        if meta.get("spacing"):
+            position = meta["origin"][selection.axis] + index * meta["spacing"][selection.axis]
+            status += f" · {position:g} {meta['spatial_units']}"
+        self.slice_status.setText(status)
+
+    def _volume_corresponds(self, first, second):
+        arrays = self._raw_planes()
+        return (first == second or first in self._volume_selections
+                and second in self._volume_selections
+                and self._sample(first) == self._sample(second)
+                and frame_correspondence(arrays[first], arrays[second],
+                                   self._raw_meta(first), self._raw_meta(second),
+                                   declared=self.declare_grid.isChecked()))
+
+    @staticmethod
+    def _mapped_slice_index(index, axis, source_meta, target_meta):
+        if source_meta.get("spacing") and target_meta.get("spacing"):
+            position = source_meta["origin"][axis] + index * source_meta["spacing"][axis]
+            return math.floor((position - target_meta["origin"][axis]) / target_meta["spacing"][axis] + .5)
+        return index
+
+    def select_volume_slice(self, *, name=None, axis=None, index=None):
+        """Select a locally retained face and invalidate all old derived results."""
+        name = self.volume_selector.currentData() if name is None else name
+        if name not in self._volume_selections or self._closed:
+            return
+        # Replacing a ViewBox while Qt owns a scene drag target invalidates
+        # its handle. Slider drags are outside this scene and remain live.
+        if self.graphics._roi_drag is not None or self.graphics.scene().mouseGrabberItem() is not None:
+            self._sync_volume_controls()
+            return
+        self.cancel_drawing()
+        previous = dict(self._volume_selections)
+        old_links = {(first, second): self._corresponds(first, second)
+                     for first in self._planes for second in self._planes}
+        selection = previous[name].select(self._raw_planes()[name].shape, axis=axis, index=index)
+        if selection == previous[name]:
+            return
+        targets = [target for target in self._volume_selections if self._volume_corresponds(name, target)]
+        for target in targets:
+            target_index = self._mapped_slice_index(selection.indices[selection.axis], selection.axis,
+                                                    self._raw_meta(name), self._raw_meta(target))
+            self._volume_selections[target] = previous[target].select(
+                self._raw_planes()[target].shape, axis=selection.axis,
+                index=target_index)
+        old_planes, old_difference = self._planes, self._difference
+        self._difference = None
+        self._planes = self._display_planes()
+        allowed = self._admit()
+        self._planes, self._difference = old_planes, old_difference
+        if not allowed:
+            self._volume_selections = previous
+            self._sync_volume_controls()
+            self.analysis_status.setText("This slice exceeds the local memory budget; close another workspace first.")
+            return
+        self._blink(False)
+        self._worker.cancel(self._analysis_owner)
+        self._analysis_token += 1
+        self._difference = self._difference_key = None
+        self._statistics = {}
+        self._profiles = {}
+        changed_axis = any(previous[target].axis != selection.axis for target in targets)
+        if changed_axis:
+            self._regions = {key: region for key, region in self._regions.items()
+                             if region.plane not in targets}
+        self._update_analysis_source()
+        self._sync_volume_controls()
+        links_unchanged = all(self._corresponds(first, second) == linked
+                              for (first, second), linked in old_links.items())
+        # Keep ViewBoxes/ROI handles alive while scrubbing one orientation.
+        # Full scene construction is only needed for shape/layout changes.
+        if not changed_axis and links_unchanged and DIFFERENCE not in self._planes:
+            self._planes = self._display_planes()
+            for target, array in self._planes.items():
+                item = self._items[target]
+                item.setImage(array, autoLevels=False, levels=item.getLevels())
+                self._set_pane_label(target)
+            for index in range(self.roi_plane.count()):
+                self.roi_plane.setItemText(index, self._display_name(self.roi_plane.itemData(index)))
+            self.blink_button.setEnabled(self._comparison_error() is None)
+            self._clear_cursor()
+        else:
+            self._render(preserve=not changed_axis)
+        self._schedule_analysis()
+
+    def _step_slice(self, delta, name=None):
+        name = self.volume_selector.currentData() if name is None else name
+        if name in self._volume_selections:
+            selection = self._volume_selections[name]
+            self.select_volume_slice(name=name, index=selection.indices[selection.axis] + delta)
+
+    def eventFilter(self, watched, event):
+        if watched is self.graphics.viewport() and event.type() == QtCore.QEvent.Type.Resize:
+            self._layout_timer.start(0)
+        if (watched is self.graphics.viewport() and event.type() == QtCore.QEvent.Type.Wheel
+                and event.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier):
+            view, _scene = self.graphics._view_at(event.position())
+            name = next((name for name, target in self._views.items() if target is view), None)
+            if name == DIFFERENCE:
+                name = self._candidate_name()
+            if name in self._volume_selections:
+                delta = event.angleDelta().y() or event.pixelDelta().y()
+                if delta:
+                    self.volume_selector.setCurrentIndex(self.volume_selector.findData(name))
+                    self._step_slice(1 if delta < 0 else -1, name)
+                event.accept()
+                return True
+        return super().eventFilter(watched, event)
 
     def _update_analysis_source(self):
         sources = tuple({id(value): value for value in (self._snapshot, self._pinned)
@@ -444,16 +693,18 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
                 self.analysis_status.setText("Pinning requires an immutable loaded snapshot.")
                 return
             self._pinned, self._pinned_name = self._snapshot, name
-            # Promotion shares source bytes but adds a second displayed pane
-            # for a single-plane publication. Admit its render buffers first.
+            if name in self._volume_selections:
+                self._volume_selections[PINNED] = self._volume_selections[name]
+            # Promotion shares source bytes but adds a displayed baseline.
+            # Keep every current member and admit all render buffers first.
             previous_planes, previous_difference = self._planes, self._difference
-            self._planes = {PINNED: self._pinned.planes[name],
-                            self._candidate_name(): self._snapshot.planes[self._candidate_name()]}
+            self._planes = self._display_planes()
             self._difference = None
             allowed = self._admit()
             self._planes, self._difference = previous_planes, previous_difference
             if not allowed:
                 self._pinned = self._pinned_name = None
+                self._volume_selections.pop(PINNED, None)
                 self.pin_button.blockSignals(True)
                 self.pin_button.setChecked(False)
                 self.pin_button.blockSignals(False)
@@ -463,7 +714,7 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             previous_pin, previous_name = self._pinned, self._pinned_name
             previous_planes, previous_difference = self._planes, self._difference
             self._pinned = self._pinned_name = None
-            self._planes, self._difference = dict(self._snapshot.planes), None
+            self._planes, self._difference = self._display_planes(), None
             allowed = self._admit()
             self._pinned, self._pinned_name = previous_pin, previous_name
             self._planes, self._difference = previous_planes, previous_difference
@@ -481,12 +732,15 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
                     else:
                         del self._regions[identifier]
             self._pinned = self._pinned_name = None
+            self._volume_selections.pop(PINNED, None)
         self._populate_selectors()
         if checked:
             self.reference.blockSignals(True)
             self.reference.setCurrentIndex(self.reference.findData(PINNED))
             self.reference.blockSignals(False)
         self.pin_button.setText("Unpin reference" if checked else "Pin reference")
+        self._populate_volumes()
+        self._populate_views()
         self._update_analysis_source()
         self._comparison_changed()
         self._publication_status()
@@ -500,7 +754,7 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             raise ValueError("snapshot must contain 1 to 4 planes")
         numerical = bool(getattr(snapshot, "numerical", True))
         if any(not isinstance(name, str) or not isinstance(array, np.ndarray)
-               or (numerical and not scalar_plane(array))
+               or (numerical and not scalar_array(array))
                or (not numerical and array.ndim != 2 and not
                    (array.ndim == 3 and array.shape[-1] in (3, 4)))
                for name, array in planes.items()):
@@ -516,6 +770,16 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         manifest = getattr(snapshot, "manifest", None) or {}
         self._blink(False)
         new_meta = _plane_metadata(manifest)
+        if numerical:
+            for name, array in planes.items():
+                meta = new_meta.get(name, {})
+                if array.ndim == 3:
+                    # Validate every selectable face before changing the UI.
+                    for axis in range(3):
+                        geometry = plane_geometry(project_metadata(meta, array.shape, axis, 0))
+                        geometry.image_rect(tuple(size for i, size in enumerate(array.shape) if i != axis))
+                else:
+                    plane_geometry(meta).image_rect(array.shape)
         old = self._snapshot
         old_manifest = getattr(old, "manifest", None) or {}
         preserve = bool(old is not None and old.numerical and numerical
@@ -524,7 +788,7 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
                         and old_manifest.get("sample_id")
                         and old_manifest.get("sample_id") == manifest.get("sample_id")
                         and set(old.planes) == set(planes)
-                        and all(correspondence(old.planes[name], planes[name],
+                        and all(frame_correspondence(old.planes[name], planes[name],
                                                self._metadata.get(name, {}), new_meta.get(name, {}),
                                                declared=self.declare_grid.isChecked())
                                 for name in planes))
@@ -546,6 +810,40 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             self.declare_units.blockSignals(False)
         self._snapshot = snapshot
         self._metadata = new_meta
+        previous_selections = self._volume_selections
+        self._volume_selections = {}
+        old_meta = _plane_metadata(old_manifest)
+        for name, array in planes.items():
+            if not numerical or array.ndim != 3:
+                continue
+            selection = VolumeSelection.centered(array.shape)
+            if name in previous_selections and old is not None and name in old.planes:
+                before, after = old_meta.get(name, {}), new_meta.get(name, {})
+                if preserve and before.get("spacing") and after.get("spacing"):
+                    previous = previous_selections[name]
+                    for axis in range(3):
+                        selection = selection.select(array.shape, axis=axis, index=self._mapped_slice_index(
+                            previous.indices[axis], axis, before, after))
+                    selection = selection.select(array.shape, axis=previous.axis)
+                elif old.planes[name].shape == array.shape:
+                    selection = previous_selections[name]
+            self._volume_selections[name] = selection
+        if PINNED in previous_selections and self._pinned is not None:
+            self._volume_selections[PINNED] = previous_selections[PINNED]
+        if old is None:
+            # Select one physical slice per compatible frame on first display.
+            names = list(self._volume_selections)
+            for index, name in enumerate(names):
+                for reference in names[:index]:
+                    if self._volume_corresponds(reference, name):
+                        source = self._volume_selections[reference]
+                        self._volume_selections[name] = self._volume_selections[name].select(
+                            planes[name].shape, axis=source.axis, index=self._mapped_slice_index(
+                                source.indices[source.axis], source.axis,
+                                self._raw_meta(reference), self._raw_meta(name)))
+                        break
+        self._populate_volumes()
+        self._populate_views()
         self._populate_selectors(preserve=preserve or self._pinned is not None)
         self._update_analysis_source()
         for widget in (self.reference, self.candidate, self.comparison, self.declare_grid,
@@ -591,7 +889,8 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
 
     def _comparison_key(self):
         return (id(self._snapshot), self._reference_name(), self._candidate_name(),
-                self.comparison.currentData(), id(self._pinned))
+                self.comparison.currentData(), id(self._pinned),
+                tuple(self._volume_selections.items()))
 
     def _comparison_changed(self, *_):
         if self._snapshot is None:
@@ -614,18 +913,42 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
 
     def _display_name(self, name):
         if name == PINNED:
-            return "Pinned: " + self._pinned_name
-        if name != DIFFERENCE:
-            return name
-        order = self.candidate.currentText() + " − " + self.reference.currentText()
-        return "|" + order + "|" if self.comparison.currentData() == "absolute" else order
+            label = "Pinned: " + self._pinned_name
+        elif name != DIFFERENCE:
+            label = name
+        else:
+            order = self.candidate.currentText() + " − " + self.reference.currentText()
+            label = "|" + order + "|" if self.comparison.currentData() == "absolute" else order
+            name = self._candidate_name()
+        if name in self._volume_selections:
+            selection = self._volume_selections[name]
+            remaining = [axis for axis in range(3) if axis != selection.axis]
+            label += f" · axis {selection.axis}={selection.indices[selection.axis]}"
+            meta = self._raw_meta(name)
+            if meta.get("spacing"):
+                position = meta["origin"][selection.axis] + selection.indices[selection.axis] * meta["spacing"][selection.axis]
+                label += f" ({position:g} {meta['spatial_units']})"
+            label += f" · rows {remaining[0]}, cols {remaining[1]}"
+        return label
 
-    def _meta(self, name):
+    def _raw_meta(self, name):
         if name == PINNED:
             return _plane_metadata(self._pinned.manifest).get(self._pinned_name, {})
         if name == DIFFERENCE:
-            name = self.candidate.currentText()
+            name = self._candidate_name()
         return self._metadata.get(name, {})
+
+    def _meta(self, name):
+        if name == DIFFERENCE:
+            name = self._candidate_name()
+        if name != PINNED and not self._snapshot.numerical:
+            return {}
+        meta = self._raw_meta(name)
+        if name in self._volume_selections:
+            selection = self._volume_selections[name]
+            meta = project_metadata(meta, self._raw_planes()[name].shape, selection.axis,
+                                    selection.indices[selection.axis])
+        return meta
 
     def _corresponds(self, first, second):
         arrays = self._all_planes()
@@ -634,7 +957,7 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         return (first == second or
                 first in arrays and second in arrays and
                 self._sample(first) == self._sample(second) and
-                correspondence(arrays[first], arrays[second], self._meta(first), self._meta(second),
+                frame_correspondence(arrays[first], arrays[second], self._meta(first), self._meta(second),
                                declared=self.declare_grid.isChecked()))
 
     def _selection(self):
@@ -658,10 +981,10 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             widget.blockSignals(False)
 
     def _display_planes(self):
-        planes = dict(self._snapshot.planes)
-        if self._difference is not None or self._reference_name() == PINNED:
-            arrays = self._all_planes()
-            planes = {name: arrays[name] for name in (self._reference_name(), self._candidate_name())}
+        planes = self._all_planes()
+        selected = self.view_selector.currentData()
+        if selected in planes:
+            return {selected: planes[selected]}
         if self._difference is not None:
             planes[DIFFERENCE] = self._difference
         return planes
@@ -682,11 +1005,14 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             item.clear()
             item.deleteLater()
         self._items.clear()
+        self._labels.clear()
+        self._plots.clear()
         self._views.clear()
         self.graphics.clear()
         numerical = self._snapshot.numerical
         self._planes = self._display_planes()
-        extrema = [_sample_extrema(array) for array in self._snapshot.planes.values() if numerical]
+        extrema = [_sample_extrema(array) for name, array in self._planes.items()
+                   if numerical and name != DIFFERENCE and not (preserve and old_levels)]
         extrema = [value for value in extrema if value is not None]
         low = min((value[0] for value in extrema), default=0.0)
         high = max((value[1] for value in extrema), default=1.0)
@@ -695,26 +1021,47 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         if preserve and old_levels:
             low = self.level.value() - self.width.value() / 2
             high = self.level.value() + self.width.value() / 2
+        columns = min(len(self._planes), 3 if len(self._planes) == 3 or len(self._planes) >= 5 else 2)
         for index, (name, array) in enumerate(self._planes.items()):
-            row, col = divmod(index, 2)
+            row, col = divmod(index, columns)
             units = self._meta(name).get("units") or "unspecified units"
             title = self._display_name(name) + (" [" + units + "]" if numerical else " (rendered image)")
-            label = self.graphics.addLabel(html.escape(title if len(title) <= 64 else title[:61] + "…"),
-                                           row=row * 2, col=col)
+            label = PaneLabel(title)
+            self.graphics.addItem(label, row=row * 2, col=col)
             label.setToolTip(title)
+            self._labels[name] = label
             view = ImageViewBox()
-            self.graphics.addItem(view, row=row * 2 + 1, col=col)
+            geometry = plane_geometry(self._meta(name))
+            # Every pane has identical axis strips, including pixel-only data.
+            # Mixed calibration and long ticks cannot make one image narrower.
+            plot = pg.PlotItem(viewBox=view, enableMenu=False)
+            selection = self._volume_selections.get(self._candidate_name() if name == DIFFERENCE else name)
+            axes = [axis for axis in range(3) if selection is None or axis != selection.axis]
+            if selection is None:
+                axes = [0, 1]
+            for edge, axis in (("left", axes[0]), ("bottom", axes[1])):
+                plot.getAxis(edge).enableAutoSIPrefix(False)
+                plot.setLabel(edge, f"Axis {axis}", units=geometry.units or "px")
+            plot.getAxis("left").setWidth(110)
+            plot.getAxis("bottom").setHeight(48)
+            plot.hideButtons()
+            self.graphics.addItem(plot, row=row * 2 + 1, col=col)
+            self._plots[name] = plot
             view.setMenuEnabled(False)
             levels = (low, high) if numerical else (0.0, 255.0)
             if name == DIFFERENCE:
                 bounds = _sample_extrema(array) or (0.0, 1.0)
                 limit = max(abs(bounds[0]), abs(bounds[1]), 1.0e-12)
                 levels = (0.0 if self.comparison.currentData() == "absolute" else -limit, limit)
-                key = self._comparison_key()[1:]
+                # Display ranges belong to the pair/mode, not every visited
+                # slice; scrubbing must not grow a per-slice settings cache.
+                key = self._comparison_key()[1:5]
                 levels = self._difference_levels.get(key, levels)
                 self._displayed_comparison = key
             item = pg.ImageItem(array, axisOrder="row-major", autoLevels=False, levels=levels)
             item.setAutoDownsample(False)
+            if geometry.physical:
+                item.setRect(QtCore.QRectF(*geometry.image_rect(array.shape)))
             view.addItem(item)
             view.invertY(True)
             self._views[name], self._items[name] = view, item
@@ -741,6 +1088,9 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             group = NavigationGroup([self._views[name] for name in members])
             self._navigation_groups.append(group)
             previous = next((cameras[name] for name in members if name in cameras), None)
+            if previous is None and preserve:
+                previous = next((state for name, state in cameras.items()
+                                 if any(self._corresponds(name, member) for member in members)), None)
             if preserve and previous is not None:
                 group.restore(previous)
             else:
@@ -768,6 +1118,37 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             self._clear_cursor()
         self._apply_blink_image()
         self._rendered_selection = self._selection()
+        self._layout_timer.start(0)
+
+    def _layout_panes(self):
+        """Allocate identical actual image rectangles, independent of labels."""
+        if self._closed or not self._plots:
+            return
+        count = len(self._plots)
+        columns = min(count, 3 if count == 3 or count >= 5 else 2)
+        rows = (count + columns - 1) // columns
+        layout = self.graphics.ci.layout
+        left, top, right, bottom = layout.getContentsMargins()
+        width = max(1, (self.graphics.viewport().width() - left - right - 8 * (columns - 1)) / columns)
+        height = max(1, (self.graphics.viewport().height() - top - bottom - 24 * rows - 6 * (2 * rows - 1)) / rows)
+        # Clear old slots too: a single image must occupy the full area after
+        # flipping out of a two/three-column layout, and vice versa.
+        for column in range(max(columns, self._layout_columns)):
+            layout.setColumnFixedWidth(column, width if column < columns else 0)
+            layout.setColumnSpacing(column, 8 if column < columns - 1 else 0)
+        for row in range(max(rows, self._layout_rows)):
+            layout.setRowFixedHeight(2 * row, 24 if row < rows else 0)
+            layout.setRowFixedHeight(2 * row + 1, height if row < rows else 0)
+            layout.setRowSpacing(2 * row, 6 if row < rows else 0)
+            layout.setRowSpacing(2 * row + 1, 6 if row < rows - 1 else 0)
+        self._layout_columns, self._layout_rows = columns, rows
+        layout.activate()
+
+    def _set_pane_label(self, name):
+        units = self._meta(name).get("units") or "unspecified units"
+        title = self._display_name(name) + " [" + units + "]"
+        self._labels[name].setText(title)
+        self._labels[name].setToolTip(title)
 
     def _blink(self, enabled):
         if enabled and (self._snapshot is None or self._comparison_error() is not None):
@@ -789,6 +1170,16 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
 
     def _targets(self, region):
         return tuple(name for name in self._planes if self._corresponds(region.plane, name))
+
+    def _measurement_planes(self):
+        """Every retained original participates even while one image is shown."""
+        arrays = self._all_planes()
+        if self._difference is not None:
+            arrays[DIFFERENCE] = self._difference
+        return arrays
+
+    def _measurement_targets(self, region):
+        return tuple(name for name in self._measurement_planes() if self._corresponds(region.plane, name))
 
     def _rebuild_rois(self):
         wanted = {(region.identifier, name) for region in self._regions.values()
@@ -940,12 +1331,13 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         identifier = self.roi_selector.currentData()
         item = next((item for (key, _name), item in self._roi_items.items() if key == identifier), None)
         if item is not None:
+            dx, dy = plane_geometry(self._meta(self._regions[identifier].plane)).pixel_delta_to_world(dx, dy)
             item.setPos(item.pos() + QtCore.QPointF(dx, dy))
 
     def copy_statistics(self):
         rows = ["ROI\tPlane\tUnits\tMean\tSD (population)\tFinite N\tExcluded"]
         for (identifier, name), value in self._statistics.items():
-            if identifier not in self._regions or name not in self._planes:
+            if identifier not in self._regions or name not in self._measurement_planes():
                 continue
             rows.append("\t".join((self._regions[identifier].name, self._display_name(name),
                                     self._meta(name).get("units") or "unspecified",
@@ -964,9 +1356,12 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         name = self.roi_plane.currentData()
         array = self._planes[name]
         view = self._views[name].viewRect()
-        width, height = max(1, min(array.shape[1], view.width()) / 3), max(1, min(array.shape[0], view.height()) / 3)
-        x = min(max(view.center().x() - width / 2, 0), array.shape[1] - width)
-        y = min(max(view.center().y() - height / 2, 0), array.shape[0] - height)
+        geometry = plane_geometry(self._meta(name))
+        bounds = QtCore.QRectF(*geometry.image_rect(array.shape))
+        width = max(geometry.spacing[1], min(bounds.width(), view.width()) / 3)
+        height = max(geometry.spacing[0], min(bounds.height(), view.height()) / 3)
+        x = min(max(view.center().x() - width / 2, bounds.left()), bounds.right() - width)
+        y = min(max(view.center().y() - height / 2, bounds.top()), bounds.bottom() - height)
         if kind == "line":
             y += height / 2
             height = 0
@@ -1059,7 +1454,7 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         candidate = self._candidate_name() if compare else None
         regions = tuple(roi for roi in self._regions.values()
                         if roi.kind != "line" or roi.identifier == self._profile_identifier)
-        targets = {roi.identifier: self._targets(roi) for roi in regions}
+        targets = {roi.identifier: self._measurement_targets(roi) for roi in regions}
         if compare:
             for roi in regions:
                 if self._corresponds(roi.plane, candidate):
@@ -1067,7 +1462,9 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self._worker.submit(AnalysisJob(self._analysis_owner, self._analysis_token, self._analysis_source,
                                        regions, targets, reference, candidate,
                                        self.comparison.currentData() == "absolute",
-                                       self._difference if self._difference_key == self._comparison_key() else None))
+                                       self._difference if self._difference_key == self._comparison_key() else None,
+                                       metadata={name: self._meta(name) for name in
+                                                 (*self._analysis_source.planes, DIFFERENCE)}))
 
     @QtCore.Slot(object, int, object, str)
     def _analysis_ready(self, owner, token, result, error):
@@ -1122,8 +1519,10 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         title = (f"{region.name}: A ({region.x:.4g}, {region.y:.4g}) → "
                  f"B ({region.x + region.width:.4g}, {region.y + region.height:.4g})")
         self.profile_plot.setTitle(html.escape(region.name))
-        entries = [(name, self._profiles[region.identifier, name]) for name in self._planes
+        entries = [(name, self._profiles[region.identifier, name]) for name in self._measurement_planes()
                    if (region.identifier, name) in self._profiles]
+        distance_units = plane_geometry(self._meta(region.plane)).units or "pixels"
+        self.profile_plot.setLabel("bottom", "Distance from A", units=distance_units)
         for index, (name, profile) in enumerate(entries):
             units = self._meta(name).get("units") or "unspecified units"
             label = self._display_name(name) + " [" + units + "]"
@@ -1136,7 +1535,7 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         if self._profile_error:
             message = self._profile_error
         elif not entries:
-            message = ("Computing profile…" if self._targets(region) else
+            message = ("Computing profile…" if self._measurement_targets(region) else
                        "No corresponding visible image for this line.")
         elif not any(profile.values.size for _name, profile in entries):
             message = "Line is outside the image."
@@ -1145,18 +1544,19 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         else:
             capped = any(profile.capped for _name, profile in entries)
             message = ("4096 samples (limit); evenly spaced, bilinear interpolation." if capped else
-                       "Bilinear interpolation; distance in pixels; non-finite samples leave gaps.")
+                       f"Bilinear interpolation; distance in {distance_units}; non-finite samples leave gaps.")
         self.profile_status.setText(title + " · " + message)
         self.profile_plot.setToolTip(
             "Values from original samples along A → B, clipped to the image. "
-            "Pixel centers are (column + 0.5, row + 0.5). Edge values extend to the image boundary. "
+            "Coordinates and distance use the declared spatial units, or pixels when unspecified. "
+            "Edge values extend to the image boundary. "
             "Sample spacing is at most one pixel, except lines limited to 4096 samples. "
             "Each curve lists its intensity units; no normalization or unit conversion is applied.")
         if entries:
             self.profile_plot.enableAutoRange()
 
     def _render_statistics(self):
-        rows = [(key, value) for key, value in self._statistics.items() if key[1] in self._planes]
+        rows = [(key, value) for key, value in self._statistics.items() if key[1] in self._measurement_planes()]
         self.stats_table.setRowCount(len(rows))
         for row, ((identifier, name), value) in enumerate(rows):
             region = self._regions[identifier]
@@ -1188,7 +1588,8 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             if not view.sceneBoundingRect().contains(position):
                 continue
             point = view.mapSceneToView(position)
-            col, row = math.floor(point.x()), math.floor(point.y())
+            x, y = plane_geometry(self._meta(name)).world_to_pixel(point.x(), point.y())
+            col, row = math.floor(x), math.floor(y)
             array = self._planes[name]
             if 0 <= row < array.shape[0] and 0 <= col < array.shape[1]:
                 if self._snapshot.numerical:
@@ -1204,16 +1605,34 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             self._clear_cursor()
             return
         self._cursor = name, row, col
+        geometry = plane_geometry(self._meta(name))
+        world_x, world_y = geometry.pixel_to_world(col + .5, row + .5)
         values = []
         for target, array in self._planes.items():
             linked = self._corresponds(name, target)
+            target_geometry = plane_geometry(self._meta(target))
+            pixel_x, pixel_y = target_geometry.world_to_pixel(world_x, world_y)
+            target_col, target_row = math.floor(pixel_x), math.floor(pixel_y)
+            linked = linked and 0 <= target_row < array.shape[0] and 0 <= target_col < array.shape[1]
             for line in self._crosshairs[target]:
                 line.setVisible(linked)
             if linked:
-                self._crosshairs[target][0].setPos(col + .5)
-                self._crosshairs[target][1].setPos(row + .5)
-                values.append(self._display_name(target) + "=" + str(array[row, col]))
-        text = f"[{row},{col}] " + " · ".join(values)
+                self._crosshairs[target][0].setPos(world_x)
+                self._crosshairs[target][1].setPos(world_y)
+                label = self._display_name(target)
+                if geometry.physical:
+                    label += f" [{target_row},{target_col}]"
+                values.append(label + "=" + str(array[target_row, target_col]))
+        if name in self._volume_selections:
+            selection = self._volume_selections[name]
+            voxel = [row, col]
+            voxel.insert(selection.axis, selection.indices[selection.axis])
+            coordinate = "crop [" + ",".join(map(str, voxel)) + "]"
+        else:
+            coordinate = f"[{row},{col}]"
+        if geometry.physical:
+            coordinate += f" · ({world_y:g}, {world_x:g}) {geometry.units}"
+        text = coordinate + " " + " · ".join(values)
         self.readout.setText(text)
         self.readout.setToolTip(text)
         self._cursor_timer.start()
@@ -1224,6 +1643,8 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         name, row, col = self._cursor
         if name not in self._planes:
             return
+        geometry = plane_geometry(self._meta(name))
+        world = geometry.pixel_to_world(col + .5, row + .5)
         planes = []
         for target, array in self._planes.items():
             if self._corresponds(name, target):
@@ -1232,7 +1653,8 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
                     array = self._all_planes()[self._reference_name()]
                     label += " (reference blink)"
                 planes.append((target, label, array, self._items[target].getLevels()))
-        self.magnifier.display(planes, row, col)
+        self.magnifier.display(planes, row, col, metadata={target: self._meta(target) for target, *_ in planes},
+                               world=world if geometry.physical else None)
 
     def _clear_cursor(self):
         self._cursor = None
@@ -1283,6 +1705,10 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         elif event.key() == QtCore.Qt.Key_B:
             if not event.isAutoRepeat():
                 self._blink(True)
+        elif event.key() in (QtCore.Qt.Key_PageUp, QtCore.Qt.Key_PageDown) and self._volume_selections:
+            self._step_slice(-1 if event.key() == QtCore.Qt.Key_PageUp else 1)
+        elif event.key() in (QtCore.Qt.Key_BracketLeft, QtCore.Qt.Key_BracketRight):
+            self._cycle_images(-1 if event.key() == QtCore.Qt.Key_BracketLeft else 1)
         else:
             super().keyPressEvent(event)
 
@@ -1306,6 +1732,7 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self._analysis_timer.stop()
         self._cursor_timer.stop()
         self._pending_snapshot_timer.stop()
+        self._layout_timer.stop()
         self._worker.cancel(self._analysis_owner)
         self._worker.ready.disconnect(self._analysis_ready)
         if self._owns_worker:
@@ -1321,12 +1748,15 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
             item.clear()
             item.deleteLater()
         self._items.clear()
+        self._labels.clear()
+        self._plots.clear()
         self._views.clear()
         self.graphics.clear()
         self._planes.clear()
         self._profiles.clear()
         self._statistics.clear()
         self._regions.clear()
+        self._volume_selections.clear()
         self._profile_identifier = None
         self._clear_profile_plot()
         self._snapshot = self._difference = self._pinned = self._analysis_source = self._pending_snapshot = None

@@ -58,47 +58,66 @@ Emacs ledger; remote-provided fields cannot override that identity. IDs are
 unique within a group. `key`, `sample_id`, `id`, `name`, `grid_id` and `units`
 are bounded strings; empty optional grid/units mean unspecified, not HU.
 
-Plane shape is `[rows, columns]`, with zero-based row/column indices and
-origin at the upper left. Integer index `(row,col)` identifies a sample;
+Plane shape is `[rows, columns]`; an explicit scalar volume has shape
+`[axis0, axis1, axis2]` in source dimension order. A rank-three member never
+means RGB. The viewer selects a two-dimensional view from retained local
+samples; it does not request further kernel data. Uncalibrated plane coordinates
+have zero-based row/column indices and origin at the upper left.
+Integer index `(row,col)` identifies a sample;
 its display pixel center is `(col+0.5,row+0.5)`. Raw bytes preserve dtype and
 byte order; supported dtype strings are `|u1`, `|i1`, `<u2`, `>u2`, `<i2`,
-`>i2`, `<u4`, `>u4`, `<i4`, `>i4`, `<f4`, `>f4`, `<f8`, `>f8`.
-No bool, object, structured, complex, float16 or int64/uint64 arrays in v1;
+`>i2`, `<u4`, `>u4`, `<i4`, `>i4`, `<f2`, `>f2`, `<f4`, `>f4`, `<f8`, `>f8`.
+No bool, object, structured, complex or int64/uint64 arrays in v1;
 reject unsupported types explicitly, without automatic casts.
 Masked arrays are rejected because v1 has no mask payload; their hidden
 backing values must never silently become measurement samples.
 
 Offsets start at zero and are exactly contiguous in plane order, with no
-overlap, holes or unused tail. `nbytes == rows * columns * dtype.itemsize`.
+overlap, holes or unused tail. `nbytes == product(shape) * dtype.itemsize`.
 The final file length must equal 12 + header length + sum(nbytes).
 The aggregate ceiling includes framing/header bytes: two exactly 32 MiB
 planes (or four 2048x2048 float32 planes) do not fit one 64 MiB group. Reject
 that group before copying; callers publish fewer/smaller selected planes.
-Per-plane optional `spacing` is two finite positive numbers in row/column
-order; `origin` is two finite numbers, and `direction` is four finite values
-for a nonsingular row-major 2x2 transform in the declared spatial units.
+Optional `spacing` has one finite positive number per source axis; `origin`
+has one finite number per axis and names the center of sample index zero.
+`direction` is a flattened nonsingular row-major 2x2 or 3x3 matrix according
+to member rank. The publisher emits identity directions for axis-aligned grids.
 `spatial_units` is a separate optional bounded string (e.g. `mm`), never
 the intensity `units`. All four spatial fields are present together or all
 absent. Absent metadata matches absent metadata only and does not imply mm.
-V1 preserves and validates these fields but links/differences only identical
-grids (same shape, grid_id, spacing/origin/direction/spatial_units). It does
-not resample.
+With explicit spatial metadata, common sample/grid identity and spatial units
+link physical navigation even across different shapes, spacing and origins.
+Pixel-edge coordinate `(x,y)` maps to `(origin_col + (x-.5)*spacing_col,
+origin_row + (y-.5)*spacing_row)`. Volume slices project the two retained
+source axes and record their physical slice coordinate. Differences require
+identical sample lattices and slice positions; no automatic resampling occurs.
 Equal-shaped planes without a nonempty common grid_id remain unlinked until
 the user explicitly declares correspondence locally.
 
 ## Publisher API
 
-`ejn.view(planes, *, key="default", sample_id, grid_id=None, units=None)`
-accepts an insertion-ordered mapping of 1-4 names to NumPy 2D arrays.
-`grid_id` is an explicit declaration of pixel correspondence within the same
-sample; `units` names the source intensity units. Both apply to the group
-members in this initial API. A later API can expose per-member spatial fields.
+`ejn.view(planes, *, key="default", sample_id, grid_id=None, units=None,
+spacing=None, origin=None, spatial_units="mm")`
+accepts an insertion-ordered mapping of 1-4 names to NumPy arrays or exact
+PyTorch Tensor/Parameter instances, each a 2D plane or explicit 3D crop.
+`grid_id` declares a common coordinate frame within the same sample, in pixels
+or the supplied spatial units; `units` names source intensity units. Both apply to the group
+members. `spacing` and `origin` accept a shared axis-order vector or a mapping
+from every published member name to its vector. Spacing is strictly positive;
+origin defaults to zero and requires spacing when supplied. `spatial_units`
+applies only when spacing is present and is independent of intensity `units`.
 The publisher requires nonempty sample_id and names. It generates IDs,
 validates all members and aggregate sizes before copies, then copies only
-the selected planes into the binary group. Non-contiguous/negative-stride
+the selected planes or crops into the binary group. Non-contiguous/negative-stride
 views are supported and copied in C order without changing values.
 
-No automatic tensor conversion: callers use e.g. `tensor[z].detach().cpu().numpy()`.
+Tensor metadata and all byte budgets are validated before detached CPU copies.
+Crop/slice before calling; `view_variable` selects a plane before conversion.
+Float16 retains its wire dtype; bfloat16 widens losslessly to float32, with
+the wider storage counted against limits. Sparse, nested, quantized, meta,
+complex and arbitrary tensor subclasses are rejected. No tensor framework
+is imported by setup. Conversion follows PyTorch's documented
+[detached CPU conversion semantics](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.numpy.html).
 No retaining remote arrays after publication. Publisher installation uses a
 marked namespace and is idempotent; user-owned `ejn` causes a capability/setup
 diagnostic, not namespace replacement. NumPy/IPython are imported lazily.
@@ -109,8 +128,8 @@ The injected code must be self-contained and not load files on the remote.
 | Resource | Ceiling / policy |
 | --- | --- |
 | Group file, including header | 67,108,864 bytes (existing artifact ceiling) |
-| One plane | 33,554,432 raw bytes |
-| Plane dimensions | Each 1..16,384; product constrained by byte ceiling |
+| One plane or cropped volume | 33,554,432 raw bytes |
+| Member dimensions | Two or three axes, each 1..16,384; product constrained by byte ceiling |
 | Members / JSON header | 4 / 16,384 UTF-8 bytes |
 | Identifiers, names, units | 128 UTF-8 bytes each; no control characters |
 | Base64 group | `4 * ceil(group_bytes / 3)`; existing encoded artifact ceiling |

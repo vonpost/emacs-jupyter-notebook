@@ -14,6 +14,30 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtGui
 
 
+class PaneLabel(pg.GraphicsWidget):
+    """One-line pane title that never contributes a text-dependent width."""
+
+    def __init__(self, text):
+        super().__init__()
+        self.text = text
+        self._font = QtGui.QFont()
+        self.setMinimumWidth(0)
+        self.setPreferredWidth(0)
+        self.setMinimumHeight(24)
+        self.setMaximumHeight(24)
+
+    def setText(self, text):
+        self.text = text
+        self.update()
+
+    def paint(self, painter, *_):
+        painter.setFont(self._font)
+        painter.setPen(pg.mkColor(pg.getConfigOption("foreground")))
+        text = QtGui.QFontMetrics(self._font).elidedText(
+            self.text, QtCore.Qt.TextElideMode.ElideRight, max(0, int(self.width()) - 8))
+        painter.drawText(self.boundingRect(), QtCore.Qt.AlignmentFlag.AlignCenter, text)
+
+
 class ImageViewBox(pg.ViewBox):
     viewportResized = QtCore.Signal(object)
 
@@ -84,6 +108,8 @@ class NavigationGroup:
     def fit(self):
         self.fitting = True
         bounds = self.views[0].childrenBoundingRect()
+        for view in self.views[1:]:
+            bounds = bounds.united(view.childrenBoundingRect())
         scale = max(max(bounds.width() / max(view.width(), 1),
                         bounds.height() / max(view.height(), 1))
                     for view in self.views) * 1.04
@@ -120,10 +146,16 @@ class ImageGraphicsWidget(pg.GraphicsLayoutWidget):
 
     def _view_at(self, position):
         scene = self.mapToScene(position.toPoint())
-        for item in self.ci.items:
-            if isinstance(item, ImageViewBox) and item.sceneBoundingRect().contains(scene):
-                return item, scene
+        for view in self._image_views():
+            if view.sceneBoundingRect().contains(scene):
+                return view, scene
         return None, scene
+
+    def _image_views(self):
+        for item in self.ci.items:
+            view = item.getViewBox() if isinstance(item, pg.PlotItem) else item
+            if isinstance(view, ImageViewBox):
+                yield view
 
     @staticmethod
     def _pan(view, delta):
@@ -164,7 +196,7 @@ class ImageGraphicsWidget(pg.GraphicsLayoutWidget):
         if kind not in (QtCore.QEvent.Type.Wheel, QtCore.QEvent.Type.NativeGesture):
             return super().viewportEvent(event)
         view, scene = self._view_at(event.position())
-        if self._gesture_view not in self.ci.items:
+        if self._gesture_view not in self._image_views():
             self._gesture_view = None
         if kind == QtCore.QEvent.Type.NativeGesture:
             gesture = event.gestureType()

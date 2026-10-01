@@ -608,10 +608,12 @@ Only the generated literal selectors cross Emacs; numerical samples do not."
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-view-variable (&optional name)
-  "View a selected numerical plane of the array NAME in the local viewer.
+  "View a numerical plane of NumPy array or PyTorch tensor NAME locally.
 Use the variable at point or prompt for a name.  For multidimensional arrays,
 choose display row/column axes and an index for every remaining dimension,
-including any channel axis.  Only the selected 2D plane leaves the kernel."
+including any channel axis.  Only the selected 2D plane leaves the kernel;
+GPU tensors are sliced before copying that plane to CPU.  To browse a 3D
+crop locally, publish it explicitly with `ejn.view' in the source code."
   (interactive)
   (emacs-jupyter-notebook-variables--ensure-ready)
   (setq name (or name (emacs-jupyter-notebook-variables--name-at-point)

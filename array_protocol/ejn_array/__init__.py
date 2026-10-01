@@ -22,7 +22,7 @@ MAX_MEMBERS = 4
 DTYPES = {"|u1": 1, "|i1": 1,
           **{endian + kind: size for endian in "<>"
              for kind, size in (("u2", 2), ("i2", 2), ("u4", 4), ("i4", 4),
-                                ("f4", 4), ("f8", 8))}}
+                                ("f2", 2), ("f4", 4), ("f8", 8))}}
 _HEADER_FIELDS = {"v", "key", "sample_id", "publication_id", "planes"}
 _PLANE_REQUIRED = {"id", "name", "shape", "dtype", "offset", "nbytes"}
 _SPATIAL = {"spacing", "origin", "direction", "spatial_units"}
@@ -97,14 +97,14 @@ def validate_header(header: object, header_bytes: int, file_bytes: int) -> dict:
         ids.add(plane["id"])
         names.add(plane["name"])
         shape = plane["shape"]
-        if not isinstance(shape, list) or len(shape) != 2:
+        if not isinstance(shape, list) or len(shape) not in (2, 3):
             _fail("invalid plane shape")
         for dimension in shape:
             _integer(dimension, 1, MAX_DIMENSION, "dimension")
         dtype = plane["dtype"]
         if not isinstance(dtype, str) or dtype not in DTYPES:
             _fail("unsupported dtype")
-        expected = shape[0] * shape[1] * DTYPES[dtype]
+        expected = math.prod(shape) * DTYPES[dtype]
         _integer(plane["nbytes"], 1, MAX_PLANE_BYTES, "plane size")
         _integer(plane["offset"], 0, MAX_GROUP_BYTES, "plane offset")
         if plane["nbytes"] != expected or plane["offset"] != offset:
@@ -117,15 +117,20 @@ def validate_header(header: object, header_bytes: int, file_bytes: int) -> dict:
         if spatial and spatial != _SPATIAL:
             _fail("incomplete spatial metadata")
         if spatial:
+            ndim = len(shape)
             _text(plane["spatial_units"], "spatial units")
-            _numbers(plane["spacing"], 2, "spacing")
+            _numbers(plane["spacing"], ndim, "spacing")
             if any(value <= 0 for value in plane["spacing"]):
                 _fail("invalid spacing")
-            _numbers(plane["origin"], 2, "origin")
-            _numbers(plane["direction"], 4, "direction")
-            a, b, c, d = plane["direction"]
+            _numbers(plane["origin"], ndim, "origin")
+            _numbers(plane["direction"], ndim * ndim, "direction")
             try:
-                determinant = a * d - b * c
+                if ndim == 2:
+                    a, b, c, d = plane["direction"]
+                    determinant = a * d - b * c
+                else:
+                    a, b, c, d, e, f, g, h, i = plane["direction"]
+                    determinant = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
                 if not math.isfinite(determinant) or determinant == 0:
                     _fail("singular direction")
             except OverflowError:

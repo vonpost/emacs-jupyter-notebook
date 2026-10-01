@@ -71,6 +71,12 @@ def _viewer_request(process, identifier, operation, params=None):
 
 class ArrayViewerVerticalTest(unittest.TestCase):
     def test_local_kernel_helper_viewer_numeric_path(self):
+        self._check_numeric_path(volume=False)
+
+    def test_local_kernel_helper_viewer_cropped_volume_path(self):
+        self._check_numeric_path(volume=True)
+
+    def _check_numeric_path(self, *, volume):
         previous_pythonpath = os.environ.get("PYTHONPATH")
         previous_path = os.environ.get("PATH", "")
         os.environ["PYTHONPATH"] = os.pathsep.join((str(ROOT / "array_protocol"),
@@ -93,12 +99,19 @@ class ArrayViewerVerticalTest(unittest.TestCase):
                         "artifact_dir": str(artifacts), "image_max_pixels": 4_194_304}))
                     reference = np.arange(2 * 3 * 4, dtype=">u2").reshape(2, 3, 4)
                     candidate = (np.arange(2 * 3 * 4, dtype="<f4") / 10).reshape(2, 3, 4)
+                    if volume:
+                        candidate = np.repeat(candidate, 2, axis=0)
                     code = ("%matplotlib inline\nimport numpy as np\n" + _publisher_setup()
                             + "reference = " + repr(reference.tolist()) + "\n"
                             + "candidate = " + repr(candidate.tolist()) + "\n"
                             + "reference = np.asarray(reference, dtype='>u2').reshape(2,3,4)\n"
-                            + "candidate = np.asarray(candidate, dtype='<f4').reshape(2,3,4)\n"
-                            + "ejn.view({'u16': reference[1], 'f32': candidate[:, :, 2]}, key='vertical', sample_id='slice-1')\n")
+                            + "candidate = np.asarray(candidate, dtype='<f4')\n"
+                            + ("ejn.view({'u16': reference[:, :, 1:3], 'f32': candidate[:, :, 1:3]}, "
+                               "key='vertical', sample_id='crop-1', grid_id='physical', "
+                               "spacing={'u16': (0.2, 0.2, 0.2), 'f32': (0.1, 0.2, 0.2)}, "
+                               "origin=(1.0, 2.0, 3.2), spatial_units='mm')\n"
+                               if volume else
+                               "ejn.view({'u16': reference[1], 'f32': candidate[:, :, 2]}, key='vertical', sample_id='slice-1')\n"))
                     execution = helper.send_async("execute", {"code": code})
                     response = helper.await_response(execution, timeout=20)
                     self.assertTrue(response.get("ok"), response)
@@ -117,15 +130,26 @@ class ArrayViewerVerticalTest(unittest.TestCase):
                     self.assertEqual(path.parent, artifacts)
                     manifest = descriptor["manifest"]
                     self.assertEqual([plane["dtype"] for plane in manifest["planes"]], [">u2", "<f4"])
-                    self.assertEqual([plane["shape"] for plane in manifest["planes"]], [[3, 4], [2, 3]])
+                    expected_u16 = reference[:, :, 1:3] if volume else reference[1]
+                    expected_f32 = candidate[:, :, 1:3] if volume else candidate[:, :, 2]
+                    self.assertEqual([plane["shape"] for plane in manifest["planes"]],
+                                     [list(expected_u16.shape), list(expected_f32.shape)])
+                    if volume:
+                        self.assertEqual([plane["spacing"] for plane in manifest["planes"]],
+                                         [[0.2, 0.2, 0.2], [0.1, 0.2, 0.2]])
+                        for plane in manifest["planes"]:
+                            self.assertEqual(plane["origin"], [1.0, 2.0, 3.2])
+                            self.assertEqual(plane["spatial_units"], "mm")
                     with path.open("rb") as stream:
                         parsed, offset = read_manifest(stream, path.stat().st_size)
                         raw = path.read_bytes()
                     self.assertEqual(parsed, manifest)
-                    u16 = np.frombuffer(raw, dtype=np.dtype(">u2"), count=12, offset=offset).reshape(3, 4)
-                    f32 = np.frombuffer(raw, dtype=np.dtype("<f4"), count=6, offset=offset + 24).reshape(2, 3)
-                    np.testing.assert_array_equal(u16, np.asarray(reference[1], dtype="<u2"))
-                    np.testing.assert_array_equal(f32, candidate[:, :, 2])
+                    u16 = np.frombuffer(raw, dtype=np.dtype(">u2"), count=expected_u16.size,
+                                        offset=offset).reshape(expected_u16.shape)
+                    f32 = np.frombuffer(raw, dtype=np.dtype("<f4"), count=expected_f32.size,
+                                        offset=offset + expected_u16.nbytes).reshape(expected_f32.shape)
+                    np.testing.assert_array_equal(u16, expected_u16)
+                    np.testing.assert_array_equal(f32, expected_f32)
                     file_stat = path.stat()
                     root_stat = artifacts.stat()
                     with path.open("rb") as stream:

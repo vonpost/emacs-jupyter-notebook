@@ -6,6 +6,12 @@ from dataclasses import dataclass
 MAX_MEMORY = 256 * 1024 * 1024
 
 
+def render_bytes(array, *, numerical=True):
+    """Reserve the largest selectable face, including conversion and RGBA."""
+    shape = sorted(array.shape) if numerical and array.ndim == 3 else array.shape[:2]
+    return shape[-2] * shape[-1] * 8
+
+
 def merge_allocations(*groups):
     """Count shared immutable resources once, keeping conservative charges."""
     result = {}

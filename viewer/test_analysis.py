@@ -60,13 +60,21 @@ class AnalysisTests(unittest.TestCase):
         self.assertFalse(correspondence(array, array, {}, {}))
 
     def test_int64_and_non_scalar_precision_is_rejected(self):
-        for dtype in (np.int64, np.uint64, np.complex64, np.bool_, np.float16):
+        for dtype in (np.int64, np.uint64, np.complex64, np.bool_):
             with self.assertRaises(ValueError):
                 difference(np.zeros((2, 2), dtype=dtype), np.zeros((2, 2), dtype=dtype))
             with self.assertRaises(ValueError):
                 statistics(np.zeros((2, 2), dtype=dtype), region())
         with self.assertRaises(ValueError):
             statistics(np.zeros((2, 2, 3), dtype=np.uint8), region())
+
+    def test_float16_original_values_promote_for_difference_and_statistics(self):
+        source = np.array([[0.25, 0.5], [1, 2]], dtype=np.float16)
+        result = difference(source, source + np.float16(.25))
+        np.testing.assert_array_equal(result, np.full((2, 2), .25))
+        self.assertEqual(result.dtype, np.dtype("float64"))
+        roi = Region(1, "all", "source", "rectangle", 0, 0, 2, 2)
+        self.assertEqual(statistics(source, roi).mean, .9375)
 
     def test_difference_budget_before_allocating(self):
         with mock.patch("ejn_viewer.analysis.MAX_DIFFERENCE_BYTES", 31):

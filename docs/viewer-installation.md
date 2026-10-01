@@ -46,14 +46,14 @@ If a tunnel exits, the EJN transport log now includes its exit status or
 signal and a bounded, redacted stderr excerpt when available. Viewer startup
 failure itself does not request tunnel reconnection or terminate a kernel.
 
-Publish a mapping of selected 2D NumPy arrays with `ejn.view`, then use
+Publish a mapping of selected 2D NumPy arrays or PyTorch tensors with `ejn.view`, then use
 `C-c j I`, the panel's `[Inspect]` button, or `C-c j J` (evaluate-and-inspect).
 The latter opens the first numerical publication from that exact execution.
 Once inspected, matching publications from that source cell follow into the
 open workspace without stealing focus. Other cells and workspace keys do not
 replace the selection. Clear/reconnect/source retirement fences old updates.
 
-For an existing NumPy variable, use `C-c j A` at its name or `v` in the variable
+For an existing NumPy or PyTorch variable, use `C-c j A` at its name or `v` in the variable
 table. Emacs prompts for display axes and any remaining slice/channel indices.
 Only that 2D plane goes through the existing bounded artifact path; the full
 volume remains in the kernel. Generated inspection requests do not add to input
@@ -93,10 +93,25 @@ differences become unavailable pixels.
 Choose the reference member in **Compare** and click **Pin reference** before
 rerunning. Its immutable local snapshot remains available while the candidate follows new
 publications. Hold **B** or the blink button to temporarily show the reference
-in the candidate pane; release to return. Comparisons and linked readouts
-require compatible sample/grid metadata. **Freeze** retains the visible
+in the candidate pane; release to return. Difference/blink require matching
+sample lattices. Linked readouts and navigation also support different sampling
+densities in the same declared physical frame. **Freeze** retains the visible
 evaluation and discards incoming updates; unfreeze follows subsequent
 publications. The status line identifies the visible and pinned executions.
+
+To flip between **input A**, **prediction B**, and **next prediction C**, publish
+`{"input": input_image, "prediction": prediction}`. In **Compare**, select
+**prediction** as Reference and pin it before changing checkpoints. Reuse the
+same Python variables and publish again with the same workspace/sample.
+Use the image selector or `[` / `]` to show one retained image at a time.
+Compatible zoom and slice state survive flipping. Comparison views remain
+available; Reference/Candidate select the pair used for differences. Apply
+per-member spacing when their grids differ.
+Compatible measurement statistics and line-profile curves remain available for
+all retained images while a single image is selected.
+In **All images**, panes have equal image areas and aligned axis gutters.
+Long image names and wider coordinate labels do not make one pane wider;
+the layout stays equal when resizing or returning from a single image.
 
 Open **Measurements**, choose an ROI pane and click **Rectangle ROI** or
 **Ellipse ROI**. Drag its body to move it and its handle to resize it. ROIs appear on corresponding
@@ -116,11 +131,13 @@ the line, or drag its body to move it. Select another named line to plot that
 selection; selecting a rectangle or ellipse returns to the statistics table.
 Toggle **Measurements** to recover image space while retaining the line.
 
-Line profiles show original pixel values against distance from A **in pixels**,
-with each curve's intensity units in its legend. Grid correspondence follows
-the same rules as linked ROIs: matching sample, shape and spatial metadata,
-plus a common grid ID or an explicit **Declare matching grids** selection for
-images whose grid IDs are absent. No intensity normalization or unit conversion
+Line profiles show values against distance from A, in **pixels** by default or
+declared physical units (such as **mm**) when spacing is supplied, with each
+curve's intensity units in its legend. Grid correspondence follows the same
+rules as linked ROIs: a common sample and physical frame, or matching pixel
+grids without spatial metadata. A common grid ID or an explicit **Declare
+matching grids** selection is required for images whose grid IDs are absent.
+No intensity normalization or unit conversion
 is applied. To compare evaluations, pin the reference before rerunning the
 same sample/grid; the line stays in place and the candidate profile updates.
 
@@ -144,9 +161,27 @@ local worker; it makes no requests to the kernel.
 
 Hovering an image places linked crosshairs on corresponding panes and displays
 reference, candidate and difference values at the same sample location. A
-31×31 magnified patch, enabled in **Options → Magnifier**, uses original
+patch of at most 31×31 samples, enabled in **Options → Magnifier**, uses original
 samples with nearest-neighbor display; non-finite values remain identifiable
 and out-of-image locations are unavailable.
+With physical spacing, linked magnifiers show the same physical field of view
+using each array's own samples.
+
+To compare an upsampled axis, publish `spacing` for each member, for example
+`spacing={"original": (0.2, 0.2), "upsampled": (0.1, 0.2)}` for row/column
+spacing. For 3D crops use three entries in source-axis order. One tuple applies
+to every member; a mapping gives each member its own tuple. Set a common
+`grid_id` and `sample_id` to declare alignment. `spatial_units` defaults to
+`"mm"`; optional `origin` in the same tuple/mapping form gives the physical
+center of sample index zero, defaulting to zero. Crop origins must include the
+crop offset in physical units. Intensity units remain a separate option.
+
+Physical axis ticks, aspect ratio, linked zoom, cursor and ROI geometry honor
+the declared spacing and origins. Each ROI is measured from that member's own
+sample centers, so pixel counts can differ at different resolutions. Volume
+slice controls link nearest physical positions and show the actual position.
+Differences/blink report incompatible sampling until the arrays themselves
+share the same lattice; the viewer performs no automatic resampling.
 
 Current controls: pinch to zoom around the pointer, two-finger scroll to pan,
 mouse wheel to zoom, drag to pan, `F` to fit, hover for source pixel values,
@@ -154,8 +189,9 @@ and edit level/width. Native pinch uses Qt's macOS/Wayland gesture events;
 platforms that do not deliver these events retain mouse-wheel zoom. Touchpad
 scrolling uses pixel deltas when available, with an angle-delta fallback for
 devices identified as touchpads. System natural-scrolling direction is retained.
-Pan/zoom link only for matching, explicitly declared grids. Linked panes share
-image center and magnification, including when navigating from a prediction.
+Pan/zoom link for explicitly declared pixel grids or compatible physical
+frames. Linked panes share center and scale in the displayed units, including
+when navigating from a prediction.
 Panning and resizing after navigation retain magnification; narrower panes
 show less of the image rather than changing its scale. `F` fits all linked
 images at a common scale. Navigation never requests new data from the remote.
@@ -170,13 +206,20 @@ automatic downsampling; the original numerical samples remain unchanged.
 
 ## Bounds and remaining work
 
-Publish one to four planes, at most 32 MiB per plane and 64 MiB per group
+Publish one to four planes or explicit 3D crops, at most 32 MiB per member and 64 MiB per group
 including its header, with each dimension at most 16384. Supported types are
-8/16/32-bit signed/unsigned integers and 32/64-bit floats, with explicit byte
+8/16/32-bit signed/unsigned integers and 16/32/64-bit floats, with explicit byte
 order. Unsupported dtypes or oversized planes fail rather than being silently
-downcast. Slice GPU tensors **before** copying to CPU/NumPy. These limits do
+downcast. PyTorch bfloat16 is widened losslessly to float32 and counted at that
+size. Slice/crop GPU tensors **before** passing them to `ejn.view`; the publisher
+handles detachment and CPU conversion after validating budgets. These limits do
 not make base64 transport cheap: each selected group is transferred in full;
-there is no remote slider, tiling, or incremental update protocol yet.
+there is no remote tiling or incremental update protocol yet. For a supplied
+3D crop, the viewer's plane selector and slice slider/number browse locally.
+Page Up/Down and Shift+wheel step slices. Axes are source array dimensions,
+not anatomical labels; 3D always means scalar volume, never RGB. Compatible
+volumes and pinned references browse together. Use a different `sample_id`
+when the crop location changes, even if its shape is unchanged.
 
 The viewer keeps independent, read-only in-memory snapshots, not disk copies.
 Clearing output or killing the source/panel cannot invalidate a loaded image.

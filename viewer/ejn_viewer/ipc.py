@@ -14,7 +14,7 @@ from PySide6 import QtCore, QtWidgets
 from .snapshots import load_snapshot
 from .workspace import WorkspaceWindow
 from .analysis_worker import AnalysisWorker
-from .memory import MAX_MEMORY, merge_allocations
+from .memory import MAX_MEMORY, merge_allocations, render_bytes
 from .magnifier import MAX_PATCH_BYTES
 
 MAX_FRAME = 65536
@@ -63,7 +63,7 @@ class Decoder:
 def snapshot_charge(snapshot):
     # Source bytes plus conservative full-resolution render/intermediate RGBA
     # buffers. This is an application allocation budget, not total Qt RSS.
-    return snapshot.nbytes + sum(array.shape[0] * array.shape[1] * 8
+    return snapshot.nbytes + sum(render_bytes(array, numerical=snapshot.numerical)
                                  for array in snapshot.planes.values())
 
 

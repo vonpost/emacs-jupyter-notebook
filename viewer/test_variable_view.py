@@ -1,4 +1,4 @@
-"""Bounded selected-plane publication from a named live NumPy variable."""
+"""Bounded selected-plane publication from named live NumPy/PyTorch variables."""
 
 import unittest
 from unittest import mock
@@ -114,6 +114,60 @@ class VariableViewTests(unittest.TestCase):
             instance.view_variable("image")
             self.assertEqual(emit.call_args.args[0]["image"].shape, (2, 3))
         self.assertEqual(set(namespace), {"image", "ejn"})
+
+    def test_tensor_plane_is_selected_before_any_cpu_transfer(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("optional PyTorch dependency unavailable")
+        from test_publisher_kernel import decode_publication
+
+        # The backing source represents 82 MB. Only a 64x64 plane is copied;
+        # broadcasting keeps the fixture tiny even on machines without a GPU.
+        source = torch.tensor(3.25, requires_grad=True).expand(5000, 64, 64)
+        original_to = torch.Tensor.to
+        copied_shapes = []
+
+        def track_to(tensor, *args, **kwargs):
+            copied_shapes.append(tuple(tensor.shape))
+            return original_to(tensor, *args, **kwargs)
+
+        with mock.patch.object(torch.Tensor, "to", track_to), mock.patch("IPython.display.display") as emit:
+            publisher._view_variable({"volume": source}, "volume", axes=[2, 1],
+                                     indices=[4999, None, None])
+        self.assertEqual(copied_shapes, [(64, 64)])
+        _, arrays = decode_publication(emit.call_args.args[0])
+        np.testing.assert_array_equal(arrays["volume"], np.full((64, 64), 3.25))
+        self.assertTrue(source.requires_grad)
+
+    def test_tensor_axis_order_parameter_and_selection_identity(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("optional PyTorch dependency unavailable")
+        source = torch.nn.Parameter(torch.arange(120, dtype=torch.float32).reshape(2, 3, 4, 5))
+        selected, metadata = self.publish({"tensor": source}, "tensor", axes=[2, 1],
+                                          indices=[1, None, None, 2])
+        self.assertIs(type(selected), torch.Tensor)
+        torch.testing.assert_close(selected, source[1, :, :, 2].transpose(0, 1))
+        self.assertEqual(selected.untyped_storage().data_ptr(), source.untyped_storage().data_ptr())
+        _, changed = self.publish({"tensor": source}, "tensor", axes=[2, 1],
+                                  indices=[0, None, None, 2])
+        self.assertEqual(metadata["key"], changed["key"])
+        self.assertNotEqual(metadata["sample_id"], changed["sample_id"])
+
+    def test_tensor_budget_validation_precedes_slicing_and_widening(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("optional PyTorch dependency unavailable")
+        source = torch.tensor(0, dtype=torch.bfloat16).expand(2, 8192, 8192)
+        with mock.patch.object(torch.Tensor, "__getitem__", side_effect=AssertionError("sliced")), \
+                mock.patch.object(publisher, "_view") as emit:
+            with self.assertRaisesRegex(ValueError, "33554432"):
+                publisher._view_variable({"volume": source}, "volume", axes=[1, 2],
+                                         indices=[0, None, None])
+            emit.assert_not_called()
 
 
 if __name__ == "__main__":
