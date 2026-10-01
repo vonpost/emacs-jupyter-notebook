@@ -197,6 +197,13 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
+- [~] owner=root claimed=2026-10-01 CC35 Deduplicate completion candidates.
+  Normalize repeated insertion strings once before caching and presentation,
+  preserving first occurrence, case-sensitive distinctions and truncation
+  semantics. Root owns helper-backend normalization, focused ERT and docs;
+  `completion` independently reviews candidate sources and frontend behavior.
+  Keep completion asynchronous and avoid extra work on the CAPF hot path.
+
 - [x] sha=0081213 CC34 Per-member physical axis grids.
   User-requested extension during CC33: spacing/origin publication for 2D/3D,
   physical display and navigation/measurement mapping across upsampled arrays.
