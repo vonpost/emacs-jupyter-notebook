@@ -647,6 +647,7 @@ How it works:
 - Matching cached candidates filter locally as you continue a name or remote path component. A reply already in flight can serve the extended prefix, so you do not need to delete and retype a character.
 - Only one request is outstanding per buffer. New demand coalesces behind it; a directory separator, attribute dot, unrelated edit or kernel transition invalidates the old context.
 - The cache is bounded by `emacs-jupyter-notebook-completion-cache-size` (default 200) with LRU eviction.
+- Repeated kernel candidates are removed before caching, preserving first occurrence and distinct case/path spellings.
 
 Frontend integration:
 

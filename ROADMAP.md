@@ -203,6 +203,13 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
   semantics. Root owns helper-backend normalization, focused ERT and docs;
   `completion` independently reviews candidate sources and frontend behavior.
   Keep completion asynchronous and avoid extra work on the CAPF hot path.
+  > Stable deduplication now runs at the helper reply adapter, before exact
+  > and reusable caches or frontend presentation. Regression tests cover lists
+  > and vectors, ordering, case/path distinctions, immutable replies, preserved
+  > truncation, delayed popup refresh and cached narrowing in CAPF/Company.
+  > Both new regressions failed before the fix. Strict compilation passed;
+  > 20 focused completion tests and the canonical source suite passed:
+  > 1,213 ERT, 8 array, 261 helper, 25 registry and 12 fixture tests, no skips.
 
 - [x] sha=0081213 CC34 Per-member physical axis grids.
   User-requested extension during CC33: spacing/origin publication for 2D/3D,

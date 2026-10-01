@@ -955,7 +955,7 @@ core can retain an attached helper for the existing PID busy arbitration.
   nil)
 
 (defun emacs-jupyter-notebook-helper-backend--complete-result (result)
-  "Validate and translate one bounded helper complete RESULT."
+  "Validate RESULT and retain the first occurrence of each completion string."
   (let ((matches (and (hash-table-p result) (gethash "matches" result)))
         (start (and (hash-table-p result) (gethash "cursor_start" result)))
         (end (and (hash-table-p result) (gethash "cursor_end" result)))
@@ -968,7 +968,9 @@ core can retain an attached helper for the existing PID busy arbitration.
                  (member status '("ok" "error"))
                  (memq truncated '(nil t :false)))
       (error "helper complete returned an invalid result"))
-    (append (list :matches (append matches nil)
+    ;; Kernels may merge several completers into identical insertion strings.
+    ;; Normalize once before caching; copy so the wire result remains untouched.
+    (append (list :matches (delete-dups (append matches nil))
                   :cursor_start start :cursor_end end :status status)
             (when (eq truncated t) (list :truncated t)))))
 
