@@ -175,10 +175,28 @@ These are binding for every workstream. Update only by appending a new entry.
   authority. Initial Docker support targets a local Linux Docker Engine on
   the SSH host with host networking and a private bind-mounted session cache.
 
+- **2026-10-01 / Explicit cropped volumes and tensor publication.** The user
+  requests PyTorch arrays and local plane/slice browsing of explicitly supplied
+  3D crops. Extend the bounded numerical publication to 2D arrays and 3D
+  volumes; never automatically fetch an entire remote volume. Validate shape,
+  dtype and aggregate budgets before copying tensors to CPU. Slice scrolling
+  and plane selection operate entirely on retained local samples. This
+  supersedes W21's 2D-only first-release restriction for explicit publication.
+
 ## Cross-cutting changes
 
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
+
+- [~] owner=root claimed=2026-10-01 CC33 PyTorch, explicit cropped volumes,
+  and responsive remote completion. Root manages integration, variable-view
+  Emacs/helper surfaces, documentation and verification. `array_publication`
+  owns publisher/array codec and their focused tests; `volume_viewer` owns
+  viewer workspace/snapshot/analysis support and volume tests; `completion`
+  owns core completion/vars and focused ERT. Shared checkout: agents do not
+  commit or edit ledgers. Preserve asynchronous helpers, bounded artifacts,
+  exact source/session ownership and source cleanliness. Review independently
+  before landing; run source ERT, Python suites and byte compilation.
 
 - [x] sha=59f5102 CC32 Execute the real Docker/Jupyter gate.
   The user started a local Docker daemon and granted socket access. Exercise
