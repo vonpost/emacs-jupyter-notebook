@@ -197,7 +197,7 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
-- [~] owner=root claimed=2026-10-01 CC34 Per-member physical axis grids.
+- [x] sha=0081213 CC34 Per-member physical axis grids.
   User-requested extension during CC33: spacing/origin publication for 2D/3D,
   physical display and navigation/measurement mapping across upsampled arrays.
   Root owns integration/docs/tests; `array_publication` owns publisher/codec;
@@ -225,7 +225,7 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
   > Final Nix viewer package/check and helper package builds passed. GPU
   > hardware and macOS were not exercised.
 
-- [~] owner=root claimed=2026-10-01 CC33 PyTorch, explicit cropped volumes,
+- [x] sha=0081213 CC33 PyTorch, explicit cropped volumes,
   and responsive remote completion. Root manages integration, variable-view
   Emacs/helper surfaces, documentation and verification. `array_publication`
   owns publisher/array codec and their focused tests; `volume_viewer` owns
