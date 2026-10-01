@@ -206,6 +206,10 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
   Scope includes new spatial module/tests, existing analysis/navigation/
   magnifier/worker where needed, viewer protocol/install docs and focused ERT.
   Manager coordinates interfaces before edits. No silent resampling.
+  > Scope update: user clarified input A + saved prediction B + new prediction
+  > C must stay visible together using reused Python variables. Preserve current
+  > publication members alongside the pinned prior prediction and optional
+  > difference; verify reference/candidate selection across checkpoint reruns.
 
 - [~] owner=root claimed=2026-10-01 CC33 PyTorch, explicit cropped volumes,
   and responsive remote completion. Root manages integration, variable-view
