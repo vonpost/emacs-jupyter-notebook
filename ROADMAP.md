@@ -229,14 +229,24 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
-- [~] owner=root claimed=2026-10-11 CC38 Automatically maintain the Org findings overview.
+- [x] sha=c525eb3 CC38 Automatically maintain the Org findings overview.
   Scope: viewer findings service/store, focused Python tests, README and
   protocol documentation. Generate after capture, note edits and removal
   without adding worker queues or blocking the GUI. Preserve explicit
   capture, current image/context semantics and edited overview protection;
   overview failure must not turn a durable save into a reported save failure.
-  Root owns implementation and verification; `overview_auto_review` performs
-  a read-only review of integration boundaries and existing-result workflow.
+  Root owns integration, documentation and verification; `overview_auto_review`
+  reviewed the integration boundaries and implemented the findings service
+  and focused regression tests in its assigned files.
+  > Capture, note edits and removal now regenerate the overview in the same
+  > worker job, with bounded memory admission and separate overview-failure
+  > warnings that preserve successful mutations and edited Org documents.
+  > Immediate worker completion also preserves save errors and note retry
+  > controls. Existing captures still rebuild after Emacs restarts without a
+  > notebook or kernel. All 228 viewer tests and 20 focused GUI regressions
+  > passed. The canonical source suite passed 1,274 ERT, 8 array, 261 helper,
+  > 25 registry and 12 fixture tests; no skips. No Elisp changed or bytecode
+  > was generated. Final diff checks passed; no remote host was used.
 
 - [x] sha=9a0daf9 CC37 Lightweight exploration and findings.
   Root owns integration in core/actions, result publication provenance,
