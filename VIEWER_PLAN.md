@@ -444,6 +444,9 @@ remain historical. A row's checkboxes mean landed work, not proposed design.
   removal. Measurement exports and polygon ROIs get separately claimed
   subrows. Gate: restart recovery, missing sources, validated schema,
   exact measurements and separation of saved data from disposable caches.
+  > 2026-10-11: user-authorized CC37 implements capture/review/report export
+  > against the shipped viewer independently of V11's remaining platform gate;
+  > see the appended design decision and ownership in ROADMAP.md.
 
 V2 and V3 may proceed in parallel after V1 with disjoint file ownership.
 V7-V9 are sequential. V12 and V14 may proceed independently after release

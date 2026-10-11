@@ -192,10 +192,33 @@ These are binding for every workstream. Update only by appending a new entry.
   silently resample data. Ordinary arrays without spatial metadata retain
   pixel-coordinate behavior.
 
+- **2026-10-11 / Lightweight notebook workflow and saved findings.** The user
+  approved implementation of scratch input, a bounded execution trail, simpler
+  viewing and durable image/context captures with report export. Scratch is an
+  input surface owned by one source buffer and delegates to that buffer's FIFO;
+  it does not acquire a client or share kernel ownership. Explicitly saved
+  findings own local images/selected samples and recorded execution context,
+  independently of transient outputs and the kernel registry. They are not
+  kernel checkpoints or a dependency graph. This user-requested extension may
+  proceed against the shipped viewer independently of V11's outstanding
+  cross-platform release verification; source cleanliness and async rules hold.
+
 ## Cross-cutting changes
 
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
+
+- [~] owner=root claimed=2026-10-11 CC37 Lightweight exploration and findings.
+  Root owns integration in core/actions, docs/protocol/packaging and review.
+  `execution_workflow` owns new history/scratch Elisp modules and focused ERT;
+  `simple_view` owns variables/inspect Elisp, publisher group/selector support
+  and their tests; `durable_findings` owns viewer snapshot/context, durable
+  store, capture/review/export UI and focused Python tests (excluding publisher
+  and test_variable_view.py). Agents do not commit or edit ledgers. Preserve
+  exact submitted source and per-pane execution identity, bounded async IO,
+  atomic capture before annotation, independent retained samples, ordinary
+  source files and a single owner/queue per kernel. Root coordinates APIs
+  and reviews all changes before local ERT, viewer tests and package checks.
 
 - [x] sha=7414c6c CC36 Doom local-leader notebook commands.
   Expose the notebook command map through Doom's configured local leader,
