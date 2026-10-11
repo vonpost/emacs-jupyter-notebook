@@ -209,7 +209,8 @@ Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
 - [~] owner=root claimed=2026-10-11 CC37 Lightweight exploration and findings.
-  Root owns integration in core/actions, docs/protocol/packaging and review.
+  Root owns integration in core/actions, result publication provenance,
+  findings commands/ERT, docs/protocol/packaging and review.
   `execution_workflow` owns new history/scratch Elisp modules and focused ERT;
   `simple_view` owns variables/inspect Elisp, publisher group/selector support
   and their tests; `durable_findings` owns viewer snapshot/context, durable
