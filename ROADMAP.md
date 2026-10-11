@@ -203,6 +203,19 @@ These are binding for every workstream. Update only by appending a new entry.
   proceed against the shipped viewer independently of V11's outstanding
   cross-platform release verification; source cleanliness and async rules hold.
 
+- **2026-10-11 / Keep saved findings lightweight.** The user explicitly
+  removed PowerPoint slide export from CC37. Keep capture, local review,
+  editable notes and image/caption copying. Store ordinary PNG, JSON and
+  NumPy files; add no presentation-generation dependency or slide-assembly UI.
+
+- **2026-10-11 / Generated Org findings overview.** The user requested a
+  document Emacs can open to review saved images and their context together,
+  with Org as a possible later presentation source. CC37 adds a generated
+  Org overview alongside ordinary finding assets with relative links.
+  Capture still requires no Org authoring or notebook restructuring; slide
+  generation remains excluded. Generate asynchronously, bound the document
+  and inline previews, preserve saved notes, and make regeneration explicit.
+
 ## Cross-cutting changes
 
 Use this section to claim ownership of changes that span workstream file
@@ -220,6 +233,12 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
   atomic capture before annotation, independent retained samples, ordinary
   source files and a single owner/queue per kernel. Root coordinates APIs
   and reviews all changes before local ERT, viewer tests and package checks.
+  > Scope refinement: the user subsequently excluded slide export. The viewer
+  > scope is capture/review/copy; report generation remains deferred.
+  > Additional approved scope: generated Org overview and an Emacs command
+  > to open it. `durable_findings` owns worker/store generation and viewer IPC;
+  > `simple_view` owns callback support in inspect.el and its focused tests;
+  > root owns the Emacs Org command, integration tests and documentation.
 
 - [x] sha=7414c6c CC36 Doom local-leader notebook commands.
   Expose the notebook command map through Doom's configured local leader,

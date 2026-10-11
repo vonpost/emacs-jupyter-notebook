@@ -444,9 +444,13 @@ remain historical. A row's checkboxes mean landed work, not proposed design.
   removal. Measurement exports and polygon ROIs get separately claimed
   subrows. Gate: restart recovery, missing sources, validated schema,
   exact measurements and separation of saved data from disposable caches.
-  > 2026-10-11: user-authorized CC37 implements capture/review/report export
+  > 2026-10-11: user-authorized CC37 implements capture/review/copy
   > against the shipped viewer independently of V11's remaining platform gate;
-  > see the appended design decision and ownership in ROADMAP.md.
+  > see the appended design decisions and ownership in ROADMAP.md. The user
+  > explicitly deferred PowerPoint export; V14's remaining exports stay open.
+  > The same scope includes a generated Org overview with relative image/data
+  > links, requested as an Emacs-native review document and possible later
+  > presentation source. It does not require authoring experiments in Org.
 
 V2 and V3 may proceed in parallel after V1 with disjoint file ownership.
 V7-V9 are sequential. V12 and V14 may proceed independently after release
