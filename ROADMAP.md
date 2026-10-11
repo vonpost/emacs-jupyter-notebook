@@ -197,13 +197,25 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
-- [~] owner=root claimed=2026-10-11 CC36 Doom local-leader notebook commands.
+- [x] sha=7414c6c CC36 Doom local-leader notebook commands.
   Expose the notebook command map through Doom's configured local leader,
   including completion and numerical viewing, with discoverable descriptions.
   Keep bindings scoped to the notebook minor mode and optional for vanilla
   Emacs. Root owns core keybinding integration, focused deterministic ERT and
   README documentation; `doom_bindings_review` inspects installed Doom APIs
   and reviews precedence/load-order behavior without editing files.
+  > The shared command map now has readable which-key labels and follows
+  > Doom's normal/visual/motion and insert/Emacs local-leader prefixes.
+  > Bindings activate with notebook mode and restore underlying Python keys
+  > on disable. No Doom/General/which-key dependency was added. Independent
+  > probes with installed Evil/General verified stale user-map precedence,
+  > late loading, custom string/vector prefixes, non-Evil operation and both
+  > terminal TAB and GUI Tab events. All four new ERTs failed before the fix.
+  > Strict byte compilation passed; bytecode was removed before canonical
+  > `EJN_TEST_TIMEOUT=120 tests/run-local-tests.sh`: 1,217 ERT, 8 array,
+  > 261 helper, 25 registry and 12 fixture tests passed, with four helper
+  > tests skipped for missing optional Pillow/NumPy. The default 30-second
+  > runner deadline was too short for the 34-second source ERT suite.
 
 - [x] sha=96d6b72 CC35 Deduplicate completion candidates.
   Normalize repeated insertion strings once before caching and presentation,
