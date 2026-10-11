@@ -43,6 +43,29 @@ local runtime, EJN finds Nix and builds the repository's pinned `.#default`
 closure in a background process.  The mode line shows `EJN…build`; `C-c j x`
 cancels the caller.  Multiple EJN buffers share one build.
 
+Notebook mode automatically exposes the same commands under Doom's local
+leader, with descriptions in which-key. No extra `map!` block is needed:
+
+| Key (normal/visual state) | Action |
+| --- | --- |
+| `SPC m TAB` | Complete at point |
+| `SPC m A` | View an array variable |
+| `SPC m I` | View the current cell's published images |
+| `SPC m J` | Evaluate the cell and view its published images |
+| `SPC m V` | Browse kernel variables |
+| `SPC m c` / `SPC m j` | Evaluate cell / evaluate and advance |
+| `SPC m .` | Kernel documentation |
+| `SPC m a` | Notebook actions |
+
+Every `C-c j` suffix below also works after the local leader, including the
+`%` cell-editing submenu. In insert/Emacs state, or without Evil, use
+`M-SPC m` instead. Custom `doom-localleader-key` and
+`doom-localleader-alt-key` values are honored when notebook mode is enabled.
+Notebook commands take precedence over overlapping Python local-leader keys
+while the mode is active; disabling it restores those bindings. Unrelated
+Python shortcuts remain available. Older hand-written notebook `map!` blocks
+can be removed so their shortcuts do not disagree with this shared map.
+
 Sampled Nix progress also appears in `*Messages*` and the bounded EJN log
 (`C-c j L`).  Doom's default modeline hides ordinary minor-mode lighters, so
 it will not show `EJN…build` unless your modeline is configured to render

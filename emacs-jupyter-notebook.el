@@ -1217,48 +1217,49 @@ The old `s' / `RET' send-current-cell-and-advance bindings have been
 removed; use the top-level send-cell binding instead.")
 
 (defun emacs-jupyter-notebook--build-prefix-map ()
-  "Return the W6.1 single-prefix command keymap.
-All command bindings live under `emacs-jupyter-notebook-prefix-key'
-\(default `C-c j').  The cell-editing keymap is attached on `%'."
+  "Return the notebook command map with labels for key discovery.
+Used by `emacs-jupyter-notebook-prefix-key' and Doom's local leader.
+The cell-editing keymap is attached on `%'."
   (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "c")    #'emacs-jupyter-notebook-send-cell)
-    (define-key map (kbd "j")    #'emacs-jupyter-notebook-send-cell-and-advance)
-    (define-key map (kbd "r")    #'emacs-jupyter-notebook-send-region)
-    (define-key map (kbd "SPC")  #'emacs-jupyter-notebook-send-paragraph)
-    (define-key map (kbd "d")    #'emacs-jupyter-notebook-send-defun)
-    (define-key map (kbd "b")    #'emacs-jupyter-notebook-send-buffer)
-    (define-key map (kbd "s")    #'emacs-jupyter-notebook-start-remote-kernel)
-    (define-key map (kbd "R")    #'emacs-jupyter-notebook-reconnect-remote-kernel)
-    (define-key map (kbd "y")    #'emacs-jupyter-notebook-retry-fresh-kernel)
-    (define-key map (kbd "k")    #'emacs-jupyter-notebook-interrupt-kernel)
-    (define-key map (kbd "K")    #'emacs-jupyter-notebook-restart-kernel)
-    (define-key map (kbd "S")    #'emacs-jupyter-notebook-shutdown-kernel)
-    (define-key map (kbd "x")    #'emacs-jupyter-notebook-cancel-operation)
-    (define-key map (kbd "z")    #'emacs-jupyter-notebook-cancel-queued-execution)
-    (define-key map (kbd "?")    #'emacs-jupyter-notebook-status)
-    (define-key map (kbd "L")    #'emacs-jupyter-notebook-show-log-buffer)
-    ;; W6.10: `clear-results' was missing from the new prefix map.
-    (define-key map (kbd "l")    #'emacs-jupyter-notebook-clear-results)
-    (define-key map (kbd "o")    #'emacs-jupyter-notebook-show-output-panel)
-    (define-key map (kbd "t")    #'emacs-jupyter-notebook-toggle-panel-view)
-    (define-key map (kbd "h")    #'emacs-jupyter-notebook-toggle-cell-output)
-    (define-key map (kbd "V")    #'emacs-jupyter-notebook-list-variables)
-    (define-key map (kbd "i")    #'emacs-jupyter-notebook-inspect)
-    (define-key map (kbd "a")    #'emacs-jupyter-notebook-actions)
-    (define-key map (kbd "A")    #'emacs-jupyter-notebook-view-variable)
-    (define-key map (kbd "I")    #'emacs-jupyter-notebook-inspect-images)
-    (define-key map (kbd "J")    #'emacs-jupyter-notebook-evaluate-and-inspect)
-    (define-key map (kbd ".")    #'emacs-jupyter-notebook-inspect-at-point)
-    (define-key map (kbd "TAB")  #'emacs-jupyter-notebook-complete-at-point)
-    (define-key map (kbd "v")    #'emacs-jupyter-notebook-fetch-remote-log)
-    (define-key map (kbd "q")    #'emacs-jupyter-notebook-list-remote-processes)
-    (define-key map (kbd "w")    #'emacs-jupyter-notebook-clean-orphaned-kernels)
-    ;; W11: non-destructive prune of dead registry entries.  (`p' is already
-    ;; taken by `backward-cell', so the prune lives on `P'.)
-    (define-key map (kbd "P")    #'emacs-jupyter-notebook-prune-dead-kernels)
-    (define-key map (kbd "n")    #'emacs-jupyter-notebook-forward-cell)
-    (define-key map (kbd "p")    #'emacs-jupyter-notebook-backward-cell)
-    (define-key map (kbd "%")    emacs-jupyter-notebook-cell-map)
+    ;; Ordinary menu labels are understood by which-key and Emacs itself;
+    ;; neither Doom nor which-key is needed to construct this shared map.
+    (dolist (binding
+             '(("c" "Evaluate cell" emacs-jupyter-notebook-send-cell)
+               ("j" "Evaluate and advance" emacs-jupyter-notebook-send-cell-and-advance)
+               ("r" "Evaluate region" emacs-jupyter-notebook-send-region)
+               ("SPC" "Evaluate paragraph" emacs-jupyter-notebook-send-paragraph)
+               ("d" "Evaluate defun" emacs-jupyter-notebook-send-defun)
+               ("b" "Evaluate buffer" emacs-jupyter-notebook-send-buffer)
+               ("s" "Start kernel" emacs-jupyter-notebook-start-remote-kernel)
+               ("R" "Reconnect kernel" emacs-jupyter-notebook-reconnect-remote-kernel)
+               ("y" "Retry with fresh kernel" emacs-jupyter-notebook-retry-fresh-kernel)
+               ("k" "Interrupt kernel" emacs-jupyter-notebook-interrupt-kernel)
+               ("K" "Restart kernel" emacs-jupyter-notebook-restart-kernel)
+               ("S" "Shut down kernel" emacs-jupyter-notebook-shutdown-kernel)
+               ("x" "Cancel operation" emacs-jupyter-notebook-cancel-operation)
+               ("z" "Cancel queued execution" emacs-jupyter-notebook-cancel-queued-execution)
+               ("?" "Notebook status" emacs-jupyter-notebook-status)
+               ("L" "Notebook log" emacs-jupyter-notebook-show-log-buffer)
+               ("l" "Clear results" emacs-jupyter-notebook-clear-results)
+               ("o" "Show output panel" emacs-jupyter-notebook-show-output-panel)
+               ("t" "Switch latest/history" emacs-jupyter-notebook-toggle-panel-view)
+               ("h" "Hide/show cell output" emacs-jupyter-notebook-toggle-cell-output)
+               ("V" "Browse variables" emacs-jupyter-notebook-list-variables)
+               ("i" "Inspect at point" emacs-jupyter-notebook-inspect)
+               ("a" "Notebook actions" emacs-jupyter-notebook-actions)
+               ("A" "View array variable" emacs-jupyter-notebook-view-variable)
+               ("I" "View cell images" emacs-jupyter-notebook-inspect-images)
+               ("J" "Evaluate cell and view" emacs-jupyter-notebook-evaluate-and-inspect)
+               ("." "Kernel documentation" emacs-jupyter-notebook-inspect-at-point)
+               ("TAB" "Complete at point" emacs-jupyter-notebook-complete-at-point)
+               ("v" "Fetch remote log" emacs-jupyter-notebook-fetch-remote-log)
+               ("q" "List remote processes" emacs-jupyter-notebook-list-remote-processes)
+               ("w" "Clean orphaned kernels" emacs-jupyter-notebook-clean-orphaned-kernels)
+               ("P" "Prune dead kernels" emacs-jupyter-notebook-prune-dead-kernels)
+               ("n" "Next cell" emacs-jupyter-notebook-forward-cell)
+               ("p" "Previous cell" emacs-jupyter-notebook-backward-cell)))
+      (define-key map (kbd (car binding)) (cons (nth 1 binding) (nth 2 binding))))
+    (define-key map (kbd "%") (cons "Cell editing" emacs-jupyter-notebook-cell-map))
     map))
 
 (defvar emacs-jupyter-notebook-prefix-map
@@ -1273,18 +1274,44 @@ Bound under `emacs-jupyter-notebook-prefix-key' in
                 emacs-jupyter-notebook-prefix-map)
     map)
   "Keymap for `emacs-jupyter-notebook-mode'.
-A single prefix (`emacs-jupyter-notebook-prefix-key', default `C-c j')
-hosts the entire command surface.  See `emacs-jupyter-notebook-prefix-map'.")
+The command map is available at `emacs-jupyter-notebook-prefix-key'
+\(default `C-c j') and, in Doom, its configured local leader.")
 
 (defvar evil-visual-beginning)
 (defvar evil-visual-end)
+(defvar doom-localleader-key)
+(defvar doom-localleader-alt-key)
 (declare-function evil-define-minor-mode-key "evil-core"
                   (state mode key def &rest bindings))
+
+(defun emacs-jupyter-notebook--setup-doom-keybindings ()
+  "Expose notebook commands under Doom's configured local leader.
+Bindings belong to the minor mode, so disabling it restores the underlying
+major-mode bindings.  Vanilla Emacs does not acquire a leader or dependency.
+Called on mode activation as Doom may initialize its prefixes after EJN."
+  (when (and (bound-and-true-p doom-localleader-key)
+             (bound-and-true-p doom-localleader-alt-key))
+    (let ((leader (if (stringp doom-localleader-key)
+                      (kbd doom-localleader-key) doom-localleader-key))
+          (alternate (if (stringp doom-localleader-alt-key)
+                         (kbd doom-localleader-alt-key) doom-localleader-alt-key)))
+      (if (featurep 'evil)
+          (progn
+            (evil-define-minor-mode-key
+             '(normal visual motion) 'emacs-jupyter-notebook-mode
+             leader emacs-jupyter-notebook-prefix-map)
+            (evil-define-minor-mode-key
+             '(insert emacs) 'emacs-jupyter-notebook-mode
+             alternate emacs-jupyter-notebook-prefix-map))
+        (define-key emacs-jupyter-notebook-mode-map
+                    alternate emacs-jupyter-notebook-prefix-map)))))
+
 (with-eval-after-load 'evil
   (evil-define-minor-mode-key
    'normal 'emacs-jupyter-notebook-mode
    (kbd "TAB") #'emacs-jupyter-notebook-toggle-cell-output
-   (kbd "<tab>") #'emacs-jupyter-notebook-toggle-cell-output))
+   (kbd "<tab>") #'emacs-jupyter-notebook-toggle-cell-output)
+  (emacs-jupyter-notebook--setup-doom-keybindings))
 
 (defun emacs-jupyter-notebook--cancel-async-context-locally (context)
   "Cancel CONTEXT's in-flight local processes, timers, and temp files.
@@ -2128,6 +2155,7 @@ panel's own kill-buffer-hook only cancels its flush timer)."
           (setq emacs-jupyter-notebook--owns-code-cells-mode t))
         (emacs-jupyter-notebook-cell-tracking-enable)
         (emacs-jupyter-notebook-variables-setup)
+        (emacs-jupyter-notebook--setup-doom-keybindings)
         (add-hook 'completion-at-point-functions
                   #'emacs-jupyter-notebook-completion-at-point nil t)
         (add-hook 'after-change-functions
