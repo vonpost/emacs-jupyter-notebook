@@ -197,6 +197,14 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
+- [~] owner=root claimed=2026-10-11 CC36 Doom local-leader notebook commands.
+  Expose the notebook command map through Doom's configured local leader,
+  including completion and numerical viewing, with discoverable descriptions.
+  Keep bindings scoped to the notebook minor mode and optional for vanilla
+  Emacs. Root owns core keybinding integration, focused deterministic ERT and
+  README documentation; `doom_bindings_review` inspects installed Doom APIs
+  and reviews precedence/load-order behavior without editing files.
+
 - [x] sha=96d6b72 CC35 Deduplicate completion candidates.
   Normalize repeated insertion strings once before caching and presentation,
   preserving first occurrence, case-sensitive distinctions and truncation
