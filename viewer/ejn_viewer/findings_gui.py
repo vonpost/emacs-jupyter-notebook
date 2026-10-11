@@ -15,6 +15,7 @@ from .findings import (Capture, FindingError, FindingStore, MAX_CAPTURE_BYTES,
 from .memory import MAX_MEMORY, merge_allocations, source_allocations
 
 IO_RESERVE = 192 * 1024**2
+ORG_RESERVE = 64 * 1024**2
 # Three derived image/PNG buffers plus coefficient tables for two bounded axes.
 PREVIEW_RESERVE = MAX_OVERVIEW_BYTES * 3 + 2 * 1024**2
 
@@ -122,6 +123,7 @@ class FindingsService(QtCore.QObject):
                 image_bytes = (capture.image.sizeInBytes() if capture.image is not None
                                else self.active.get("image_bytes", 0))
                 result["capture-image", id(capture)] = image_bytes * 5 + PREVIEW_RESERVE
+                result["finding-io", id(self)] = self.active.get("reserve_bytes", 0)
             else:
                 result["finding-io", id(self)] = self.active.get("reserve_bytes", IO_RESERVE)
         if self.review is not None and not self.review._closed:
@@ -163,11 +165,37 @@ class FindingsService(QtCore.QObject):
             result, error = None, str(exc) or "The local findings operation failed."
         job["callback"](result, error)
 
+    def submit_mutation(self, function, callback, *, success_message, capture=None):
+        """Commit a change and refresh its Org index in the same worker job.
+
+        The assets are durable before index generation. A failed index must
+        never turn that completed change into a failure the user might repeat.
+        """
+        def update():
+            result = function()
+            try:
+                self.store.org_overview()
+            except Exception as exc:
+                return result, str(exc) or "The local overview operation failed."
+            return result, ""
+
+        def updated(value, error):
+            if error:
+                callback(None, error)
+                return
+            result, warning = value
+            callback(result, "")
+            if warning:
+                self._message(success_message + ", but the Org overview could not be refreshed.\n" + warning)
+
+        self.submit(update, updated, capture=capture, reserve_bytes=ORG_RESERVE)
+
     def capture(self, window, *, ask_note=True):
         if self.active is not None:
             raise FindingError("A findings operation is still running; try again shortly.")
         def admit(capture, image_bytes):
-            self.active = {"capture": capture, "image_bytes": image_bytes}
+            self.active = {"capture": capture, "image_bytes": image_bytes,
+                           "reserve_bytes": ORG_RESERVE}
             try:
                 if not self.admit():
                     raise FindingError("This capture exceeds the local memory budget; reduce the viewer window or close another viewer.")
@@ -185,8 +213,9 @@ class FindingsService(QtCore.QObject):
             else:
                 self.changed.emit()
 
-        self.submit(lambda: self.store.save(frozen), saved, capture=frozen)
         window.analysis_status.setText("Saving finding…")
+        self.submit_mutation(lambda: self.store.save(frozen), saved,
+                             success_message="Finding saved", capture=frozen)
 
     def edit_note(self, identifier, note, parent=None):
         dialog = QtWidgets.QDialog(parent)
@@ -224,11 +253,12 @@ class FindingsService(QtCore.QObject):
                         dialog.accept()
                     self.changed.emit()
             try:
-                self.submit(lambda value=line.text(): self.store.update_note(identifier, value), updated,
-                            reserve_bytes=1024 * 1024)
                 buttons.setEnabled(False)
+                self.submit_mutation(lambda value=line.text(): self.store.update_note(identifier, value), updated,
+                                     success_message="Observation saved")
             except FindingError as exc:
                 label.setText(str(exc) + "\nObservation:")
+                buttons.setEnabled(True)
         buttons.accepted.connect(accepted)
         dialog.rejected.connect(self.changed.emit)
         dialog.open()
@@ -469,9 +499,17 @@ class FindingsWindow(QtWidgets.QMainWindow):
         identifiers = self.selected_ids()
         if identifiers and QtWidgets.QMessageBox.question(self, "Remove saved findings",
                 f"Permanently remove {len(identifiers)} saved finding(s)?") == QtWidgets.QMessageBox.StandardButton.Yes:
-            self._run(lambda: self.service.store.delete(identifiers),
-                      lambda _value, error: self.status.setText(error) if error else self.refresh(),
-                      reserve_bytes=1024 * 1024)
+            def removed(_value, error):
+                if not self._closed:
+                    if error:
+                        self.status.setText(error)
+                    else:
+                        self.refresh()
+            try:
+                self.service.submit_mutation(lambda: self.service.store.delete(identifiers), removed,
+                                             success_message="Findings removed")
+            except FindingError as exc:
+                self.status.setText(str(exc))
 
     def closeEvent(self, event):
         self._closed = True

@@ -4,6 +4,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from pathlib import Path
+from concurrent.futures import Future
 import tempfile
 import threading
 from types import SimpleNamespace
@@ -17,6 +18,16 @@ from ejn_viewer.findings import FindingError, FindingStore, MAX_IMAGE_EXTENT
 from ejn_viewer.findings_gui import FindingsService, FindingsWindow, PREVIEW_RESERVE, freeze_window
 from ejn_viewer.workspace import PINNED, WorkspaceWindow
 from test_analysis_gui import APP, pump_until, snapshot
+
+
+def completed_future(function):
+    """Model a worker finishing before add_done_callback is registered."""
+    future = Future()
+    try:
+        future.set_result(function())
+    except Exception as exc:
+        future.set_exception(exc)
+    return future
 
 
 class FindingsGuiTests(unittest.TestCase):
@@ -79,6 +90,54 @@ class FindingsGuiTests(unittest.TestCase):
         manifest, _image, arrays = self.store.load(notes[0], arrays=True)
         self.assertEqual(manifest["view"]["panes"][0]["sources"][0]["execution"], "model-A")
         np.testing.assert_array_equal(arrays[0], np.arange(12).reshape(3, 4))
+
+    def test_capture_generates_overview_off_ui_before_optional_note(self):
+        window = self.window()
+        entered, release = threading.Event(), threading.Event()
+        original = self.store.org_overview
+        gui_thread = threading.get_ident()
+        notes, worker_threads, overview_at_prompt = [], [], []
+        def slow():
+            worker_threads.append(threading.get_ident())
+            entered.set()
+            release.wait(3)
+            return original()
+        def note(identifier, *_args):
+            path = self.store.root / "findings.org"
+            overview_at_prompt.append(path.read_text() if path.exists() else "")
+            notes.append(identifier)
+        self.addCleanup(release.set)
+        self.service.edit_note = note
+        with mock.patch.object(self.store, "org_overview", slow):
+            self.service.capture(window)
+            pump_until(entered.is_set)
+            self.assertFalse(notes)
+            self.assertEqual(len(self.store.catalog()[0]), 1)
+            with self.assertRaisesRegex(FindingError, "still running"):
+                self.service.capture(window)
+            # The GUI keeps processing events while generation owns the worker.
+            responsive = []
+            QtCore.QTimer.singleShot(0, lambda: responsive.append(True))
+            pump_until(lambda: responsive)
+            release.set()
+            pump_until(lambda: self.service.active is None)
+        self.assertEqual(len(notes), 1)
+        self.assertIn(notes[0], overview_at_prompt[0])
+        self.assertEqual(len(worker_threads), 1)
+        self.assertNotEqual(worker_threads[0], gui_thread)
+
+    def test_capture_admits_overview_memory_before_grabbing_image(self):
+        window = self.window()
+        scale = window.graphics.devicePixelRatioF()
+        image_bytes = int(window.graphics.width() * window.graphics.height() * scale * scale * 4)
+        # Enough for capture encoding, but not its additional 64 MiB Org job.
+        available = image_bytes * 5 + PREVIEW_RESERVE + 32 * 1024**2
+        self.service.admit = lambda: sum(self.service.allocations.values()) <= available
+        with mock.patch.object(window.graphics, "grab", side_effect=AssertionError("unexpected screenshot")):
+            with self.assertRaisesRegex(FindingError, "memory budget"):
+                self.service.capture(window)
+        self.assertIsNone(self.service.active)
+        self.assertFalse(self.store.root.exists())
 
     def test_blink_capture_stores_the_actually_visible_reference_samples(self):
         window = self.window()
@@ -186,6 +245,118 @@ class FindingsGuiTests(unittest.TestCase):
         buttons.accepted.emit()
         pump_until(lambda: self.service.active is None)
         self.assertEqual(self.store.manifest(kept["id"])["note"], "The important observation")
+        self.assertIn("* The important observation", (self.store.root / "findings.org").read_text())
+
+    def test_removing_findings_updates_overview_including_empty_collection(self):
+        first = self.store.save(freeze_window(self.window()), "Remove first")
+        second = self.store.save(freeze_window(self.window()), "Remove second")
+        self.store.org_overview()
+        review = FindingsWindow(self.service)
+        self.service.review = review
+        with mock.patch.object(QtWidgets.QMessageBox, "question",
+                               return_value=QtWidgets.QMessageBox.StandardButton.Yes):
+            for identifier, remaining in ((first["id"], 1), (second["id"], 0)):
+                with mock.patch.object(review, "selected_ids", return_value=[identifier]):
+                    review.remove()
+                    pump_until(lambda: self.service.active is None)
+                overview = (self.store.root / "findings.org").read_text()
+                self.assertNotIn(identifier, overview)
+                self.assertIn(f"{remaining} findings;", overview)
+
+    def test_overview_failure_preserves_successful_capture_note_and_deletion(self):
+        window = self.window()
+        kept = self.store.save(freeze_window(window), "Initial observation")
+        path = Path(self.store.org_overview()["path"])
+        path.chmod(0o600)
+        edited = path.read_bytes() + b"\n* My report draft\n"
+        path.write_bytes(edited)
+        self.service._message = mock.Mock()
+        notes = []
+        with mock.patch.object(self.service, "edit_note", side_effect=lambda identifier, *args: notes.append(identifier)):
+            self.service.capture(window)
+            pump_until(lambda: self.service.active is None)
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(len(self.store.catalog()[0]), 2)
+        self.assertIn("Finding saved", window.analysis_status.text())
+        self.assertEqual(path.read_bytes(), edited)
+        self.service.edit_note(kept["id"], "Initial observation")
+        dialog = self.service._note_dialog
+        dialog.findChild(QtWidgets.QLineEdit).setText("Observation updated")
+        dialog.findChild(QtWidgets.QDialogButtonBox).accepted.emit()
+        pump_until(lambda: self.service.active is None)
+        self.assertTrue(dialog._closed)
+        self.assertEqual(self.store.manifest(kept["id"])["note"], "Observation updated")
+        review = FindingsWindow(self.service)
+        self.service.review = review
+        with (mock.patch.object(review, "selected_ids", return_value=[kept["id"]]),
+              mock.patch.object(QtWidgets.QMessageBox, "question",
+                                return_value=QtWidgets.QMessageBox.StandardButton.Yes)):
+            review.remove()
+            pump_until(lambda: self.service.active is None)
+        self.assertEqual([entry["id"] for entry in self.store.catalog()[0]], notes)
+        self.assertEqual(path.read_bytes(), edited)
+        self.assertEqual(self.service._message.call_count, 3)
+        for call in self.service._message.call_args_list:
+            self.assertIn("overview", call.args[0])
+            self.assertIn("has been edited", call.args[0])
+
+    def test_overview_io_failure_does_not_repeat_or_fail_capture(self):
+        window = self.window()
+        self.service._message = mock.Mock()
+        with (mock.patch.object(self.store, "org_overview", side_effect=OSError("disk failure")) as overview,
+              mock.patch.object(self.store, "save", wraps=self.store.save) as save):
+            self.service.capture(window, ask_note=False)
+            pump_until(lambda: self.service.active is None)
+        save.assert_called_once()
+        overview.assert_called_once()
+        self.assertEqual(len(self.store.catalog()[0]), 1)
+        self.assertIn("Finding saved", window.analysis_status.text())
+        self.assertIn("disk failure", self.service._message.call_args.args[0])
+
+    def test_note_overview_memory_rejection_keeps_draft_and_old_note(self):
+        kept = self.store.save(freeze_window(self.window()), "Before")
+        self.service.edit_note(kept["id"], "Before")
+        dialog = self.service._note_dialog
+        self.addCleanup(lambda: dialog.close() if not dialog._closed else None)
+        line = dialog.findChild(QtWidgets.QLineEdit)
+        line.setText("Keep my draft")
+        self.service.admit = lambda: sum(self.service.allocations.values()) < 64 * 1024**2
+        dialog.findChild(QtWidgets.QDialogButtonBox).accepted.emit()
+        self.assertIsNone(self.service.active)
+        self.assertTrue(dialog.isVisible())
+        self.assertEqual(line.text(), "Keep my draft")
+        self.assertEqual(self.store.manifest(kept["id"])["note"], "Before")
+
+    def test_failed_capture_does_not_generate_overview_or_report_success(self):
+        window = self.window()
+        self.service._message = mock.Mock()
+        self.service.edit_note = mock.Mock()
+        with (mock.patch.object(self.store, "save", side_effect=OSError("capture disk failure")),
+              mock.patch.object(self.store, "org_overview") as overview,
+              mock.patch.object(self.service.executor, "submit", side_effect=completed_future)):
+            self.service.capture(window)
+            pump_until(lambda: self.service.active is None)
+        overview.assert_not_called()
+        self.service.edit_note.assert_not_called()
+        self.service._message.assert_not_called()
+        self.assertEqual(window.analysis_status.text(), "capture disk failure")
+
+    def test_immediate_note_failure_keeps_observation_enabled_for_retry(self):
+        kept = self.store.save(freeze_window(self.window()), "Before")
+        self.service.edit_note(kept["id"], "Before")
+        dialog = self.service._note_dialog
+        self.addCleanup(lambda: dialog.close() if not dialog._closed else None)
+        line = dialog.findChild(QtWidgets.QLineEdit)
+        buttons = dialog.findChild(QtWidgets.QDialogButtonBox)
+        line.setText("Keep this observation")
+        with (mock.patch.object(self.store, "update_note", side_effect=OSError("note disk failure")),
+              mock.patch.object(self.service.executor, "submit", side_effect=completed_future)):
+            buttons.accepted.emit()
+        self.assertIsNone(self.service.active)
+        self.assertTrue(dialog.isVisible())
+        self.assertTrue(buttons.isEnabled())
+        self.assertEqual(line.text(), "Keep this observation")
+        self.assertEqual(self.store.manifest(kept["id"])["note"], "Before")
 
     def test_note_dialog_can_close_while_worker_keeps_the_observation(self):
         kept = self.store.save(freeze_window(self.window()))

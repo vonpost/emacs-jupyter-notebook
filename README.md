@@ -59,7 +59,7 @@ leader, with descriptions in which-key. No extra `map!` block is needed:
 | `SPC m H` / `SPC m D` | Execution trail / changes since the previous run |
 | `SPC m ~` | Disposable scratch input |
 | `SPC m C` / `SPC m f` | Capture a finding / review saved findings |
-| `SPC m O` | Generate and open the findings overview in Org |
+| `SPC m O` | Open or rebuild the findings overview in Org |
 
 Every `C-c j` suffix below also works after the local leader, including the
 `%` cell-editing submenu. In insert/Emacs state, or without Evil, use
@@ -153,7 +153,16 @@ use `C-c j C` / `SPC m C` from the notebook. The current image panes are
 frozen before an optional note. The saved finding includes the image, exact
 displayed numerical planes, slice/view/ROI settings, and each pane's own
 recorded execution context—including a pinned result from an earlier run.
-Later cell edits and new predictions do not change it.
+Later cell edits and new predictions do not change it. Each capture also
+creates or updates `findings.org` in the findings folder, without a separate
+export step. Editing a saved note or removing a finding updates it too.
+
+An interesting result does not need to have been saved earlier: if it is
+still displayed, capture it now. If its numerical output is still in the
+notebook, open that output with `C-c j I` / `SPC m I` (current cell), or
+**View** on the selected output, then capture it. Neither step reruns the
+cell. An overwritten result that is no longer retained cannot be recovered
+from the overview; viewing a live variable shows its current value.
 
 Open **Findings** in the viewer or use `C-c j f` / `SPC m f` to review saved
 thumbnails and notes, even after restarting Emacs without a kernel.
@@ -161,16 +170,23 @@ thumbnails and notes, even after restarting Emacs without a kernel.
 `M-x emacs-jupyter-notebook-review-findings` works outside a notebook, and
 `ejn-viewer --findings` opens the same collection directly.
 
-For an Emacs overview, use `C-c j O` / `SPC m O`, or
-`M-x emacs-jupyter-notebook-findings-overview` from any buffer. This generates
-and opens `findings.org` alongside the saved assets: notes become headings,
+Open the generated `findings.org` directly from Emacs, or use `C-c j O` /
+`SPC m O` or `M-x emacs-jupyter-notebook-findings-overview` from any buffer
+for the enhanced Emacs view. The command also rebuilds the overview from
+existing saved findings, including captures made before automatic generation
+was added. Notes become headings,
 readable image previews appear inline, and recorded context is folded underneath.
-Links open the full image, JSON context and numerical data. Generation runs
-asynchronously and needs no kernel. The document is read-only; `C-x C-w`
+Direct file opening uses ordinary Org display; the command manages visible
+inline previews. Links open the full image, JSON context and numerical data.
+Generation runs asynchronously and needs no kernel. If the overview is
+already open, use the command again to reload it after a capture. The
+document is read-only; `C-x C-w`
 saves an editable report copy. Keep the copy in the same folder to preserve
 relative links, or move the whole collection together. You can then select
 findings, arrange them and write a story in your own Org report. Regeneration
-preserves edited overviews; PowerPoint conversion is left for a later step.
+preserves edited overviews. If the overview cannot be updated, the capture
+or note is still saved and a warning explains the overview failure.
+PowerPoint conversion is left for a later step.
 
 The recent trail is bounded (200 executions / 4 MiB of code by default) and
 lives with its source buffer; it survives clearing outputs and deleting
@@ -409,7 +425,7 @@ or bind `emacs-jupyter-notebook-prefix-map` under your own prefix.
 | `C-c j ~` | `scratch` (disposable input on this notebook's queue) |
 | `C-c j C` | `capture-finding` (freeze the displayed viewer result) |
 | `C-c j f` | `review-findings` (saved images, notes and copying) |
-| `C-c j O` | `findings-overview` (generate and open an Org results library) |
+| `C-c j O` | `findings-overview` (open or rebuild an Org results library) |
 | `C-c j .` | `inspect-at-point` |
 | `C-c j TAB` | `complete-at-point` (capf usually handles it) |
 | `C-c j v` | `fetch-remote-log` |

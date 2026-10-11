@@ -268,6 +268,15 @@ and each pane's source context independently of disposable snapshots. Limits:
 128 MiB selected samples per capture, 16,777,216 image pixels, 1,000 findings /
 2 GiB per collection. Explicit deletion only.
 
+Capture, saved-note edits and removal automatically regenerate `findings.org`
+after the durable mutation, in the same single worker job. The document is
+ready before successful operation completion, without another IPC request.
+Overview failure is reported separately: the committed finding or note stays
+saved, removal stays completed, and protected edited Org content remains
+untouched. Automatic generation reserves an additional 64 MiB during capture;
+note edits and removal reserve 64 MiB for the combined job. No UI callback
+performs generation and no additional worker queue is introduced.
+
 `findings_org` takes an empty params object and generates a bounded local
 `findings.org` index in the findings directory. It replies only after atomic
 generation completes, with `path` (absolute local filename), `count` and

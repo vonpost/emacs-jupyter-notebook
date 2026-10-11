@@ -543,7 +543,8 @@ class FindingStore:
             entries.sort(reverse=True)
             intro = ("#+TITLE: Saved findings\n#+STARTUP: content noinlineimages\n"
                      "#+OPTIONS: toc:nil num:nil\n\n"
-                     "Generated read-only overview, newest capture first. Regenerate to refresh.\n"
+                     "Generated read-only overview, newest capture first.\n"
+                     "Updated automatically when findings are captured, annotated or removed.\n"
                      "Save a separate copy to compose a report. Keep it alongside the asset folders\n"
                      "or copy the entire findings folder to preserve the relative links.\n\n"
                      f"{len(entries)} findings; {skipped} unreadable findings skipped.\n\n")
