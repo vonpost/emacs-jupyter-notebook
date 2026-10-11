@@ -216,10 +216,27 @@ These are binding for every workstream. Update only by appending a new entry.
   generation remains excluded. Generate asynchronously, bound the document
   and inline previews, preserve saved notes, and make regeneration explicit.
 
+- **2026-10-11 / Keep the Org overview current automatically.** The user
+  requests `findings.org` immediately when a finding is saved. Supersedes the
+  explicit-regeneration requirement above: capture, note edits and removal
+  refresh the generated document in the existing bounded worker. Preserve
+  edited documents and successful finding writes if overview generation
+  fails, with a clear warning. The overview command remains available for
+  opening and rebuilding the collection, including previously saved findings.
+
 ## Cross-cutting changes
 
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
+
+- [~] owner=root claimed=2026-10-11 CC38 Automatically maintain the Org findings overview.
+  Scope: viewer findings service/store, focused Python tests, README and
+  protocol documentation. Generate after capture, note edits and removal
+  without adding worker queues or blocking the GUI. Preserve explicit
+  capture, current image/context semantics and edited overview protection;
+  overview failure must not turn a durable save into a reported save failure.
+  Root owns implementation and verification; `overview_auto_review` performs
+  a read-only review of integration boundaries and existing-result workflow.
 
 - [x] sha=9a0daf9 CC37 Lightweight exploration and findings.
   Root owns integration in core/actions, result publication provenance,
