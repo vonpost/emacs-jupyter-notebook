@@ -221,8 +221,8 @@ def _view(planes, *, key="default", sample_id=None, grid_id=None, units=None,
     return None
 
 
-def _view_variable(namespace, name, *, axes=None, indices=None):
-    """Publish only one selected 2D plane of a named NumPy/PyTorch variable.
+def _select_variable(namespace, name, *, axes=None, indices=None, crop=None):
+    """Select a bounded plane or explicit crop of a named array, without copying.
 
     AXES contains the display row and column dimensions, in that order.
     INDICES has one item per source dimension: None for each display axis and
@@ -247,46 +247,88 @@ def _view_variable(namespace, name, *, axes=None, indices=None):
         if ndim != 2:
             raise ValueError("choose two display axes for a multidimensional array")
         axes = [0, 1]
-    if (type(axes) not in (list, tuple) or len(axes) != 2
+    if (type(axes) not in (list, tuple) or len(axes) not in (2, 3)
             or any(type(axis) is not int or not 0 <= axis < ndim for axis in axes)
-            or axes[0] == axes[1]):
-        raise ValueError("choose two distinct valid display axes")
+            or len(set(axes)) != len(axes)):
+        raise ValueError("choose two or three distinct valid display axes")
     if indices is None:
         indices = [None if axis in axes else 0 for axis in range(ndim)]
     if type(indices) not in (list, tuple) or len(indices) != ndim:
         raise ValueError("provide one slice index per dimension")
+    if len(axes) == 3 and crop is None:
+        raise ValueError("3D viewing requires an explicit bounded crop")
+    if crop is not None and (type(crop) not in (list, tuple) or len(crop) != len(axes)):
+        raise ValueError("provide one crop range per display axis")
+    ranges = {}
+    for position, axis in enumerate(axes):
+        bounds = [0, shape[axis]] if crop is None else crop[position]
+        if (type(bounds) not in (list, tuple) or len(bounds) != 2
+                or any(type(bound) is not int for bound in bounds)
+                or not 0 <= bounds[0] < bounds[1] <= shape[axis]):
+            raise ValueError("crop range is outside its array dimension")
+        if not 1 <= bounds[1] - bounds[0] <= _MAX_DIMS:
+            raise ValueError("selected plane dimensions must be between 1 and 16384")
+        ranges[axis] = bounds
     selector = []
     for axis, (size, index) in enumerate(zip(shape, indices)):
         if axis in axes:
             if index is not None:
                 raise ValueError("display axes must have None slice indices")
-            if not 1 <= size <= _MAX_DIMS:
-                raise ValueError("selected plane dimensions must be between 1 and 16384")
-            selector.append(slice(None))
+            selector.append(slice(*ranges[axis]))
         else:
             if type(index) is not int or not 0 <= index < size:
                 raise ValueError("slice index is outside its array dimension")
             selector.append(index)
-    if shape[axes[0]] * shape[axes[1]] * dtype.itemsize > _MAX_PLANE:
+    if math.prod(stop - start for start, stop in ranges.values()) * dtype.itemsize > _MAX_PLANE:
         raise ValueError("selected plane exceeds 33554432 raw bytes")
     if torch is None:
         # A base ndarray view has no Python subclass finalizer or __getitem__.
         base = np.ndarray.view(value, np.ndarray)
         plane = np.ndarray.__getitem__(base, tuple(selector))
-        if axes[0] > axes[1]:
-            plane = np.ndarray.transpose(plane)
+        plane = np.ndarray.transpose(plane, tuple(sorted(axes).index(axis) for axis in axes))
     else:
         plane = value[tuple(selector)]
-        if axes[0] > axes[1]:
-            plane = plane.transpose(0, 1)
+        plane = plane.permute(*(sorted(axes).index(axis) for axis in axes))
+    return plane, [name, list(shape), list(axes), list(indices), crop]
+
+
+def _view_variable(namespace, name, *, axes=None, indices=None, crop=None):
+    """Publish one selected numerical plane or explicit bounded 3D crop."""
+    plane, selection = _select_variable(namespace, name, axes=axes, indices=indices, crop=crop)
     # Stable workspace and selection identity. A different slice must not
     # inherit ROI geometry. A variable may be rebound to an unrelated image,
     # so shape/indices alone cannot declare spatial correspondence or units;
     # the viewer asks for those declarations before comparisons across runs.
     key = "variable-" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:24]
-    selection = json.dumps([name, list(shape), list(axes), list(indices)], separators=(",", ":"))
+    selection = json.dumps(selection, separators=(",", ":"))
     identity = hashlib.sha256(selection.encode("utf-8")).hexdigest()[:32]
     return _view({name: plane}, key=key, sample_id=identity)
+
+
+def _view_variables(namespace, selections):
+    """Publish up to four explicitly selected variables as one comparison group.
+
+    No spatial correspondence is inferred from variable names or equal shapes.
+    Each selection is bounded before slicing and the group is budgeted by _view
+    before any sample copying, including GPU-to-CPU transfers.
+    """
+    if type(selections) not in (list, tuple) or not 1 <= len(selections) <= _MAX_MEMBERS:
+        raise ValueError("choose between one and four array variables")
+    planes, identities = {}, []
+    for selection in selections:
+        if (type(selection) is not dict or "name" not in selection
+                or set(selection) - {"name", "axes", "indices", "crop"}):
+            raise ValueError("invalid variable selection")
+        name = selection["name"]
+        if type(name) is not str or name in planes:
+            raise ValueError("choose distinct variable names")
+        plane, identity = _select_variable(namespace, **selection)
+        planes[name] = plane
+        identities.append(identity)
+    key = "variables-" + hashlib.sha256(
+        json.dumps(list(planes), ensure_ascii=False).encode("utf-8")).hexdigest()[:24]
+    identity = hashlib.sha256(json.dumps(identities, separators=(",", ":")).encode("utf-8")).hexdigest()[:32]
+    return _view(planes, key=key, sample_id=identity)
 
 
 def install(namespace):
@@ -298,8 +340,12 @@ def install(namespace):
         view = staticmethod(_view)
 
         @staticmethod
-        def view_variable(name, *, axes=None, indices=None):
-            return _view_variable(namespace, name, axes=axes, indices=indices)
+        def view_variable(name, *, axes=None, indices=None, crop=None):
+            return _view_variable(namespace, name, axes=axes, indices=indices, crop=crop)
+
+        @staticmethod
+        def view_variables(selections):
+            return _view_variables(namespace, selections)
     if "ejn" in namespace:
         existing = namespace["ejn"]
         if getattr(existing, "_ejn_publisher_marker", None) == _MARKER:
@@ -307,6 +353,7 @@ def install(namespace):
             # owned methods while retaining callers' identity reference.
             type(existing).view = staticmethod(_view)
             type(existing).view_variable = staticmethod(_EJN.view_variable)
+            type(existing).view_variables = staticmethod(_EJN.view_variables)
             return existing
         raise RuntimeError("cannot install array-group publisher: user-owned ejn exists")
     instance = _EJN()

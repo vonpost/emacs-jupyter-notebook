@@ -35,6 +35,9 @@
 (require 'emacs-jupyter-notebook-viewer)
 (require 'emacs-jupyter-notebook-inspect)
 (require 'emacs-jupyter-notebook-variables)
+(require 'emacs-jupyter-notebook-history)
+(require 'emacs-jupyter-notebook-scratch)
+(require 'emacs-jupyter-notebook-findings)
 (require 'emacs-jupyter-notebook-actions)
 
 ;;; W8 — local interactive matplotlib viewer: remote formatter injection
@@ -1247,9 +1250,15 @@ The cell-editing keymap is attached on `%'."
                ("V" "Browse variables" emacs-jupyter-notebook-list-variables)
                ("i" "Inspect at point" emacs-jupyter-notebook-inspect)
                ("a" "Notebook actions" emacs-jupyter-notebook-actions)
-               ("A" "View array variable" emacs-jupyter-notebook-view-variable)
+               ("A" "View" emacs-jupyter-notebook-view)
                ("I" "View cell images" emacs-jupyter-notebook-inspect-images)
                ("J" "Evaluate cell and view" emacs-jupyter-notebook-evaluate-and-inspect)
+               ("H" "Execution trail" emacs-jupyter-notebook-history)
+               ("D" "Changes since previous run" emacs-jupyter-notebook-history-diff)
+               ("~" "Scratch input" emacs-jupyter-notebook-scratch)
+               ("C" "Capture finding" emacs-jupyter-notebook-capture-finding)
+               ("f" "Saved findings" emacs-jupyter-notebook-review-findings)
+               ("O" "Findings Org overview" emacs-jupyter-notebook-findings-overview)
                ("." "Kernel documentation" emacs-jupyter-notebook-inspect-at-point)
                ("TAB" "Complete at point" emacs-jupyter-notebook-complete-at-point)
                ("v" "Fetch remote log" emacs-jupyter-notebook-fetch-remote-log)
@@ -1493,6 +1502,7 @@ at the FIFO head until correlated terminal evidence arrives.
                  (emacs-jupyter-notebook--execution-cell-fringe-current-p record))
         (ignore-errors
           (emacs-jupyter-notebook-fringe-set cell-key status execution-count))))
+    (emacs-jupyter-notebook-history-record-finished record status execution-count)
     (emacs-jupyter-notebook--execution-remove record)
     (emacs-jupyter-notebook--execution-pump)
     (emacs-jupyter-notebook-variables-execution-finished)))
@@ -1518,6 +1528,10 @@ uses the normal presentation and helper-wire retirement primitives, but does
 not invoke `--execution-finish': pumping between records could replay queued
 source while the old transport is still being released."
   (unless (plist-get record :terminal)
+    ;; This classification is authoritative even if loss happened between
+    ;; the helper's wire admission and returning its request ID to the core.
+    (when (eq status 'outcome-unknown)
+      (emacs-jupyter-notebook-history-record-dispatched record))
     (setq record (emacs-jupyter-notebook--execution-cancel-timer record))
     (setq record (plist-put record :state status))
     (setq record (plist-put record :terminal t))
@@ -1534,6 +1548,7 @@ source while the old transport is still being released."
         (ignore-errors (emacs-jupyter-notebook-fringe-set cell-key status))))
     ;; `--execution-remove' tombstones helper wire ids before the adapter is
     ;; closed, so late output/replies are observationally inert.
+    (emacs-jupyter-notebook-history-record-finished record status nil)
     (emacs-jupyter-notebook--execution-remove record)))
 
 (defun emacs-jupyter-notebook--execution-mark-transport-lost (client)
@@ -2145,6 +2160,10 @@ panel's own kill-buffer-hook only cancels its flush timer)."
   "Minor mode for evaluating local source cells in remote Jupyter kernels."
   :lighter (:eval (emacs-jupyter-notebook--mode-line-string))
   :keymap emacs-jupyter-notebook-mode-map
+  (when (and emacs-jupyter-notebook-mode
+             (bound-and-true-p emacs-jupyter-notebook-scratch--owner))
+    (setq emacs-jupyter-notebook-mode nil)
+    (user-error "Scratch input uses its source notebook's session"))
   (if emacs-jupyter-notebook-mode
       (unless emacs-jupyter-notebook--mode-initialized
         ;; Re-enabling code-cells saves its own outline-level function as
@@ -6274,6 +6293,8 @@ deferred, so even a slow backend cannot block this editing hot path."
                              (eq (plist-get record :state) 'dispatched))
                     (setq record (plist-put record :backend-request-id backend-id))
                     (emacs-jupyter-notebook--execution-put record)
+                    (when backend-id
+                      (emacs-jupyter-notebook-history-record-dispatched record))
                     (setq record
                           (emacs-jupyter-notebook--execution-consume-staged-terminal
                            record backend-id))))
@@ -6490,8 +6511,8 @@ returns is boundedly staged until its generic backend id can be validated."
 (defun emacs-jupyter-notebook--evaluate-code
     (code cell-key &optional start-profile announce-start options)
   "Reserve CODE in FIFO order before asynchronous client/completeness work.
-Internal OPTIONS may carry :title, :inspection, and :on-created.  The latter
-receives the reserved record before dispatch can produce any output."
+Internal OPTIONS may carry :title, :origin, :inspection, and :on-created.
+The latter receives the reserved record before dispatch can produce output."
   (emacs-jupyter-notebook--ensure-no-replacement-operation)
   (unless (stringp code)
     (user-error "Evaluation code must be a string"))
@@ -6514,6 +6535,7 @@ receives the reserved record before dispatch can produce any output."
                        :started-at (float-time) :reply-seen nil :idle-seen nil
                        :terminal nil :timer nil :start-profile start-profile
                        :announce-start announce-start
+                       :origin (plist-get options :origin)
                        :inspection (plist-get options :inspection)))
          (modified (buffer-modified-p)))
     (emacs-jupyter-notebook-panel--display panel)
@@ -6525,6 +6547,7 @@ receives the reserved record before dispatch can produce any output."
           (append emacs-jupyter-notebook--execution-queue (list id)))
     (emacs-jupyter-notebook-variables-invalidate)
     (set-buffer-modified-p modified)
+    (emacs-jupyter-notebook-history-record-created record)
     (when-let ((created (plist-get options :on-created)))
       (funcall created record))
     (run-hook-with-args 'emacs-jupyter-notebook-execution-created-hook record)
@@ -7789,12 +7812,18 @@ restoration.  Failure retains the durable terminal transition for recovery."
               context (error-message-string err))))))
 
 (defun emacs-jupyter-notebook--restart-shutdown-confirmed (context client epoch)
-  "Advance exact restart CONTEXT after helper proved old kernel terminal."
+  "Advance exact restart CONTEXT after helper proved old kernel terminal.
+This is also the history identity boundary, even if replacement later fails."
   (when (and (emacs-jupyter-notebook--lifecycle-context-live-p context client epoch)
              (not (plist-get context :restart-shutdown-confirmed)))
     (setq context (emacs-jupyter-notebook--async-put
                    context :restart-shutdown-confirmed t))
     (emacs-jupyter-notebook--execution-restart-acknowledged client epoch)
+    ;; Restart may reuse the registry session id and even the remote PID.
+    ;; The confirmed terminal boundary, not preflight or reconnect, separates
+    ;; old execution context from the replacement.  The guard above makes it
+    ;; idempotent for duplicate helper callbacks.
+    (emacs-jupyter-notebook-history-kernel-restarted)
     (emacs-jupyter-notebook--lifecycle-retire-local-transport client)
     (condition-case err
         (let* ((entry (copy-sequence (plist-get context :entry)))

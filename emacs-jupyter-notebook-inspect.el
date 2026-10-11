@@ -9,6 +9,11 @@
 
 (declare-function emacs-jupyter-notebook--current-cell-key "emacs-jupyter-notebook")
 (declare-function emacs-jupyter-notebook-send-cell "emacs-jupyter-notebook")
+(declare-function emacs-jupyter-notebook-view-variables "emacs-jupyter-notebook-variables"
+                  (&optional reconfigure preferred))
+(declare-function emacs-jupyter-notebook-variables-view-row "emacs-jupyter-notebook-variables")
+(declare-function emacs-jupyter-notebook-variables--name-at-point "emacs-jupyter-notebook-variables")
+(declare-function emacs-jupyter-notebook-history-provenance "emacs-jupyter-notebook-history" (handle))
 (declare-function emacs-jupyter-notebook--execution-record "emacs-jupyter-notebook" (id))
 (declare-function emacs-jupyter-notebook--evaluate-code "emacs-jupyter-notebook"
                   (code cell-key &optional start-profile announce-start options))
@@ -22,7 +27,8 @@ The manager appends --stdio. No command is installed on a remote system."
 
 (cl-defstruct (ejn-inspection (:constructor ejn-inspection-create))
   process stderr decoder ready closed pending active waiter timer drain raw raw-bytes
-  partial-timer counter owner cancels stderr-tail spawning build-owner phase)
+  partial-timer counter owner cancels stderr-tail spawning build-owner phase
+  capabilities control control-timer workspaces)
 
 (defvar emacs-jupyter-notebook-inspect--state nil)
 (defvar emacs-jupyter-notebook-inspect--watches nil)
@@ -82,7 +88,7 @@ Each subscription coalesces publications into a single pending timer.")
     (when (eq state emacs-jupyter-notebook-inspect--state)
       (setq emacs-jupyter-notebook-inspect--state nil))
     (dolist (timer (list (ejn-inspection-timer state) (ejn-inspection-drain state)
-                        (ejn-inspection-partial-timer state)))
+                        (ejn-inspection-partial-timer state) (ejn-inspection-control-timer state)))
       (when (timerp timer) (ignore-errors (cancel-timer timer))))
     (when (ejn-inspection-waiter state)
       (ignore-errors (emacs-jupyter-notebook-runtime-cancel-waiter (ejn-inspection-waiter state))))
@@ -99,7 +105,8 @@ Each subscription coalesces publications into a single pending timer.")
     (emacs-jupyter-notebook-inspect--release (ejn-inspection-active state))
     (emacs-jupyter-notebook-inspect--release (ejn-inspection-pending state))
     (setf (ejn-inspection-active state) nil (ejn-inspection-pending state) nil
-          (ejn-inspection-raw state) nil)
+          (ejn-inspection-raw state) nil (ejn-inspection-control state) nil
+          (ejn-inspection-control-timer state) nil (ejn-inspection-workspaces state) nil)
     (when reason
       (let ((tail (or (ejn-inspection-stderr-tail state) "")))
         ;; A full rolling tail may begin inside a credential-bearing line.
@@ -161,7 +168,19 @@ Each subscription coalesces publications into a single pending timer.")
                        "size" (plist-get lease :size) "sha256" (plist-get lease :sha256)))))
     (when (eq (plist-get lease :kind) 'raster)
       (puthash "mime" (plist-get lease :mime) params))
+    (when-let ((context (emacs-jupyter-notebook-inspect--context lease)))
+      (puthash "context" context params))
     params))
+
+(defun emacs-jupyter-notebook-inspect--context (lease)
+  "Return LEASE's frozen context, or resolve its exact producer once."
+  (if (plist-member lease :context)
+      (plist-get lease :context)
+    (when (and (buffer-live-p (plist-get lease :source-buffer))
+               (fboundp 'emacs-jupyter-notebook-history-provenance))
+      (with-current-buffer (plist-get lease :source-buffer)
+        (emacs-jupyter-notebook-history-provenance
+         (or (plist-get lease :execution-handle) (plist-get lease :entry-handle)))))))
 
 (defun emacs-jupyter-notebook-inspect--pump (state)
   (when (and (emacs-jupyter-notebook-inspect--live-p state)
@@ -209,7 +228,22 @@ Each subscription coalesces publications into a single pending timer.")
         (error "Viewer negotiation failed"))
       (when (timerp (ejn-inspection-timer state)) (cancel-timer (ejn-inspection-timer state)))
       (setf (ejn-inspection-timer state) nil (ejn-inspection-ready state) t)
+      (setf (ejn-inspection-capabilities state)
+            (append (gethash "capabilities" (gethash "result" object)) nil))
+      (emacs-jupyter-notebook-inspect--pump-control state)
       (emacs-jupyter-notebook-inspect--pump state))
+     ((equal id (plist-get (ejn-inspection-control state) :id))
+      (let ((callback (plist-get (ejn-inspection-control state) :callback)))
+        (when (timerp (ejn-inspection-control-timer state))
+          (cancel-timer (ejn-inspection-control-timer state)))
+        (setf (ejn-inspection-control state) nil (ejn-inspection-control-timer state) nil)
+        (emacs-jupyter-notebook-inspect--report
+         state "%s" (if (eq (gethash "ok" object) t) "Finding request accepted"
+                      (format "Finding request failed — %s"
+                              (gethash "message" (gethash "error" object)))))
+        (when (and callback (eq (gethash "ok" object) t))
+          (emacs-jupyter-notebook-inspect--defer-control-callback
+           callback (gethash "result" object)))))
      ((equal id (plist-get (ejn-inspection-active state) :id))
       (when (timerp (ejn-inspection-timer state)) (cancel-timer (ejn-inspection-timer state)))
       (let ((success (eq (gethash "ok" object) t)))
@@ -222,6 +256,18 @@ Each subscription coalesces publications into a single pending timer.")
             (emacs-jupyter-notebook-inspect--forget-follows
              (lambda (follow) (and (eq state (plist-get follow :state))
                                    (equal workspace (plist-get follow :workspace)))))))
+        (when success
+          (let* ((lease (plist-get (ejn-inspection-active state) :lease))
+                 (workspace (plist-get lease :workspace)))
+            (setf (ejn-inspection-workspaces state)
+                  (cl-remove workspace (ejn-inspection-workspaces state)
+                             :key (lambda (item) (plist-get item :workspace)) :test #'equal))
+            (unless (eq (gethash "closed" (gethash "result" object)) t)
+              (push (list :workspace workspace :source (plist-get lease :source-buffer)
+                          :cell-key (plist-get lease :cell-key))
+                    (ejn-inspection-workspaces state))
+              (when (> (length (ejn-inspection-workspaces state)) 4)
+                (setcdr (nthcdr 3 (ejn-inspection-workspaces state)) nil)))))
         (emacs-jupyter-notebook-inspect--release (ejn-inspection-active state))
         (setf (ejn-inspection-active state) nil (ejn-inspection-timer state) nil)
         (setf (ejn-inspection-phase state) 'ready)
@@ -313,11 +359,49 @@ Each subscription coalesces publications into a single pending timer.")
                                                 (emacs-jupyter-notebook-inspect--object)))))
       (error (emacs-jupyter-notebook-inspect--stop state (error-message-string err))))))
 
-;;;###autoload
-(defun emacs-jupyter-notebook-inspect-publication (lease &optional no-focus)
-  "Inspect exact acquired LEASE asynchronously, taking ownership of its release.
-At most one handoff and one latest pending selection are retained."
-  (unless (functionp (plist-get lease :release)) (error "Inspection requires an acquired artifact lease"))
+(defun emacs-jupyter-notebook-inspect--ensure-running (state)
+  "Start or advance STATE without requiring any artifact handoff."
+  (condition-case err
+      (if (ejn-inspection-process state)
+	  (progn
+	    (emacs-jupyter-notebook-inspect--report
+	     state "%s" (cond ((not (ejn-inspection-ready state)) "Waiting for viewer startup")
+			      ((ejn-inspection-active state) "Image selection queued")
+			      (t "Inspecting selected images")))
+	    (emacs-jupyter-notebook-inspect--pump state))
+	(if (ejn-inspection-waiter state)
+	    (emacs-jupyter-notebook-inspect--report state "Waiting for viewer build")
+	  ;; The build is shared by the current selection, not by the first
+	  ;; source that happened to trigger it. Superseding A with B must not
+	  ;; let killing A cancel B's still-live handoff.
+	  (setf (ejn-inspection-build-owner state)
+		(generate-new-buffer " *ejn-inspector-build-owner*"))
+	  (setf (ejn-inspection-phase state) 'building)
+	  (emacs-jupyter-notebook-inspect--report
+	   state "%s" (if (emacs-jupyter-notebook-inspect--command)
+			  "Using available local viewer"
+			"Building local viewer via Nix (.#ejn-viewer)"))
+	  (let ((token
+		 (emacs-jupyter-notebook-runtime-ensure
+		  #'emacs-jupyter-notebook-inspect--probe
+		  (lambda ()
+		    (setf (ejn-inspection-waiter state) nil)
+		    (emacs-jupyter-notebook-inspect--spawn state)
+		    (when (buffer-live-p (ejn-inspection-build-owner state))
+		      (kill-buffer (ejn-inspection-build-owner state))))
+		  (lambda (reason) (emacs-jupyter-notebook-inspect--stop state reason))
+		  (ejn-inspection-build-owner state) t
+		  (lambda (_buffer line)
+		    (when (emacs-jupyter-notebook-inspect--live-p state)
+		      (emacs-jupyter-notebook-inspect--report state "Nix — %s" line))))))
+	    ;; Ready/failure callbacks may fire before ensure returns.
+	    (when (and (emacs-jupyter-notebook-inspect--live-p state)
+		       (not (ejn-inspection-process state)))
+	      (setf (ejn-inspection-waiter state) token)))))
+    ((error quit) (emacs-jupyter-notebook-inspect--stop state (error-message-string err)))))
+
+(defun emacs-jupyter-notebook-inspect--ensure-state ()
+  "Return the live viewer epoch, replacing a stale local startup if needed."
   ;; A stale waiter token must not swallow every later explicit Inspect.
   ;; Revoke the old epoch before rebuilding so late callbacks cannot adopt it.
   (when-let ((old emacs-jupyter-notebook-inspect--state))
@@ -331,10 +415,99 @@ At most one handoff and one latest pending selection are retained."
       (emacs-jupyter-notebook-inspect--stop old "Recovering stale local viewer startup")
       (when (eq old emacs-jupyter-notebook-inspect--state)
         (setq emacs-jupyter-notebook-inspect--state nil))))
-  (let* ((state (or emacs-jupyter-notebook-inspect--state
-                    (setq emacs-jupyter-notebook-inspect--state
-                          (ejn-inspection-create :decoder (ejn-helper-protocol-make-decoder 65536 65536)
-                                                 :raw-bytes 0 :counter 0 :owner (current-buffer)))))
+  (or emacs-jupyter-notebook-inspect--state
+      (setq emacs-jupyter-notebook-inspect--state
+            (ejn-inspection-create :decoder (ejn-helper-protocol-make-decoder 65536 65536)
+                                   :raw-bytes 0 :counter 0 :owner (current-buffer)))))
+
+(defun emacs-jupyter-notebook-inspect--pump-control (state)
+  "Send STATE's one pending control without changing any publication job."
+  (when (and (emacs-jupyter-notebook-inspect--live-p state)
+             (ejn-inspection-ready state) (ejn-inspection-control state)
+             (not (plist-get (ejn-inspection-control state) :sent)))
+    (let ((control (ejn-inspection-control state)))
+      (unless (member "findings-v1" (ejn-inspection-capabilities state))
+        (setf (ejn-inspection-control state) nil)
+        (user-error "This viewer does not support findings; restart it after updating"))
+      (setf (ejn-inspection-control-timer state)
+            (run-at-time 30 nil #'emacs-jupyter-notebook-inspect--stop state
+                         "Finding request timed out; it was not repeated"))
+      (plist-put control :sent t)
+      (emacs-jupyter-notebook-inspect--send
+       state (plist-get control :id) (plist-get control :operation) (plist-get control :params)))))
+
+(defun emacs-jupyter-notebook-inspect--defer-control-callback (callback result)
+  "Deliver successful RESULT to CALLBACK once, outside the process drain.
+The generated local result outlives both the originating source and viewer.
+CALLBACK owns any further input deferral before showing interactive UI."
+  (let (delivered)
+    (run-at-time
+     0 nil
+     (lambda ()
+       (unless delivered
+         (setq delivered t)
+         (condition-case err
+             (funcall callback result)
+           (quit nil)
+           (error (emacs-jupyter-notebook-inspect--report
+                   nil "Finding review could not be opened — %s" (error-message-string err)))))))))
+
+(defun emacs-jupyter-notebook-inspect-control (operation params &optional existing-only callback)
+  "Send bounded viewer OPERATION with JSON PARAMS without kernel traffic.
+EXISTING-ONLY requires a ready viewer and never starts one.  One request may
+be pending at a time; it has its own deadline and cannot replace an image
+handoff.  Capture is applied to the viewer's displayed state on receipt.
+Optional CALLBACK receives a successful result once, outside the process
+drain.  It owns any further UI deferral; callback failures do not stop the
+viewer, and generated results remain usable after the source/viewer closes."
+  (unless (and (member operation '("capture" "findings" "findings_org"))
+               (hash-table-p params) (or (null callback) (functionp callback)))
+    (error "Unsupported viewer control request"))
+  (let ((state
+         (if existing-only
+             (let ((current emacs-jupyter-notebook-inspect--state))
+               (unless (and current (not (ejn-inspection-closed current))
+                            (ejn-inspection-ready current)
+                            (process-live-p (ejn-inspection-process current)))
+                 (user-error "Open an image in the viewer before capturing a finding"))
+               current)
+           (emacs-jupyter-notebook-inspect--ensure-state))))
+    (when (ejn-inspection-control state)
+      (user-error "A finding request is already pending"))
+    (setf (ejn-inspection-control state)
+          (list :id (format "control-%d" (cl-incf (ejn-inspection-counter state)))
+                :operation operation :params params :callback callback))
+    (condition-case err
+        (if (ejn-inspection-ready state)
+            (emacs-jupyter-notebook-inspect--pump-control state)
+          (emacs-jupyter-notebook-inspect--ensure-running state))
+      (error
+       (setf (ejn-inspection-control state) nil)
+       (when (timerp (ejn-inspection-control-timer state))
+         (cancel-timer (ejn-inspection-control-timer state)))
+       (setf (ejn-inspection-control-timer state) nil)
+       (signal (car err) (cdr err))))
+    state))
+
+(defun emacs-jupyter-notebook-inspect-workspaces ()
+  "Return copied descriptors of at most four acknowledged viewer workspaces."
+  (when-let ((state emacs-jupyter-notebook-inspect--state))
+    (when (and (not (ejn-inspection-closed state)) (ejn-inspection-ready state))
+      (copy-tree (ejn-inspection-workspaces state)))))
+
+;;;###autoload
+(defun emacs-jupyter-notebook-inspect-publication (lease &optional no-focus)
+  "Inspect exact acquired LEASE asynchronously, taking ownership of its release.
+At most one handoff and one latest pending selection are retained."
+  (unless (functionp (plist-get lease :release)) (error "Inspection requires an acquired artifact lease"))
+  ;; Freeze before a viewer build or an earlier handoff can delay this image.
+  ;; A nil context is also frozen: never substitute a later kernel history.
+  (condition-case err
+      (setq lease (plist-put lease :context (emacs-jupyter-notebook-inspect--context lease)))
+    (error
+     (funcall (plist-get lease :release))
+     (signal (car err) (cdr err))))
+  (let* ((state (emacs-jupyter-notebook-inspect--ensure-state))
          (job (list :lease lease :focus (not no-focus) :owner (current-buffer))))
     (if (and no-focus (plist-get (ejn-inspection-pending state) :focus))
         ;; An automatic update must not replace the user's exact explicit
@@ -352,45 +525,30 @@ At most one handoff and one latest pending selection are retained."
 	(when (buffer-live-p (plist-get lease :source-buffer))
 	  (with-current-buffer (plist-get lease :source-buffer)
             (add-hook 'kill-buffer-hook #'emacs-jupyter-notebook-inspect--owner-killed nil t)))
-	(condition-case err
-	    (if (ejn-inspection-process state)
-		(progn
-		  (emacs-jupyter-notebook-inspect--report
-		   state "%s" (cond ((not (ejn-inspection-ready state)) "Waiting for viewer startup")
-				    ((ejn-inspection-active state) "Image selection queued")
-				    (t "Inspecting selected images")))
-		  (emacs-jupyter-notebook-inspect--pump state))
-	      (if (ejn-inspection-waiter state)
-		  (emacs-jupyter-notebook-inspect--report state "Waiting for viewer build")
-		;; The build is shared by the current selection, not by the first
-		;; source that happened to trigger it. Superseding A with B must not
-		;; let killing A cancel B's still-live handoff.
-		(setf (ejn-inspection-build-owner state)
-		      (generate-new-buffer " *ejn-inspector-build-owner*"))
-		(setf (ejn-inspection-phase state) 'building)
-		(emacs-jupyter-notebook-inspect--report
-		 state "%s" (if (emacs-jupyter-notebook-inspect--command)
-				"Using available local viewer"
-			      "Building local viewer via Nix (.#ejn-viewer)"))
-		(let ((token
-		       (emacs-jupyter-notebook-runtime-ensure
-			#'emacs-jupyter-notebook-inspect--probe
-			(lambda ()
-			  (setf (ejn-inspection-waiter state) nil)
-			  (emacs-jupyter-notebook-inspect--spawn state)
-			  (when (buffer-live-p (ejn-inspection-build-owner state))
-			    (kill-buffer (ejn-inspection-build-owner state))))
-			(lambda (reason) (emacs-jupyter-notebook-inspect--stop state reason))
-			(ejn-inspection-build-owner state) t
-			(lambda (_buffer line)
-			  (when (emacs-jupyter-notebook-inspect--live-p state)
-			    (emacs-jupyter-notebook-inspect--report state "Nix — %s" line))))))
-		  ;; Ready/failure callbacks may fire before ensure returns.
-		  (when (and (emacs-jupyter-notebook-inspect--live-p state)
-			     (not (ejn-inspection-process state)))
-		    (setf (ejn-inspection-waiter state) token)))))
-	  ((error quit) (emacs-jupyter-notebook-inspect--stop state (error-message-string err))))))
+	(emacs-jupyter-notebook-inspect--ensure-running state)))
     state))
+
+;;;###autoload
+(defun emacs-jupyter-notebook-view (&optional choose)
+  "View an array at point, selected output, or a group of live arrays.
+In source, prefer an array name at point, then the current cell's published
+numerical output.  With prefix CHOOSE, choose variables even if output exists;
+with a double prefix, reconfigure remembered axes, indices or 3D crop.
+This command never evaluates the source cell."
+  (interactive "P")
+  (cond
+   ((derived-mode-p 'emacs-jupyter-notebook-panel-mode)
+    (emacs-jupyter-notebook-inspect-images))
+   ((derived-mode-p 'emacs-jupyter-notebook-variables-mode)
+    (emacs-jupyter-notebook-variables-view-row))
+   (t
+    (let* ((name (and (not choose) (emacs-jupyter-notebook-variables--name-at-point)))
+           (lease (and (not choose) (not name)
+                       (emacs-jupyter-notebook-panel-acquire-array-for-cell
+                        (current-buffer) (emacs-jupyter-notebook--current-cell-key)))))
+      (if lease (emacs-jupyter-notebook-inspect-publication lease)
+        (emacs-jupyter-notebook-view-variables
+         (and choose (>= (prefix-numeric-value choose) 16)) name))))))
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-inspect-images ()
@@ -418,7 +576,10 @@ At most one handoff and one latest pending selection are retained."
         (setf (ejn-inspection-pending state) nil))
       (cond
        ((and (not (ejn-inspection-ready state)) (not (ejn-inspection-process state))
-             (not (ejn-inspection-pending state)))
+             (not (ejn-inspection-pending state))
+             ;; Review requests have no source/artifact lifetime.  A source
+             ;; closing during the shared build must not revoke that work.
+             (not (ejn-inspection-control state)))
         (emacs-jupyter-notebook-inspect--stop state))
        ((and (owned (ejn-inspection-active state))
              (not (plist-get (ejn-inspection-active state) :cancelled)))

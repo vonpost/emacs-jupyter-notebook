@@ -9,6 +9,47 @@ from ejn_viewer import publisher
 
 
 class VariableViewTests(unittest.TestCase):
+    def test_grouped_variables_publish_once_without_modifying_namespace(self):
+        source = np.arange(120, dtype=np.float32).reshape(2, 3, 4, 5)
+        namespace = {"input": source, "prediction": source + 1}
+        selections = [{"name": name, "axes": [2, 1], "indices": [1, None, None, 2]}
+                      for name in namespace]
+        with mock.patch.object(publisher, "_view") as emit:
+            publisher._view_variables(namespace, selections)
+        emit.assert_called_once()
+        planes = emit.call_args.args[0]
+        for name, array in namespace.items():
+            np.testing.assert_array_equal(planes[name], array[1, :, :, 2].T)
+        self.assertEqual(set(namespace), {"input", "prediction"})
+        self.assertNotIn("grid_id", emit.call_args.kwargs)
+
+    def test_crop_selection_slices_before_conversion_and_preserves_axis_order(self):
+        source = np.broadcast_to(np.arange(8, dtype=np.float32), (100000, 6, 8))
+        with mock.patch.object(publisher, "_view") as emit, \
+                mock.patch.object(np, "asarray", side_effect=AssertionError("whole array")):
+            publisher._view_variables({"volume": source}, [
+                {"name": "volume", "axes": [2, 0, 1], "indices": [None, None, None],
+                 "crop": [[2, 6], [100, 103], [1, 5]]}])
+        selected = emit.call_args.args[0]["volume"]
+        self.assertEqual(selected.shape, (4, 3, 4))
+        np.testing.assert_array_equal(selected, source[100:103, 1:5, 2:6].transpose(2, 0, 1))
+        self.assertTrue(np.shares_memory(selected, source))
+
+    def test_group_and_crop_reject_invalid_inputs_before_publication(self):
+        namespace = {"x": np.ones((8, 9, 10), dtype=np.float32)}
+        valid = {"name": "x", "axes": [1, 2], "indices": [0, None, None]}
+        invalid = [[], [valid] * 5, [valid, valid],
+                   [{**valid, "crop": [[0, 10], [0, 10]]}],
+                   [{**valid, "crop": [[0, 0], [0, 10]]}],
+                   [{**valid, "crop": [[0, True], [0, 10]]}],
+                   [{"name": "x", "axes": [0, 1, 2], "indices": [None] * 3}],
+                   [{**valid, "unexpected": 1}]]
+        for selection in invalid:
+            with self.subTest(selection=selection), mock.patch.object(publisher, "_view") as emit:
+                with self.assertRaises((ValueError, TypeError)):
+                    publisher._view_variables(namespace, selection)
+                emit.assert_not_called()
+
     def publish(self, namespace, name, **kwargs):
         with mock.patch.object(publisher, "_view") as view:
             publisher._view_variable(namespace, name, **kwargs)

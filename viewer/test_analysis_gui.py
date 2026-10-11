@@ -268,7 +268,8 @@ class AnalysisGuiTests(unittest.TestCase):
         data.nbytes = sum(array.nbytes for array in data.planes.values())
         derived = np.broadcast_to(np.float64(0), (2048, 2048))
         window = SimpleNamespace(allocations={**source_allocations(data), ("array", id(derived)): derived.nbytes, ("render", "test"): 3 * derived.size * 8})
-        server = SimpleNamespace(windows={"test": window}, active=None)
+        server = SimpleNamespace(windows={"test": window}, active=None,
+                                 findings=SimpleNamespace(allocations={}))
         worker = AnalysisWorker(admit=lambda: PipeServer.memory_used(server) <= MAX_MEMORY)
         server.analysis = worker
         self.addCleanup(worker.shutdown)

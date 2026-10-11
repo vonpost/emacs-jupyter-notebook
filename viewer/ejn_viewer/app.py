@@ -256,6 +256,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Local EJN PyQtGraph viewer")
     parser.add_argument("--demo", action="store_true", help="show demo planes")
     parser.add_argument("--stdio", action="store_true", help="serve bounded local Emacs control")
+    parser.add_argument("--findings", action="store_true", help="review saved findings without a kernel")
     parser.add_argument("--smoke-test", action="store_true", help="run a paint/resize smoke test")
     parser.add_argument("--offscreen", action="store_true", help="use Qt's offscreen platform for smoke tests")
     args = parser.parse_args(argv)
@@ -264,8 +265,13 @@ def main(argv=None) -> int:
         return run()
     if args.smoke_test:
         return smoke_test(args.offscreen)
+    if args.findings:
+        from .findings_gui import findings_service
+        app = QtWidgets.QApplication(sys.argv if argv is None else [sys.argv[0], *argv])
+        findings_service().show_review()
+        return app.exec()
     if not args.demo:
-        parser.error("one of --demo, --smoke-test or --stdio is required")
+        parser.error("one of --demo, --smoke-test, --stdio or --findings is required")
     app = QtWidgets.QApplication(sys.argv if argv is None else [sys.argv[0], *argv])
     window = ViewerWindow(demo_planes())
     window.show()

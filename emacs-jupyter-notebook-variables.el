@@ -72,6 +72,10 @@ Use Customize or directory-local settings for persistent defaults."
 (defvar-local emacs-jupyter-notebook-variables--refresh-retry-timer nil)
 (defvar-local emacs-jupyter-notebook-variables--refresh-retries 0)
 (defvar-local emacs-jupyter-notebook-variables--view-token nil)
+(defvar-local emacs-jupyter-notebook-variables--view-selections nil
+  "At most 32 recent variable names and validated numerical selectors.")
+(defvar-local emacs-jupyter-notebook-variables--view-recent nil
+  "Most recently viewed group of at most four variable names.")
 
 (defconst emacs-jupyter-notebook-variables--name-buffer-max-chars (* 1024 1024)
   "Largest source buffer admitted to automatic variable syntax inspection.")
@@ -587,6 +591,113 @@ Only the generated literal selectors cross Emacs; numerical samples do not."
           (mapconcat #'number-to-string axes ",")
           (mapconcat (lambda (index) (if (null index) "None" (number-to-string index))) indices ",")))
 
+(defun emacs-jupyter-notebook-variables--array-p (metadata)
+  "Return non-nil when METADATA describes a nonempty numerical array."
+  (let ((shape (plist-get metadata :shape)))
+    (and (<= 2 (length shape) 32)
+         (plist-get metadata :dtype)
+         (cl-every (lambda (size) (and (integerp size) (> size 0))) shape))))
+
+(defun emacs-jupyter-notebook-variables--valid-selection-p (selection shape)
+  "Return non-nil when remembered SELECTION is still in bounds for SHAPE."
+  (let ((axes (car selection)) (indices (cadr selection)) (crop (nth 2 selection)))
+    (and selection (= (length indices) (length shape))
+         (cl-every (lambda (axis) (< axis (length shape))) axes)
+         (cl-loop for axis below (length shape)
+                  always (or (memq axis (append axes nil))
+                             (and (integerp (aref indices axis))
+                                  (< (aref indices axis) (elt shape axis)))))
+         (or (null crop)
+             (cl-loop for axis across axes for bounds across crop
+                      always (<= (aref bounds 1) (elt shape axis)))))))
+
+(defun emacs-jupyter-notebook-variables--select-crop (shape)
+  "Choose three display axes and explicit bounded ranges for SHAPE."
+  (let ((choices (cl-loop for axis below (length shape)
+                          collect (cons (format "Axis %d — size %d" axis (elt shape axis)) axis)))
+        axes ranges)
+    (dolist (label '("Depth (Z)" "Rows (Y)" "Columns (X)"))
+      (let* ((axis (cdr (assoc (completing-read (concat label ": ") choices nil t nil nil
+                                              (caar choices)) choices)))
+             (size (elt shape axis))
+             (start (read-number (format "Axis %d crop start (inclusive): " axis) 0))
+             (stop (read-number (format "Axis %d crop end (exclusive, size %d): " axis size)
+                                (min size (+ start 64)))))
+        (unless (and (integerp start) (integerp stop) (<= 0 start) (< start stop)
+                     (<= stop size) (<= (- stop start) 16384))
+          (user-error "Choose a nonempty in-bounds crop of at most 16384 samples per axis"))
+        (push axis axes)
+        (push (vector start stop) ranges)
+        (setq choices (cl-remove axis choices :key #'cdr))))
+    (setq axes (vconcat (nreverse axes)))
+    (let ((indices (make-vector (length shape) nil)))
+      (dotimes (axis (length shape))
+        (unless (memq axis (append axes nil))
+          (let ((index (read-number (format "Axis %d index: " axis) 0)))
+            (unless (and (integerp index) (<= 0 index) (< index (elt shape axis)))
+              (user-error "Index is outside axis %d" axis))
+            (aset indices axis index))))
+      (list axes indices (vconcat (nreverse ranges))))))
+
+(defun emacs-jupyter-notebook-variables--selection (name metadata &optional reconfigure)
+  "Choose or reuse NAME's selector using fresh METADATA.
+RECONFIGURE explicitly offers a plane or bounded 3D crop."
+  (let* ((shape (plist-get metadata :shape))
+         (saved (cdr (assoc name emacs-jupyter-notebook-variables--view-selections))))
+    (unless (emacs-jupyter-notebook-variables--array-p metadata)
+      (user-error "%s needs a nonempty numerical array with at least two dimensions" name))
+    (if (and (not reconfigure)
+             (emacs-jupyter-notebook-variables--valid-selection-p saved shape))
+        saved
+      (let ((selection
+             (if (and reconfigure (>= (length shape) 3)
+                      (equal (completing-read "View selection: " '("2D plane" "3D crop") nil t nil nil
+                                              (if (= (length (car saved)) 3) "3D crop" "2D plane"))
+                             "3D crop"))
+                 (emacs-jupyter-notebook-variables--select-crop shape)
+               (emacs-jupyter-notebook-variables--select-plane shape))))
+        (setq emacs-jupyter-notebook-variables--view-selections
+              (cons (cons name selection)
+                    (cl-remove name emacs-jupyter-notebook-variables--view-selections
+                               :key #'car :test #'equal)))
+        (when (> (length emacs-jupyter-notebook-variables--view-selections) 32)
+          (setcdr (nthcdr 31 emacs-jupyter-notebook-variables--view-selections) nil))
+        selection))))
+
+(defun emacs-jupyter-notebook-variables--selection-code (name selection)
+  "Return a bounded literal Python dict for NAME's SELECTION."
+  (format "{\"name\":%s,\"axes\":[%s],\"indices\":[%s]%s}"
+          (json-encode-string name)
+          (mapconcat #'number-to-string (car selection) ",")
+          (mapconcat (lambda (index) (if (null index) "None" (number-to-string index)))
+                     (cadr selection) ",")
+          (if (nth 2 selection) (concat ",\"crop\":" (json-encode (nth 2 selection))) "")))
+
+(defun emacs-jupyter-notebook-variables--view-group (names metadata &optional reconfigure)
+  "Select and publish NAMES together using fresh METADATA."
+  (unless (<= 1 (length names) 4) (user-error "Choose one to four array variables"))
+  (let ((client emacs-jupyter-notebook--client)
+        (generation emacs-jupyter-notebook-variables--generation)
+        selections)
+    (dolist (name names)
+      (push (cons name (emacs-jupyter-notebook-variables--selection
+                       name (cl-find name metadata :key (lambda (item) (plist-get item :name))
+                                     :test #'equal) reconfigure)) selections))
+    (unless (and (eq client emacs-jupyter-notebook--client)
+                 (= generation emacs-jupyter-notebook-variables--generation))
+      (user-error "The kernel changed while selecting arrays; view again"))
+    (setq selections (nreverse selections)
+          emacs-jupyter-notebook-variables--view-recent names)
+    (emacs-jupyter-notebook-inspect-evaluate
+     (if (and (= (length names) 1) (null (nth 2 (cdar selections))))
+         (emacs-jupyter-notebook-variables--plane-code
+          (caar selections) (cadar selections) (nth 2 (car selections)))
+       (concat "ejn.view_variables(["
+               (mapconcat (lambda (selection)
+                            (emacs-jupyter-notebook-variables--selection-code
+                             (car selection) (cdr selection))) selections ",") "])\n"))
+     (concat "View " (mapconcat #'identity names " + ")))))
+
 (defun emacs-jupyter-notebook-variables--view-metadata (name metadata)
   "Select and publish a plane from NAME using bounded METADATA."
   (let ((shape (plist-get metadata :shape))
@@ -596,33 +707,74 @@ Only the generated literal selectors cross Emacs; numerical samples do not."
       (user-error "%s needs an array with at least two dimensions" name))
     (unless (cl-every (lambda (size) (and (integerp size) (> size 0))) shape)
       (user-error "%s has an empty or unavailable array dimension" name))
-    (let* ((selection (emacs-jupyter-notebook-variables--select-plane shape))
+    (let* ((selection (emacs-jupyter-notebook-variables--selection name metadata))
            (axes (car selection))
            (indices (cadr selection)))
       (unless (and (eq client emacs-jupyter-notebook--client)
                    (= generation emacs-jupyter-notebook-variables--generation))
         (user-error "The kernel changed while selecting the array slice; inspect again"))
       (emacs-jupyter-notebook-inspect-evaluate
-       (emacs-jupyter-notebook-variables--plane-code name axes indices)
+       (if (nth 2 selection)
+           (concat "ejn.view_variables(["
+                   (emacs-jupyter-notebook-variables--selection-code name selection) "])\n")
+         (emacs-jupyter-notebook-variables--plane-code name axes indices))
        (format "View %s · axes %d,%d" name (aref axes 0) (aref axes 1))))))
 
 ;;;###autoload
 (defun emacs-jupyter-notebook-view-variable (&optional name)
   "View a numerical plane of NumPy array or PyTorch tensor NAME locally.
-Use the variable at point or prompt for a name.  For multidimensional arrays,
-choose display row/column axes and an index for every remaining dimension,
-including any channel axis.  Only the selected 2D plane leaves the kernel;
-GPU tensors are sliced before copying that plane to CPU.  To browse a 3D
-crop locally, publish it explicitly with `ejn.view' in the source code."
+Use the variable at point or choose live arrays.  Remember valid row/column
+axes and slice indices between invocations.  Only selected samples leave the
+kernel; GPU tensors are sliced before copying to CPU.  Use the unified
+`emacs-jupyter-notebook-view' with a double prefix to configure a 3D crop."
   (interactive)
   (emacs-jupyter-notebook-variables--ensure-ready)
-  (setq name (or name (emacs-jupyter-notebook-variables--name-at-point)
-                 (read-string "Array variable name: ")))
-  (unless (and (stringp name) (<= (string-bytes name) 128)
-               (string-match-p "\\`[[:alpha:]_][[:alnum:]_]*\\'" name))
-    (user-error "Use a simple Python variable name"))
-  ;; Always refresh metadata before picking axes: a previous cell may have
-  ;; rebound the variable, including to a differently shaped array.
+  (setq name (or name (emacs-jupyter-notebook-variables--name-at-point)))
+  (if (null name)
+      (emacs-jupyter-notebook-view-variables)
+    (unless (and (stringp name) (<= (string-bytes name) 128)
+                 (string-match-p "\\`[[:alpha:]_][[:alnum:]_]*\\'" name))
+      (user-error "Use a simple Python variable name"))
+    ;; Always refresh metadata before picking axes: a previous cell may have
+    ;; rebound the variable, including to a differently shaped array.
+    (let* ((source (current-buffer))
+           (selected (window-buffer (selected-window)))
+           (origin (if (eq selected emacs-jupyter-notebook-variables--table) selected source))
+           (client emacs-jupyter-notebook--client)
+           (generation emacs-jupyter-notebook-variables--generation)
+           (token (list 'variable-view)))
+      (setq emacs-jupyter-notebook-variables--view-token token)
+      (emacs-jupyter-notebook-variables--request
+       (vector name)
+       (lambda (reply)
+         (when (eq token emacs-jupyter-notebook-variables--view-token)
+           (let ((metadata (car (append (plist-get reply :variables) nil))))
+             (unless metadata (user-error "%s is not defined in this kernel" name))
+             (emacs-jupyter-notebook-variables--cache-put name metadata)
+             (if (> (length (plist-get metadata :shape)) 2)
+                 ;; Never enter recursive minibuffer input from a helper drain.
+                 ;; Keep the explicit request pending until its source/table is
+                 ;; selected and another minibuffer interaction has finished.
+                 (emacs-jupyter-notebook-ui-defer
+                  source
+                  (lambda ()
+                    (and (bound-and-true-p emacs-jupyter-notebook-mode)
+                         (eq token emacs-jupyter-notebook-variables--view-token)
+                         (eq client emacs-jupyter-notebook--client)
+                         (= generation emacs-jupyter-notebook-variables--generation)))
+                  (lambda () (emacs-jupyter-notebook-variables--view-metadata name metadata))
+                  origin 'variable-view)
+               (emacs-jupyter-notebook-variables--view-metadata name metadata)))))
+       (lambda () (message "Array metadata unavailable; try again when the kernel is idle"))))))
+
+;;;###autoload
+(defun emacs-jupyter-notebook-view-variables (&optional reconfigure preferred)
+  "Choose up to four live arrays and view their remembered planes together.
+With RECONFIGURE, ask again for selectors and offer bounded 3D crops.
+PREFERRED, when non-nil, views that array without a chooser if it exists.
+All metadata lookup is asynchronous; no source cell is evaluated."
+  (interactive "P")
+  (emacs-jupyter-notebook-variables--ensure-ready)
   (let* ((source (current-buffer))
          (selected (window-buffer (selected-window)))
          (origin (if (eq selected emacs-jupyter-notebook-variables--table) selected source))
@@ -631,15 +783,17 @@ crop locally, publish it explicitly with `ejn.view' in the source code."
          (token (list 'variable-view)))
     (setq emacs-jupyter-notebook-variables--view-token token)
     (emacs-jupyter-notebook-variables--request
-     (vector name)
+     (and preferred (vector preferred))
      (lambda (reply)
-       (let ((metadata (car (append (plist-get reply :variables) nil))))
-         (unless metadata (user-error "%s is not defined in this kernel" name))
-         (emacs-jupyter-notebook-variables--cache-put name metadata)
-         (if (> (length (plist-get metadata :shape)) 2)
-             ;; Never enter recursive minibuffer input from a helper drain.
-             ;; Keep the explicit request pending until its source/table is
-             ;; selected and another minibuffer interaction has finished.
+       (when (eq token emacs-jupyter-notebook-variables--view-token)
+         (let* ((metadata (cl-remove-if-not #'emacs-jupyter-notebook-variables--array-p
+                                            (append (plist-get reply :variables) nil)))
+                (names (mapcar (lambda (item) (plist-get item :name)) metadata)))
+           (if (and preferred (not (member preferred names)))
+               (emacs-jupyter-notebook-view-variables reconfigure)
+             (unless names (user-error "No nonempty numerical arrays are available in this kernel"))
+             (dolist (item metadata)
+               (emacs-jupyter-notebook-variables--cache-put (plist-get item :name) item))
              (emacs-jupyter-notebook-ui-defer
               source
               (lambda ()
@@ -647,9 +801,27 @@ crop locally, publish it explicitly with `ejn.view' in the source code."
                      (eq token emacs-jupyter-notebook-variables--view-token)
                      (eq client emacs-jupyter-notebook--client)
                      (= generation emacs-jupyter-notebook-variables--generation)))
-              (lambda () (emacs-jupyter-notebook-variables--view-metadata name metadata))
-              origin 'variable-view)
-           (emacs-jupyter-notebook-variables--view-metadata name metadata))))
+              (lambda ()
+                (let* ((recent (cl-remove-if-not (lambda (name) (member name names))
+                                                 emacs-jupyter-notebook-variables--view-recent))
+                       (completion-extra-properties
+                        (list :annotation-function
+                              (lambda (name)
+                                (let ((item (cl-find name metadata :test #'equal
+                                                     :key (lambda (entry) (plist-get entry :name)))))
+                                  (format "  %s %s"
+                                          (emacs-jupyter-notebook-variables--shape-text (plist-get item :shape))
+                                          (plist-get item :dtype))))))
+                       (chosen
+                        (if preferred (list preferred)
+                          (delete-dups
+                           (completing-read-multiple
+                            (if (plist-get reply :truncated)
+                                "View arrays (comma-separated; list truncated): "
+                              "View arrays (comma-separated): ")
+                            names nil t nil nil (and recent (mapconcat #'identity recent ",")))))))
+                  (emacs-jupyter-notebook-variables--view-group chosen metadata reconfigure)))
+              origin 'variable-view)))))
      (lambda () (message "Array metadata unavailable; try again when the kernel is idle")))))
 
 (defun emacs-jupyter-notebook-variables-view-row ()

@@ -16,6 +16,8 @@ from .workspace import WorkspaceWindow
 from .analysis_worker import AnalysisWorker
 from .memory import MAX_MEMORY, merge_allocations, render_bytes
 from .magnifier import MAX_PATCH_BYTES
+from .findings_gui import findings_service
+from .findings import FindingError
 
 MAX_FRAME = 65536
 MAX_WORKSPACES = 4
@@ -85,6 +87,8 @@ class PipeServer(QtCore.QObject):
         self.active = None
         self.pending = None
         self.analysis = AnalysisWorker(self, admit=lambda: self.memory_used() <= MAX_MEMORY)
+        self.findings = findings_service()
+        self.findings.admit = lambda: self.memory_used() <= MAX_MEMORY
         self.finished = deque(maxlen=128)
         self.negotiated = False
         self.closed = False
@@ -176,11 +180,38 @@ class PipeServer(QtCore.QObject):
             raise ValueError("invalid operation")
         if op == "hello":
             self.negotiated = True
-            self.reply(request_id, {"version": 1, "capabilities": ["array-group-v1", "raster-v1"]})
+            self.reply(request_id, {"version": 1, "capabilities": ["array-group-v1", "raster-v1", "findings-v1"]})
         elif not self.negotiated:
             self.reply(request_id, error="hello-required")
         elif op == "ping":
             self.reply(request_id, {"alive": True})
+        elif op == "findings":
+            self.findings.show_review()
+            self.reply(request_id, {"state": "visible"})
+        elif op == "findings_org":
+            def generated(result, error):
+                if error:
+                    self.findings._message(error)
+                    self.reply(request_id, error="findings-org-failed")
+                else:
+                    self.reply(request_id, result)
+            try:
+                self.findings.submit(self.findings.store.org_overview, generated,
+                                     reserve_bytes=64 * 1024**2)
+            except FindingError as exc:
+                self.findings._message(str(exc))
+                self.reply(request_id, error="findings-busy")
+        elif op == "capture":
+            window = self.windows.get(params.get("workspace"))
+            if window is None:
+                self.reply(request_id, error="workspace-not-found")
+            else:
+                try:
+                    self.findings.capture(window)
+                    self.reply(request_id, {"state": "saving"})
+                except FindingError as exc:
+                    window.analysis_status.setText(str(exc))
+                    self.reply(request_id, error="capture-failed")
         elif op == "open":
             if any(job and job["id"] == request_id for job in (self.active, self.pending)):
                 self.reply(request_id, error="duplicate-request")
@@ -319,7 +350,7 @@ class PipeServer(QtCore.QObject):
 
     def memory_used(self):
         """Conservative application allocations, including worker references."""
-        allocations = merge_allocations(self.analysis.allocations,
+        allocations = merge_allocations(self.analysis.allocations, self.findings.allocations,
                                         *(window.allocations for window in self.windows.values()))
         return (sum(allocations.values())
                 + (self.active.get("reserve", 0) if self.active is not None else 0))
@@ -354,6 +385,7 @@ class PipeServer(QtCore.QObject):
         for window in list(self.windows.values()):
             window.close()
         self.analysis.shutdown()
+        self.findings.shutdown()
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.app.quit()
 

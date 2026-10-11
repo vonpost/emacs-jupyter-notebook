@@ -209,7 +209,9 @@ independently versioned as viewer v1. Diagnostics use stderr only. This local
 pipe replaces the originally proposed socket; EOF revokes the entire epoch
 and exits the viewer. No socket discovery or reconnect/resend is required.
 Request: `{"v":1,"id":"r-1","op":"open","params":{...}}`.
-Operations: `hello`, `open`, `cancel`, `focus`, `close_workspace`, `ping`, `close`.
+Operations: `hello`, `open`, `cancel`, `focus`, `close_workspace`, `ping`, `close`,
+and the optional negotiated `findings-v1` operations `findings`, `capture`
+and `findings_org`.
 Replies have the same id, `ok` boolean and bounded `result` or
 `error:{code,message}`. Error message maximum: 512 UTF-8 bytes; no arbitrary
 tracebacks or data payloads. Invalid/oversized/partial frames close the local
@@ -239,6 +241,48 @@ in a bounded worker with a 16,777,216-pixel ceiling. Raster RGB/RGBA displays
 retain channel appearance but numerical ROI/difference functions are disabled
 and labeled unavailable for rendered images in the first release. Native
 resolution raster viewing is not evidence of original array fidelity.
+
+CC37 adds optional `open.params.context`: a JSON object of at most 24,576
+encoded UTF-8 bytes, independently copied into the immutable snapshot.
+The source-side execution trail supplies `version`, `source`, `scope`,
+`truncated`, `target_id`, `target_missing`, and ordered `entries`. Each entry
+records its ID, exact submitted/reserved code, SHA-256, omission flag,
+cell/origin, queue/submission/finish times, outcome, kernel session and
+execution count. The `kernel_identity` object records the session ID, remote
+PID, Docker container ID when applicable, and a source-local confirmed-restart
+epoch; reconnecting to the same kernel does not increment that epoch.
+Missing code is null with `code_omitted=true`; it is never
+silently shortened. This context is frozen before viewer startup/queueing.
+Display-id updates use the producing execution's handle, even when rendered
+on an older panel entry. No helper/Jupyter protocol or frame limit changes.
+
+`findings` takes an empty params object and opens the local saved collection;
+success returns `state: "visible"`. `capture` takes an exact `workspace` ID
+and immediately freezes that workspace's current painted panes before any
+note prompt or subsequent publication. It never starts a kernel, opens a new
+publication or captures a different workspace. Acceptance returns
+`state: "saving"`; disk completion/errors are reported in the viewer. One
+bounded local findings IO job handles atomic persistence and review.
+Saved findings own their image, lossless displayed planes, view/ROI settings
+and each pane's source context independently of disposable snapshots. Limits:
+128 MiB selected samples per capture, 16,777,216 image pixels, 1,000 findings /
+2 GiB per collection. Explicit deletion only.
+
+`findings_org` takes an empty params object and generates a bounded local
+`findings.org` index in the findings directory. It replies only after atomic
+generation completes, with `path` (absolute local filename), `count` and
+`skipped`. The existing findings worker owns the operation; busy and failed
+requests return stable error codes and are never replayed automatically.
+The document is bounded to 8 MiB and uses relative preview/image/JSON/NumPy
+links, escaped plaintext context excerpts and no executable source blocks.
+Existing generated content is replaced only when its recorded body hash
+still matches; edited content is preserved. Emacs validates a bounded regular
+local file before opening, disables file-local evaluation, and defers display
+until the requesting buffer owns input. Each finding owns a derived
+`overview.png` of at most 800×600 pixels, separately from its full image and
+120×80 browser thumbnail. Emacs displays at most eight visible previews and
+releases decoded offscreen images while scrolling. No full saved array is
+loaded by opening the overview.
 
 `cancel` names an open request ID. Revocation is recorded before worker
 completion can install its result; every completion checks connection epoch,

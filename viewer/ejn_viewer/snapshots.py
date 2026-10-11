@@ -13,7 +13,7 @@ import io
 import os
 import re
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -50,6 +50,7 @@ class Snapshot:
     numerical: bool
     raw_bytes: bytes
     nbytes: int
+    context: dict = field(default_factory=dict)
 
 
 def _bounded_text(value: Any, name: str, *, nonempty: bool = True) -> str:
@@ -295,11 +296,16 @@ def load_snapshot(params: dict[str, Any]) -> Snapshot:
     elif "mime" in params:
         raise SnapshotError("unexpected raster MIME")
     artifact = _artifact(params)
+    from .findings import copy_context, FindingError
+    try:
+        context = copy_context(params.get("context", {}))
+    except FindingError as exc:
+        raise SnapshotError(str(exc)) from exc
     raw = _read_copy(artifact)
     if kind == "array-group":
         manifest, planes = _load_array_group(raw)
         return Snapshot(workspace, generation, execution, kind, params["focus"],
-                        manifest, planes, None, True, raw, len(raw))
+                        manifest, planes, None, True, raw, len(raw), context)
     image = _load_raster(raw, mime)
     return Snapshot(workspace, generation, execution, kind, params["focus"],
-                    None, {"rendered": image}, None, False, b"", image.nbytes)
+                    None, {"rendered": image}, None, False, b"", image.nbytes, context)

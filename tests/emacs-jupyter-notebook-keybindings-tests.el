@@ -44,7 +44,7 @@
         (should (eq (lookup-key map (kbd "TAB"))
                     #'emacs-jupyter-notebook-complete-at-point))
         (should (eq (lookup-key map (kbd "A"))
-                    #'emacs-jupyter-notebook-view-variable))
+                    #'emacs-jupyter-notebook-view))
         (should (eq (lookup-key map (kbd "% i"))
                     #'emacs-jupyter-notebook-insert-cell-below))))))
 
@@ -68,7 +68,7 @@
       (dolist (enabled '(nil t nil t))
         (setq-local emacs-jupyter-notebook-mode enabled)
         (should (eq (key-binding (kbd "C-c m A"))
-                    (if enabled #'emacs-jupyter-notebook-view-variable
+                    (if enabled #'emacs-jupyter-notebook-view
                       #'backward-char)))
         (should (eq (key-binding (kbd "C-c m e a")) #'forward-char)))
       ;; Never consume the space key in a non-Evil buffer.

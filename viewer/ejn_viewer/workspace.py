@@ -320,6 +320,16 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self.draw_button.setMenu(menu)
         controls.addWidget(self.draw_button)
         controls.addWidget(self.measurements_button)
+        self.capture_button = QtWidgets.QToolButton(central)
+        self.capture_button.setText("Capture")
+        self.capture_button.setToolTip("Save the displayed images and their recorded context (Ctrl+S)")
+        self.capture_button.clicked.connect(self.capture_finding)
+        controls.addWidget(self.capture_button)
+        self.findings_button = QtWidgets.QToolButton(central)
+        self.findings_button.setText("Findings")
+        self.findings_button.setToolTip("Review saved images and observations")
+        self.findings_button.clicked.connect(self.show_findings)
+        controls.addWidget(self.findings_button)
         controls.addStretch(1)
         controls.addWidget(self.options_button)
         self.roi_name = QtWidgets.QLineEdit(central)
@@ -389,6 +399,8 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self.slice_slider.valueChanged.connect(lambda index: self.select_volume_slice(index=index))
         self.slice_index.valueChanged.connect(lambda index: self.select_volume_slice(index=index))
         self._slice_shortcuts = []
+        self._capture_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+S"), self)
+        self._capture_shortcut.activated.connect(self.capture_finding)
         for key, step in (("PgUp", -1), ("PgDown", 1)):
             shortcut = QtGui.QShortcut(QtGui.QKeySequence(key), self.graphics)
             shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
@@ -411,6 +423,18 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
     def analysis_bytes(self):
         """Retained derived data and conservative render conversion reservation."""
         return 0 if self._difference is None else self._difference.nbytes * 2
+
+    def capture_finding(self):
+        from .findings import FindingError
+        from .findings_gui import findings_service
+        try:
+            findings_service().capture(self)
+        except FindingError as exc:
+            self.analysis_status.setText(str(exc))
+
+    def show_findings(self):
+        from .findings_gui import findings_service
+        findings_service().show_review()
 
     @property
     def frozen(self):

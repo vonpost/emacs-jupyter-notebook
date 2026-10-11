@@ -69,6 +69,15 @@ class SnapshotTests(unittest.TestCase):
         np.testing.assert_array_equal(snapshot.planes["plane"], original)
         self.assertEqual(snapshot.raw_bytes[:8], b"EJNARR01")
 
+    def test_execution_context_is_independent_and_bounded(self):
+        path = self.write(group_bytes(np.ones((2, 3), dtype="<f4")))
+        context = {"source": "a.py", "entries": [{"code": "model = A"}]}
+        result = load_snapshot(self.params(path, context=context))
+        context["entries"][0]["code"] = "model = B"
+        self.assertEqual(result.context["entries"][0]["code"], "model = A")
+        with self.assertRaises(SnapshotError):
+            load_snapshot(self.params(path, context={"code": "x" * 25000}))
+
     def test_raster_rgb_is_independent_and_non_numeric(self):
         from PIL import Image
         image = Image.new("RGB", (3, 2), (12, 34, 56))

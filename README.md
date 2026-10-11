@@ -49,13 +49,17 @@ leader, with descriptions in which-key. No extra `map!` block is needed:
 | Key (normal/visual state) | Action |
 | --- | --- |
 | `SPC m TAB` | Complete at point |
-| `SPC m A` | View an array variable |
+| `SPC m A` | View a variable, selected output, or choose arrays |
 | `SPC m I` | View the current cell's published images |
 | `SPC m J` | Evaluate the cell and view its published images |
 | `SPC m V` | Browse kernel variables |
 | `SPC m c` / `SPC m j` | Evaluate cell / evaluate and advance |
 | `SPC m .` | Kernel documentation |
 | `SPC m a` | Notebook actions |
+| `SPC m H` / `SPC m D` | Execution trail / changes since the previous run |
+| `SPC m ~` | Disposable scratch input |
+| `SPC m C` / `SPC m f` | Capture a finding / review saved findings |
+| `SPC m O` | Generate and open the findings overview in Org |
 
 Every `C-c j` suffix below also works after the local leader, including the
 `%` cell-editing submenu. In insert/Emacs state, or without Evil, use
@@ -115,6 +119,70 @@ cell evaluation, including when startup fails. Later cell, region, and buffer
 evaluations retry that profile. The global default applies until you make a
 choice in that buffer; an existing registered session still reconnects to its
 recorded kernel.
+
+## Exploring without growing the source file
+
+Keep editing and rerunning your existing cells. The notebook remembers the
+exact code submitted, its order, kernel session and outcome in a separate
+execution trail (`C-c j H`, or `SPC m H`). `RET` shows code, `w` copies it and
+`s` recalls it into scratch input. `C-c j D` shows changes from the previous
+submitted run of this cell in the same kernel instance, including commands
+executed in between. This makes checkpoint changes visible even when the
+inference cell itself stayed the same. Queued, failed and unsent work remain
+distinguishable. Reconnecting preserves the comparison baseline; restarting
+the kernel starts a new one. Nothing is replayed automatically.
+
+Use `C-c j ~` for disposable Python input attached to this notebook. `C-c C-c`
+submits the input (or active region) through its existing kernel queue, then
+clears the accepted input; `C-c C-z` returns to the source. Doom's scratch
+local leader offers `c` to send, `r` for a region, `H` for the trail, `o` for
+output and `~` to return. Scratch commands appear in the same trail without
+adding cells to your source. Closing scratch leaves the kernel running.
+
+`C-c j A` is the main **View** command. At an array name it views that array;
+on an output it opens the selected publication; elsewhere it opens this
+cell's numerical output or offers live arrays. With `C-u C-c j A`, choose one
+to four arrays together, for example `input,prediction`. Valid axes and slice
+indices are remembered, and the previous group is offered again. Use
+`C-u C-u C-c j A` to change the selection, including an explicit bounded 3D
+crop. Only the chosen samples are transferred. `C-c j J` explicitly runs the
+cell and opens its published images.
+
+When a result is interesting, click **Capture** in the viewer (`Ctrl+S`), or
+use `C-c j C` / `SPC m C` from the notebook. The current image panes are
+frozen before an optional note. The saved finding includes the image, exact
+displayed numerical planes, slice/view/ROI settings, and each pane's own
+recorded execution context—including a pinned result from an earlier run.
+Later cell edits and new predictions do not change it.
+
+Open **Findings** in the viewer or use `C-c j f` / `SPC m f` to review saved
+thumbnails and notes, even after restarting Emacs without a kernel.
+**Copy image + caption** supports pasting into an existing presentation.
+`M-x emacs-jupyter-notebook-review-findings` works outside a notebook, and
+`ejn-viewer --findings` opens the same collection directly.
+
+For an Emacs overview, use `C-c j O` / `SPC m O`, or
+`M-x emacs-jupyter-notebook-findings-overview` from any buffer. This generates
+and opens `findings.org` alongside the saved assets: notes become headings,
+readable image previews appear inline, and recorded context is folded underneath.
+Links open the full image, JSON context and numerical data. Generation runs
+asynchronously and needs no kernel. The document is read-only; `C-x C-w`
+saves an editable report copy. Keep the copy in the same folder to preserve
+relative links, or move the whole collection together. You can then select
+findings, arrange them and write a story in your own Org report. Regeneration
+preserves edited overviews; PowerPoint conversion is left for a later step.
+
+The recent trail is bounded (200 executions / 4 MiB of code by default) and
+lives with its source buffer; it survives clearing outputs and deleting
+cells. Saved findings are durable, independently owned files under
+`${XDG_DATA_HOME:-~/.local/share}/ejn/findings`. Each finding is an ordinary
+directory containing `image.png`, a larger `overview.png` preview, a browser
+`thumbnail.png`, a readable `finding.json`
+with the note and context, and lossless `plane-*.npy` arrays. They retain up to 24 KiB of
+recorded context per source snapshot; omitted history/code is explicitly
+marked. This is a memory aid, not a complete kernel checkpoint or inferred
+dependency graph. Saved findings are never automatically evicted: the
+collection allows 1,000 findings / 2 GiB, with explicit **Remove** in review.
 
 ## Minimal Configuration
 
@@ -332,10 +400,16 @@ or bind `emacs-jupyter-notebook-prefix-map` under your own prefix.
 | `C-c j h` | `toggle-cell-output` (hide/show the current cell's output) |
 | `C-c j i` | `inspect` (context-sensitive variable, documentation or output inspection) |
 | `C-c j a` | `actions` (contextual menu with keyboard shortcuts) |
-| `C-c j A` | `view-variable` (open a NumPy array plane without writing viewer code) |
+| `C-c j A` | `view` (contextual output/array viewing; prefix chooses a group) |
 | `C-c j V` | `list-variables` (kernel variable table) |
 | `C-c j I` | `inspect-images` (inspect the current cell's numerical publication) |
 | `C-c j J` | `evaluate-and-inspect` (evaluate and open that execution's first numerical publication) |
+| `C-c j H` | `history` (recorded execution trail) |
+| `C-c j D` | `history-diff` (previous run and intervening commands) |
+| `C-c j ~` | `scratch` (disposable input on this notebook's queue) |
+| `C-c j C` | `capture-finding` (freeze the displayed viewer result) |
+| `C-c j f` | `review-findings` (saved images, notes and copying) |
+| `C-c j O` | `findings-overview` (generate and open an Org results library) |
 | `C-c j .` | `inspect-at-point` |
 | `C-c j TAB` | `complete-at-point` (capf usually handles it) |
 | `C-c j v` | `fetch-remote-log` |

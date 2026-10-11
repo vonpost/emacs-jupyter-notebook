@@ -5036,6 +5036,9 @@ read array bytes.  Nil means ownership was not accepted by this panel."
                         (list :manifest manifest :kind 'array-group
                               :publication-id (gethash "publication_id" manifest)
                               :output-id output-id :entry-handle effective
+                              ;; A display-id update is presented on the old
+                              ;; entry but was produced by HANDLE's new code.
+                              :execution-handle handle
                               :generation (plist-get effective :generation)
                               :execution (format "%s/%s/%d" workspace
                                                  (plist-get metadata :root-identity)

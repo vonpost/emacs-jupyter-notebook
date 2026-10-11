@@ -54,11 +54,15 @@ open workspace without stealing focus. Other cells and workspace keys do not
 replace the selection. Clear/reconnect/source retirement fences old updates.
 
 For an existing NumPy or PyTorch variable, use `C-c j A` at its name or `v` in the variable
-table. Emacs prompts for display axes and any remaining slice/channel indices.
-Only that 2D plane goes through the existing bounded artifact path; the full
-volume remains in the kernel. Generated inspection requests do not add to input
-history. Unsupported dtypes, empty axes and oversized planes report an error.
-Reopen the variable to choose another plane; this requires an idle kernel.
+table. View remembers valid display axes and remaining slice/channel indices.
+`C-u C-c j A` offers live arrays with completion; enter up to four names
+separated by commas to view a group. `C-u C-u C-c j A` reconfigures selections
+and offers explicit 3D crops. Only selected samples go through the existing
+bounded artifact path; full remote volumes are never transferred implicitly.
+Generated inspection requests do not add to IPython input history, but appear
+in EJN's execution trail for saved context. Unsupported dtypes, empty axes and
+oversized selections report an error. Reading a new selection requires an idle
+kernel; opening an existing published output and reviewing saved findings do not.
 Variable names and shapes do not establish physical alignment or intensity
 units. Use the viewer's explicit grid/unit declarations for comparisons, or
 publish those metadata yourself with `ejn.view`.
@@ -81,6 +85,40 @@ statistics table or line profile without removing selections or results. Both
 the measurement panel and magnifier start hidden. Pixel values, analysis messages and the
 following/frozen/pinned evaluation status remain visible below the images;
 hover over shortened status text to read it in full.
+
+**Capture** (`Ctrl+S`, or `C-c j C` / Doom `SPC m C`) freezes the displayed
+graphics and selected numerical planes before asking for an optional note.
+The image includes the current axes/ROI markings and excludes transient cursor
+crosshairs. Pinned and current panes retain separate execution identities and
+their recorded code context. Capture uses the current display even when a
+new publication or slice is pending; it never runs code or waits for a new
+prediction. An in-progress save remains independent of closing its workspace.
+
+**Findings** (`C-c j f` / `SPC m f`, or `ejn-viewer --findings`) reopens the
+durable collection without a kernel. Review thumbnails, edit notes and copy
+the image with its caption into an existing presentation. Findings are listed
+chronologically. **Remove** deletes only explicitly selected saved findings.
+
+`C-c j O` / Doom `SPC m O` generates and opens an Org overview in Emacs.
+`M-x emacs-jupyter-notebook-findings-overview` also works without a notebook.
+The generated `findings.org` sits beside the finding directories and uses
+relative links: image previews, full images, context JSON and NumPy data.
+Each observation has a heading and folded context. The overview uses sharp
+previews up to 800×600 pixels and loads only visible images, with at most eight
+decoded at a time. Offscreen previews are released as you scroll; the original
+full-resolution capture remains linked separately.
+Generation is explicit and atomic; a modified generated file or unsaved
+overview is preserved. Use `C-x C-w` to save a separate, editable report in the
+same directory, or move the whole folder to keep relative links intact.
+The capture workflow requires no Org editing or slide-generation dependency.
+
+Finding directories live under `${XDG_DATA_HOME:-~/.local/share}/ejn/findings`
+with private permissions. Each contains a versioned `finding.json`, captured
+PNG, overview preview, thumbnail and lossless `.npy` planes. The default/hard collection limits
+are 1,000 findings and 2 GiB; saved items are never silently evicted. Context
+is bounded to 24 KiB per retained source snapshot and marks missing/omitted
+code explicitly. It records executions observed by EJN, not all kernel state
+or a guarantee that arbitrary external dependencies can be reconstructed.
 
 In **Compare**, use the Reference and Candidate selectors and choose **Signed
 difference** (`candidate − reference`) or **Absolute difference**. If neither
