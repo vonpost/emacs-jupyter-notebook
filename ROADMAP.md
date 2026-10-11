@@ -221,13 +221,13 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
-- [~] owner=root claimed=2026-10-11 CC37 Lightweight exploration and findings.
+- [x] sha=9a0daf9 CC37 Lightweight exploration and findings.
   Root owns integration in core/actions, result publication provenance,
   findings commands/ERT, docs/protocol/packaging and review.
   `execution_workflow` owns new history/scratch Elisp modules and focused ERT;
   `simple_view` owns variables/inspect Elisp, publisher group/selector support
   and their tests; `durable_findings` owns viewer snapshot/context, durable
-  store, capture/review/export UI and focused Python tests (excluding publisher
+  store, capture/review/copy UI and focused Python tests (excluding publisher
   and test_variable_view.py). Agents do not commit or edit ledgers. Preserve
   exact submitted source and per-pane execution identity, bounded async IO,
   atomic capture before annotation, independent retained samples, ordinary
@@ -239,6 +239,26 @@ scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?
   > to open it. `durable_findings` owns worker/store generation and viewer IPC;
   > `simple_view` owns callback support in inspect.el and its focused tests;
   > root owns the Emacs Org command, integration tests and documentation.
+  > Landed: source-owned scratch, exact bounded execution trail and same-kernel
+  > comparisons, contextual View with remembered selectors/groups, durable
+  > per-pane image/sample/context captures, review/copy, and a generated Org
+  > results library. PowerPoint generation and its dependency were removed at
+  > the user's request. Org uses relative assets and readable 800x600 previews;
+  > at most eight visible images are decoded, with offscreen cache release.
+  > Edited overviews and report copies are preserved. No kernel-lifecycle or
+  > source-text behavior changed; restart identity is recorded only after the
+  > existing lifecycle path confirms the old kernel terminated.
+  > Strict compilation of eight production Elisp files passed using temporary
+  > output, with no repository bytecode. Canonical source checks passed with
+  > `PYTHON=/tmp/ejn-cc33-env/bin/python EJN_TEST_TIMEOUT=120 tests/run-local-tests.sh`:
+  > 1,274 ERT, 8 array, 261 helper, 25 registry and 12 fixture tests; no skips.
+  > All 220 viewer tests passed, including test-owned local-kernel/socket
+  > fixtures (sandbox socket access required escalation). The local Nix viewer
+  > package check passed. Actual Linux Qt capture/annotation/review recovery
+  > and graphical Emacs inline-preview rendering passed with temporary data;
+  > the desktop clipboard was preserved. Independent real Org parser/export
+  > checks confirmed captured text cannot become executable Org constructs.
+  > No remote Jupyter host or macOS graphical verification was performed.
 
 - [x] sha=7414c6c CC36 Doom local-leader notebook commands.
   Expose the notebook command map through Doom's configured local leader,

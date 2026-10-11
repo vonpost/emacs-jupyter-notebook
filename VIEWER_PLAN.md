@@ -451,6 +451,11 @@ remain historical. A row's checkboxes mean landed work, not proposed design.
   > The same scope includes a generated Org overview with relative image/data
   > links, requested as an Emacs-native review document and possible later
   > presentation source. It does not require authoring experiments in Org.
+  > Landed in 9a0daf9: bounded atomic storage, missing-source/restart recovery,
+  > exact selected planes and per-pane context, review/copy, and the generated
+  > Org library with relative assets and larger previews. CC37's local tests,
+  > Linux viewer/Emacs rendering and package checks pass. Future presentation
+  > and measurement exports, polygon ROIs and V11's platform gate stay open.
 
 V2 and V3 may proceed in parallel after V1 with disjoint file ownership.
 V7-V9 are sequential. V12 and V14 may proceed independently after release
