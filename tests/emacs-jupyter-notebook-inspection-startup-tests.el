@@ -57,7 +57,8 @@
          (emacs-jupyter-notebook-runtime-viewer-directory nil)
          (emacs-jupyter-notebook-inspect--state nil)
          (emacs-jupyter-notebook-inspect--watches nil)
-         (emacs-jupyter-notebook-inspector-command nil))
+         (emacs-jupyter-notebook-inspector-command nil)
+         (emacs-jupyter-notebook-inspector-memory-budget 3072))
     (make-directory (file-name-directory viewer) t)
     (with-temp-file viewer (insert "#!/bin/sh\nexec sleep 10\n"))
     (set-file-modes viewer #o700)
@@ -154,6 +155,8 @@
               (should (= 1 (length viewer-commands)))
               (should (member ".#ejn-viewer" (car build-commands)))
               (should (member "--stdio" (car viewer-commands)))
+              (should (equal (last (car viewer-commands) 2)
+                             '("--memory-budget-mib" "3072")))
               (should emacs-jupyter-notebook-runtime-viewer-directory)
               (should (string-match-p "Nix" (with-current-buffer log-buffer
                                                (buffer-string))))

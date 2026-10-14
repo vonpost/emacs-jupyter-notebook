@@ -12,10 +12,13 @@ import unittest
 from unittest import mock
 
 import numpy as np
+from PIL import Image
 from PySide6 import QtCore, QtWidgets
 
 from ejn_viewer.findings import FindingError, FindingStore, MAX_IMAGE_EXTENT
-from ejn_viewer.findings_gui import FindingsService, FindingsWindow, PREVIEW_RESERVE, freeze_window
+from ejn_viewer.findings_gui import (CATALOG_RESERVE, FindingsService, FindingsWindow, PREVIEW_RESERVE,
+                                     freeze_window, preview_reserve)
+from ejn_viewer.memory import MIB, MIN_MEMORY_BUDGET_MIB, memory_budget, set_memory_budget
 from ejn_viewer.workspace import PINNED, WorkspaceWindow
 from test_analysis_gui import APP, pump_until, snapshot
 
@@ -167,6 +170,50 @@ class FindingsGuiTests(unittest.TestCase):
         self.assertIn("figcaption", APP.clipboard().mimeData().html())
         APP.clipboard().clear()
         self.assertEqual(self.service._clipboard_bytes, 0)
+
+    def test_review_and_preview_fit_beside_large_workspace_at_minimum_budget(self):
+        kept = self.store.save(freeze_window(self.window()), "Kept")
+        self.addCleanup(set_memory_budget, memory_budget() // MIB)
+        set_memory_budget(MIN_MEMORY_BUDGET_MIB)
+        # A workspace holding 160 MiB left no room for the former fixed
+        # 192 MiB review reservation at this budget.
+        self.service.admit = lambda: 160 * MIB + sum(self.service.allocations.values()) <= memory_budget()
+        reserves, submit = [], self.service.submit
+        def recorded(function, callback, **options):
+            reserves.append(options["reserve_bytes"])
+            return submit(function, callback, **options)
+        review = FindingsWindow(self.service)
+        self.service.review = review
+        self.addCleanup(review.close)
+        with mock.patch.object(self.service, "submit", side_effect=recorded):
+            review.show()
+            review.refresh()
+            pump_until(lambda: review.list.count() == 1)
+            review.list.setCurrentRow(0)
+            pump_until(lambda: review._current is not None)
+        self.assertEqual(review._current["id"], kept["id"])
+        path = self.store.root / kept["id"] / "image.png"
+        with Image.open(path) as image:
+            pixels = image.width * image.height
+        self.assertEqual(reserves, [CATALOG_RESERVE, preview_reserve(path.stat().st_size, pixels)])
+
+    def test_capture_charges_source_views_once_and_derived_planes_with_workspace(self):
+        window = self.window()
+        window.comparison.setCurrentIndex(1)
+        pump_until(lambda: window._difference is not None)
+        frozen = freeze_window(window)
+        self.assertEqual(len(frozen.arrays), 3)
+        self.service.active = {"capture": frozen, "image_bytes": 0, "reserve_bytes": 0}
+        try:
+            charged = self.service.allocations
+        finally:
+            self.service.active = None
+        self.assertIn(("source", id(window._snapshot)), charged)
+        # Displayed source planes are views of that charged source. Only the
+        # derived difference is charged, under the key the workspace uses.
+        arrays = {key for key in charged if key[0] == "array"}
+        self.assertEqual(len(arrays), 1)
+        self.assertLessEqual(arrays, set(window.allocations))
 
     def test_capture_budget_rejection_retains_no_worker_job(self):
         window = self.window()

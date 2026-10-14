@@ -20,7 +20,8 @@ the manual build above is optional. To use a manually built executable, set:
       '("/absolute/path/to/result/bin/ejn-viewer"))
 ```
 
-The manager adds `--stdio`; do not add `--demo` to this command. Update the
+The manager adds `--stdio` and `--memory-budget-mib`, so the command must be
+a viewer build that accepts both; do not add `--demo` to this command. Update the
 bundled helper as well as the Elisp files, then reconnect to inject `ejn.view`
 into the existing kernel. No remote installation or kernel restart is required.
 The Doom package recipe must include `array_protocol` alongside `helper`,
@@ -263,13 +264,18 @@ The viewer keeps independent, read-only in-memory snapshots, not disk copies.
 Clearing output or killing the source/panel cannot invalidate a loaded image.
 Snapshots are disposable on workspace close, viewer crash, or Emacs exit;
 there are no snapshot files to recover or orphan-clean. The application admits
-at most four workspaces against a 256 MiB accounting budget including source
+at most four workspaces against one accounting budget including source
 and estimated display/load buffers; Qt/Python overhead is additional.
 
 Differences are limited to 32 MiB of float64 samples; source images, derived
-displays, pending loads and analysis scratch share the viewer's 256 MiB
-accounting budget, including pinned snapshots and active worker references.
-Over-budget requests report an error and leave the source samples intact.
+displays, pending loads, analysis scratch and finding capture/review share the
+viewer's accounting budget, including pinned snapshots and active worker
+references. Over-budget requests report an error and leave the source samples
+intact. The budget is 2 GiB by default. Emacs passes
+`emacs-jupyter-notebook-inspector-memory-budget` (MiB) as
+`--memory-budget-mib`; the viewer accepts 256 MiB through 1 TiB and reads the
+value at startup. Findings reserve memory from the saved image's recorded size
+and dimensions, and captured views of loaded samples are charged once.
 
 Native-pixel verification and routing ordinary PNG/JPEG outputs into this
 viewer remain unfinished. PNG/JPEG originals still open with the panel's `o`.

@@ -22,8 +22,18 @@
 
 (defcustom emacs-jupyter-notebook-inspector-command nil
   "Explicit local PyQtGraph viewer argv, or nil for the separate Nix output.
-The manager appends --stdio. No command is installed on a remote system."
+The manager appends --stdio and the memory budget. No command is installed
+on a remote system."
   :type '(choice (const nil) (repeat string)) :group 'emacs-jupyter-notebook)
+
+(defcustom emacs-jupyter-notebook-inspector-memory-budget 2048
+  "Local viewer allocation budget in MiB.
+Loaded samples, displays, analysis and finding capture or review share
+this budget.  The viewer refuses work its conservative accounting expects
+to exceed it, so raise it if large data or a high-resolution display
+reports that the local memory budget is exceeded.  Values are clamped to
+256 MiB through 1 TiB; a change applies when the viewer next starts."
+  :type 'integer :group 'emacs-jupyter-notebook)
 
 (cl-defstruct (ejn-inspection (:constructor ejn-inspection-create))
   process stderr decoder ready closed pending active waiter timer drain raw raw-bytes
@@ -131,6 +141,17 @@ Each subscription coalesces publications into a single pending timer.")
       (let ((program (expand-file-name "bin/ejn-viewer"
                                       emacs-jupyter-notebook-runtime-viewer-directory)))
         (when (file-executable-p program) (list program))))))
+
+(defun emacs-jupyter-notebook-inspect--memory-budget ()
+  "Return the bounded viewer memory budget in whole MiB."
+  (floor (emacs-jupyter-notebook--bounded-positive-option
+          emacs-jupyter-notebook-inspector-memory-budget 2048 256 1048576)))
+
+(defun emacs-jupyter-notebook-inspect--launch-command (command)
+  "Return viewer COMMAND with the stdio control and budget arguments."
+  (append command
+          (list "--stdio" "--memory-budget-mib"
+                (number-to-string (emacs-jupyter-notebook-inspect--memory-budget)))))
 
 (defun emacs-jupyter-notebook-inspect--probe ()
   (list :ready (and (emacs-jupyter-notebook-inspect--command) t)
@@ -336,7 +357,7 @@ Each subscription coalesces publications into a single pending timer.")
           (setf (ejn-inspection-spawning state) t)
           (let ((process
                  (make-process
-                  :name "ejn-inspector" :command (append command '("--stdio"))
+                  :name "ejn-inspector" :command (emacs-jupyter-notebook-inspect--launch-command command)
                   :connection-type 'pipe :coding 'binary :noquery t :buffer nil :stderr (ejn-inspection-stderr state)
                   :filter (lambda (process bytes) (emacs-jupyter-notebook-inspect--filter state process bytes))
                   :sentinel (lambda (process _event)
