@@ -237,13 +237,29 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
-- [~] owner=root claimed=2026-10-14 CC39 Configurable viewer memory budget and sized findings reservations.
+- [x] sha=7ba2aba CC39 Configurable viewer memory budget and sized findings reservations.
   Scope: viewer memory/IPC/findings/workspace/analysis admission, viewer CLI,
   inspector launch option in Emacs, focused Python and ERT tests, README and
   viewer documentation. Default the budget to 2 GiB, validate its bounds on
   both sides, and read it dynamically. Size catalog, preview and Org
   reservations from bounded reads; stop charging captured views of retained
   sources twice. Saved findings remain readable without migration.
+  Root owns implementation and verification; a read-only reviewer checked
+  reservation peaks, accounting keys and Elisp integration.
+  > `emacs-jupyter-notebook-inspector-memory-budget` (MiB, clamped 256 MiB-1
+  > TiB, default 2048) reaches the viewer as `--memory-budget-mib`. Review
+  > reserves about 64 MiB for the catalog instead of 192 MiB; previews and
+  > clipboard copies are sized from the saved PNG header, and captured source
+  > views and derived differences are charged once. Review found a Pillow
+  > peak at the preview reserve and an fd leak on a directory `image.png`;
+  > both were fixed with regressions. All 210 viewer tests passed (three
+  > optional PyTorch skips) from source and in the pinned Nix check; array
+  > 8, helper 261 (four skips), registry 25 and fixture 12 Python tests
+  > passed. The canonical ERT run passed 1,268 of 1,275 on Emacs 31.0.50;
+  > the same seven docker-shell, PID, registry-deadline and Org-workflow
+  > tests fail identically on the unchanged tree. Strict compilation of the
+  > changed Elisp (obsolete-macro warnings excluded) passed with bytecode kept
+  > outside the repository. No remote host was used.
 
 - [x] sha=c525eb3 CC38 Automatically maintain the Org findings overview.
   Scope: viewer findings service/store, focused Python tests, README and
