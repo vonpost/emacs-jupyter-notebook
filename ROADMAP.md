@@ -224,10 +224,26 @@ These are binding for every workstream. Update only by appending a new entry.
   fails, with a clear warning. The overview command remains available for
   opening and rebuilding the collection, including previously saved findings.
 
+- **2026-10-14 / Configurable viewer memory budget, 2 GiB by default.** The
+  user hit the fixed 256 MiB viewer accounting budget when capturing and
+  reviewing findings, and rarely opens several viewers. Supersedes the fixed
+  256 MiB in VIEWER_PLAN, the viewer protocol and installation notes: Emacs
+  passes a bounded user option to the viewer, defaulting to 2 GiB. Admission
+  stays finite and conservative; findings reservations derive from the
+  bounded data an operation actually reads instead of fixed worst cases.
+
 ## Cross-cutting changes
 
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
+
+- [~] owner=root claimed=2026-10-14 CC39 Configurable viewer memory budget and sized findings reservations.
+  Scope: viewer memory/IPC/findings/workspace/analysis admission, viewer CLI,
+  inspector launch option in Emacs, focused Python and ERT tests, README and
+  viewer documentation. Default the budget to 2 GiB, validate its bounds on
+  both sides, and read it dynamically. Size catalog, preview and Org
+  reservations from bounded reads; stop charging captured views of retained
+  sources twice. Saved findings remain readable without migration.
 
 - [x] sha=c525eb3 CC38 Automatically maintain the Org findings overview.
   Scope: viewer findings service/store, focused Python tests, README and
