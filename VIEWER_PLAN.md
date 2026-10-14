@@ -271,8 +271,9 @@ only bounded metadata, with per-output identities and handoff leases. The
 viewer verifies and copies selected groups into read-only **memory**, not a
 disk snapshot store: there are no snapshot files to orphan-clean. Loaded
 images outlive panel/source cleanup, and EOF reaps only the local viewer.
-The four-workspace/256 MiB admission accounting includes retained samples and
-estimated load/render buffers, but is not a process RSS guarantee.
+The four-workspace admission accounting (a configurable budget, 2 GiB by
+default since 2026-10-14) includes retained samples and estimated load/render
+buffers, but is not a process RSS guarantee.
 
 The initial GUI has named row-major panes, compatible linked zoom/pan, fit,
 pixel readout and window level/width. V5-V7 remain partial: ordinary raster

@@ -14,8 +14,9 @@ from unittest import mock
 import numpy as np
 from PIL import Image
 
-from ejn_viewer.findings import (Capture, FindingError, FindingStore, MAX_MANIFEST_BYTES,
-                                 MAX_OVERVIEW_BYTES, copy_context)
+from ejn_viewer.findings import (Capture, FindingError, FindingStore, MAX_IMAGE_PIXELS,
+                                 MAX_MANIFEST_BYTES, MAX_OVERVIEW_BYTES, MAX_PNG_BYTES,
+                                 copy_context)
 
 
 def capture():
@@ -137,6 +138,30 @@ class FindingTests(unittest.TestCase):
         self.assertEqual(self.store.catalog(), ([], 1))
         with mock.patch("ejn_viewer.findings.Image.open", side_effect=Image.DecompressionBombError("bomb")):
             self.assertEqual(self.store.catalog(), ([], 1))
+
+    def test_catalog_reports_saved_image_extent_without_blocking_on_damage(self):
+        kept = self.store.save(capture())
+        image = self.root / kept["id"] / "image.png"
+        item = self.store.catalog()[0][0]
+        self.assertEqual((item["image_bytes"], item["pixels"]), (image.stat().st_size, 60 * 40))
+        # Damaged or non-regular images keep the finding listed with the
+        # conservative format limits; opening the preview reports the damage.
+        image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0\0\0\x0dIHDR" + b"\xff" * 8)
+        item = self.store.catalog()[0][0]
+        self.assertEqual((item["image_bytes"], item["pixels"]), (MAX_PNG_BYTES, MAX_IMAGE_PIXELS))
+        with self.assertRaises(FindingError):
+            self.store.preview(kept["id"])
+        image.unlink()
+        os.mkfifo(image)
+        item = self.store.catalog()[0][0]
+        self.assertEqual((item["image_bytes"], item["pixels"]), (MAX_PNG_BYTES, MAX_IMAGE_PIXELS))
+        image.unlink()
+        image.mkdir()
+        before = len(os.listdir("/dev/fd"))
+        for _ in range(5):
+            item = self.store.catalog()[0][0]
+        self.assertEqual((item["image_bytes"], item["pixels"]), (MAX_PNG_BYTES, MAX_IMAGE_PIXELS))
+        self.assertEqual(len(os.listdir("/dev/fd")), before)
 
     def test_modified_numerical_samples_are_detected(self):
         kept = self.store.save(capture())

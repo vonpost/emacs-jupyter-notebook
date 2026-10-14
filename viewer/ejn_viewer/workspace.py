@@ -16,7 +16,7 @@ from .analysis import (DIFFERENCE, MAX_ROIS, MAX_PROFILE_BYTES, Profile, Region,
 from .spatial import plane_geometry, project_metadata
 from .analysis_worker import AnalysisJob, AnalysisWorker
 from .navigation import ImageGraphicsWidget, ImageViewBox, NavigationGroup, PaneLabel, camera
-from .memory import AnalysisSource, MAX_MEMORY, merge_allocations, source_allocations, render_bytes
+from .memory import AnalysisSource, memory_budget, merge_allocations, source_allocations, render_bytes
 from .magnifier import Magnifier, MAX_PATCH_BYTES
 
 
@@ -145,7 +145,7 @@ class WorkspaceWindow(QtWidgets.QMainWindow):
         self._owns_worker = analysis_worker is None
         self._worker = analysis_worker or AnalysisWorker(self)
         self._admit = admit or (lambda: sum(merge_allocations(
-            self.allocations, self._worker.allocations).values()) <= MAX_MEMORY)
+            self.allocations, self._worker.allocations).values()) <= memory_budget())
         if self._owns_worker:
             self._worker.admit = self._admit
         self._worker.ready.connect(self._analysis_ready)

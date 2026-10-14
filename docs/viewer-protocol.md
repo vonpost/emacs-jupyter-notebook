@@ -141,7 +141,7 @@ The injected code must be self-contained and not load files on the remote.
 | Viewer ready / load ACK deadline | 10 / 30 seconds, excluding Nix build time |
 | Viewer-owned snapshot disk (future disk-backed storage) | 512 MiB total; at most 16 groups |
 | Active workspaces / visible planes | 4 / 4 per active workspace |
-| In-memory source arrays | 256 MiB; evict inactive unpinned views first |
+| In-memory source arrays | 2 GiB by default, configurable 256 MiB–1 TiB; evict inactive unpinned views first |
 | ROI definitions / worker queue | 16 per workspace / one active + latest pending |
 | ROI temporary working set | 32 MiB; scan large ROIs in bounded row blocks |
 | Viewer idle exit | 900 seconds with no visible windows or pending requests |
@@ -154,7 +154,8 @@ include all workspaces, outstanding workers and conversion/difference buffers.
 The experimental implementation uses independently owned read-only memory
 snapshots only: no disk copies, pins or frozen pending snapshots exist yet.
 It limits workspaces to four and accounts retained source samples plus
-estimated load/render buffers against 256 MiB. This is application admission
+estimated load/render buffers against the launch-time budget (2 GiB unless
+`--memory-budget-mib` says otherwise). This is application admission
 accounting, not a guarantee about Qt/Python process RSS. Disk reservations
 and orphan cleanup apply only if disk-backed snapshots are implemented.
 
@@ -163,7 +164,10 @@ retention prevents fitting the next group; never silently unpin. Account for
 candidate/baseline, difference planes, display conversion buffers, loading
 and worker references before allocating. Data budgets are not a total RSS
 promise: report Qt/rendering overhead separately. All limits can be lowered;
-raising them requires updating this contract and stress evidence.
+raising them requires updating this contract and stress evidence. The
+aggregate memory budget is the user-configured exception: it only changes how
+much bounded work can coexist, while per-artifact, per-plane, raster and
+finding limits stay fixed.
 
 Responsiveness acceptance targets after startup on recorded reference
 hardware: Emacs timer delay p95 below 50 ms, max below 200 ms during bounded

@@ -11,10 +11,13 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import numpy as np
 
+from ejn_viewer.app import main
 from ejn_viewer.ipc import Decoder, MAX_FRAME, encode
+from ejn_viewer.memory import MIB, memory_budget, set_memory_budget
 
 
 def _group(array):
@@ -65,6 +68,35 @@ class DecoderTests(unittest.TestCase):
     def test_input_backlog_bound(self):
         with self.assertRaises(ValueError):
             Decoder().feed(b"x" * (MAX_FRAME * 2 + 1))
+
+
+class MemoryBudgetOptionTests(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(set_memory_budget, memory_budget() // MIB)
+
+    def test_default_budget_is_two_gibibytes(self):
+        self.assertEqual(memory_budget(), 2 * 1024**3)
+
+    def test_launch_option_is_installed_before_serving(self):
+        seen = []
+        with mock.patch("ejn_viewer.ipc.run", side_effect=lambda: seen.append(memory_budget()) or 0):
+            self.assertEqual(main(["--stdio", "--memory-budget-mib", "4096"]), 0)
+        self.assertEqual(seen, [4096 * MIB])
+
+    def test_unsupported_budget_exits_before_serving_and_keeps_budget(self):
+        before = memory_budget()
+        for value in ("255", "1048577", "-1", "lots"):
+            with (mock.patch("ejn_viewer.ipc.run") as run,
+                  mock.patch("sys.stderr", io.StringIO()) as stderr):
+                with self.assertRaises(SystemExit) as raised:
+                    main(["--stdio", "--memory-budget-mib", value])
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("--memory-budget-mib", stderr.getvalue())
+            run.assert_not_called()
+        self.assertEqual(memory_budget(), before)
+        for value in (256.0, True, "512"):
+            with self.assertRaises(ValueError):
+                set_memory_budget(value)
 
 
 class StdioProcessTests(unittest.TestCase):
