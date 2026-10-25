@@ -229,6 +229,16 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
+- [~] owner=root claimed=2026-10-26 CC39 Isolate every ProxyJump leg from
+  user-owned SSH control masters. Scope: SSH command construction, local SSH
+  launcher lifecycle, focused isolation ERTs, affected command-shape tests,
+  option documentation and README. Preserve native SSH configuration and
+  target one-shot multiplexing; tunnels, probes and both SCP directions must
+  use independent jump connections, including nested/configured jumps.
+  Root implements and integrates; `review_proxyjump` investigates and reviews
+  the command/lifecycle boundaries. Verification uses local configuration
+  evaluation only, never a real remote host.
+
 - [x] sha=c525eb3 CC38 Automatically maintain the Org findings overview.
   Scope: viewer findings service/store, focused Python tests, README and
   protocol documentation. Generate after capture, note edits and removal
