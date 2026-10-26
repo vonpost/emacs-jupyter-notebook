@@ -152,6 +152,72 @@ Docker belongs in `:launcher', never in this resolver command prefix."
         (format "%s@%s" user host)
       host)))
 
+(defvar emacs-jupyter-notebook-ssh--ssh-wrapper-directory nil
+  "Private local directory holding this Emacs's SSH launchers.")
+
+(defvar emacs-jupyter-notebook-ssh--ssh-wrapper-programs nil
+  "Alist of resolved (SSH BASH) executables to top-level launcher paths.")
+
+(defun emacs-jupyter-notebook-ssh--ssh-wrapper-cleanup ()
+  "Remove local SSH launchers on Emacs exit, without touching connections."
+  (when emacs-jupyter-notebook-ssh--ssh-wrapper-directory
+    (ignore-errors
+      (delete-directory emacs-jupyter-notebook-ssh--ssh-wrapper-directory t)))
+  (setq emacs-jupyter-notebook-ssh--ssh-wrapper-directory nil
+        emacs-jupyter-notebook-ssh--ssh-wrapper-programs nil))
+
+(defun emacs-jupyter-notebook-ssh--ssh-program ()
+  "Return a local SSH launcher that isolates every implicit ProxyJump leg.
+OpenSSH builds implicit jump commands from argv[0], but does not pass the
+target's `-S none' to them.  Use Bash's exec -a to set argv[0] to a second
+launcher that supplies `-S none'.  That launcher repeats the same exec-a
+selection, so configured and comma-separated jump chains remain isolated.
+The top-level launcher preserves the target's own multiplexing policy.
+
+No config parsing or subprocess runs here.  Both launchers exec into the
+configured SSH executable, preserving process supervision and native SSH
+configuration.  Keep the files until Emacs exit: a delayed jump child may
+still need them after the top-level process has started."
+  (let* ((ssh (or (executable-find emacs-jupyter-notebook-ssh-command)
+                  (error "Cannot find SSH executable: %s"
+                         emacs-jupyter-notebook-ssh-command)))
+         (bash (or (executable-find "bash")
+                   (error "EJN requires local Bash for ProxyJump isolation")))
+         (key (list ssh bash)))
+    (unless (and emacs-jupyter-notebook-ssh--ssh-wrapper-directory
+                 (file-directory-p
+                  emacs-jupyter-notebook-ssh--ssh-wrapper-directory))
+      ;; OpenSSH interpolates argv[0] unquoted into its ProxyCommand and
+      ;; expands % tokens.  Use a private, shell-safe path even when HOME,
+      ;; the package path or temporary-file-directory contains metacharacters.
+      (setq emacs-jupyter-notebook-ssh--ssh-wrapper-directory
+            (make-temp-file "/tmp/ejn-ssh-" t)
+            emacs-jupyter-notebook-ssh--ssh-wrapper-programs nil)
+      (add-hook 'kill-emacs-hook
+                #'emacs-jupyter-notebook-ssh--ssh-wrapper-cleanup))
+    (let ((cached (cdr (assoc key emacs-jupyter-notebook-ssh--ssh-wrapper-programs))))
+      (if (and cached (file-executable-p cached)
+               (file-executable-p (concat cached "-jump")))
+          cached
+        (let* ((program (make-temp-file
+                         (expand-file-name
+                          "ssh-" emacs-jupyter-notebook-ssh--ssh-wrapper-directory)))
+               (jump (concat program "-jump")))
+          (dolist (file (list program jump))
+            (with-temp-file file
+              ;; /bin/sh also permits resolved Bash paths containing spaces;
+              ;; neither executable lookup nor exec depends on the shell PATH.
+              (insert (format
+                       "#!/bin/sh\nexec %s -c 'exec -a \"$0\" \"$@\"' %s %s%s \"$@\"\n"
+                       (shell-quote-argument bash)
+                       (shell-quote-argument jump)
+                       (shell-quote-argument ssh)
+                       (if (equal file jump) " -S none" ""))))
+            (set-file-modes file #o700))
+          (push (cons key program)
+                emacs-jupyter-notebook-ssh--ssh-wrapper-programs)
+          program)))))
+
 (defun emacs-jupyter-notebook-ssh--option-args (profile &optional scp)
   "Return option arguments for PROFILE.
 When SCP is non-nil, translate :port to scp's -P option."
@@ -187,14 +253,14 @@ see `--no-control-args'."
 The persistent target tunnel must own its connection, even when one-shot
 multiplexing is disabled.  Append these args after all user options: unlike
 `-o ControlPath=none', the final `-S none' overrides an earlier `-S' or
-`-o ControlPath' as well as ssh_config.  A ProxyJump child still uses the
-jump host's own SSH configuration."
+`-o ControlPath' as well as ssh_config.  `--ssh-program' separately isolates
+every implicit ProxyJump child, including children of one-shot commands."
   (list "-S" "none"))
 
 (defun emacs-jupyter-notebook-ssh-command (profile &optional remote-command)
   "Return an SSH argv list for PROFILE.
 When REMOTE-COMMAND is non-nil, append it as the remote shell command."
-  (append (list emacs-jupyter-notebook-ssh-command)
+  (append (list (emacs-jupyter-notebook-ssh--ssh-program))
           (emacs-jupyter-notebook-ssh--option-args profile)
           (emacs-jupyter-notebook-ssh--control-args)
           (emacs-jupyter-notebook-ssh--keepalive-args)
@@ -215,7 +281,7 @@ positive integer, return `(\"-o\" \"ServerAliveInterval=N\" \"-o\"
   "Return an SSH tunnel argv list for PROFILE.
 REMOTE-PORTS and LOCAL-PORTS are plists keyed by Jupyter channel
 port keys."
-  (append (list emacs-jupyter-notebook-ssh-command)
+  (append (list (emacs-jupyter-notebook-ssh--ssh-program))
           (emacs-jupyter-notebook-ssh--option-args profile)
           (emacs-jupyter-notebook-ssh--no-control-args)
           (list "-N" "-T" "-o" "ExitOnForwardFailure=yes")
@@ -251,6 +317,7 @@ without a `~' anchor) are returned unchanged."
           (emacs-jupyter-notebook-ssh--option-args profile t)
           (emacs-jupyter-notebook-ssh--control-args)
           (emacs-jupyter-notebook-ssh--keepalive-args)
+          (list "-S" (emacs-jupyter-notebook-ssh--ssh-program))
           (list (format "%s:%s"
                         (emacs-jupyter-notebook-ssh-destination profile)
                         (emacs-jupyter-notebook-ssh--scp-remote-path remote-file))
@@ -264,6 +331,7 @@ so an interrupted upload can never replace the live connection file."
           (emacs-jupyter-notebook-ssh--option-args profile t)
           (emacs-jupyter-notebook-ssh--control-args)
           (emacs-jupyter-notebook-ssh--keepalive-args)
+          (list "-S" (emacs-jupyter-notebook-ssh--ssh-program))
           (list local-file
                 (format "%s:%s"
                         (emacs-jupyter-notebook-ssh-destination profile)

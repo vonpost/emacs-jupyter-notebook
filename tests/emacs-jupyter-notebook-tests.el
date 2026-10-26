@@ -1137,7 +1137,8 @@ wedged buffer could only be recovered by nuking the live kernel."
         (emacs-jupyter-notebook-tunnel-keepalive-interval 0))
     (should (equal (emacs-jupyter-notebook-ssh-command
                     '(:profile "p" :host "example.com" :user "alice" :port 2222))
-                   '("ssh" "-o" "BatchMode=yes" "-p" "2222" "alice@example.com")))))
+                   (list (emacs-jupyter-notebook-ssh--ssh-program)
+                         "-o" "BatchMode=yes" "-p" "2222" "alice@example.com")))))
 
 (ert-deftest ejn-a3a4-ssh-command-carries-connect-timeout-and-control-master ()
   "A4: every ssh command carries `ConnectTimeout' (bounded handshake).
@@ -1193,7 +1194,7 @@ A3: it also carries multiplexing options so short commands share a master."
               '(:profile "p" :host "example.com")
               '(:shell_port 1 :iopub_port 2 :stdin_port 3 :hb_port 4 :control_port 5)
               '(:shell_port 1001 :iopub_port 1002 :stdin_port 1003 :hb_port 1004 :control_port 1005))))
-    (should (equal (car cmd) emacs-jupyter-notebook-ssh-command))
+    (should (equal (car cmd) (emacs-jupyter-notebook-ssh--ssh-program)))
     (should (member "1001:127.0.0.1:1" cmd))
     (should (member "1005:127.0.0.1:5" cmd))
     (should (equal (car (last cmd)) "example.com"))))
@@ -1215,6 +1216,7 @@ legacy SCP protocols."
                     '(:profile "p" :host "example.com")
                     "~/.cache/ejn/kernel.json" "/tmp/kernel.json")
                    (list emacs-jupyter-notebook-scp-command
+                         "-S" (emacs-jupyter-notebook-ssh--ssh-program)
                          "example.com:.cache/ejn/kernel.json"
                          "/tmp/kernel.json")))))
 
@@ -1228,6 +1230,7 @@ legacy SCP protocols."
                     '(:profile "p" :host "example.com")
                     "/home/alice/.cache/ejn/kernel.json" "/tmp/kernel.json")
                    (list emacs-jupyter-notebook-scp-command
+                         "-S" (emacs-jupyter-notebook-ssh--ssh-program)
                          "example.com:/home/alice/.cache/ejn/kernel.json"
                          "/tmp/kernel.json")))))
 

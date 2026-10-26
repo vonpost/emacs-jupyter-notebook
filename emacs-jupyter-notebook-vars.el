@@ -41,7 +41,10 @@ to paths and executables inside the image."
   :group 'emacs-jupyter-notebook)
 
 (defcustom emacs-jupyter-notebook-ssh-command "ssh"
-  "SSH executable used for remote commands and tunnels."
+  "OpenSSH executable used for remote commands, tunnels and SCP transport.
+EJN uses local Bash launchers to isolate implicit ProxyJump children.
+Use the OpenSSH executable or a symlink to it: a script that resets argv[0]
+when invoking OpenSSH bypasses the jump-launcher isolation."
   :type 'string
   :group 'emacs-jupyter-notebook)
 
@@ -53,7 +56,8 @@ to paths and executables inside the image."
 (defcustom emacs-jupyter-notebook-ssh-options nil
   "Extra SSH options inserted before the remote destination.
 The persistent target tunnel appends `-S none' after user options to keep
-its connection independent of shared control sockets."
+its connection independent of shared control sockets.  Implicit ProxyJump
+children also receive `-S none' through EJN's local SSH launcher."
   :type '(repeat string)
   :group 'emacs-jupyter-notebook)
 
@@ -88,9 +92,11 @@ ride, collapsing those handshakes to roughly one — a large win on
 high-latency links and through a ProxyJump.  When nil, one-shot commands
 continue to honor multiplexing settings from SSH options and ssh_config.
 The persistent target tunnel always opts out with a final `-S none', so
-its lifetime can be supervised.  ProxyJump children retain their jump
-host's SSH configuration, including any multiplexing configured there.
-Requires OpenSSH 6.7+ (for the `%C'/`%i' ControlPath tokens)."
+its lifetime can be supervised.  Every implicit ProxyJump child also uses
+`-S none', including those belonging to one-shot commands, so ending a
+probe cannot take down the user's jump-host master or EJN's tunnel.
+Other jump-host SSH settings remain in effect.  Requires local Bash and
+OpenSSH 7.3+ (for ProxyJump)."
   :type 'boolean
   :group 'emacs-jupyter-notebook)
 

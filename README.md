@@ -382,7 +382,23 @@ falls back to a compatibility transport.
 
 ### ProxyJump / ssh config
 
-`ssh` and `scp` read your `~/.ssh/config`, and this package never bypasses it (no `-F none`, no `ProxyCommand` override). ProxyJump therefore works transparently: set the profile `:host` to the **`Host` alias** from your ssh config (not a raw IP) so its `ProxyJump`/`HostName`/`User`/`IdentityFile`/`Port` all apply, and leave `:port`/`:user`/`:identity-file` **unset** in the profile (those emit `-p`/`user@`/`-i`, which override the config). Connection multiplexing (on by default, `emacs-jupyter-notebook-ssh-control-master`) reuses one connection across the whole jump chain, so a ProxyJump setup is where it pays off most.
+`ssh` and `scp` read your `~/.ssh/config`, including its `Include` and `Match`
+rules and the normal system config. Set the profile `:host` to the **`Host`
+alias** from your ssh config so its `ProxyJump`/`HostName`/`User`/`IdentityFile`/
+`Port` all apply, and leave `:port`/`:user`/`:identity-file` **unset** in the
+profile (those emit `-p`/`user@`/`-i`, which override the config). Explicit
+`-F` config files and `-J` jump chains work as well.
+
+EJN requires local OpenSSH and Bash. Its private local launchers give every
+implicit ProxyJump leg `-S none`, for tunnels, liveness probes and SCP in
+both directions. Ending a probe therefore cannot tear down a jump-host
+master shared by terminals or other tunnels. All other SSH settings retain
+their normal meaning. Short commands still reuse EJN's destination master
+by default, avoiding repeated authentication through the jump chain.
+Configure `emacs-jupyter-notebook-ssh-command` with the OpenSSH executable
+or a symlink to it; scripts that reset its program name (`argv[0]`) bypass
+the jump launcher. A custom `ProxyCommand` that starts SSH must arrange
+its own isolation, for example by passing `-S none` to that SSH process.
 
 ## Keymap
 
@@ -680,9 +696,10 @@ with a neutral `✓`; this does not claim that the code succeeded. A helper cras
 or Emacs restart still loses the in-memory execution queue. Update the local
 helper together with the Elisp to use tunnel recovery.
 
-The persistent tunnel uses its own SSH connection, including when global or
-profile SSH options enable multiplexing. Short setup and management commands
-can still share EJN's master connection. In `ssh -vvv` output,
+The persistent tunnel and each of its ProxyJump legs use their own SSH
+connections, including when global or profile SSH options enable
+multiplexing. Short setup and management commands can still share EJN's
+destination master, with independent jump connections. In `ssh -vvv` output,
 `mux_client_read_packet_timeout: read header failed: Broken pipe` describes
 the local multiplexing socket and can appear at normal session exit. Check
 the following line: `Received exit status from master 0` is successful,
@@ -690,11 +707,11 @@ whereas `Control master terminated unexpectedly` indicates lost master
 ownership. The debug line alone does not identify a proxy or server failure.
 See [OpenSSH's mux client implementation](https://github.com/openssh/openssh-portable/blob/master/mux.c).
 
-For a terminal comparison using EJN's default keepalive policy, run
+For a terminal comparison of the destination's keepalive policy, run
 `ssh -vvv -S none -o ServerAliveInterval=15 -o ServerAliveCountMax=3 HOST`.
-Three unanswered probes disconnect in about 45 seconds. A ProxyJump uses a
-separate SSH process with its own host configuration, so target-host options
-do not by themselves disable multiplexing on the jump host.
+Three unanswered probes disconnect in about 45 seconds. This terminal command
+only isolates the destination: OpenSSH does not pass `-S none` to ProxyJump
+children. EJN's launchers apply it to every implicit jump process as well.
 
 ## Status buffer (`C-c j ?`)
 
