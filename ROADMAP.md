@@ -229,7 +229,7 @@ These are binding for every workstream. Update only by appending a new entry.
 Use this section to claim ownership of changes that span workstream file
 scopes. Format: `[ ] CC<n> <short description> — touches: <files> — for: <W?>`.
 
-- [~] owner=root claimed=2026-10-26 CC39 Isolate every ProxyJump leg from
+- [x] sha=45e3aa1 CC39 Isolate every ProxyJump leg from
   user-owned SSH control masters. Scope: SSH command construction, local SSH
   launcher lifecycle, focused isolation ERTs, affected command-shape tests,
   option documentation and README. Preserve native SSH configuration and
