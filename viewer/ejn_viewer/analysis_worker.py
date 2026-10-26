@@ -11,7 +11,7 @@ from PySide6 import QtCore
 from .analysis import (DIFFERENCE, MAX_PROFILE_BYTES, SCRATCH_BYTES,
                        difference, line_profile, statistics, world_region_to_pixel)
 from .spatial import plane_geometry
-from .memory import MAX_MEMORY, merge_allocations, source_allocations
+from .memory import memory_budget, merge_allocations, source_allocations
 
 
 @dataclass
@@ -75,7 +75,7 @@ class AnalysisWorker(QtCore.QObject):
 
     def __init__(self, parent=None, admit=None):
         super().__init__(parent)
-        self.admit = admit or (lambda: self.reserved <= MAX_MEMORY)
+        self.admit = admit or (lambda: self.reserved <= memory_budget())
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ejn-analysis")
         self.active = self.pending = None
         self.closed = False

@@ -16,8 +16,9 @@ from PySide6 import QtCore, QtTest, QtWidgets
 from ejn_viewer.analysis import DIFFERENCE
 from ejn_viewer.analysis_worker import AnalysisJob, AnalysisWorker, compute
 from ejn_viewer.workspace import WorkspaceWindow
-from ejn_viewer.memory import source_allocations
-from ejn_viewer.ipc import MAX_MEMORY, PipeServer
+from ejn_viewer.memory import (MIB, MIN_MEMORY_BUDGET_MIB, memory_budget, set_memory_budget,
+                               source_allocations)
+from ejn_viewer.ipc import PipeServer
 
 
 APP = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -260,6 +261,9 @@ class AnalysisGuiTests(unittest.TestCase):
             pump_until(lambda: worker.reserved == 0)
 
     def test_2048_difference_roi_and_coalesced_move_fit_shared_budget(self):
+        # The smallest supported budget must still hold this comparison.
+        self.addCleanup(set_memory_budget, memory_budget() // MIB)
+        set_memory_budget(MIN_MEMORY_BUDGET_MIB)
         # Shape-only broadcast fixtures avoid allocating megabytes just to test
         # the real admission formulas; production snapshots are contiguous.
         data = snapshot()
@@ -270,7 +274,7 @@ class AnalysisGuiTests(unittest.TestCase):
         window = SimpleNamespace(allocations={**source_allocations(data), ("array", id(derived)): derived.nbytes, ("render", "test"): 3 * derived.size * 8})
         server = SimpleNamespace(windows={"test": window}, active=None,
                                  findings=SimpleNamespace(allocations={}))
-        worker = AnalysisWorker(admit=lambda: PipeServer.memory_used(server) <= MAX_MEMORY)
+        worker = AnalysisWorker(admit=lambda: PipeServer.memory_used(server) <= memory_budget())
         server.analysis = worker
         self.addCleanup(worker.shutdown)
         entered, release = threading.Event(), threading.Event()
@@ -286,7 +290,7 @@ class AnalysisGuiTests(unittest.TestCase):
             self.addCleanup(release.set)
             worker.submit(job(1))
             pump_until(entered.is_set)
-            self.assertLessEqual(PipeServer.memory_used(server), MAX_MEMORY)
+            self.assertLessEqual(PipeServer.memory_used(server), memory_budget())
             active_charge = worker.reserved
             for token in range(2, 10):
                 worker.submit(job(token))

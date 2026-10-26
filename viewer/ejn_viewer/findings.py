@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import struct
 import tempfile
 import uuid
 
@@ -31,7 +32,9 @@ MAX_CAPTURE_BYTES = 128 * 1024**2
 MAX_IMAGE_PIXELS = 16_777_216
 MAX_IMAGE_EXTENT = 16_384
 MAX_PNG_BYTES = 64 * 1024**2
+MAX_THUMBNAIL_BYTES = 48 * 1024
 MAX_OVERVIEW_BYTES = 2 * 1024**2
+PREVIEW_EXTENT = 2048
 OVERVIEW_SIZE = (800, 600)
 MAX_MANIFEST_BYTES = 256 * 1024
 MAX_CONTEXT_BYTES = 24 * 1024
@@ -220,6 +223,37 @@ def _preview_png(path, size, limit):
     return raw
 
 
+def png_pixels(raw):
+    """Return the pixel count a PNG declares, or None if invalid or over the limit."""
+    if len(raw) < 24 or raw[:8] != b"\x89PNG\r\n\x1a\n" or raw[12:16] != b"IHDR":
+        return None
+    width, height = struct.unpack(">II", raw[16:24])
+    return width * height if 0 < width * height <= MAX_IMAGE_PIXELS else None
+
+
+def _png_extent(path):
+    """Return (file bytes, pixels) from a saved PNG header without decoding it.
+
+    Unreadable or out-of-limit headers report the format limits, keeping
+    reservations conservative; the preview itself then reports the damage.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return MAX_PNG_BYTES, MAX_IMAGE_PIXELS
+    try:
+        info = os.fstat(fd)
+        header = os.read(fd, 24) if stat.S_ISREG(info.st_mode) else b""
+    except OSError:
+        return MAX_PNG_BYTES, MAX_IMAGE_PIXELS
+    finally:
+        os.close(fd)
+    pixels = png_pixels(header)
+    if pixels is None or info.st_size > MAX_PNG_BYTES:
+        return MAX_PNG_BYTES, MAX_IMAGE_PIXELS
+    return info.st_size, pixels
+
+
 def _resized_png(image, size, limit):
     factor = min(1, size[0] / image.width, size[1] / image.height)
     dimensions = (max(1, round(image.width * factor)), max(1, round(image.height * factor)))
@@ -349,7 +383,7 @@ class FindingStore:
             image.save(buffer, format="PNG")
             raw_image = buffer.getvalue()
             _png(raw_image)
-        thumb = _resized_png(image, (120, 80), 48 * 1024)
+        thumb = _resized_png(image, (120, 80), MAX_THUMBNAIL_BYTES)
         overview = _resized_png(image, OVERVIEW_SIZE, MAX_OVERVIEW_BYTES)
         identifier = uuid.uuid4().hex
         manifest = {"version": 1, "id": identifier,
@@ -429,9 +463,10 @@ class FindingStore:
         for path in self._directories():
             try:
                 value = self.manifest(path.name)
-                thumb = _preview_png(path / "thumbnail.png", (120, 80), 48 * 1024)
+                thumb = _preview_png(path / "thumbnail.png", (120, 80), MAX_THUMBNAIL_BYTES)
+                image_bytes, pixels = _png_extent(path / "image.png")
                 items.append({key: value[key] for key in ("id", "created", "note")}
-                             | {"thumbnail": thumb})
+                             | {"thumbnail": thumb, "image_bytes": image_bytes, "pixels": pixels})
             except (FindingError, OSError):
                 errors += 1
         return sorted(items, key=lambda item: (item["created"], item["id"])), errors
@@ -467,7 +502,7 @@ class FindingStore:
     def preview(self, identifier):
         manifest, raw, _ = self.load(identifier)
         image = _png(raw)
-        image.thumbnail((2048, 2048))
+        image.thumbnail((PREVIEW_EXTENT, PREVIEW_EXTENT))
         preview = io.BytesIO()
         image.save(preview, format="PNG")
         return manifest, raw, preview.getvalue()

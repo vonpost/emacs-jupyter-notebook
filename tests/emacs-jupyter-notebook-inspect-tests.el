@@ -146,6 +146,22 @@
     (should (= (gethash "new" counts 0) 1))
     (should-not emacs-jupyter-notebook-inspect--state)))
 
+(ert-deftest ejn-inspect-launch-passes-bounded-memory-budget ()
+  (should (equal (eval (car (get 'emacs-jupyter-notebook-inspector-memory-budget
+                                 'standard-value)))
+                 2048))
+  (let ((emacs-jupyter-notebook-inspector-memory-budget 2048))
+    (should (equal (emacs-jupyter-notebook-inspect--launch-command '("/viewer" "--flag"))
+                   '("/viewer" "--flag" "--stdio" "--memory-budget-mib" "2048"))))
+  ;; Fractions truncate, out-of-range values clamp, and invalid ones fall
+  ;; back to the default instead of producing an argument the viewer rejects.
+  (dolist (case '((4096 . "4096") (300.7 . "300") (1 . "256") (2000000 . "1048576")
+                  (0 . "2048") (-5 . "2048") (nil . "2048") ("lots" . "2048")
+                  (0.0e+NaN . "2048")))
+    (let ((emacs-jupyter-notebook-inspector-memory-budget (car case)))
+      (should (equal (last (emacs-jupyter-notebook-inspect--launch-command '("/viewer")) 2)
+                     (list "--memory-budget-mib" (cdr case)))))))
+
 (ert-deftest ejn-inspect-missing-command-does-not-leak-stderr-process ()
   (ejn-inspect-test--with-state
     (let ((make-pipe (symbol-function 'make-pipe-process)) created)

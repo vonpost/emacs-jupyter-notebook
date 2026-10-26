@@ -18,6 +18,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from .memory import set_memory_budget
 from .navigation import ImageGraphicsWidget, ImageViewBox
 
 
@@ -259,7 +260,14 @@ def main(argv=None) -> int:
     parser.add_argument("--findings", action="store_true", help="review saved findings without a kernel")
     parser.add_argument("--smoke-test", action="store_true", help="run a paint/resize smoke test")
     parser.add_argument("--offscreen", action="store_true", help="use Qt's offscreen platform for smoke tests")
+    parser.add_argument("--memory-budget-mib", type=int, metavar="MIB",
+                        help="shared allocation budget for loaded data and findings (default 2048)")
     args = parser.parse_args(argv)
+    if args.memory_budget_mib is not None:
+        try:
+            set_memory_budget(args.memory_budget_mib)
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.stdio:
         from .ipc import run
         return run()

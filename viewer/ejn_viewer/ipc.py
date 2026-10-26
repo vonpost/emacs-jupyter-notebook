@@ -14,9 +14,9 @@ from PySide6 import QtCore, QtWidgets
 from .snapshots import load_snapshot
 from .workspace import WorkspaceWindow
 from .analysis_worker import AnalysisWorker
-from .memory import MAX_MEMORY, merge_allocations, render_bytes
+from .memory import memory_budget, merge_allocations, render_bytes
 from .magnifier import MAX_PATCH_BYTES
-from .findings_gui import findings_service
+from .findings_gui import ORG_RESERVE, findings_service
 from .findings import FindingError
 
 MAX_FRAME = 65536
@@ -86,9 +86,9 @@ class PipeServer(QtCore.QObject):
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ejn-snapshot")
         self.active = None
         self.pending = None
-        self.analysis = AnalysisWorker(self, admit=lambda: self.memory_used() <= MAX_MEMORY)
+        self.analysis = AnalysisWorker(self, admit=lambda: self.memory_used() <= memory_budget())
         self.findings = findings_service()
-        self.findings.admit = lambda: self.memory_used() <= MAX_MEMORY
+        self.findings.admit = lambda: self.memory_used() <= memory_budget()
         self.finished = deque(maxlen=128)
         self.negotiated = False
         self.closed = False
@@ -197,7 +197,7 @@ class PipeServer(QtCore.QObject):
                     self.reply(request_id, result)
             try:
                 self.findings.submit(self.findings.store.org_overview, generated,
-                                     reserve_bytes=64 * 1024**2)
+                                     reserve_bytes=ORG_RESERVE)
             except FindingError as exc:
                 self.findings._message(str(exc))
                 self.reply(request_id, error="findings-busy")
@@ -280,7 +280,7 @@ class PipeServer(QtCore.QObject):
         if params.get("kind") == "raster":
             reserve += 3 * 16777216 * 4
         if (workspace not in self.windows and len(self.windows) >= MAX_WORKSPACES
-                or retained + reserve > MAX_MEMORY):
+                or retained + reserve > memory_budget()):
             self.reply(job["id"], error="viewer-budget-exceeded")
             return
         self.active = job
@@ -312,7 +312,7 @@ class PipeServer(QtCore.QObject):
             job["reserve"] = 0
             retained = self.memory_used()
             incoming = snapshot_charge(snapshot) + (MAX_PATCH_BYTES if window is None else 0)
-            if retained + incoming > MAX_MEMORY:
+            if retained + incoming > memory_budget():
                 self.reply(job["id"], error="viewer-budget-exceeded")
                 return
             window = self.windows.get(snapshot.workspace)
@@ -321,7 +321,7 @@ class PipeServer(QtCore.QObject):
                 return
             if window is None:
                 window = WorkspaceWindow(analysis_worker=self.analysis,
-                                         admit=lambda: self.memory_used() <= MAX_MEMORY)
+                                         admit=lambda: self.memory_used() <= memory_budget())
                 window.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
                 window.closed.connect(lambda key=snapshot.workspace: self.workspace_closed(key))
                 self.windows[snapshot.workspace] = window

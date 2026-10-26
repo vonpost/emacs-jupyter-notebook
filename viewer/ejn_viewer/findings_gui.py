@@ -8,16 +8,35 @@ import base64
 import html
 import json
 
+import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .findings import (Capture, FindingError, FindingStore, MAX_CAPTURE_BYTES,
-                       MAX_IMAGE_PIXELS, MAX_IMAGE_EXTENT, MAX_NOTE, MAX_OVERVIEW_BYTES, json_bytes)
-from .memory import MAX_MEMORY, merge_allocations, source_allocations
+from .findings import (Capture, FindingError, FindingStore, MAX_CAPTURE_BYTES, MAX_FINDINGS,
+                       MAX_IMAGE_PIXELS, MAX_IMAGE_EXTENT, MAX_MANIFEST_BYTES, MAX_NOTE,
+                       MAX_ORG_BYTES, MAX_OVERVIEW_BYTES, MAX_THUMBNAIL_BYTES, PREVIEW_EXTENT,
+                       json_bytes, png_pixels)
+from .memory import array_owner, memory_budget, merge_allocations, source_allocations
 
-IO_RESERVE = 192 * 1024**2
-ORG_RESERVE = 64 * 1024**2
+# The existing document, generated sections, joined body and final bytes,
+# each with an encoding copy. Overview images are validated one at a time.
+ORG_RESERVE = MAX_ORG_BYTES * 8
+# One manifest at a time; every listed finding keeps a thumbnail and its note.
+CATALOG_RESERVE = MAX_FINDINGS * (MAX_THUMBNAIL_BYTES + 16 * 1024) + 4 * MAX_MANIFEST_BYTES
 # Three derived image/PNG buffers plus coefficient tables for two bounded axes.
 PREVIEW_RESERVE = MAX_OVERVIEW_BYTES * 3 + 2 * 1024**2
+PREVIEW_COST_ROLE = QtCore.Qt.ItemDataRole.UserRole + 1
+
+
+def preview_reserve(image_bytes, pixels):
+    """Reserve review preview IO for a saved PNG of known size and pixel count.
+
+    The raw file and its copy; the RGBA decode, Pillow's premultiplied copy
+    and a horizontal resampling pass bounded by the full image; the bounded
+    preview, its conversion and PNG encoding; and the parsed manifest.
+    """
+    scaled = min(pixels, PREVIEW_EXTENT * PREVIEW_EXTENT) * 4
+    return (image_bytes * 2 + pixels * 4 * 3 + scaled * 3
+            + MAX_MANIFEST_BYTES * 4 + 2 * 1024**2)
 
 
 def freeze_window(window, *, admit=None):
@@ -102,7 +121,7 @@ class FindingsService(QtCore.QObject):
         self._clipboard_mime = None
         self._clipboard_bytes = 0
         QtWidgets.QApplication.clipboard().dataChanged.connect(self._clipboard_changed)
-        self.admit = lambda: sum(self.allocations.values()) <= MAX_MEMORY
+        self.admit = lambda: sum(self.allocations.values()) <= memory_budget()
         self.completed.connect(self._finished)
 
     @property
@@ -115,8 +134,15 @@ class FindingsService(QtCore.QObject):
             if capture is not None:
                 for source in capture.sources:
                     result = merge_allocations(result, source_allocations(source))
+                planes = [plane for source in capture.sources
+                          for plane in getattr(source, "planes", {}).values()]
                 for array in capture.arrays:
-                    result["capture-array", id(array)] = array.nbytes
+                    # A view of retained source samples is charged with its
+                    # source. Derived planes are charged under their owning
+                    # array, which the workspace charges while displaying it.
+                    if not any(np.may_share_memory(array, plane) for plane in planes):
+                        owner = array_owner(array)
+                        result["array", id(owner)] = owner.nbytes
                 # Detached pixels, encoded PNG, decoded pixels, Pillow's RGBA
                 # premultiplication and resampling intermediate can coexist.
                 # Derived preview pixels/encoding remain separately bounded.
@@ -125,7 +151,7 @@ class FindingsService(QtCore.QObject):
                 result["capture-image", id(capture)] = image_bytes * 5 + PREVIEW_RESERVE
                 result["finding-io", id(self)] = self.active.get("reserve_bytes", 0)
             else:
-                result["finding-io", id(self)] = self.active.get("reserve_bytes", IO_RESERVE)
+                result["finding-io", id(self)] = self.active["reserve_bytes"]
         if self.review is not None and not self.review._closed:
             result["finding-review", id(self)] = self.review.reserved_bytes
         return result
@@ -135,7 +161,7 @@ class FindingsService(QtCore.QObject):
             self._clipboard_mime = None
             self._clipboard_bytes = 0
 
-    def submit(self, function, callback, *, capture=None, reserve_bytes=IO_RESERVE):
+    def submit(self, function, callback, *, reserve_bytes, capture=None):
         if self.closed or self.active is not None:
             raise FindingError("A findings operation is still running; try again shortly.")
         job = {"callback": callback, "capture": capture, "reserve_bytes": reserve_bytes}
@@ -367,7 +393,7 @@ class FindingsWindow(QtWidgets.QMainWindow):
         self.list.currentItemChanged.connect(self._selected)
         service.changed.connect(self.refresh)
 
-    def _run(self, action, done, *, reserve_bytes=IO_RESERVE):
+    def _run(self, action, done, *, reserve_bytes):
         try:
             self.service.submit(action, lambda result, error: None if self._closed else done(result, error),
                                 reserve_bytes=reserve_bytes)
@@ -400,6 +426,7 @@ class FindingsWindow(QtWidgets.QMainWindow):
                 self._thumbnail_bytes += pixmap.width() * pixmap.height() * 4
                 item = QtWidgets.QListWidgetItem(QtGui.QIcon(pixmap), value["created"][:16] + "\n" + (value["note"] or "Untitled finding"))
                 item.setData(QtCore.Qt.ItemDataRole.UserRole, value["id"])
+                item.setData(PREVIEW_COST_ROLE, preview_reserve(value["image_bytes"], value["pixels"]))
                 self.list.addItem(item)
                 if value["id"] == selected:
                     self.list.setCurrentItem(item)
@@ -409,7 +436,7 @@ class FindingsWindow(QtWidgets.QMainWindow):
                                 + (f" {damaged} unreadable findings skipped." if damaged else ""))
             if self.list.currentItem() is not None:
                 self._selected(self.list.currentItem())
-        self._run(self.service.store.catalog, loaded)
+        self._run(self.service.store.catalog, loaded, reserve_bytes=CATALOG_RESERVE)
 
     def _selected(self, item, *_):
         self._token += 1
@@ -417,6 +444,7 @@ class FindingsWindow(QtWidgets.QMainWindow):
         if item is None:
             return
         identifier = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        reserve = item.data(PREVIEW_COST_ROLE)
         self._clear_preview()
 
         def loaded(value, error):
@@ -434,7 +462,7 @@ class FindingsWindow(QtWidgets.QMainWindow):
             self.note.setText(self._current["note"] or "Untitled finding")
             self.context.setPlainText(json.dumps(self._current["view"], ensure_ascii=False, indent=2))
             self._paint_image()
-        self._run(lambda: self.service.store.preview(identifier), loaded)
+        self._run(lambda: self.service.store.preview(identifier), loaded, reserve_bytes=reserve)
 
     def _clear_preview(self):
         self._current = None
@@ -469,8 +497,9 @@ class FindingsWindow(QtWidgets.QMainWindow):
             self.status.setText("Wait for the current findings operation before copying.")
             return
         # Clipboard HTML and platform adapters can each duplicate the bytes.
-        from .findings import MAX_IMAGE_PIXELS
-        reserve = len(self._image_bytes) * 7 + MAX_IMAGE_PIXELS * 8
+        # The worker verified this PNG, so its header gives the decoded size.
+        pixels = png_pixels(self._image_bytes) or MAX_IMAGE_PIXELS
+        reserve = len(self._image_bytes) * 7 + pixels * 8
         self.service.active = {"reserve_bytes": reserve}
         try:
             if not self.service.admit():

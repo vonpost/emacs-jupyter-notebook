@@ -634,6 +634,16 @@ first use. It adds no Qt dependency to ordinary kernel work. See
 [viewer setup and limits](docs/viewer-installation.md) for manual setup and
 verification.
 
+Loaded images, comparisons, analysis and finding capture/review share one
+conservative local memory budget, 2 GiB by default. If the viewer reports that
+an operation exceeds the local memory budget, raise
+`emacs-jupyter-notebook-inspector-memory-budget` (in MiB, 256 MiB–1 TiB); the
+new value applies the next time the viewer starts:
+
+```elisp
+(setq emacs-jupyter-notebook-inspector-memory-budget 4096)
+```
+
 The viewer includes signed/absolute differences, hold-to-blink comparison,
 linked sample readout and magnification, rectangular/elliptical ROI
 mean/population SD, and line intensity profiles. Choose **Draw ROI → Draw line**
